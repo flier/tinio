@@ -238,10 +238,13 @@ impl<S: Storage> S3Backend<S> {
         // Cloned: the checksum-spec parse below borrows the whole input.
         let bucket = self.bucket(req.input.bucket.clone())?;
         let key = self.key(req.input.key.clone())?;
-        // The fail-open guard for a request carrying `versionId`: s3s's
-        // non-`minio` `PutObjectInput` drops the parameter (the field
-        // exists only under s3s's `minio` feature, which this workspace
-        // does not enable), so the guard reads it from the raw query.
+        // The fail-open guard for a request carrying `versionId`: s3s
+        // ships two `PutObjectInput`s and only the one behind
+        // `#[cfg(feature = "minio")]` carries `version_id` — that struct
+        // and the `deserialize_http` that parses `versionId` into it are
+        // gated together, and this workspace enables only s3s's default
+        // features — so the parameter is absent from the input the
+        // handler receives and the guard reads the raw query instead.
         // With versioning unavailable the request is refused like every
         // other version-addressed one — never answered as an ordinary
         // write — and with versioning available the parameter stays

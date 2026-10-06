@@ -216,14 +216,17 @@ impl<S: Storage> S3Backend<S> {
         use crate::_core::acl::Acl;
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
-        // The fail-open guard for a request carrying `versionId`: s3s's
-        // non-`minio` `CreateMultipartUploadInput` drops the parameter
-        // (the field exists only under s3s's `minio` feature, which this
-        // workspace does not enable), so the guard reads it from the raw
-        // query. With versioning unavailable the request is refused like
-        // every other version-addressed one, and with versioning
-        // available the parameter stays ignored (the create is the plain
-        // create; no per-version behavior is invented).
+        // The fail-open guard for a request carrying `versionId`: s3s
+        // ships two `CreateMultipartUploadInput`s and only the one behind
+        // `#[cfg(feature = "minio")]` carries `version_id` — that struct
+        // and the `deserialize_http` that parses `versionId` into it are
+        // gated together, and this workspace enables only s3s's default
+        // features — so the parameter is absent from the input the
+        // handler receives and the guard reads the raw query instead.
+        // With versioning unavailable the request is refused like every
+        // other version-addressed one, and with versioning available the
+        // parameter stays ignored (the create is the plain create; no
+        // per-version behavior is invented).
         require_versioning(self, query_version_id(&req.uri))?;
         // The create-time checksum spec is persisted and drives the
         // per-part algorithm consistency + the compute-only tee (spec

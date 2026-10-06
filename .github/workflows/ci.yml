@@ -387,6 +387,22 @@ jobs:
       - name: feature-matrix check (tinio-server)
         run: cargo hack check --package tinio-server --each-feature --no-dev-deps --profile ci
 
+      # tinio-fs's feature-off arm is invisible to every test graph: its
+      # self dev-dependency (tinio-fs on itself, features = ["versioning"])
+      # unifies the feature back ON whenever test targets build, so the
+      # workspace no-default leg never compiles it. A cargo check builds no
+      # dev-deps, so --each-feature's no-default-features run is that arm
+      # without --no-dev-deps (which would only rewrite the real manifest
+      # while cargo-hack runs).
+      - name: feature-matrix check (tinio-fs)
+        run: cargo hack check --package tinio-fs --each-feature --profile ci
+
+      # tinio-mem carries the same self dev-dependency shape and the same
+      # blind spot: its feature-off arm compiles only in a dev-dep-free
+      # check.
+      - name: feature-matrix check (tinio-mem)
+        run: cargo hack check --package tinio-mem --each-feature --profile ci
+
   e2e:
     name: E2E (cucumber fs/mem + traceability)
     # Ubuntu cucumber legs chain behind the ubuntu test job: they compile

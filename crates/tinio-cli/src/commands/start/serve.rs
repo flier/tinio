@@ -119,7 +119,37 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     // The startup repair, post-bind (decision 12): the fast, deterministic items only, and
     // best-effort — a failed stage is warned and readiness proceeds, because the scanner
     // covers the residue.
-    repair(&storage, &resolution).await;
+    let repaired = repair(&storage, &resolution).await;
+
+    // Crash evidence arms the design's optional post-unclean-shutdown verify (2026-10-06
+    // review): when the repair actually cleared residue, every versioned bucket's stored
+    // blocks are re-read and re-hashed in the background — report-only, the corrupt count on
+    // `tinio_storage_blocks_corrupt_total`. Serving is not delayed: the trust-the-store read
+    // path is compensated, never gated.
+    #[cfg(feature = "versioning")]
+    if repaired {
+        let storage = storage.clone();
+        let access = AccessMode::from(resolution.read_only);
+        tokio::spawn(async move {
+            let cleanup = FsCleanup::new(
+                &storage,
+                CleanupOptions {
+                    access,
+                    ..Default::default()
+                },
+            );
+            match cleanup.verify_all_blocks().await {
+                Ok((checked, corrupt)) => tracing::info!(
+                    blocks_checked = checked,
+                    blocks_corrupt = corrupt,
+                    "post-repair block verification finished"
+                ),
+                Err(err) => {
+                    tracing::warn!(error = %err, "post-repair block verification failed")
+                }
+            }
+        });
+    }
 
     // One shutdown path, three entry points: the signal handlers flip this channel, `/stop`
     // sends on it, and every serving arm below ends on it.
@@ -512,16 +542,22 @@ fn background_arm(name: &str, outcome: Result<(), JoinError>) -> Result<(), Erro
 /// Best-effort by contract (`failure-handling.md` §3): every stage is warned rather than
 /// propagated, because the scanner covers whatever residue a failed stage leaves behind, and a
 /// server that refuses to start over a full `tmp/` would be a worse failure than the residue.
-async fn repair(storage: &FsStorage, resolution: &Resolution) {
+async fn repair(storage: &FsStorage, resolution: &Resolution) -> bool {
     let cleanup = repair_cleanup(storage, resolution);
+    // Whether any stage actually cleared something: the startup repair runs
+    // with `dry_run` off, so an `Ok` action is executed repair — residue a
+    // crash left (2026-10-06 review). That is the unclean-shutdown signal
+    // the optional post-repair block verification arms on.
+    let mut repaired = false;
     match cleanup.repair(RepairKind::Startup).await {
         Ok(mut actions) => {
             while let Some(action) = actions.next().await {
-                if let Err(err) = action {
-                    tracing::warn!(
+                match action {
+                    Ok(_) => repaired = true,
+                    Err(err) => tracing::warn!(
                         error = %err,
                         "startup repair step failed; the scanner covers the residue"
-                    );
+                    ),
                 }
             }
         }
@@ -530,6 +566,7 @@ async fn repair(storage: &FsStorage, resolution: &Resolution) {
             "startup repair failed; the scanner covers the residue"
         ),
     }
+    repaired
 }
 
 /// The `FsCleanup` the startup repair runs: the access mode plus the pipeline's orphan-upload
@@ -607,10 +644,11 @@ async fn scanner_and_sweeper(
 
 /// The background sweep's options from the resolved `[s3]` section (R2): the two TTLs —
 /// `temp_ttl_hours` and `multipart_expire_days` (hours and days in the config, a `Duration` at
-/// the sweeper) — and the three retention keys — `noncurrent_keep`, `noncurrent_expire_days` and
+/// the sweeper) — the three versioning keys — `noncurrent_keep`, `noncurrent_expire_days` and
 /// `block_grace_minutes` (minutes in the config, a `Duration` at the sweeper; the key's floor of
-/// 1 is the parser's). Without an `[s3]` section every default applies, which is what an absent
-/// section means everywhere else.
+/// 1 is the parser's) — and `block_bytes_warn` (bytes; 0 = off), the block store's size warning
+/// threshold. Without an `[s3]` section every default applies, which is what an absent section
+/// means everywhere else.
 fn sweep_options_for(resolution: &Resolution) -> sweep::Options {
     match resolution.config.s3.as_ref() {
         Some(s3) => sweep::Options {
@@ -619,6 +657,7 @@ fn sweep_options_for(resolution: &Resolution) -> sweep::Options {
             noncurrent_keep: s3.noncurrent_keep,
             noncurrent_expire_days: s3.noncurrent_expire_days,
             block_grace: Duration::from_secs(s3.block_grace_minutes.saturating_mul(60)),
+            block_bytes_warn: s3.block_bytes_warn,
         },
         None => sweep::Options::default(),
     }

@@ -11,6 +11,8 @@
 **Spec:** `docs/superpowers/specs/2026-10-03-s3-versioning-design.md` — this plan implements its **Error surface**, **Feature gating and configuration**, **Interaction with existing behavior** (the read-only amendment) and the wire half of **Read paths**, plus the corpus updates its **Ownership** section names.
 
 **Depends on:** plan 1 (`tinio-core::blob`, `tinio-blob`) and plan 2 (`tinio-core::version`, `VersionOps`, the version tables, the fs/mem implementations). **Amendment 2026-10-03:** plan 1 was executed and then revised on operator rulings — `tinio-blob`'s `versioning` feature and its crate-root gate were **removed** (the feature had exactly one referent, and its off-state compiled an empty crate), and `BlockStore` gained a required `walk`. Neither alters this plan's surface, but the compile-time level of the three-level gating model no longer includes plan 1's crate, and the gating prose in Task 8 below has been corrected to match. `tinio-server`'s own `versioning` feature — the one this plan is about — is unaffected.
+>
+> **Execution note (2026-10-06, review round).** This plan landed as one commit, `ba5004a6` (2026-10-06): every non-commit step below was verified against that tree and is ticked; the eight Commit steps are unticked because they were not performed as written (the tree landed as one bundled commit). Three steps are landed-as-amended: Task 2 Step 3 (one `require_versioning` body using `cfg!`, not the sketch's two `#[cfg]` arms), Task 3 Step 3 (the marker `405` goes through the error route — the landed note sits beside the sketch), and Task 5 Step 4 (the metric families are `tinio-fs`'s, per plan 2's wave F4 — corrected in place below).
 
 ## Global Constraints
 
@@ -43,7 +45,7 @@
 - Consumes: nothing from plans 1–2.
 - Produces: `Capabilities::versioning: bool` (default `true`, `#[serde(default = "versioning")]`, `#[default = true]`, default fn `fn versioning() -> bool { Capabilities::default().versioning }`); `Config::noncurrent_keep: u64` (default 0) and `Config::noncurrent_expire_days: u64` (default 0), each with its default fn in the established shape (`crates/tinio-config/src/schema/s3.rs:171-221`); and `Config::block_grace_minutes: u64` (default 10, `#[garde(range(min = 1))]` — the floor makes a zero a startup error rather than a silent disarm of the block sweep's race guard, decided with the operator on 2026-10-03).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `crates/tinio-config/src/schema/s3.rs`'s tests, in the file's existing pattern:
 
@@ -72,20 +74,20 @@ Append to `crates/tinio-config/src/schema/s3.rs`'s tests, in the file's existing
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-config --lib schema::s3`
 Expected: FAIL — `no field versioning`.
 
-- [ ] **Step 3: Add the keys**
+- [x] **Step 3: Add the keys**
 
 `Capabilities` (beside `tagging`, `cors`, `acl`) and `Config` (beside `temp_ttl_hours`, `multipart_expire_days`); the default fns beside the existing ones. The flattening is unchanged, so the keys stay under `[s3]` (`s3.rs:144-169`).
 
-- [ ] **Step 4: Update the config contract**
+- [x] **Step 4: Update the config contract**
 
 `specs/001-s3-local-server/contracts/config.md`: the `[s3]` example block gains the four keys with their defaults and one line each — `versioning` (capability toggle, default on), `noncurrent_keep` (retain the newest N noncurrent versions; `0` = unlimited), `noncurrent_expire_days` (expire a noncurrent version D days after it stopped being current; `0` = never), `block_grace_minutes` (the minimum age before an unreferenced block may be reclaimed; default 10, minimum 1). These four lines are the contract's; plan 2's sweep reads them as `sweep::Options` fields.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test -p tinio-config`
 Expected: PASS.
@@ -114,7 +116,7 @@ git commit -m "feat(config): add the versioning toggle and the retention keys"
 - Consumes: `Capabilities::versioning` (Task 1), `VersionOps` (plan 2), the decorator stack (`crates/tinio-server/src/data.rs:270-285`).
 - Produces: table rows `#[gated(versioning: "versioning")] fn get_bucket_versioning (GetBucketVersioningInput) -> GetBucketVersioningOutput;`, the same for `put_bucket_versioning` and `list_object_versions`. The groups follow the surface, not convenience: `get_bucket_versioning` and `list_object_versions` are `read` rows and `put_bucket_versioning` is a `write` row, so the read-only plane (`crates/tinio-server/src/readonly.rs`, the crate-root decorator beside `metrics.rs` — `AccessDenied` at `:48`) forwards the reads and refuses the write through the existing macro, exactly as it does for every other operation; `pub(crate) fn require_versioning<S: Storage>(backend: &S3Backend<S>, version: Option<&str>) -> S3Result<()>`; the error mapping arms `StorageError::NoSuchVersion(_) => s3_error!(NoSuchVersion)` and `StorageError::InvalidVersion(_) => s3_error!(InvalidArgument, …)`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The table's own cross-check test already fails once a row exists without a dispatch method (`ops.rs:288`), so the first step is the row; the fail-open helper gets its own test in `versioning.rs`:
 
@@ -141,12 +143,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-server --lib versioning`
 Expected: FAIL — `cannot find function require_versioning`.
 
-- [ ] **Step 3: Write the helper and the rows**
+- [x] **Step 3: Write the helper and the rows**
 
 `crates/tinio-server/src/backend/versioning.rs`:
 
@@ -203,7 +205,7 @@ The cargo feature `versioning` is declared by `tinio-server` (`[features] versio
 
 The **toggle-off startup warning** is this task's second obligation from the design's **Feature gating and configuration**: with the feature compiled in but `[s3] versioning` off, a root that holds version data still starts — current versions keep serving, every version operation answers `NotImplemented` — and startup logs exactly one warning naming how many buckets hold version data. The count is one range scan of the bucket-versioning table (`tinio_store::bucket_versioning`, plan 2's reader — never a per-bucket lookup, so a large root stays cheap), the log site is the run's startup (`crates/tinio-cli/src/commands/start/serve.rs`, where the parsed config and the storage are both in hand), and the test pins the warning's count on a root with two versioned buckets plus its absence when the toggle is on or no bucket holds version data.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p tinio-server --lib && cargo hack check --package tinio-server --each-feature`
 Expected: PASS — including `table_matches_the_s3_dispatch` and the write-group pin `WRITE_OPS` (`ops.rs:317`), which gains `put_bucket_versioning`.
@@ -230,7 +232,7 @@ git commit -m "feat(server): declare the versioning operations and the fail-open
 - Consumes: `VersionOps::{get_object_version, head_object_version, delete_object_version}`, `version::{Id, Marker, ReadResult, HeadResult}`, `require_versioning` (Task 2).
 - Produces: `pub(crate) fn set_version_headers(out: &mut http::HeaderMap, id: Option<&version::Id>, is_delete_marker: bool)` — sets `x-amz-version-id` (`"null"` when `id` is `None`) and, when `is_delete_marker`, `x-amz-delete-marker: true`. It takes the identity, not a `Marker`, because the write path has none: `op_put_object` and its siblings answer from the `Info` the storage returned (`info.version_id: Option<version::Id>`), and only the delete path holds a `Marker` (`marker.id`, `marker.is_delete_marker`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/tinio-server/src/backend/versioning.rs`'s tests gain the wire journeys (the handler-level tests the repo already writes for ops — `crate::backend::testutil`'s request helpers):
 
@@ -257,22 +259,22 @@ git commit -m "feat(server): declare the versioning operations and the fail-open
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-server --lib versioning`
 Expected: FAIL.
 
-- [ ] **Step 3: Thread the reads and the delete**
+- [x] **Step 3: Thread the reads and the delete**
 
 **The parse.** Every version value on the wire is turned into an `Option<version::Id>` by one step before it reaches a call, and the step has an owner: `version::Id::from_wire(value)` owns the literal `"null"` (`"null"` → `None`), and any other value is validated by the checked constructor `version::Id::new(value)` (the 1024-byte cap, `version::MAX_ID_LEN`) — a malformed value answers `400 InvalidArgument` through plan 2's `StorageError::InvalidVersion` arm, and a well-formed id that names no version answers `404 NoSuchVersion` through `StorageError::NoSuchVersion`. `from_wire` alone also answers `None` for a malformed string (it validates and drops the error), which is exactly the collapse Review Focus 2 forbids, so it is never the only parse. The sites are `GET`/`HEAD`/`DELETE`'s `versionId`, `CopySource`'s source version, and Task 6's tagging/ACL `versionId`.
 
-- `op_get_object` / `op_head_object`: first `require_versioning(self, req.input.version_id.as_deref())?`; when the input carries an id, call `storage.get_object_version(…, version, range)`; a `ReadResult::Marker { id, .. }` answers `s3_error!(MethodNotAllowed)` **with** the response's headers set — s3s's `S3Error` carries no headers, so the marker case builds the response directly: `S3Response::new(GetObjectOutput { last_modified: …, ..Default::default() })` with the 405 status set on `resp` and the two headers inserted through `set_version_headers(resp.headers_mut(), id.as_ref(), true)` (the pattern `op_head_object` already uses for `x-amz-tagging-count`, `crates/tinio-server/src/backend/objects.rs:566-578`). The status override is `resp.status = Some(http_modified_405)` — s3s's `S3Response` carries `status: Option<StatusCode>` precisely to override the output's implied code (`src/protocol.rs:183-185`) — and s3s renders it when set. **The plain, non-version-addressed branch carries the header too**, through the same helper (`info.version_id.as_ref(), false`): decided with the operator on 2026-10-03 — AWS returns `x-amz-version-id` on every `GET`/`HEAD` of a versioned bucket, and a client records the current version's id from exactly that header, which is what makes a later `?versionId=` request possible without a listing first. An unversioned bucket answers without it.
+- `op_get_object` / `op_head_object`: first `require_versioning(self, req.input.version_id.as_deref())?`; when the input carries an id, call `storage.get_object_version(…, version, range)`; a `ReadResult::Marker { id, .. }` answers `s3_error!(MethodNotAllowed)` **with** the response's headers set — s3s's `S3Error` carries no headers, so the marker case builds the response directly: `S3Response::new(GetObjectOutput { last_modified: …, ..Default::default() })` with the 405 status set on `resp` and the two headers inserted through `set_version_headers(resp.headers_mut(), id.as_ref(), true)` (the pattern `op_head_object` already uses for `x-amz-tagging-count`, `crates/tinio-server/src/backend/objects.rs:566-578`). The status override is `resp.status = Some(http_modified_405)` — s3s's `S3Response` carries `status: Option<StatusCode>` precisely to override the output's implied code (`src/protocol.rs:183-185`) — and s3s renders it when set. **Landed 2026-10-06 — superseded.** s3s 0.17 never reads `S3Response::status`; the shipped handler answers the marker `405` through the error route with headers (`crates/tinio-server/src/backend/versioning.rs`'s `marker_error`), and the contract records it as ruling R11. **The plain, non-version-addressed branch carries the header too**, through the same helper (`info.version_id.as_ref(), false`): decided with the operator on 2026-10-03 — AWS returns `x-amz-version-id` on every `GET`/`HEAD` of a versioned bucket, and a client records the current version's id from exactly that header, which is what makes a later `?versionId=` request possible without a listing first. An unversioned bucket answers without it.
 - `op_delete_object`: `require_versioning(...)`, then `delete_object_version` when an id is present and plain `delete_object` otherwise; the resulting `Marker` goes through `set_version_headers(resp.headers_mut(), marker.id.as_ref(), marker.is_delete_marker)` into the response, and the `DELETE` of a marker answers with `x-amz-delete-marker: true`.
 - `op_put_object` / `op_copy_object` / `op_complete_multipart_upload`: no input version, but their responses carry `x-amz-version-id` — one `set_version_headers(resp.headers_mut(), info.version_id.as_ref(), false)` call each, from the `Info`/`PutObjectResult` the storage returned. `CopyObject`'s source `versionId` (inside `CopySource`, `s3s` `src/dto/copy_source.rs:23-63`) threads into a version-addressed read of the source; `UploadPartCopy` the same.
 - **Conditional writes.** The existing conditionals handling (`crates/tinio-server/src/backend/objects.rs`'s write path and `crates/tinio-server/src/backend/conditions.rs`) gains the two versioning arms the design's **version model** pins: `If-None-Match: *` applies to the **current version only** and succeeds when there is no current version or the current version is a delete marker; `If-Match` fails with `404 Not Found` (not `412`) in those same two cases. A test beside the existing conditionals tests drives both arms — on an enabled bucket with a live current version, on a key whose current version is a marker, and on a key with no current version.
 - **`DeleteObjects` (batch) with version ids.** `op_delete_objects` threads each `ObjectIdentifier.version_id` through the same delete path (a version-addressed delete per entry, the plain delete when the id is absent) and fills each `DeletedObject { version_id, delete_marker, delete_marker_version_id }` from the `Marker` that path returned — the same triple the single-object `DELETE` renders as `x-amz-version-id`/`x-amz-delete-marker` headers. This is the design's Goal 4 (bounded disk by explicit version deletion) reached through the batch surface; a test deletes two version ids and one plain key in one request and asserts the three entries.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p tinio-server`
 Expected: PASS — the new journeys plus every existing handler test.
@@ -298,7 +300,7 @@ git commit -m "feat(server): address object versions on the wire"
 - Consumes: `VersionOps::list_object_versions`, `version::{Entry, ListParams, Listing, IdMarker}`, the existing listing helpers (`crates/tinio-server/src/backend/buckets.rs`'s `op_list_objects_v2` is the pagination template).
 - Produces: `op_list_object_versions` filling `ListObjectVersionsOutput { versions: Some(ObjectVersionList), delete_markers: Some(DeleteMarkers), is_truncated, key_marker, version_id_marker, next_key_marker, next_version_id_marker, name, prefix, delimiter, max_keys, common_prefixes, .. }`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[tokio::test]
@@ -311,16 +313,16 @@ git commit -m "feat(server): address object versions on the wire"
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-server --lib versioning`
 Expected: FAIL.
 
-- [ ] **Step 3: Write the handler**
+- [x] **Step 3: Write the handler**
 
-Map `ListParams` from the input (`prefix`, `delimiter`, `key_marker`, `version_id_marker` — the wire's raw string wrapped in `version::IdMarker`, plan 2's newtype; the cursor is never parsed into a `version::Id`, because the wire may send any id and the backend compares it to the listing's own cursors — and `max_keys`, the capability's cap applying as it does for the object listings, `crates/tinio-config/src/schema/s3.rs`'s `max_keys`), call `list_object_versions`, and split the entries: markers into `delete_markers` as `DeleteMarkerEntry`, objects into `versions` as `ObjectVersion`; `is_latest` is `true` for the first entry of each key (the backend returns each key's versions newest first, so the handler derives it from position and `Entry` carries no flag). Set `name` to the bucket, echo `prefix`/`delimiter`/`max_keys`, and set the four cursors when `is_truncated`.
+Map `ListParams` from the input (`prefix`, `delimiter`, `key_marker`, `version_id_marker` — the wire's raw string wrapped in `version::IdMarker`, plan 2's newtype; the cursor is never parsed into a `version::Id`, because the wire may send any id and the backend compares it to the listing's own cursors — and `max_keys`, the capability's cap applying as it does for the object listings (`crates/tinio-config/src/schema/s3.rs`'s `max_keys`) plus this listing's own hard ceiling of 1,000 — AWS's documented maximum for the operation, landed by the 2026-10-06 review as the walk's memory bound), call `list_object_versions`, and split the entries: markers into `delete_markers` as `DeleteMarkerEntry`, objects into `versions` as `ObjectVersion`; `is_latest` is `true` for the first entry of each key (the backend returns each key's versions newest first, so the handler derives it from position and `Entry` carries no flag). Set `name` to the bucket, echo `prefix`/`delimiter`/`max_keys`, and set the four cursors when `is_truncated`.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p tinio-server`
 Expected: PASS.
@@ -346,7 +348,7 @@ git commit -m "feat(server): list object versions"
 - Consumes: `VersionOps::{bucket_versioning, set_bucket_versioning}`, `version::State`.
 - Produces: `op_get_bucket_versioning` (fills `status` only — `mfa_delete` stays `None`, per the design: `GetBucketVersioning` never reports MFA delete) and `op_put_bucket_versioning` (reads `VersioningConfiguration.status`, refuses `mfa_delete: Some(MFADelete::ENABLED)` with `NotImplemented`, and otherwise calls `set_bucket_versioning`). Two rules decided with the operator on 2026-10-03: **authorization goes through the existing ACL layer** — the same `AclAccess` that decides every other bucket write (`crates/tinio-server/src/data.rs:246-268`) — rather than an operation-level owner check, because `PutBucketAcl` (the plan's earlier model) has no requester-owner check at all and a single op-level exception would be the only one in the workspace; the corpus says so in one clause, translating AWS's owner-only rule into this workspace's model. And **a request with neither `Status` nor `MfaDelete` answers `200` with no state change** — an empty request changes nothing, so it is a no-op rather than a `400`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[tokio::test]
@@ -358,20 +360,20 @@ git commit -m "feat(server): list object versions"
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-server --lib versioning`
 Expected: FAIL.
 
-- [ ] **Step 3: Write the handlers**
+- [x] **Step 3: Write the handlers**
 
 `VersioningConfiguration` is a DTO (`s3s` `src/dto/generated.rs:33498`): `status: Option<BucketVersioningStatus>`, `mfa_delete: Option<MFADelete>`. `BucketVersioningStatus` is a `Cow<'static, str>` newtype with `ENABLED`/`SUSPENDED` consts (`:1882`) — compare against those, never against a re-typed literal. The unversioned state is the **absence** of `Status` in the response, which is what makes the round-trip test's first assertion meaningful.
 
-- [ ] **Step 4: Add the storage metric families**
+- [x] **Step 4: Add the storage metric families**
 
-`crates/tinio-server/src/metrics.rs`: register `tinio_storage_versions_total` (a gauge: noncurrent versions currently stored) and `tinio_storage_blocks_reclaimed_total` / `tinio_storage_blocks_reclaimed_bytes_total` (counters fed by the block pass — plan 1's `tinio_blob::SweepReport`, whose `removed`/`bytes` plan 2's sweep task consumes), following the file's existing registration shape. The retention pass reports through its own type, plan 2's `tinio_fs::sweep::Summary { temp_files, uploads, expired_versions, reclaimed_blocks, reclaimed_bytes }` — the two reports stay distinct, because plan 1's `SweepReport` counts blocks and plan 2's `Summary` counts the retention run's work. No dedup-ratio family exists: the design dropped it on 2026-10-03 (the ratio would need write-versus-stored byte counters for a low-information number in a whole-blob design), so the versioning metrics keep exactly what the observability ruling asks for — the versions count, blocks reclaimed, bytes reclaimed — and these three families are the only new facts about it a reader of `/metrics` cannot otherwise see.
+**Landed 2026-10-06 — superseded as drafted.** The families are declared by the crate that observes the sweep, `crates/tinio-fs/src/metrics.rs`: `tinio_storage_blocks_reclaimed_total`, `tinio_storage_bytes_reclaimed_total` and `tinio_storage_noncurrent_versions_total` (plan 2's code-review fix wave F4, 2026-10-04), owned by `specs/001-s3-local-server/data-model.md`'s `## Metrics` list; `crates/tinio-server/src/metrics.rs` gained only the ops-label pin over the new rows. The retention pass reports through its own type, plan 2's `tinio_fs::sweep::Summary { temp_files, uploads, expired_versions, reclaimed_blocks, reclaimed_bytes }` — the two reports stay distinct, because plan 1's `SweepReport` counts blocks and plan 2's `Summary` counts the retention run's work. No dedup-ratio family exists: the design dropped it on 2026-10-03 (the ratio would need write-versus-stored byte counters for a low-information number in a whole-blob design), so the versioning metrics keep exactly what the observability ruling asks for — the versions count, blocks reclaimed, bytes reclaimed — and these three families are the only new facts about it a reader of `/metrics` cannot otherwise see.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test -p tinio-server && cargo test -p tinio-config`
 Expected: PASS.
@@ -390,13 +392,13 @@ git commit -m "feat(server): read and write the bucket versioning state"
 ### Task 6: Per-version tagging and ACL
 
 **Files:**
-- Modify: `crates/tinio-server/src/backend/tags.rs`, `crates/tinio-server/src/backend/objects.rs` (the ACL ops)
+- Modify: `crates/tinio-server/src/backend/objects.rs` (the tagging and ACL handlers — `backend/tags.rs` holds only the Tags↔core conversion and was not touched)
 
 **Interfaces:**
 - Consumes: `VersionOps::{version_tags, set_version_tags, version_acl, set_version_acl}` (plan 2).
 - Produces: the six operations (`get`/`put`/`delete_object_tagging`, `get`/`put_object_acl`; `delete_object_tagging` clears the version's tags) honouring `req.input.version_id`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[tokio::test]
@@ -407,16 +409,16 @@ git commit -m "feat(server): read and write the bucket versioning state"
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-server --lib versioning`
 Expected: FAIL.
 
-- [ ] **Step 3: Thread the version**
+- [x] **Step 3: Thread the version**
 
 Each handler: `require_versioning(...)`, then route to the version-scoped accessor when the input carries an id and to the existing current-version path otherwise. The capability gates are unchanged (`tagging`, `acl`), so an operator may run versioning with tagging off — the version rows carry the wires either way (plan 2 stores them), and the handlers simply never read them.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -p tinio-server`
 Expected: PASS.
@@ -449,7 +451,7 @@ git commit -m "feat(server): scope tags and ACLs to a version"
 
 **Why the root's own `.tinio/`**: the root's database is where the version rows and the object rows live; reading it read-only is what makes history (and tags/ACLs/CORS) visible to a read-only run. The relocation keeps its purpose — the tool state a run *writes* (socket, `state`, logs) must not land in a root that may be genuinely read-only — and the one rule that changes is which database the *storage* reads. Redb documents the constraint that shapes the failure path: a `ReadOnlyDatabase` may not be opened concurrently with a `Database` (`redb` `db.rs:390-391`), so a read-write server holding the same root makes the open fail, and that failure is the degrade path — serve objects from their files with an empty metadata view and a warning naming the reason, which is exactly today's behavior.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[tokio::test]
@@ -466,12 +468,12 @@ async fn a_read_only_store_over_a_root_with_no_database_degrades_to_an_empty_vie
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p tinio-fs --lib read_only`
 Expected: FAIL — there is no read-only open anywhere in the workspace.
 
-- [ ] **Step 3: Implement the read-only open and the handle**
+- [x] **Step 3: Implement the read-only open and the handle**
 
 `crates/tinio-fs/src/database/open.rs`: `open_read_only(state_dir)` opens `<state_dir>/meta.redb` with `ReadOnlyDatabase::open` and maps every failure (absent file, corrupt, format the build refuses — checked by reading `state::Table::version`, a missing table included) into the crate error, without creating or writing anything.
 
@@ -479,21 +481,21 @@ Expected: FAIL — there is no read-only open anywhere in the workspace.
 
 `crates/tinio-store/src/table.rs`: `open_readonly` currently propagates redb's "table does not exist" error; a read-only handle must treat a missing table as empty, because a root written by a build without versioning has no version tables — that is the difference between "no history" and "this root cannot be read".
 
-- [ ] **Step 4: Point the read-only backend at the root's database**
+- [x] **Step 4: Point the read-only backend at the root's database**
 
 `FsStorage::resolve` (`crates/tinio-fs/src/backend/mod.rs:432-476`): in read-only mode the metadata/state dir is `root.join(RESERVED_SEGMENT)` — opened read-only — and the refusal at `:460-470` (an explicit state dir inside the root) becomes the opposite rule: a read-only run's *storage* dir must be the root's own. Decided with the operator on 2026-10-03, so nothing is left to the executor: `FsStorage` keeps **one** state dir per run — the root's own `.tinio/` in read-only mode, the configured one otherwise — and it never holds the CLI's tool-state directory, because a read-only run writes nothing through the storage (every mutating operation is refused upstream, the scanner is off, and blocks are read from `<root>/.tinio/blobs`) and the tool state (socket, `state`, logs) lives where `resolve_state_dir` put it.
 
-- [ ] **Step 5: Disable the scanner in read-only mode**
+- [x] **Step 5: Disable the scanner in read-only mode**
 
 `crates/tinio-cli/src/commands/start/serve.rs:434-450`: `Scanner::new(storage.clone(), ScannerOptions { enabled: !access.is_read_only(), …, access })`. The scanner's purpose is to pre-warm ETags by *writing* rows; with the rows readable, listings recompute on demand and write nothing (`crates/tinio-fs/src/listing.rs`'s existing claim path), so a read-only run writes no database at all.
 
-- [ ] **Step 6: Invert the scenario and update the corpus**
+- [x] **Step 6: Invert the scenario and update the corpus**
 
 `crates/tinio-e2e/tests/features/read_only.feature:247-273` becomes "The in-root meta database is read, read-only": the read-write run plants a tag, the read-only run **serves** it, and the root's snapshot after the run is unchanged (the existing `state_lands_under_the_injected_home` leg, `crates/tinio-server/tests/read_only.rs:189-223`, stays and keeps asserting the root is untouched). A second leg covers the degrade: a root with no `.tinio/` serves objects with an empty metadata view.
 
 `data-model.md` (Read-only mode's paragraph and the state-dir row) and `fs-backend.md` §9 (the scanner's read-only note) lose their "not read" sentences and state the amended rule; the design's **Read paths** owns the reasoning and the corpus states the rule only.
 
-- [ ] **Step 7: Run the gates**
+- [x] **Step 7: Run the gates**
 
 Run: `cargo test -p tinio-fs -p tinio-cli -p tinio-server && cargo test -p tinio-e2e` (plus the `@cli` read-only scenarios).
 Expected: PASS — every read-only scenario against the amended rule.
@@ -524,7 +526,7 @@ git commit -m "feat(read-only): serve the root's metadata, read-only"
 - Consumes: everything above; the harness's `config_from_tags` (`crates/tinio-e2e/tests/steps/mod.rs:112`) and `World` (`:56`).
 - Produces: the feature file with `@FR-037`-class tags (the corpus's FR-035 and FR-036 are the service verbs and the confinement channels, so this feature's requirements are FR-037 onward), and the corpus text that stops being plan-owned the moment it lands.
 
-- [ ] **Step 1: Write the feature file**
+- [x] **Step 1: Write the feature file**
 
 > **Landed 2026-10-06 — this sketch is superseded wherever it differs**: the authoritative record is the landed `crates/tinio-e2e/tests/features/versioning.feature` together with the corpus it drives (`contracts/s3-surface.md` §Object versioning, `data-model.md`, `fs-backend.md`, `tasks.md`), and the sketch below is kept as the plan's own record rather than rewritten — it still shows presence-form header steps where the landed file asserts values, an object-addressed `?versions` where the contract's one listing shape is bucket-addressed (`GET /<bucket>?versions&prefix=…`), and it lacks the landed version-addressed delete journey.
 
@@ -613,28 +615,28 @@ The external-client journeys run at their existing tiers, not a fourth harness: 
 
 The feature matrix the design names (feature on/off × toggle on/off × bucket state × object kind) is stated here rather than enumerated as scenarios. **Covered cells**: feature on × toggle on × {unversioned, enabled, suspended} × {object, delete marker} — the scenarios above plus the handler tests of Tasks 3–6 (an unversioned bucket is today's behavior, which the existing suites already pin); and feature on × toggle off × a `versionId` request — the `@versioning-off` leg. **Derivable cells, no scenario**: feature off × every toggle and bucket-state cell (a stripped build has no rows and no handlers, so no feature-off server exists to run — `cargo hack check --package tinio --each-feature` plus the `#[cfg(not(feature = "versioning"))]` arm's own test prove the refusal at compile level); toggle off × bucket state (the refusal precedes any state read, so the cell collapses into the row above); unversioned × object kind (today's behavior, covered by the suites that keep passing unchanged). Folder markers sit outside the matrix by the design's non-goal.
 
-- [ ] **Step 2: Write the step definitions**
+- [x] **Step 2: Write the step definitions**
 
 `tests/steps/versioning.rs`: `I enable versioning on {string}` and `I suspend versioning on {string}` (a `PUT /<bucket>?versioning` with the `VersioningConfiguration` body — `Enabled` and `Suspended`), and two listing steps the versioning scenarios need — `the version listing has {int} versions and {int} delete markers` (counts the `<Version>` and `<DeleteMarker>` elements in the body; the listing carries metadata, never an object's bytes, which is why the scenarios assert on these counts and never on content) and `the first version in the listing is the latest` (the first `<IsLatest>` element in document order is `true`, which is how "newest first" is pinned without parsing ids). Reuse the existing steps for the rest (`I upload`, `I send a "GET" request to`, `the response body contains`, `the response has a "…" header`, plus the `@cli` read-only harness's run/bind steps); register the module in `steps/mod.rs`, and add the `versioning-off` arm to `config_from_tags`.
 
-- [ ] **Step 3: Run the journeys**
+- [x] **Step 3: Run the journeys**
 
 Run: `cargo test -p tinio-e2e` and, for the mem pass, `TINIO_E2E_BACKEND=mem cargo test -p tinio-e2e`.
 Expected: PASS on both backends.
 
-- [ ] **Step 4: Update the corpus**
+- [x] **Step 4: Update the corpus**
 
 - `contracts/s3-surface.md`: the three operations' rows, the `x-amz-version-id`/`x-amz-delete-marker` headers on every response AWS carries them on (**including the plain, non-version-addressed `GET`/`HEAD` of a versioned bucket**), the `404`/`405` delete-marker rules (with the no-`Allow` ruling and its evidence), `NoSuchVersion`/`InvalidArgument` rows, the suspended-write and marker-stacking rules, **the `PutBucketVersioning` authorization rule** (the ACL layer decides, per the 2026-10-03 ruling that translates AWS's owner-only wording into this workspace's model) and **the empty-configuration no-op** (`200` when neither `Status` nor `MfaDelete` is given), and the FR rows the feature file's `@FR-0xx` tags resolve to (the traceability gate in Step 5 reads them both ways).
 - `data-model.md`: the version tables under their module names — `tinio_store::{version, version_index, bucket_versioning}` — and the 10-tuple `object_meta` value; `blobs/` in the state-dir table; the version columns' meaning.
 - `fs-backend.md`: the supersede and materialize protocols (the ordering from the design's **Write paths**), the retention pass, the block pass, the startup repair's new stage, the doctor checks, the state dir's closed set (`blobs/` joins `tmp/` and `multipart/`; the closed-set test at `crates/tinio-fs/src/backend/tests.rs:791` moves with it), and §9's scanner note (the scanner is disabled in read-only mode — the rule Task 7's amendment lands).
 - `tasks.md`: `T152` (the surface) and `T153` (the journeys and the corpus).
 
-- [ ] **Step 5: Run the traceability gate**
+- [x] **Step 5: Run the traceability gate**
 
 Run: `cargo test -p tinio-e2e --test traceability`
 Expected: PASS — every new `@FR-` tag resolves both ways; nothing new lands in `NOT_COVERED_BY_CUCUMBER`.
 
-- [ ] **Step 6: Run the full gate**
+- [x] **Step 6: Run the full gate**
 
 Run each, expecting success:
 - `cargo test -p tinio-config -p tinio-server -p tinio-e2e -p tinio-core -p tinio-fs -p tinio-mem`

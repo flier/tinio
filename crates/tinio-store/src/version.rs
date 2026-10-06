@@ -675,6 +675,14 @@ fn decode_row(
     ),
 ) -> Option<Row> {
     decode_blob(blob)?;
+    // The identity element must be the literal `null` or a well-formed id
+    // (2026-10-06 review): a corrupt id must not self-heal to the **null
+    // version** — a meaningful value, so the row would list and read as the
+    // null version while the index still keys it by its raw wire. A row that
+    // fails this check reads as missing, like the blob/kind checks above.
+    if id != "null" && version::Id::new(id).is_err() {
+        return None;
+    }
     Some(Row {
         id: id.to_owned(),
         blob: blob.to_owned(),
@@ -696,7 +704,7 @@ where
     T: ReadableTable<<Def as TableDef>::Key, <Def as TableDef>::Value>,
 {
     /// One version row, if present and decodable (`None` also covers a row
-    /// whose blob/kind element is corrupt — self-healing, the row is
+    /// whose blob/kind/id element is corrupt — self-healing, the row is
     /// treated as missing).
     ///
     /// # Examples
@@ -1793,5 +1801,35 @@ mod tests {
             [],
             "a bound past the bucket's last key ends immediately"
         );
+    }
+
+    #[test]
+    fn a_row_with_a_corrupt_identity_reads_as_missing() {
+        let h = handle();
+        h.write(|txn| -> Result<(), Error> {
+            let mut v = Table::open(txn)?;
+            let mut bad = row("v1", 1);
+            bad.id = String::new();
+            v.put("b", "k", &bad)?;
+            v.put("b", "k2", &row("v2", 1))?;
+            Ok(())
+        })
+        .unwrap();
+
+        let missing = h
+            .read(|txn| -> Result<Option<Row>, Error> {
+                Table::open_readonly(txn)?.get("b", "k", 1)
+            })
+            .unwrap();
+        assert!(
+            missing.is_none(),
+            "a corrupt id must read as a missing row, never as the null version"
+        );
+        let valid = h
+            .read(|txn| -> Result<Option<Row>, Error> {
+                Table::open_readonly(txn)?.get("b", "k2", 1)
+            })
+            .unwrap();
+        assert_eq!(valid.unwrap().id.as_str(), "v2");
     }
 }

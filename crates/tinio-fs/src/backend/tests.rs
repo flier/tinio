@@ -234,6 +234,66 @@ async fn new_from_db_in_read_only_mode_reads_the_roots_database() {
     assert!(!fresh.exists(), "the path created `{}`", fresh.display());
 }
 
+/// I7 (the 2026-10-06 review): a version-creating write whose metadata row
+/// write fails must **fail** rather than answer a version id no read can
+/// resolve. A read-only handle makes the `OBJECT_META` write fail
+/// deterministically; the enabled bucket's fresh-key write mints an id and
+/// needs no supersede, so the row write is the failing step — while an
+/// unversioned bucket's write keeps FR-022's best-effort rule and succeeds.
+#[tokio::test]
+async fn a_versioned_write_fails_when_the_row_write_fails() {
+    // A read-write run plants an enabled bucket and a plain one.
+    let root = tempfile::tempdir().unwrap();
+    let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+    let versioned = name("versioned").unwrap();
+    let plain = name("plain").unwrap();
+    for bucket in [&versioned, &plain] {
+        storage
+            .create_bucket(bucket, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+    }
+    storage
+        .set_bucket_versioning(&versioned, State::Enabled)
+        .await
+        .unwrap();
+    drop(storage);
+
+    // The read-only run: every metadata write is refused at the handle.
+    let storage = FsStorage::new(
+        root.path(),
+        FsOptions {
+            access: AccessMode::ReadOnly,
+            ..fs_options()
+        },
+    )
+    .unwrap();
+    let key: object::Key = "fresh.txt".into();
+
+    // The enabled bucket records versions: the id it would answer is only
+    // real once the row is durable, so the PUT reports the failure.
+    let err = storage
+        .put_object(&versioned, &key, body(b"one"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.is_read_only(),
+        "the row write's refusal is reported: {err:?}"
+    );
+    // The unrecorded publish still reads as the null version — the shape an
+    // out-of-band edit produces — never as a resolvable id.
+    let read = storage.get_object(&versioned, &key, None).await.unwrap();
+    assert_eq!(read.info.version_id, None);
+    assert_eq!(read_body(read.body).await.unwrap(), b"one");
+
+    // An unversioned write answers no identity, so the best-effort rule
+    // (FR-022) stands.
+    storage
+        .put_object(&plain, &key, body(b"two"))
+        .await
+        .unwrap();
+}
+
 /// FR-023 amended: a root with objects but **no** `.tinio/` cannot be
 /// read as a metadata source. The read-only open fails, the run degrades
 /// to today's shape — objects serve from their files, every metadata read

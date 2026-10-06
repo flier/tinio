@@ -29,6 +29,13 @@
 //! only — on Windows std cannot open a directory handle, and no heavyweight
 //! dependency is added for a directory flush (`tinio-fs` documents the same
 //! limitation for its own writes).
+//!
+//! A symlink planted at a canonical block path is followed by the read path
+//! (`contains`, `open`) but skipped by `walk`/`list`, which list regular files
+//! only — so it is served but never swept or counted. The asymmetry is
+//! deliberate and recorded: the block directory is private state (nothing but
+//! this store writes it), so a planted link is the operator's own doing, and
+//! the two halves must not be "fixed" apart from each other.
 
 use std::{
     io,
@@ -200,7 +207,15 @@ impl BlockStore for LocalBlocks {
             // concurrent `tmp/` sweep reaped it) is the same stored block the
             // commit below reads as a hit.
             let temp = staged.take_path()?;
-            ok_if_missing(fs::remove_file(&temp).await).map_err(Error::Io)?;
+            // A failed unlink must not turn a publish that already found the
+            // block into an error: the block is present, which is what the
+            // caller asked for, and the startup repair/sweep reaps the
+            // residue.
+            if let Err(err) = fs::remove_file(&temp).await
+                && err.kind() != io::ErrorKind::NotFound
+            {
+                tracing::warn!(error = %err, "a dedup publish left its staged temp behind");
+            }
             return Ok(Published::Existing);
         }
         file.flush().await?;
@@ -341,11 +356,19 @@ impl LocalBlocks {
         // The shared listing reads a missing root as empty (a store with no
         // blocks yet) and propagates every other read error.
         let mut prefixes = Vec::new();
-        for (_, name) in entries_of(&self.root).await.map_err(Error::Io)? {
+        for (path, name) in entries_of(&self.root).await.map_err(Error::Io)? {
             // Two lowercase hex digits — `tmp` is three characters, so the
             // length test excludes it, and lowercase only keeps the sort below
-            // in address order (`AB` sorts before `aa`).
-            if name.len() == 2 && name.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+            // in address order (`AB` sorts before `aa`). The name alone is not
+            // enough: a *file* wearing a fan-out name must be skipped, or the
+            // per-directory read below fails with `NotADirectory` and every
+            // walk — and so every sweep — errors until a human removes it.
+            let is_dir = fs::metadata(&path)
+                .await
+                .map(|meta| meta.is_dir())
+                .unwrap_or(false);
+            if is_dir && name.len() == 2 && name.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+            {
                 prefixes.push(name);
             }
         }
@@ -1062,5 +1085,31 @@ mod tests {
             "a walk of an absent root ends immediately"
         );
         assert!(!root.exists(), "reading an absent root must not create it");
+    }
+
+    #[tokio::test]
+    async fn a_file_wearing_a_fan_out_name_never_aborts_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalBlocks::new(dir.path());
+        let hash = BlockHash::of(b"hello");
+        store
+            .publish(staged(&store, b"hello").await, &hash)
+            .await
+            .unwrap();
+        // A stray *file* named like a fan-out directory must be skipped, not
+        // probed as one: otherwise every walk — and so every sweep — errors
+        // until a human removes it. "ab" cannot collide with the real block's
+        // own fan-out directory ("hello" hashes to the "2c" prefix).
+        fs::write(dir.path().join("ab"), b"stray").await.unwrap();
+
+        let entries = store.list(None, 10).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, hash);
+        let mut walk = store.walk(None).await.unwrap();
+        let mut seen = Vec::new();
+        while let Some(entry) = walk.next().await {
+            seen.push(entry.unwrap().hash);
+        }
+        assert_eq!(seen, vec![hash]);
     }
 }

@@ -802,29 +802,44 @@ impl FsStorage {
             let _ = fs::remove_file(&published.path).await;
             return Err(err.into());
         }
-        // The object is committed — a meta-write failure (full
-        // state dir) must not fail the PUT: the entry is recomputed
-        // from the content on the next read (self-healing, FR-022).
-        // The stale-part removal rides in the same transaction. The
-        // guard the publish holds stays alive until this write is
-        // done: the branch, the rename and the row are one critical
-        // section.
-        self.record_committed(
-            bucket,
-            key,
-            &etag,
-            published.size,
-            published.mtime,
-            published.identity,
-            &tags,
-            checksum.as_ref(),
-            owner,
-            acl,
-            published.marker.id.as_ref(),
-            published.seq,
-            published.superseded,
-        )
-        .await;
+        // The object is committed. The stale-part removal and the
+        // outgoing version's stamp ride in the same transaction; what a
+        // meta-write failure means is decided below (I7). The guard the
+        // publish holds stays alive until this write is done: the
+        // branch, the rename and the row are one critical section.
+        if let Err(err) = self
+            .record_committed(
+                bucket,
+                key,
+                &etag,
+                published.size,
+                published.mtime,
+                published.identity,
+                &tags,
+                checksum.as_ref(),
+                owner,
+                acl,
+                published.marker.id.as_ref(),
+                published.seq,
+                published.superseded,
+            )
+            .await
+        {
+            // I7 (the 2026-10-06 review): a versioned write's identity is
+            // real only once the row that records it is durable — answering
+            // it after a failed row write hands the client an id no read
+            // resolves (`?versionId=` answers NoSuchVersion and the slot
+            // reads as the null version). The publish fails instead; the
+            // file at the key path stays (the rename already happened) and
+            // reads serve it as the null version, the same shape an
+            // out-of-band edit produces, and a retry re-publishes. An
+            // unversioned write keeps FR-022's best-effort rule: its answer
+            // carries no identity.
+            if published.records_versions {
+                return Err(err);
+            }
+            tracing::warn!(error = %err, "meta entry not persisted after commit");
+        }
         Ok(Info {
             key: key.clone(),
             size: published.size,
@@ -851,9 +866,11 @@ impl FsStorage {
     /// `OBJECT_PARTS` rows of the key, and the outgoing version's row stamp
     /// (`superseded`) in ONE write transaction: the transaction that moves
     /// the current slot off that row is the one that makes it history, so the
-    /// two can never disagree. Best-effort — a failed meta write must not fail
-    /// the PUT (the entry self-heals on the next read, FR-022); the failure
-    /// is warned.
+    /// two can never disagree. The caller decides what a failure means: a
+    /// versioned write must not answer an identity whose row never landed
+    /// (I7, the 2026-10-06 review) and fails, while an unversioned write
+    /// keeps FR-022's best-effort rule — its entry self-heals on the next
+    /// read and the failure is warned.
     #[allow(clippy::too_many_arguments)]
     async fn record_committed(
         &self,
@@ -870,7 +887,7 @@ impl FsStorage {
         version_id: Option<&version::Id>,
         version_seq: u64,
         superseded: Option<u64>,
-    ) {
+    ) -> Result<(), Error> {
         let bucket = bucket.clone();
         let key = key.clone();
         let etag = etag.clone();
@@ -882,8 +899,7 @@ impl FsStorage {
             owner: None,
             grants: acl.grants.clone(),
         };
-        if let Err(err) = self
-            .handle
+        self.handle
             .write(move |txn| {
                 meta::Table::open(txn)?.put(
                     &bucket,
@@ -907,9 +923,7 @@ impl FsStorage {
                 Ok(())
             })
             .await
-        {
-            tracing::warn!(error = %err, "meta entry not persisted after commit");
-        }
+            .map_err(Error::from)
     }
 }
 

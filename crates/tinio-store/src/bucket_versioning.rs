@@ -114,6 +114,15 @@ where
 impl<'txn> table::Table<'txn, Def> {
     /// Record the bucket's versioning state (upsert; the state's wire name
     /// is the stored element).
+    ///
+    /// **The caller owns the transition rule** (2026-10-06 review): the
+    /// design's bucket-state rule is that a versioned bucket may be
+    /// suspended but never returns to `Unversioned`, and the wire handler
+    /// refuses that request before any storage call. This codec layer
+    /// accepts what it is given — flipping a versioned bucket to
+    /// `Unversioned` here would strand its version rows under a bucket that
+    /// reads as unversioned — so a future caller that bypasses the wire
+    /// layer must carry the same check.
     pub fn set(&mut self, bucket: &str, state: State) -> Result<(), Error> {
         self.0.insert(bucket, state.to_string().as_str())?;
         Ok(())

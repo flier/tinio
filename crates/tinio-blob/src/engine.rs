@@ -272,8 +272,16 @@ fn expect_exact(body: BodyStream, expected: u64) -> BodyStream {
             }
             match body.next().await {
                 Some(Ok(chunk)) => {
-                    let remaining = remaining.saturating_sub(chunk.len() as u64);
-                    Some((Ok(chunk), (body, remaining)))
+                    let len = chunk.len() as u64;
+                    if len > remaining {
+                        // A backend that overshoots the sub-range it was
+                        // asked for is serving bytes outside the slice it
+                        // declared: the mirror of the short-read rule below,
+                        // and forwarding the chunk whole would splice
+                        // foreign bytes into the blob.
+                        return Some((Err(io::Error::from(io::ErrorKind::InvalidData)), (body, 0)));
+                    }
+                    Some((Ok(chunk), (body, remaining - len)))
                 }
                 Some(Err(err)) => Some((Err(err), (body, 0))),
                 None => Some((
@@ -736,5 +744,18 @@ mod tests {
             b"o",
             "a suffix beginning inside the second block is clipped to its last byte"
         );
+    }
+
+    #[tokio::test]
+    async fn a_block_yielding_more_than_its_slice_declares_is_an_error() {
+        let body: BodyStream =
+            Box::pin(stream::once(async { Ok(Bytes::from_static(b"too much")) }));
+        let mut wrapped = expect_exact(body, 3);
+        let first = wrapped.next().await.unwrap();
+        assert!(
+            matches!(first, Err(err) if err.kind() == io::ErrorKind::InvalidData),
+            "an overshooting backend must not splice extra bytes into the blob"
+        );
+        assert!(wrapped.next().await.is_none());
     }
 }

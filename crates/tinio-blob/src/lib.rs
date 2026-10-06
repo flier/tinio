@@ -26,7 +26,7 @@ pub use self::{
     engine::Store,
     error::Error,
     local::LocalBlocks,
-    sweep::{LiveSet, SweepReport},
+    sweep::{LiveSet, SweepCandidates, SweepReport},
 };
 
 /// The crate's result alias.

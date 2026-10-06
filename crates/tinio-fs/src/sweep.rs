@@ -15,7 +15,7 @@
 //! repair.
 
 #[cfg(feature = "versioning")]
-use std::{cmp::Reverse, collections::BTreeMap};
+use std::collections::{BTreeMap, HashSet};
 use std::{
     io::ErrorKind,
     path::Path,
@@ -27,10 +27,15 @@ use tokio::{fs, sync::watch};
 
 #[cfg(feature = "versioning")]
 use crate::{
-    _core::{bucket::Name, from_nanos, object, version::State},
+    _blob::{LiveSet, SweepCandidates, SweepReport},
+    _core::{
+        blob::{BlobRef, BlockHash},
+        bucket::Name,
+        from_nanos, object,
+    },
     _store::{meta, version as rows},
     error::projected,
-    metrics::{record_noncurrent_versions, record_sweep},
+    metrics::{record_block_bytes, record_noncurrent_versions, record_sweep},
 };
 use crate::{
     _util::pacing, backend::FsStorage, error::Error, fsutil::entries_of, path::TMP_DIR_NAME,
@@ -90,6 +95,13 @@ pub struct Options {
     /// still in flight, so it is never zero.
     #[default(_code = "Duration::from_secs(10 * 60)")]
     pub block_grace: Duration,
+    /// Warn when the versioned buckets' block stores hold more than this
+    /// many bytes (`[s3] block_bytes_warn`); `0` = no warning. The number
+    /// compared is the sweep walk's own total ([`Summary::block_bytes`]) —
+    /// the store's size as of the last pass — so the threshold is a
+    /// capacity-planning signal, not a hard cap.
+    #[default(_code = "0")]
+    pub block_bytes_warn: u64,
 }
 
 /// Sweep cadence: one pass per hour. Not a config knob — the contract's
@@ -198,6 +210,117 @@ pub struct Sweeper {
     options: Options,
 }
 
+/// One key's retirement set: the key and the sequences the retention keys
+/// retire from it.
+#[cfg(feature = "versioning")]
+type Retirement = (object::Key, Vec<u64>);
+
+/// One buffered history row as the retention walk holds it: the sequence,
+/// the noncurrent stamp, the creation time and the blob reference — the
+/// columns [`retires`] reads and the live-set fold needs.
+#[cfg(feature = "versioning")]
+type BufferedRow = (u64, u64, u64, BlobRef);
+
+/// One key's buffered history: the key and its rows, oldest first.
+#[cfg(feature = "versioning")]
+type HistoryBuffer = Option<(String, Vec<BufferedRow>)>;
+
+/// One versioned bucket's retention view, from `Sweeper::plan_retention`'s
+/// single read transaction.
+#[cfg(feature = "versioning")]
+struct BucketPlan {
+    /// Every row's block addresses — the live set the block walk judges
+    /// against.
+    live: LiveSet,
+    /// The history rows the walk saw, before the expiry — the gauge's
+    /// number.
+    noncurrent: u64,
+    /// The retirements the thresholds imply, per key, applied under the
+    /// bucket lock so nothing moves a slot between the decision and the
+    /// removal.
+    retire: Vec<Retirement>,
+}
+
+/// What `Sweeper::plan_retention`'s read transaction hands back.
+#[cfg(feature = "versioning")]
+struct RetentionScan {
+    hashes: HashSet<BlockHash>,
+    noncurrent: u64,
+    retire: Vec<Retirement>,
+}
+
+/// Whether the history row at `index` (0 = newest) is past a retention
+/// threshold — the pure rule behind [`Options`]' two retention keys. Every
+/// row the walk hands over is history by the predicate that walk applied
+/// (`Row::is_history` against the key's recorded slot), so nothing here
+/// re-asks it.
+///
+/// The age runs from the moment the version stopped being current: the
+/// row's own stamp where the transaction that moved the slot off it landed
+/// one, and its creation where it never did (a publish that aborted before
+/// its state transaction, or a removal out of band). The row's write is the
+/// earliest moment it can have stopped being current, so the age is never
+/// under-counted and an unstamped row is never aged from the epoch.
+#[cfg(feature = "versioning")]
+fn retires(
+    index: usize,
+    became: u64,
+    created: u64,
+    keep: u64,
+    expire: Duration,
+    now: SystemTime,
+) -> bool {
+    if keep > 0 && index as u64 >= keep {
+        return true;
+    }
+    if expire.is_zero() {
+        return false;
+    }
+    let became = if became != 0 { became } else { created };
+    now.duration_since(from_nanos(became))
+        .map(|age| age >= expire)
+        .unwrap_or(false)
+}
+
+/// Turn one key's history (oldest first) into its retirement decision —
+/// the sequences the retention keys retire, indexed newest-first as
+/// [`retires`] defines it — and fold the decision into the scan: a row the
+/// keys retire contributes **no** live blocks (the same pass's walk must
+/// see them as dead, or the reclamation would trail the expiry by a full
+/// cadence), while every row that survives contributes its block list. A
+/// key that is not a valid object key cannot be addressed by an expiry, so
+/// its rows keep their blocks and retire nothing.
+#[cfg(feature = "versioning")]
+fn flush_retirement(
+    history: HistoryBuffer,
+    keep: u64,
+    expire: Duration,
+    now: SystemTime,
+    scan: &mut RetentionScan,
+) {
+    let Some((key, history)) = history else {
+        return;
+    };
+    // Only a valid object key can be addressed by an expiry.
+    let key = object::key(&key).ok();
+    let can_retire = key.is_some() && (keep > 0 || !expire.is_zero());
+    let mut seqs = Vec::new();
+    for (index, (seq, became, created, blob)) in history.iter().rev().enumerate() {
+        if can_retire && retires(index, *became, *created, keep, expire, now) {
+            seqs.push(*seq);
+            continue;
+        }
+        for block in blob.blocks() {
+            scan.hashes.insert(block.hash);
+        }
+    }
+    if let Some(key) = key
+        && !seqs.is_empty()
+    {
+        scan.retire.push((key, seqs));
+    }
+}
+
 impl Sweeper {
     /// Construct the sweeper.
     pub fn new(storage: FsStorage, options: Options) -> Self {
@@ -221,6 +344,7 @@ impl Sweeper {
                         reclaimed_blocks = summary.reclaimed_blocks,
                         reclaimed_bytes = summary.reclaimed_bytes,
                         reclaimed_subtrees = summary.reclaimed_subtrees,
+                        block_bytes = summary.block_bytes,
                         "sweep pass complete"
                     );
                     // The metrics carrier for what the pass just did: the
@@ -234,6 +358,16 @@ impl Sweeper {
                     {
                         record_sweep(&summary);
                         record_noncurrent_versions(summary.noncurrent_versions);
+                        record_block_bytes(summary.block_bytes);
+                        if self.options.block_bytes_warn > 0
+                            && summary.block_bytes > self.options.block_bytes_warn
+                        {
+                            tracing::warn!(
+                                block_bytes = summary.block_bytes,
+                                warn_over = self.options.block_bytes_warn,
+                                "the block store is above its configured warning threshold"
+                            );
+                        }
                     }
                 }
                 Err(err) => tracing::warn!(error = %err, "sweep pass failed"),
@@ -258,12 +392,30 @@ impl Sweeper {
     /// effort — an evaluation failure is logged, never a sweep failure.
     pub async fn sweep_once(&self, now: SystemTime) -> Result<Summary, Error> {
         let mut summary = Summary::default();
-        self.sweep_versioned(&mut summary, now).await?;
-        self.sweep_orphan_blobs(&mut summary).await?;
-        summary.temp_files += self.sweep_tmp(now).await?;
-        summary.uploads = self.sweep_multipart(now).await?;
+        // The sections run independently: one failing section must not
+        // cancel the others' work (one unreadable subtree would otherwise
+        // skip the whole rest of the pass). The first error is reported
+        // after every section ran.
+        let mut first_error: Option<Error> = None;
+        if let Err(err) = self.sweep_versioned(&mut summary, now).await {
+            first_error = first_error.or(Some(err));
+        }
+        if let Err(err) = self.sweep_orphan_blobs(&mut summary).await {
+            first_error = first_error.or(Some(err));
+        }
+        match self.sweep_tmp(now).await {
+            Ok(temps) => summary.temp_files += temps,
+            Err(err) => first_error = first_error.or(Some(err)),
+        }
+        match self.sweep_multipart(now).await {
+            Ok(uploads) => summary.uploads = uploads,
+            Err(err) => first_error = first_error.or(Some(err)),
+        }
         self.evaluate_compact_needed().await;
-        Ok(summary)
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(summary),
+        }
     }
 
     /// Reclaim the block subtrees of buckets that are gone. `remove_bucket_state`
@@ -300,36 +452,151 @@ impl Sweeper {
         Ok(())
     }
 
-    /// The versioned half of one pass: one critical section per bucket
-    /// whose state is enabled or suspended, holding that bucket's mutation
-    /// lock across the retention walk and the block reclamation.
-    ///
-    /// The lock is the design's race guard (the [`Sweeper`] doc states it):
-    /// every reference-adding path holds the same lock across its block
-    /// publish and its row commit, so the live set read here — under the
-    /// lock, immediately before the store is walked — cannot be stale with
-    /// respect to a reference the reclamation is about to orphan.
+    /// The versioned half of one pass: one pass per bucket whose state is
+    /// enabled or suspended. One bucket's failure is logged and the other
+    /// buckets still run; the first error is reported after the loop.
     #[cfg(feature = "versioning")]
     async fn sweep_versioned(&self, summary: &mut Summary, now: SystemTime) -> Result<(), Error> {
-        for bucket in self.versioned_buckets().await? {
-            let versions = self.storage.versions(&bucket);
-            let _guard = self.storage.lock_bucket_mutations(&bucket).await;
-            let (expired, noncurrent) = self.expire_versions(&bucket, now).await?;
-            summary.expired_versions += expired;
-            summary.noncurrent_versions += noncurrent;
-            let live = versions.live_blocks(&bucket).await.map_err(projected)?;
-            let report = versions
-                .blobs()
-                .sweep(&live, self.options.block_grace, now)
-                .await
-                .map_err(projected)?;
+        let mut first_error: Option<Error> = None;
+        for bucket in self.storage.versioned_buckets().await? {
+            if let Err(err) = self.sweep_bucket(&bucket, summary, now).await {
+                tracing::warn!(
+                    bucket = %bucket,
+                    error = %err,
+                    "the versioned sweep of one bucket failed; the other buckets still run"
+                );
+                first_error = first_error.or(Some(err));
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// One versioned bucket's pass, in three phases against the bucket's
+    /// mutation lock.
+    ///
+    /// **Phase 1 (under the bucket mutation lock): the plan.** One read
+    /// transaction decodes every row once — the live set the block walk
+    /// judges against, the noncurrent count the gauge reports, and the
+    /// retirement decisions the retention keys imply — and the retirements
+    /// are applied before the lock is released, so nothing moves a slot
+    /// between a decision and its removal.
+    ///
+    /// **Phase 2 (lock-free): the walk.** The whole block store is scanned
+    /// and the dead, past-grace candidates collected — the seconds-long
+    /// filesystem work of the pass, and the reason it no longer runs under
+    /// the lock. Nothing is removed yet.
+    ///
+    /// **Phase 3 (locked again): the removal.** The version-reference
+    /// epoch read at the end of phase 1 is re-checked under the bucket
+    /// mutation lock, and the candidates are removed only when it is
+    /// unchanged. The lock is what makes the check total: every
+    /// reference-adding path commits inside its own hold of the same lock,
+    /// so once this phase holds it, no publisher is in flight — an equal
+    /// epoch means none committed since the plan was read, and every
+    /// removal is safe. An unequal epoch (a publish landed during the walk
+    /// — the dedup-hit race the grace cannot cover, because a dedup hit
+    /// leaves the block's timestamp untouched) defers the whole candidate
+    /// set to the next pass: a block has no reverse index to re-check
+    /// individually.
+    #[cfg(feature = "versioning")]
+    async fn sweep_bucket(
+        &self,
+        bucket: &Name,
+        summary: &mut Summary,
+        now: SystemTime,
+    ) -> Result<(), Error> {
+        let (plan, expired, epoch) = self.plan_bucket(bucket, now).await?;
+        summary.expired_versions += expired;
+        summary.noncurrent_versions += plan.noncurrent.saturating_sub(expired as u64);
+        let candidates = self
+            .storage
+            .versions(bucket)
+            .blobs()
+            .sweep_candidates(&plan.live, self.options.block_grace, now)
+            .await
+            .map_err(projected)?;
+        // The walk measured every block's length on the way: the size gauge
+        // reads the store's total off the pass that already stat'ed it.
+        summary.block_bytes += candidates.bytes_total;
+        if !candidates.entries.is_empty() {
+            let report = self.apply_bucket(bucket, &candidates, epoch).await?;
             summary.reclaimed_blocks += report.removed;
             summary.reclaimed_bytes += report.bytes;
-            summary.temp_files += self
-                .sweep_block_staging(&versions.blobs().blocks().temp_dir(), now)
-                .await?;
+            if report.failed > 0 {
+                tracing::warn!(
+                    bucket = %bucket,
+                    failed = report.failed,
+                    "some dead blocks could not be removed; the next sweep retries"
+                );
+            }
         }
+        summary.temp_files += self
+            .sweep_block_staging(
+                &self.storage.versions(bucket).blobs().blocks().temp_dir(),
+                now,
+            )
+            .await?;
         Ok(())
+    }
+
+    /// Phase 1 of [`Self::sweep_bucket`]: the retention plan and its
+    /// retirements under the bucket's mutation lock, and the
+    /// version-reference epoch read before the lock is released — the
+    /// token [`Self::apply_bucket`] validates. A method of its own so the
+    /// tests can interleave a publish between the phases.
+    #[cfg(feature = "versioning")]
+    async fn plan_bucket(
+        &self,
+        bucket: &Name,
+        now: SystemTime,
+    ) -> Result<(BucketPlan, usize, u64), Error> {
+        let guard = self.storage.lock_bucket_mutations(bucket).await;
+        let plan = self.plan_retention(bucket, now).await?;
+        let expired = self.apply_retirement(bucket, &plan.retire).await?;
+        // Read last, still under the lock: every reference committed before
+        // this point is inside `plan.live`, and every one after it bumps the
+        // counter — during the walk, or while waiting on the lock this
+        // phase is about to re-take.
+        let epoch = self.storage.block_epoch();
+        drop(guard);
+        Ok((plan, expired, epoch))
+    }
+
+    /// Phase 3 of [`Self::sweep_bucket`]: remove the walk's candidates
+    /// after validating the version-reference epoch under the bucket's
+    /// mutation lock.
+    #[cfg(feature = "versioning")]
+    async fn apply_bucket(
+        &self,
+        bucket: &Name,
+        candidates: &SweepCandidates,
+        epoch: u64,
+    ) -> Result<SweepReport, Error> {
+        let guard = self.storage.lock_bucket_mutations(bucket).await;
+        if self.storage.block_epoch() != epoch {
+            tracing::warn!(
+                bucket = %bucket,
+                "a version reference was committed during the sweep; block removals are deferred to the next pass"
+            );
+            return Ok(SweepReport {
+                scanned: candidates.scanned,
+                kept_live: candidates.kept_live,
+                kept_young: candidates.kept_young,
+                ..Default::default()
+            });
+        }
+        let report = self
+            .storage
+            .versions(bucket)
+            .blobs()
+            .remove_candidates(candidates)
+            .await
+            .map_err(projected)?;
+        drop(guard);
+        Ok(report)
     }
 
     /// A build without the version machinery has no version rows and no
@@ -339,128 +606,36 @@ impl Sweeper {
         Ok(())
     }
 
-    /// Every bucket whose versioning state is enabled or suspended — the
-    /// buckets that can own version rows and blocks.
-    #[cfg(feature = "versioning")]
-    async fn versioned_buckets(&self) -> Result<Vec<Name>, Error> {
-        let mut out = Vec::new();
-        for name in self.storage.bucket_names("").await? {
-            let state = self
-                .storage
-                .versions(&name)
-                .state(&name)
-                .await
-                .map_err(projected)?;
-            if matches!(state, State::Enabled | State::Suspended) {
-                out.push(name);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Expire the noncurrent versions of `bucket` past the retention
-    /// thresholds: for each key, walk the history newest-first and drop a
-    /// version beyond [`Options::noncurrent_keep`] or older than
-    /// [`Options::noncurrent_expire_days`] (measured from
-    /// `became_noncurrent_at`), whichever is met first. Marker rows count
-    /// like any other version, as AWS counts them; a row that is not history
-    /// (the supersede crash window's adopted row, whose version is still
-    /// current) never enters the walk.
+    /// One read transaction answers the whole retention view of `bucket`:
+    /// the live set the block walk judges against, the noncurrent count the
+    /// gauge reports, and the retirement decisions the retention keys imply.
+    /// Every row is decoded once, in the pass that needs all three — the
+    /// shape this replaced decoded the whole table twice, on every pass,
+    /// even with both retention keys unset.
     ///
-    /// Both thresholds unset (`0`, the default) expires nothing: the safe
-    /// reading of an unconfigured retention key. Returns
-    /// `(expired, retained)` — the second is the noncurrent versions still
-    /// held after the expiry, the metrics gauge's number, counted off the
-    /// same walk.
-    #[cfg(feature = "versioning")]
-    async fn expire_versions(&self, bucket: &Name, now: SystemTime) -> Result<(usize, u64), Error> {
-        // One walk answers both the expiry and the metrics gauge: the pass
-        // already decodes every row, so the count is folded here rather than
-        // re-derived by a second walk of the whole table.
-        let history = self.bucket_history(bucket).await?;
-        let counted = history.iter().map(|(_, rows)| rows.len() as u64).sum();
-        if self.options.noncurrent_keep == 0 && self.options.noncurrent_expire_days == 0 {
-            return Ok((0, counted));
-        }
-        let versions = self.storage.versions(bucket);
-        let mut expired = 0;
-        for (key, history) in history {
-            // One port call per key: the whole retired set drops in one
-            // transaction, so a sweep over a long history pays one durable
-            // commit per key rather than one per version. The history is
-            // already in hand, so nothing is re-read to resolve the set.
-            let retired: Vec<u64> = history
-                .iter()
-                .enumerate()
-                .filter(|(index, row)| self.retires(*index, row, now))
-                .map(|(_, row)| row.seq)
-                .collect();
-            if retired.is_empty() {
-                continue;
-            }
-            versions
-                .expire_many(bucket, &key, &retired)
-                .await
-                .map_err(projected)?;
-            expired += retired.len();
-        }
-        Ok((expired, counted - expired as u64))
-    }
-
-    /// Whether the noncurrent version at `index` (0 = newest) is past a
-    /// retention threshold. Every row the walk hands over is history by the
-    /// predicate that walk applied (`Row::is_history` against the key's
-    /// recorded slot), so nothing here re-asks it.
-    #[cfg(feature = "versioning")]
-    fn retires(&self, index: usize, row: &rows::Row, now: SystemTime) -> bool {
-        if self.options.noncurrent_keep > 0 && index as u64 >= self.options.noncurrent_keep {
-            return true;
-        }
-        if self.options.noncurrent_expire_days > 0 {
-            // The age runs from the moment the version stopped being current:
-            // the row's own stamp where the transaction that moved the slot
-            // off it landed one, and its creation where it never did (a
-            // publish that aborted before its state transaction, or a removal
-            // out of band). The row's write is the earliest moment it can
-            // have stopped being current, so the age is never under-counted
-            // and an unstamped row is never aged from the epoch.
-            let became = if row.became_noncurrent != 0 {
-                row.became_noncurrent
-            } else {
-                row.created
-            };
-            let limit =
-                Duration::from_secs(self.options.noncurrent_expire_days.saturating_mul(86_400));
-            return now
-                .duration_since(from_nanos(became))
-                .map(|age| age >= limit)
-                .unwrap_or(false);
-        }
-        false
-    }
-
-    /// `bucket`'s version rows grouped by key, newest first — the
-    /// retention walk's view. A key whose stored string is not a valid
-    /// object key cannot be expired (`Versions::expire` addresses a key),
-    /// so it is skipped; so is a row that is not history, which the walk
-    /// decides per key with the slot `bucket`'s `object_meta` rows record
+    /// A row that is not history never retires, which the walk decides per
+    /// key with the slot the bucket's `object_meta` rows record
     /// (`Row::is_history`): the row at the recorded sequence is the current
     /// version's own while the slot still holds it — the supersede crash
     /// window's adopted row, which retention must not retire — and a row at
     /// any other sequence, or one at a key with no recorded slot at all, is
     /// history whatever its stamp says (the residue of an aborted publish or
-    /// an out-of-band removal, which the old stamp-only rule could never
-    /// retire). The slots and the rows come from ONE read transaction, so
-    /// the walk never judges a row against a slot view a concurrent write
-    /// has already moved.
+    /// an out-of-band removal). Every row's blocks feed the live set whether
+    /// it is history or not: the row references them until it is removed.
+    /// The slots and the rows come from the same transaction, so the walk
+    /// never judges a row against a slot view a concurrent write has already
+    /// moved. The table's own order is `(bucket, key, seq)` ascending, so
+    /// one key's rows arrive contiguously and oldest first; a key whose
+    /// stored string is not a valid object key cannot be expired (`expire`
+    /// addresses a key), so its rows feed the live set but retire nothing.
     #[cfg(feature = "versioning")]
-    async fn bucket_history(
-        &self,
-        bucket: &Name,
-    ) -> Result<Vec<(object::Key, Vec<rows::Row>)>, Error> {
+    async fn plan_retention(&self, bucket: &Name, now: SystemTime) -> Result<BucketPlan, Error> {
         let handle = self.storage.handle().clone();
         let scanned = bucket.clone();
-        let history = handle
+        let keep = self.options.noncurrent_keep;
+        let expire =
+            Duration::from_secs(self.options.noncurrent_expire_days.saturating_mul(86_400));
+        let scan = handle
             .read_blocking(move |txn| {
                 // The key's current slots, keyed the same way the rows below
                 // are. A key with no recorded row (`None` — no slot, or one
@@ -481,27 +656,70 @@ impl Sweeper {
                     },
                 )?;
                 let table = rows::Table::open_readonly(txn)?;
-                let mut grouped: BTreeMap<String, Vec<rows::Row>> = BTreeMap::new();
+                let mut scan = RetentionScan {
+                    hashes: HashSet::new(),
+                    noncurrent: 0,
+                    retire: Vec::new(),
+                };
+                // The history rows of the key being walked, oldest first —
+                // the table's own order — buffered until the key changes,
+                // because the retirement decision reads the history
+                // newest-first and the live set must exclude whatever the
+                // keys retire (so the same pass's walk reclaims it).
+                let mut current: HistoryBuffer = None;
                 table.for_bucket_of(scanned.as_ref(), |key, row| {
+                    let blob = row.blob();
                     let slot = slots.get(key).copied().unwrap_or(rows::Slot::Gone);
-                    if row.is_history(slot) {
-                        grouped.entry(key.to_owned()).or_default().push(row);
+                    if !row.is_history(slot) {
+                        // A row the walk does not consider history — the
+                        // current slot's own row, the crash-window adopted
+                        // row included — is live whatever the retention keys
+                        // say.
+                        for block in blob.blocks() {
+                            scan.hashes.insert(block.hash);
+                        }
+                        return Ok(());
+                    }
+                    scan.noncurrent += 1;
+                    let same_key = current
+                        .as_ref()
+                        .is_some_and(|(name, _)| name.as_str() == key);
+                    if !same_key {
+                        flush_retirement(current.take(), keep, expire, now, &mut scan);
+                        current = Some((key.to_owned(), Vec::new()));
+                    }
+                    if let Some((_, history)) = current.as_mut() {
+                        history.push((row.seq, row.became_noncurrent, row.created, blob));
                     }
                     Ok(())
                 })?;
-                Ok(grouped)
+                flush_retirement(current.take(), keep, expire, now, &mut scan);
+                Ok(scan)
             })
             .await
             .map_err(Error::from)?;
-        let mut out = Vec::new();
-        for (key, mut rows) in history {
-            let Ok(key) = object::key(&key) else {
-                continue;
-            };
-            rows.sort_by_key(|row| Reverse(row.seq));
-            out.push((key, rows));
+        Ok(BucketPlan {
+            live: LiveSet::from_hashes(scan.hashes),
+            noncurrent: scan.noncurrent,
+            retire: scan.retire,
+        })
+    }
+
+    /// Apply one plan's retirements — one port call per key, so a sweep
+    /// over a long history pays one durable commit per key rather than one
+    /// per version.
+    #[cfg(feature = "versioning")]
+    async fn apply_retirement(&self, bucket: &Name, retire: &[Retirement]) -> Result<usize, Error> {
+        let versions = self.storage.versions(bucket);
+        let mut expired = 0;
+        for (key, seqs) in retire {
+            versions
+                .expire_many(bucket, key, seqs)
+                .await
+                .map_err(projected)?;
+            expired += seqs.len();
         }
-        Ok(out)
+        Ok(expired)
     }
 
     /// Reap the staged block temps of one bucket's block store older than
@@ -581,6 +799,7 @@ impl Sweeper {
 ///     reclaimed_bytes: 8,
 ///     reclaimed_subtrees: 0,
 ///     noncurrent_versions: 3,
+///     block_bytes: 16,
 /// };
 /// assert_eq!(summary.temp_files, 1);
 /// assert_eq!(summary.reclaimed_bytes, 8);
@@ -606,10 +825,17 @@ pub struct Summary {
     /// the pass that already decoded the rows (`0` in a build without the
     /// versioning feature, which walks no version table).
     pub noncurrent_versions: u64,
+    /// The total bytes the versioned buckets' block stores held when the
+    /// pass walked them — the size gauge's number, read off the walk that
+    /// already stat'ed every block (`0` in a build without the versioning
+    /// feature, which walks no block store).
+    pub block_bytes: u64,
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "versioning")]
+    use std::cmp::Reverse;
     use std::fs::{self, FileTimes, OpenOptions};
 
     use tokio::time;
@@ -1054,18 +1280,16 @@ mod tests {
         assert_eq!(storage.bucket_versioning(&b).await.unwrap(), State::Enabled);
     }
 
-    /// The reclamation guard's ordering, pinned: the sweep must read the
-    /// live set **under** the bucket's mutation lock. The test holds that
-    /// lock while a versioned PUT commits the version that references a
-    /// block, so the PUT parks on the lock first and the sweep parks behind
-    /// it. With the read inside the lock the sweep sees the PUT's row and
-    /// the block survives; with the read hoisted above the lock (the
-    /// regression the design's GC-race bullet warns about) the sweep judges
-    /// the store against a live set that predates the row and reclaims the
-    /// block the row names — the assertion below fails.
+    /// The reclamation guard's ordering, end to end: whatever order a
+    /// versioned PUT and a sweep take when they race on the bucket mutation
+    /// lock, the block the PUT's row references survives. PUT first: its
+    /// reference is inside the plan the sweep reads (phase 1 takes the same
+    /// lock). Sweep first: the walk meets the epoch the PUT bumped, and the
+    /// removal phase defers the pass (2026-10-06 — the mark-epoch guard the
+    /// design sanctions, in place of holding the lock across the walk).
     #[cfg(feature = "versioning")]
     #[tokio::test]
-    async fn the_sweeper_reads_the_live_set_under_the_bucket_mutation_lock() {
+    async fn a_publish_racing_the_sweep_never_loses_the_block_it_references() {
         use crate::_core::{
             storage::{ObjectOps, VersionOps},
             version,
@@ -1130,6 +1354,77 @@ mod tests {
             }
             version::ReadResult::Marker { .. } => panic!("the superseded version is content"),
         }
+    }
+
+    /// The race guard's decisive window, pinned end to end: a reference
+    /// committed **after** the block walk — the dedup-hit case the grace
+    /// cannot cover, because the re-upload finds the old block and leaves
+    /// its timestamp untouched — must keep its block. The removal phase
+    /// re-checks the version-reference epoch under the bucket mutation
+    /// lock; the commit bumped it, so the pass defers and the block
+    /// survives — without that check the walk's stale live set would
+    /// delete a block a committed row now names.
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_reference_committed_after_the_block_walk_keeps_its_block() {
+        use crate::_core::storage::{ObjectOps, VersionOps};
+
+        let (_root, storage, b, key) = versioned_single_fixture().await;
+        let sweeper = Sweeper::new(storage.clone(), Options::default());
+        let now = SystemTime::now() + Duration::from_secs(601);
+        let dead = BlockHash::of(b"hello");
+
+        // Make "hello"'s block dead: supersede it into the store (v1's
+        // row), then delete v1 permanently — the block stays on disk,
+        // unreferenced.
+        let previous = storage
+            .head_object(&b, &key)
+            .await
+            .unwrap()
+            .version_id
+            .expect("an enabled write mints a version id");
+        storage.put_object(&b, &key, body(b"second")).await.unwrap();
+        storage
+            .delete_object_version(&b, &key, Some(&previous))
+            .await
+            .unwrap();
+
+        // Phases 1 and 2 of a pass: the plan (with its epoch snapshot), then
+        // the walk — which judges the block dead and past the grace.
+        let (plan, _, epoch) = sweeper.plan_bucket(&b, now).await.unwrap();
+        let candidates = storage
+            .versions(&b)
+            .blobs()
+            .sweep_candidates(&plan.live, sweeper.options.block_grace, now)
+            .await
+            .unwrap();
+        assert!(
+            candidates.entries.iter().any(|entry| entry.hash == dead),
+            "the deleted version's block is a candidate: {candidates:?}"
+        );
+
+        // A publish commits a row naming the block before the removals run:
+        // re-upload "hello", then supersede it — the supersede dedup-hits
+        // the old block and commits a row that references it.
+        storage.put_object(&b, &key, body(b"hello")).await.unwrap();
+        storage.put_object(&b, &key, body(b"fourth")).await.unwrap();
+
+        // Phase 3: the epoch check must defer the removals.
+        let report = sweeper.apply_bucket(&b, &candidates, epoch).await.unwrap();
+        assert_eq!(
+            report.removed, 0,
+            "the epoch check defers the re-referenced block's removal: {report:?}"
+        );
+        assert!(
+            storage
+                .versions(&b)
+                .blobs()
+                .blocks()
+                .contains(&dead)
+                .await
+                .unwrap(),
+            "the block a just-committed row names must survive the removal phase"
+        );
     }
 
     #[tokio::test]

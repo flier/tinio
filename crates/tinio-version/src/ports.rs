@@ -75,9 +75,10 @@ pub struct Current {
     pub is_delete_marker: bool,
     /// The sequence the current version already records (`0` for a key with
     /// no version, and for a null version written while the bucket was
-    /// unversioned). The fs backend's suspended-bucket write onto a fresh key
-    /// records its null version at the next sequence (`1`), so a nonzero
-    /// sequence does not imply a non-null version.
+    /// unversioned). The shared write policy records a fresh null version at
+    /// sequence `0` while `0` is free and at the key's next sequence when a
+    /// retired null version's row occupies it, so a nonzero sequence does not
+    /// imply a non-null version.
     pub seq: u64,
     /// Whether the gate **degraded** the slot: the content a recorded
     /// identity named no longer matches, so the identity is not served and

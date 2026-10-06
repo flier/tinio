@@ -528,7 +528,7 @@ pub struct Listing {
 ///     etag: ETag::EMPTY,
 /// };
 /// let page = version::paginate(
-///     vec![entry("a.txt"), entry("b.txt")],
+///     &[entry("a.txt"), entry("b.txt")],
 ///     &version::ListParams {
 ///         max_keys: 1,
 ///         ..Default::default()
@@ -539,11 +539,14 @@ pub struct Listing {
 /// assert_eq!(page.next_key_marker.as_deref(), Some("a.txt"));
 /// assert_eq!(page.next_version_id_marker.as_deref(), Some("null"));
 /// ```
-pub fn paginate(entries: Vec<Entry>, params: &ListParams) -> Listing {
-    /// The last thing a page emitted — an entry or a rolled-up prefix; the
-    /// resume markers are read off it.
+pub fn paginate(entries: &[Entry], params: &ListParams) -> Listing {
+    /// The last thing a page emitted — a version or a rolled-up prefix; the
+    /// resume markers are read off it. The version arm keeps only the cursor
+    /// pair (the key and the version-id wire, `null` included), so emitting
+    /// an entry does not clone it a second time just to remember where the
+    /// page stopped.
     enum Emitted {
-        Entry(Entry),
+        Entry(String, String),
         Prefix(String),
     }
 
@@ -598,17 +601,17 @@ pub fn paginate(entries: Vec<Entry>, params: &ListParams) -> Listing {
                         truncated = true;
                         break;
                     }
-                    last = Some(Emitted::Entry(entry.clone()));
+                    last = Some(Emitted::Entry(
+                        key_of(entry).to_owned(),
+                        wire_of(entry.id.as_ref()),
+                    ));
                     page.push(entry.clone());
                 }
             }
         }
     }
     let (next_key_marker, next_version_id_marker) = match (truncated, last) {
-        (true, Some(Emitted::Entry(entry))) => (
-            Some(entry.key.as_ref().to_owned()),
-            Some(wire_of(entry.id.as_ref())),
-        ),
+        (true, Some(Emitted::Entry(key, version))) => (Some(key), Some(version)),
         (true, Some(Emitted::Prefix(rolled))) => (Some(rolled), None),
         _ => (None, None),
     };

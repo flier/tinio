@@ -78,10 +78,19 @@ use crate::{
 /// matches (an out-of-band edit or removal) as the null version, whose
 /// supersede is a no-op while it holds no content.
 fn row_conflict(bucket: &Name, key: &object::Key, seq: u64, existing: &str) -> storage::Error {
-    storage::io(IoError::other(format!(
-        "refusing to overwrite the version row of `{key}` at sequence {seq} in bucket `{bucket}`: \
-         it holds version `{existing}`, not the version being superseded"
-    )))
+    // The context goes to the log, not the wire (2026-10-06 review): the
+    // client answers the family's generic internal error, while an operator
+    // gets the bucket, key, sequence and the identity sitting there.
+    tracing::warn!(
+        bucket = %bucket,
+        key = %key,
+        seq,
+        existing,
+        "refusing to overwrite a version row that names a different version"
+    );
+    storage::io(IoError::other(
+        "a version row conflicts with the version being superseded",
+    ))
 }
 
 /// The key's current slot as the gate left it: the port's [`Current`],
@@ -389,7 +398,14 @@ impl VersionRows for Rows {
                 seq,
                 &existing,
             )),
-            None => Ok(()),
+            None => {
+                // The committed row may name a block: record the reference
+                // so a concurrent sweep's epoch check sees it. Every caller
+                // holds the bucket mutation lock across this commit, and
+                // this runs after the transaction landed.
+                self.storage.bump_block_epoch();
+                Ok(())
+            }
         }
     }
 
@@ -879,9 +895,11 @@ mod tests {
             panic!("expected the refusal as a contract I/O error, got {err:?}");
         };
         assert_eq!(io.kind(), ErrorKind::Other, "the refusal is loud: {io}");
-        assert!(
-            io.to_string().contains("sequence 0"),
-            "and names the sequence it would have destroyed: {io}"
+        // The wire message stays generic (2026-10-06 review): the bucket,
+        // key, sequence and identity go to the log, never to the client.
+        assert_eq!(
+            io.to_string(),
+            "a version row conflicts with the version being superseded"
         );
 
         // The committed row is untouched, content address included.

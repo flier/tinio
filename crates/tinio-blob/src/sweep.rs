@@ -1,8 +1,9 @@
 //! The live-set sweep: reclaim addresses no reference points at.
 //!
 //! `LiveSet` and `SweepReport` are defined here — the reachability input the
-//! sweep tests blocks against, and what one sweep reclaimed — and `Store::sweep`
-//! is the walk itself.
+//! sweep tests blocks against, and what one sweep reclaimed — with
+//! `SweepCandidates` and the `Store` methods that plan a sweep
+//! (`Store::sweep_candidates`) and apply it (`Store::remove_candidates`).
 
 use std::{
     collections::HashSet,
@@ -13,7 +14,7 @@ use futures::StreamExt;
 use smart_default::SmartDefault;
 
 use crate::{
-    _core::blob::{BlobRef, BlockHash, BlockStore},
+    _core::blob::{BlobRef, BlockHash, BlockStore, Entry},
     Error,
 };
 
@@ -71,12 +72,16 @@ impl LiveSet {
     /// assert!(live.contains(&BlockHash::of(b"hello")));
     /// ```
     pub fn from_blobs(blobs: impl IntoIterator<Item = BlobRef>) -> Self {
-        Self::from_hashes(blobs.into_iter().flat_map(|blob| {
-            blob.blocks()
-                .iter()
-                .map(|block| block.hash)
-                .collect::<Vec<_>>()
-        }))
+        // The set is built in place: the `flat_map` + `collect` shape this
+        // replaced allocated one `Vec` per blob, which is one heap
+        // allocation per live version on the sweep's setup path.
+        let mut hashes = HashSet::new();
+        for blob in blobs {
+            for block in blob.blocks() {
+                hashes.insert(block.hash);
+            }
+        }
+        Self::from_hashes(hashes)
     }
 
     /// Whether the sweep must keep this block.
@@ -118,6 +123,43 @@ pub struct SweepReport {
     pub removed: u64,
     /// Bytes removed.
     pub bytes: u64,
+    /// Blocks whose removal failed (a sharing violation, a read-only
+    /// residue): the pass logs and continues, and the next sweep retries
+    /// them.
+    pub failed: u64,
+}
+
+/// The blocks a sweep's walk judged reclaimable — its plan, before any
+/// removal — with what the walk measured on the way: the counts and the
+/// store's total byte size at walk time. Produced by
+/// [`crate::Store::sweep_candidates`] and applied by
+/// [`crate::Store::remove_candidates`]; a caller whose live set can go
+/// stale between the two calls validates that itself before removing (the
+/// fs backend checks a mutation epoch under its bucket lock).
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_blob::SweepCandidates;
+///
+/// let candidates = SweepCandidates::default();
+/// assert!(candidates.entries.is_empty());
+/// assert_eq!(candidates.scanned, 0);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepCandidates {
+    /// The reclaimable blocks, in the walk's order.
+    pub entries: Vec<Entry>,
+    /// Blocks examined.
+    pub scanned: u64,
+    /// Blocks kept because the live set holds them.
+    pub kept_live: u64,
+    /// Blocks kept because they are younger than the grace.
+    pub kept_young: u64,
+    /// The total bytes the store held when it was walked — every scanned
+    /// entry's length, kept or reclaimable. The sweep's size gauge reads it
+    /// off the walk that already stat'ed every block.
+    pub bytes_total: u64,
 }
 
 impl<S: BlockStore> super::Store<S> {
@@ -135,6 +177,12 @@ impl<S: BlockStore> super::Store<S> {
     /// commit a row naming a block older than the grace, which a sweep holding
     /// a stale live set then deletes. Only a live set that cannot be stale
     /// closes that window.
+    ///
+    /// This method is the composed pair [`Self::sweep_candidates`] +
+    /// [`Self::remove_candidates`]; it validates nothing between them, so a
+    /// caller whose live set can go stale while the walk runs drives the two
+    /// phases itself and validates before removing (the fs backend checks a
+    /// mutation epoch under the bucket mutation lock).
     ///
     /// # Examples
     ///
@@ -177,9 +225,48 @@ impl<S: BlockStore> super::Store<S> {
         min_age: Duration,
         now: SystemTime,
     ) -> Result<SweepReport, Error> {
-        let mut report = SweepReport::default();
-        // One walk of the whole store. An entry is judged — and a dead one
-        // removed, while the walk is parked between items — before the next is
+        let candidates = self.sweep_candidates(live, min_age, now).await?;
+        self.remove_candidates(&candidates).await
+    }
+
+    /// Walk the whole store and collect the blocks no entry of `live`
+    /// references and that were published at least `min_age` before `now` —
+    /// the sweep's plan, computed without removing anything.
+    ///
+    /// The two-phase shape exists for callers whose live set can go stale
+    /// between the walk and the removal: those validate between
+    /// [`Self::sweep_candidates`] and [`Self::remove_candidates`]. The walk
+    /// streams: the store's listing is consumed entry by entry and never
+    /// held whole, and only the reclaimable entries are retained.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// use tinio_blob::{LiveSet, LocalBlocks, Store};
+    ///
+    /// # async fn example() -> Result<(), tinio_blob::Error> {
+    /// let store = Store::new(LocalBlocks::new("/var/lib/tinio/blobs/demo"));
+    /// let candidates = store
+    ///     .sweep_candidates(
+    ///         &LiveSet::default(),
+    ///         Duration::from_secs(600),
+    ///         SystemTime::now(),
+    ///     )
+    ///     .await?;
+    /// assert_eq!(candidates.scanned, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn sweep_candidates(
+        &self,
+        live: &LiveSet,
+        min_age: Duration,
+        now: SystemTime,
+    ) -> Result<SweepCandidates, Error> {
+        let mut candidates = SweepCandidates::default();
+        // One walk of the whole store. An entry is judged before the next is
         // asked for, so the store's listing is consumed as a stream and never
         // held whole.
         let mut walk = self
@@ -189,9 +276,10 @@ impl<S: BlockStore> super::Store<S> {
             .map_err(|err| Error::Storage(err.into()))?;
         while let Some(entry) = walk.next().await {
             let entry = entry.map_err(|err| Error::Storage(err.into()))?;
-            report.scanned += 1;
+            candidates.scanned += 1;
+            candidates.bytes_total += entry.len;
             if live.contains(&entry.hash) {
-                report.kept_live += 1;
+                candidates.kept_live += 1;
                 continue;
             }
             let young = now
@@ -199,15 +287,73 @@ impl<S: BlockStore> super::Store<S> {
                 .map(|age| age < min_age)
                 .unwrap_or(true);
             if young {
-                report.kept_young += 1;
+                candidates.kept_young += 1;
                 continue;
             }
-            self.blocks()
-                .remove(&entry.hash)
-                .await
-                .map_err(|err| Error::Storage(err.into()))?;
-            report.removed += 1;
-            report.bytes += entry.len;
+            candidates.entries.push(entry);
+        }
+        Ok(candidates)
+    }
+
+    /// Remove every block the walk judged reclaimable.
+    ///
+    /// The caller owns staleness: a reference committed after the walk made
+    /// one of these entries live again, and this method does not re-check —
+    /// the caller must have validated its live view between the two calls
+    /// (the fs backend checks a mutation epoch under the bucket mutation
+    /// lock, which every reference-adding path holds across its block
+    /// publish and its row commit). A removal that fails (a sharing
+    /// violation, a read-only residue) is logged and counted in
+    /// [`SweepReport::failed`]; the pass continues, and the next one
+    /// retries it.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// use tinio_blob::{LiveSet, LocalBlocks, Store};
+    ///
+    /// # async fn example() -> Result<(), tinio_blob::Error> {
+    /// let store = Store::new(LocalBlocks::new("/var/lib/tinio/blobs/demo"));
+    /// let live = LiveSet::default();
+    /// let candidates = store
+    ///     .sweep_candidates(&live, Duration::from_secs(600), SystemTime::now())
+    ///     .await?;
+    /// let report = store.remove_candidates(&candidates).await?;
+    /// assert_eq!(report.failed, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn remove_candidates(
+        &self,
+        candidates: &SweepCandidates,
+    ) -> Result<SweepReport, Error> {
+        let mut report = SweepReport {
+            scanned: candidates.scanned,
+            kept_live: candidates.kept_live,
+            kept_young: candidates.kept_young,
+            ..Default::default()
+        };
+        for entry in &candidates.entries {
+            match self.blocks().remove(&entry.hash).await {
+                Ok(()) => {
+                    report.removed += 1;
+                    report.bytes += entry.len;
+                }
+                Err(err) => {
+                    // One undeletable block must not abort the pass: the
+                    // sweep's other sections (and the next pass) still have
+                    // work to do, and a transient sharing violation clears
+                    // on its own.
+                    report.failed += 1;
+                    tracing::warn!(
+                        hash = %entry.hash,
+                        error = %err,
+                        "a dead block could not be removed; the next sweep retries"
+                    );
+                }
+            }
         }
         tracing::debug!(
             scanned = report.scanned,
@@ -215,6 +361,7 @@ impl<S: BlockStore> super::Store<S> {
             kept_young = report.kept_young,
             removed = report.removed,
             bytes = report.bytes,
+            failed = report.failed,
             "block sweep finished"
         );
         Ok(report)
@@ -223,10 +370,105 @@ impl<S: BlockStore> super::Store<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use tinio_util::testing::body;
 
     use super::*;
-    use crate::{_core::blob::BlockStore, LocalBlocks, Store};
+    use crate::{
+        _core::{
+            BodyStream, ByteRange,
+            blob::{BlockStore, EntryStream, Published},
+        },
+        LocalBlocks, Store,
+    };
+
+    /// A store that refuses to remove one block — the undeletable-block case
+    /// (a sharing violation, a read-only residue). Every other operation
+    /// delegates to the inner store.
+    struct Flaky {
+        inner: LocalBlocks,
+        fail: BlockHash,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockStore for Flaky {
+        type Error = Error;
+        type Staged = <LocalBlocks as BlockStore>::Staged;
+
+        async fn stage(&self) -> Result<Self::Staged, Self::Error> {
+            self.inner.stage().await
+        }
+
+        async fn publish(
+            &self,
+            staged: Self::Staged,
+            hash: &BlockHash,
+        ) -> Result<Published, Self::Error> {
+            self.inner.publish(staged, hash).await
+        }
+
+        async fn contains(&self, hash: &BlockHash) -> Result<bool, Self::Error> {
+            self.inner.contains(hash).await
+        }
+
+        async fn open(
+            &self,
+            hash: &BlockHash,
+            range: Option<ByteRange>,
+        ) -> Result<BodyStream, Self::Error> {
+            self.inner.open(hash, range).await
+        }
+
+        async fn remove(&self, hash: &BlockHash) -> Result<(), Self::Error> {
+            if *hash == self.fail {
+                return Err(Error::Io(io::Error::other("the block is locked")));
+            }
+            self.inner.remove(hash).await
+        }
+
+        async fn list(
+            &self,
+            after: Option<&BlockHash>,
+            limit: usize,
+        ) -> Result<Vec<Entry>, Self::Error> {
+            self.inner.list(after, limit).await
+        }
+
+        async fn walk(
+            &self,
+            after: Option<&BlockHash>,
+        ) -> Result<EntryStream<Self::Error>, Self::Error> {
+            self.inner.walk(after).await
+        }
+    }
+
+    /// One undeletable block must not abort the pass: it is counted in
+    /// [`SweepReport::failed`] and the other dead blocks still go.
+    #[tokio::test]
+    async fn an_undeletable_block_is_counted_and_does_not_abort_the_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let stuck = BlockHash::of(b"stuck");
+        let doomed = BlockHash::of(b"doomed");
+        let store = Store::new(Flaky {
+            inner: LocalBlocks::new(dir.path()),
+            fail: stuck,
+        });
+        let live = LiveSet::default();
+        let now = SystemTime::now() + Duration::from_secs(3600);
+        store.put(body(b"stuck")).await.unwrap();
+        store.put(body(b"doomed")).await.unwrap();
+
+        let report = store
+            .sweep(&live, Duration::from_secs(600), now)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 1, "the locked block is reported: {report:?}");
+        assert_eq!(report.removed, 1, "the deletable block still goes");
+        assert!(store.blocks().inner.contains(&stuck).await.unwrap());
+        assert!(!store.blocks().inner.contains(&doomed).await.unwrap());
+    }
 
     #[tokio::test]
     async fn a_sweep_removes_unreferenced_blocks_once_they_are_past_the_grace() {

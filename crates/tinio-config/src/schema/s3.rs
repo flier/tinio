@@ -196,6 +196,14 @@ pub struct Config {
     #[default = 10]
     #[garde(range(min = 1))]
     pub block_grace_minutes: u64,
+    /// Warn when the versioned buckets' block stores hold more than this
+    /// many bytes (default 0 = never warn, the safe reading of an unset
+    /// key). The store has no hard cap, so this threshold is the
+    /// capacity-planning signal: the sweep compares the block walk's own
+    /// byte total against it and logs a warning above it.
+    #[serde(default = "block_bytes_warn")]
+    #[default = 0]
+    pub block_bytes_warn: u64,
     /// Cap on concurrently in-progress multipart uploads (default 1000):
     /// without a cap an authenticated client can accumulate an unbounded
     /// number of uploads (each up to 10,000 parts), exhausting disk,
@@ -287,6 +295,10 @@ fn noncurrent_expire_days() -> u64 {
 
 fn block_grace_minutes() -> u64 {
     Config::default().block_grace_minutes
+}
+
+fn block_bytes_warn() -> u64 {
+    Config::default().block_bytes_warn
 }
 
 fn max_concurrent_uploads() -> u32 {
@@ -497,13 +509,18 @@ mod tests {
             s3.block_grace_minutes, 10,
             "the block sweep's grace defaults to ten minutes"
         );
+        assert_eq!(
+            s3.block_bytes_warn, 0,
+            "0 = never warn about the block store's size"
+        );
 
-        let off = RootConfig::parse("version = 1\n[s3]\nversioning = false\nnoncurrent_keep = 3\nnoncurrent_expire_days = 30\nblock_grace_minutes = 45").unwrap();
+        let off = RootConfig::parse("version = 1\n[s3]\nversioning = false\nnoncurrent_keep = 3\nnoncurrent_expire_days = 30\nblock_grace_minutes = 45\nblock_bytes_warn = 1073741824").unwrap();
         let s3 = off.s3.unwrap();
         assert!(!s3.capabilities.versioning);
         assert_eq!(s3.noncurrent_keep, 3);
         assert_eq!(s3.noncurrent_expire_days, 30);
         assert_eq!(s3.block_grace_minutes, 45);
+        assert_eq!(s3.block_bytes_warn, 1073741824);
     }
 
     #[test]

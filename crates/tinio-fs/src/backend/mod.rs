@@ -19,7 +19,10 @@ use std::{
     fs::canonicalize,
     io::{self, ErrorKind},
     path::{Path, PathBuf, absolute},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -37,6 +40,8 @@ use crate::_blob::{LocalBlocks, Store as BlobStore};
 #[cfg(feature = "versioning")]
 use crate::_version::Versions;
 pub use crate::error::Error;
+#[cfg(feature = "versioning")]
+use crate::error::projected;
 pub(crate) use crate::error::{invalid_path, invalid_state_dir, invalid_value, root_not_directory};
 #[cfg(feature = "versioning")]
 use crate::version_adapter::{Files, Rows};
@@ -53,7 +58,7 @@ use crate::{
             META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN, Storage, no_such_bucket,
         },
         to_nanos,
-        version::Id,
+        version::{Id, State},
     },
     _store::{
         bucket, bucket_versioning, decode_acl_wire, decode_owner_wire, meta, object_part, upload,
@@ -314,6 +319,14 @@ pub struct FsStorage {
     /// and [`key_path`](Self::key_path).
     #[getset(skip)]
     boundary_cache: BoundaryCache,
+    /// The version-reference epoch: bumped by every commit that adds a
+    /// version row (the one place a block reference enters the version
+    /// tables) and read by the sweeper, which validates a walk's live set
+    /// against it instead of re-reading every row. Monotonic and
+    /// process-local; every bump and every read is sequenced by the
+    /// bucket mutation lock the referencing commits run under.
+    #[getset(skip)]
+    block_epoch: Arc<AtomicU64>,
 }
 
 /// The per-bucket mutation-lock wait above which [`FsStorage::lock_bucket_mutations`]
@@ -477,6 +490,21 @@ impl FsStorage {
     /// A wait past [`MUTATION_LOCK_WARN_THRESHOLD`] is warned (D-E): a
     /// delete/create/commit of the same name is holding the mutex — long
     /// enough to see in the logs, never silently absorbed.
+    /// The version-reference epoch (the field's doc explains it). Read it
+    /// under the same bucket mutation lock the referencing commits run in,
+    /// then compare it after the walk: equal means no reference landed in
+    /// between.
+    pub(crate) fn block_epoch(&self) -> u64 {
+        self.block_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Record that a version row was committed — every reference-adding
+    /// path calls this inside its bucket mutation lock, after the row's
+    /// transaction committed.
+    pub(crate) fn bump_block_epoch(&self) {
+        self.block_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub(crate) async fn lock_bucket_mutations(&self, name: &Name) -> lockmap::Guard<Name> {
         let started = Instant::now();
         let guard = self.bucket_mutation_locks.lock(name.clone()).await;
@@ -653,6 +681,7 @@ impl FsStorage {
             writer: AtomicWriter::new(&state_dir),
             bucket_mutation_locks: Map::new(),
             boundary_cache: BoundaryCache::new(),
+            block_epoch: Arc::new(AtomicU64::new(0)),
             root: canonical,
             state_dir,
         })
@@ -810,6 +839,21 @@ impl FsStorage {
             Files::new(self.clone()),
             BlobStore::new(LocalBlocks::new(self.blobs_dir().join(bucket.as_ref()))),
         )
+    }
+
+    /// The buckets that record versions — state enabled or suspended — in
+    /// name order: the sweeper's retention/GC pass and the startup block
+    /// verify both iterate exactly these, from one home.
+    #[cfg(feature = "versioning")]
+    pub(crate) async fn versioned_buckets(&self) -> Result<Vec<Name>, Error> {
+        let mut out = Vec::new();
+        for name in self.bucket_names("").await? {
+            let state = self.versions(&name).state(&name).await.map_err(projected)?;
+            if matches!(state, State::Enabled | State::Suspended) {
+                out.push(name);
+            }
+        }
+        Ok(out)
     }
 
     /// Every bucket of the root matching `prefix`: top-level directories

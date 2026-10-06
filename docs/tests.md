@@ -6,13 +6,13 @@
 - One-off scripts: any language. Standing unit / e2e: Rust only. Scratch outside the repo and not `target/`; delete at round end; reap spawned processes else the next build cannot replace the binary.
 - Placement (2026-10-01, test-placement plan): unit next to the subject (sibling file once the module outgrows one file — not a crate-level gather). Flow cucumber iff the migration rule admits, else integration (crate boundary / foreign oracle / bench-shared / public-API properties). One-module property suite moves inline with its subject.
 - Shared harness = lib behind a test feature. Shared include = file-scope (path resolution differs by platform). Spawn sites outside the guard's scan: record at the guard.
-- Drop a duplicate only when the survivor covers the same rule; fold missing asserts first. State-dir layout: closed set the fs backend tests pin.
+- Drop a duplicate only when the survivor covers the same rule; fold missing asserts first. State-dir layout: closed set the fs backend tests pin — `meta.redb`, `tmp/`, `multipart/`, `blobs/` and the tool-state files.
 
 ## Standard acceptance (pre-push gate)
 
 - Local cmds cover every CI workflow leg. CI profile = dev. CI unit = nextest; local = cargo test; doctest separate. Out of gate: interop (external tools on `PATH`), audit, semver (constitution VI). Platform: [Platform-gated verification](#platform-gated-verification).
 - Doc gate: workspace rustdoc with warnings denied — not doctests. Public docs must not rustdoc-link private items.
-- Feature-gate breakage needs each-feature — the default graph cannot see it. Matrix: facade + server, not a powerset. Feature-off: lib-only check/clippy (dev-deps re-enable; Unix lints on Linux); test-run the refusal arm. Versioning graph is a runtime seam (`docs/cargo.md`). Sandbox e2e requires the sandbox feature; the feature gates the body, not the program — the binary must still compile and serve with features off.
+- Feature-gate breakage needs each-feature — the default graph cannot see it. Matrix: facade + server + `tinio-fs`'s feature-off leg, not a powerset. Feature-off: lib-only check/clippy (dev-deps re-enable; Unix lints on Linux) — `tinio-fs`'s self dev-dependency unifies `versioning` back on for every test build, so `cargo hack check --package tinio-fs --each-feature` (a check builds no dev-deps) is the leg that compiles the stripped arm; test-run the refusal arm. Versioning graph is a runtime seam (`docs/cargo.md`). Sandbox e2e requires the sandbox feature; the feature gates the body, not the program — the binary must still compile and serve with features off.
 
 ## Cucumber (tinio-e2e)
 

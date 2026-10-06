@@ -84,6 +84,15 @@ use crate::{
 /// correct walk fail that test.
 pub(crate) const RESOLVE_CONCURRENCY: usize = 16;
 
+/// How many keys' worth of per-key row caps one window may buffer, in total
+/// (2026-10-06 review): the per-key bound alone still let a window of
+/// `max_keys + 1` long-history keys multiply, so the row walk stops once a
+/// window holds this many caps' worth and leaves the key it stopped at to
+/// the next window — which re-reads it with a fresh budget, at its full cap,
+/// and a key read at its full cap is guaranteed to fill (and truncate) the
+/// page by itself; see [`read_window`].
+const WINDOW_KEY_ROWS: usize = 3;
+
 /// One page of the bucket's versions, in the wire's order: by key, the current
 /// version first, then the noncurrent versions newest first. `key_marker`
 /// skips the keys up to and including the marker (alone) or resumes after the
@@ -107,7 +116,7 @@ pub(crate) async fn page(
     // empty page ([`version::paginate`]'s own rule) without walking the
     // bucket for a truncation that can never come.
     if params.max_keys == 0 {
-        return Ok(version::paginate(Vec::new(), params));
+        return Ok(version::paginate(&[], params));
     }
 
     let mut walk = Walk::new(storage, bucket, params);
@@ -121,14 +130,14 @@ pub(crate) async fn page(
         // truncated answer already carries the page's cut and its cursors,
         // so the walk stops there. Anything else walks on.
         if walk.entries.len() >= params.max_keys {
-            let listing = version::paginate(walk.entries.clone(), params);
+            let listing = version::paginate(&walk.entries, params);
             if listing.is_truncated {
                 return Ok(listing);
             }
         }
         match walk.next_cursor(&window) {
             Some(next) => cursor = next,
-            None => return Ok(version::paginate(walk.entries, params)),
+            None => return Ok(version::paginate(&walk.entries, params)),
         }
     }
 }
@@ -221,13 +230,32 @@ struct Window {
 /// that would, and the window keeps only the keys at or before the earlier of
 /// the two stops — the keys past it are unread by one side, so the next
 /// window re-reads them rather than pair a known slot with unknown history
-/// (or the reverse). The stop is checked on a key boundary, so a key's own
-/// version rows are always read whole.
+/// (or the reverse). The stop is checked on a key boundary.
+///
+/// A key's rows are read **bounded**, newest first, at most `budget + 2` of
+/// them (2026-10-06 review: the walk used to buffer a covered key's whole
+/// history, so one key with a long version chain materialized it whole per
+/// page). The bound is safe because a key whose read hit it is guaranteed to
+/// fill and truncate the page by itself: `budget + 2` buffered rows minus at
+/// most one row that is the key's own current slot — and, when the cursor
+/// resumes inside the key, minus the marker row the page drops — still leave
+/// at least `budget` post-cut entries, and the page needs `max_keys + 1 =
+/// budget` of them to prove truncation. The key a `version_id_marker`
+/// resumes inside is therefore read streamed from the marker down (rows above
+/// it pass through the visitor without being buffered), because its cut can
+/// lie anywhere below the marker.
+///
+/// The window's **total** row budget is [`WINDOW_KEY_ROWS`] per-key caps:
+/// once the buffered rows reach it, a further key that cannot be read at its
+/// full cap is left out of the window (the coverage stops at the previous
+/// key) and the next window re-reads it with a fresh budget — as the first
+/// key it is read at its full cap, which guarantees the page fills.
 fn read_window(
     txn: &redb::ReadTransaction,
     bucket: &str,
     cursor: &Cursor,
     budget: usize,
+    resumed: Option<(&str, &str)>,
 ) -> Result<Window, DatabaseError> {
     let from = cursor.as_bound();
     // The current slots: one gated row per key, in key order.
@@ -243,26 +271,75 @@ fn read_window(
         })?;
     }
     let slots_end = slots.len() < budget;
-    // The version rows: the same key span, key order, sequence ascending. A
-    // row whose shape is corrupt is skipped, never fails the walk.
+    // The version rows: the same key span, key order, each key read newest
+    // first and bounded (see the function's doc for why the bounds are
+    // safe). A row whose shape is corrupt is skipped, never fails the walk.
+    let row_cap = budget.saturating_add(2);
+    let mut remaining = row_cap.saturating_mul(WINDOW_KEY_ROWS);
+    let mut stopped = false;
     let mut history: BTreeMap<String, Vec<rows::Row>> = BTreeMap::new();
     {
-        let table = rows::Table::open_readonly(txn)?;
-        table.for_bucket_from(bucket, from, |key, row| match history.get_mut(key) {
-            Some(rows) => {
-                rows.push(row);
-                Ok(true)
+        // The key span comes from a row walk of its own (the visitor is
+        // row-granular, so a key's later rows only advance it); each key's
+        // payload is then one bounded per-key read on a second handle.
+        let span = rows::Table::open_readonly(txn)?;
+        let reading = rows::Table::open_readonly(txn)?;
+        span.for_bucket_from(bucket, from, |key, _row| {
+            if history.len() == budget {
+                stopped = true;
+                return Ok(false);
             }
-            None => {
-                if history.len() == budget {
+            if history.contains_key(key) {
+                return Ok(true);
+            }
+            // What this key may buffer: its full cap while the window's
+            // budget allows, and one row past that to learn whether the
+            // key has more. A key that would need more rows than the
+            // remaining budget is left to the next window — but only when
+            // the shortfall is the *window's* (below the cap); a key read
+            // at its full cap is the guaranteed-page case and stays.
+            let need = remaining.min(row_cap);
+            let probe = need.saturating_add(1);
+            let mut rows = match resumed {
+                Some((resumed_key, marker)) if resumed_key == key => {
+                    // The resume stream: rows above the marker pass through
+                    // unbuffered (the page drops up to and including the
+                    // marker), and the buffer starts at the marker row.
+                    let mut rows = Vec::new();
+                    let mut below = false;
+                    reading.for_key(bucket, key, |row| {
+                        if !below {
+                            below = row.id == marker;
+                        }
+                        if below && rows.len() < probe {
+                            rows.push(row);
+                        }
+                        Ok(())
+                    })?;
+                    rows
+                }
+                _ => reading
+                    .newest(bucket, key, probe)?
+                    .into_iter()
+                    .map(|(_, row)| row)
+                    .collect(),
+            };
+            if rows.len() > need {
+                if need < row_cap {
+                    stopped = true;
                     return Ok(false);
                 }
-                history.insert(key.to_owned(), vec![row]);
-                Ok(true)
+                rows.truncate(need);
             }
+            remaining -= rows.len();
+            history.insert(key.to_owned(), rows);
+            Ok(true)
         })?;
     }
-    let history_end = history.len() < budget;
+    // Reached the bucket's end only when neither stop fired: the budget stop
+    // holds its budget's worth of keys, and the exclusion stop deliberately
+    // holds fewer — the key it stopped at was never read.
+    let history_end = !stopped && history.len() < budget;
 
     // The window's coverage: a walk that stopped early bounds it (the other
     // walked past that key), and two early stops meet at the earlier key.
@@ -381,8 +458,22 @@ impl<'a> Walk<'a> {
         let bucket = self.bucket.clone();
         let cursor = cursor.clone();
         let budget = self.budget;
+        // The key a `version_id_marker` resumes inside, if the request names
+        // one: its rows must be read streamed from the marker down. The
+        // cursor only carries a key, so the pair rides beside it.
+        let resumed = self.params.version_id_marker.as_ref().and_then(|marker| {
+            self.params
+                .key_marker
+                .as_deref()
+                .map(|key| (key.to_owned(), marker.0.clone()))
+        });
         handle
-            .read_blocking(move |txn| read_window(txn, bucket.as_ref().as_str(), &cursor, budget))
+            .read_blocking(move |txn| {
+                let resumed = resumed
+                    .as_ref()
+                    .map(|(key, marker)| (key.as_str(), marker.as_str()));
+                read_window(txn, bucket.as_ref().as_str(), &cursor, budget, resumed)
+            })
             .await
             .map_err(Error::from)
     }

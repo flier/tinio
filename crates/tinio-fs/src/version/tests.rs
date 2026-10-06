@@ -2172,3 +2172,161 @@ async fn a_rolled_up_group_never_resolves_every_member() {
     let tail_row = stored_row(&storage, &b, &object::key(&tail).unwrap()).await;
     assert_eq!(tail_row.size, tampered[tampered.len() - 1]);
 }
+
+/// The state flip is serialized with the write path: a
+/// `set_bucket_versioning` call parks on the bucket mutation lock while a
+/// writer holds it, so no write's state read can straddle the flip.
+#[tokio::test]
+async fn setting_the_versioning_state_waits_on_the_bucket_mutation_lock() {
+    let (_root, storage, b) = fixture().await;
+
+    let guard = storage.lock_bucket_mutations(&b).await;
+    let setter = storage.clone();
+    let set_bucket = b.clone();
+    let set = tokio::spawn(async move {
+        setter
+            .set_bucket_versioning(&set_bucket, version::State::Enabled)
+            .await
+    });
+    testutil::wait_for_lock_waiter().await;
+    assert!(!set.is_finished(), "the flip waits on the lock");
+    drop(guard);
+    set.await.unwrap().unwrap();
+    assert_eq!(
+        storage.bucket_versioning(&b).await.unwrap(),
+        version::State::Enabled
+    );
+}
+
+/// The paging walk over one key with a version chain longer than a window's
+/// per-key row bound (2026-10-06 review: the walk buffers at most
+/// `max_keys + 3` rows of a key). Every version must still be enumerated
+/// exactly once across the pages — including the pages that resume inside
+/// the key, where the read streams from the marker down.
+#[tokio::test]
+async fn a_version_chain_longer_than_the_window_row_bound_still_pages_whole() {
+    let (_root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let key = object::key("notes.txt").unwrap();
+
+    // Thirty versions: far past the five rows a window may buffer at
+    // `max_keys = 2`, so both the capped read and the streamed resume run.
+    let mut expected = Vec::new();
+    for index in 0..30u32 {
+        let body = format!("v{index:02}");
+        let id = put(&storage, &b, &key, body.as_bytes())
+            .await
+            .version_id
+            .expect("an enabled write mints a version id");
+        expected.push(Some(id.as_str().to_owned()));
+    }
+    expected.reverse(); // newest first
+
+    let mut collected: Vec<Option<String>> = Vec::new();
+    let mut key_marker: Option<String> = None;
+    let mut version_marker: Option<version::IdMarker> = None;
+    let mut pages = 0;
+    loop {
+        let page = page(
+            &storage,
+            &b,
+            ListParams {
+                key_marker: key_marker.clone(),
+                version_id_marker: version_marker.clone(),
+                max_keys: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        pages += 1;
+        assert!(pages < 40, "the walk must terminate");
+        assert!(page.entries.len() <= 2, "a page never exceeds max_keys");
+        collected.extend(
+            page.entries
+                .iter()
+                .map(|entry| entry.id.as_ref().map(|id| id.as_str().to_owned())),
+        );
+        if !page.is_truncated {
+            break;
+        }
+        key_marker = page.next_key_marker.clone();
+        version_marker = page.next_version_id_marker.clone().map(version::IdMarker);
+        assert!(key_marker.is_some() && version_marker.is_some());
+    }
+    assert_eq!(pages, 15, "thirty versions at two per page");
+    assert_eq!(collected, expected, "every version is listed exactly once");
+}
+
+/// The window's total row budget (2026-10-06 review): with more keys than
+/// `WINDOW_KEY_ROWS` per-key caps allow, the walk leaves the key it cannot
+/// read at its full cap to the next window — and still enumerates every
+/// version exactly once, with every page within `max_keys`.
+#[tokio::test]
+async fn a_window_budget_that_skips_a_key_still_pages_every_version() {
+    let (_root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+
+    // Four keys, six versions each: 20 rows against a window budget of
+    // `3 * (2 + 3)` rows, so one window cannot hold all four keys.
+    let mut expected: Vec<(String, Option<String>)> = Vec::new();
+    for index in 0..4u32 {
+        let key = object::key(format!("k{index}.txt")).unwrap();
+        let mut ids = Vec::new();
+        for version_index in 0..6u32 {
+            let body = format!("v{index}-{version_index}");
+            ids.push(
+                put(&storage, &b, &key, body.as_bytes())
+                    .await
+                    .version_id
+                    .expect("an enabled write mints a version id")
+                    .as_str()
+                    .to_owned(),
+            );
+        }
+        ids.reverse(); // newest first
+        for id in ids {
+            expected.push((key.as_ref().to_owned(), Some(id)));
+        }
+    }
+
+    let mut collected: Vec<(String, Option<String>)> = Vec::new();
+    let mut key_marker: Option<String> = None;
+    let mut version_marker: Option<version::IdMarker> = None;
+    let mut pages = 0;
+    loop {
+        let page = page(
+            &storage,
+            &b,
+            ListParams {
+                key_marker: key_marker.clone(),
+                version_id_marker: version_marker.clone(),
+                max_keys: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        pages += 1;
+        assert!(pages < 40, "the walk must terminate");
+        assert!(page.entries.len() <= 2, "a page never exceeds max_keys");
+        collected.extend(page.entries.iter().map(|entry| {
+            (
+                entry.key.as_ref().to_owned(),
+                entry.id.as_ref().map(|id| id.as_str().to_owned()),
+            )
+        }));
+        if !page.is_truncated {
+            break;
+        }
+        key_marker = page.next_key_marker.clone();
+        version_marker = page.next_version_id_marker.clone().map(version::IdMarker);
+        assert!(key_marker.is_some() && version_marker.is_some());
+    }
+    assert_eq!(pages, 12, "twenty-four versions at two per page");
+    assert_eq!(collected, expected, "every version is listed exactly once");
+}

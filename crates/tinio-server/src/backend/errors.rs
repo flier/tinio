@@ -2,16 +2,31 @@ use s3s::{S3Error, s3_error};
 
 use crate::_core::storage::Error as StorageError;
 
+/// A client-supplied value made safe to reflect into an XML error body
+/// (2026-10-06 review): the version-id rules are **length-only**, so a
+/// request may carry control characters, and quick-xml escapes markup but not
+/// control bytes — a reflected one would make the body non-well-formed. Each
+/// control character becomes `U+FFFD`.
+fn printable(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 /// Map a backend error (any `S::Error`, which converts into the contract
 /// error) onto its S3 error code (FR-005).
 pub(crate) fn map_backend_error<E: Into<StorageError>>(err: E) -> S3Error {
     match err.into() {
         StorageError::NoSuchBucket(_) => s3_error!(NoSuchBucket),
         StorageError::NoSuchKey(_) => s3_error!(NoSuchKey),
-        StorageError::NoSuchUpload(id) => s3_error!(NoSuchUpload, "no such upload: {id}"),
-        StorageError::NoSuchVersion(id) => s3_error!(NoSuchVersion, "no such version: {id}"),
+        StorageError::NoSuchUpload(id) => {
+            s3_error!(NoSuchUpload, "no such upload: {}", printable(&id))
+        }
+        StorageError::NoSuchVersion(id) => {
+            s3_error!(NoSuchVersion, "no such version: {}", printable(&id))
+        }
         StorageError::InvalidVersion(raw) => {
-            s3_error!(InvalidArgument, "invalid version: `{raw}`")
+            s3_error!(InvalidArgument, "invalid version: `{}`", printable(&raw))
         }
         // A duplicate create on a locally-owned bucket answers
         // `BucketAlreadyOwnedByYou` (AWS/MinIO semantics) — clients such as
@@ -176,5 +191,27 @@ mod tests {
         for (storage_err, expected) in cases {
             assert_eq!(s3_code(storage_err), expected);
         }
+    }
+
+    #[test]
+    fn a_reflected_version_id_never_carries_a_control_byte() {
+        // The version-id rules are length-only, so a request may carry
+        // control characters (the repo's own pin builds `"bad\nid"`), and
+        // quick-xml does not escape control bytes: a reflected one would
+        // make the error body non-well-formed. The message replaces them.
+        let err = map_backend_error(StorageError::NoSuchVersion("bad\nid".into()));
+        assert_eq!(err.code().as_str(), "NoSuchVersion");
+        assert_eq!(err.message(), Some("no such version: bad\u{FFFD}id"));
+
+        let err = map_backend_error(StorageError::InvalidVersion("a\u{1}b\u{0}".into()));
+        assert_eq!(err.code().as_str(), "InvalidArgument");
+        assert!(
+            !err.message()
+                .unwrap_or_default()
+                .chars()
+                .any(char::is_control),
+            "no control byte survives the reflection: {:?}",
+            err.message()
+        );
     }
 }

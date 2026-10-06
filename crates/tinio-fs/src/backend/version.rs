@@ -332,7 +332,7 @@ mod enabled {
                 State, wire_of,
             },
         },
-        _store::{meta, object_part, version as rows, version_index},
+        _store::{bucket_versioning, meta, object_part, version as rows, version_index},
         _version::{Current, Identity, Intent, Seqs, plan_write as write_plan},
         Error, FsStorage,
         backend::objects::{prune_parents, remove_object_file},
@@ -421,6 +421,34 @@ mod enabled {
             Ok((judged.current, judged.stored))
         }
 
+        /// The bucket's versioning state and the key's sequence view from
+        /// **one** point-read transaction (2026-10-06 review: the versioned
+        /// write path paid one read for the state and another for the
+        /// sequences; both values feed the same plan, so one transaction
+        /// answers them together).
+        fn state_and_seqs(&self, bucket: &Name, key: &object::Key) -> Result<(State, Seqs), Error> {
+            let bucket = bucket.clone();
+            let key = key.clone();
+            self.handle()
+                .read(move |txn| {
+                    let state = bucket_versioning::Table::open_readonly(txn)?
+                        .get(bucket.as_ref().as_str())?
+                        .unwrap_or_default();
+                    let table = rows::Table::open_readonly(txn)?;
+                    let (bucket, key) = (bucket.as_ref().as_str(), key.as_ref().as_str());
+                    let latest = table.latest(bucket, key)?.map_or(0, |(seq, _)| seq);
+                    let null_at_zero = table.get(bucket, key, 0)?.is_some();
+                    Ok((
+                        state,
+                        Seqs {
+                            latest,
+                            null_at_zero,
+                        },
+                    ))
+                })
+                .map_err(Error::from)
+        }
+
         /// The key's sequence view, as the shared write decision takes it: the
         /// newest version row's sequence (the crash window's adopted row
         /// included — that row occupies its sequence for good) and whether a
@@ -450,7 +478,10 @@ mod enabled {
             key: &object::Key,
         ) -> Result<Plan, Error> {
             let versions = self.versions(bucket);
-            let state = versions.state(bucket).await.map_err(projected)?;
+            // One transaction answers the state and the sequence view (see
+            // `state_and_seqs`); the early return below skips only the slot
+            // gate.
+            let (state, seqs) = self.state_and_seqs(bucket, key)?;
             if state == State::Unversioned {
                 return Ok(Plan {
                     marker: Marker::none(),
@@ -466,7 +497,6 @@ mod enabled {
             // function both backends execute — and this backend owns only the
             // reads, the supersede and the writes below.
             let (current, _) = self.gated_current(bucket, key).await?;
-            let seqs = self.seq_view(bucket, key)?;
             let plan = write_plan(Intent::Put, state, &current, &seqs);
             if plan.supersede {
                 versions
@@ -788,10 +818,17 @@ mod enabled {
                 .await
                 .map_err(projected)?
             else {
-                return Err(Error::Io(IoError::other(format!(
-                    "the version row of `{key}` at sequence {seq} names content, \
-                     but its materialize published none"
-                ))));
+                // The context goes to the log, not the wire (2026-10-06
+                // review): the client answers the generic internal error.
+                tracing::warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    seq,
+                    "the version row names content, but its materialize published none"
+                );
+                return Err(Error::Io(IoError::other(
+                    "a version row names content, but its materialize published none",
+                )));
             };
             let dir = self.ensure_bucket(bucket).await?;
             let path = self.resolve_key(&dir, key).await?;
@@ -924,6 +961,13 @@ mod enabled {
 
         async fn set_bucket_versioning(&self, bucket: &Name, state: State) -> Result<(), Error> {
             self.ensure_bucket(bucket).await?;
+            // The state flip is serialized with the write path: every write
+            // reads the state inside its own hold of this lock, so without
+            // the same lock here a write that overlapped the flip could act
+            // on the old state after the flip answered (orderable, but only
+            // by an argument; the lock makes the serialization the obvious
+            // reading).
+            let _guard = self.lock_bucket_mutations(bucket).await;
             self.versions(bucket)
                 .set_state(bucket, state)
                 .await

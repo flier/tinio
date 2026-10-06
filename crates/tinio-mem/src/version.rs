@@ -1575,7 +1575,7 @@ mod enabled {
                 // without walking the bucket for a truncation that can never
                 // come.
                 if params.max_keys == 0 {
-                    return Ok(version::paginate(Vec::new(), &params));
+                    return Ok(version::paginate(&[], &params));
                 }
                 // The bounded walk, the fs listing's own shape: one window of
                 // keys at a time, from the listing's first key, stopping as
@@ -1595,7 +1595,7 @@ mod enabled {
                     // holds that many — and a truncated answer already carries
                     // the page's cut and its cursors, so the walk stops there.
                     if walk.entries.len() >= params.max_keys {
-                        let listing = version::paginate(walk.entries.clone(), &params);
+                        let listing = version::paginate(&walk.entries, &params);
                         if listing.is_truncated {
                             return Ok(listing);
                         }
@@ -1604,7 +1604,7 @@ mod enabled {
                         Some(next) => cursor = next,
                         None => {
                             let entries = mem::take(&mut walk.entries);
-                            return Ok(version::paginate(entries, &params));
+                            return Ok(version::paginate(&entries, &params));
                         }
                     }
                 }

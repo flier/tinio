@@ -204,4 +204,117 @@ mod tests {
             .await
             .expect("PutBucketTagging with the toggle on is not refused");
     }
+
+    /// Drive one `versioning`-gated operation through the decorator, by
+    /// wire name — [`refusal`]'s shape, for the three rows whose
+    /// `#[gated(versioning: "versioning")]` clause strips them (and this
+    /// test with them) from a build without the feature.
+    #[cfg(feature = "versioning")]
+    async fn versioning_refusal<T: S3 + Send + Sync>(
+        backend: &CapabilityS3<T>,
+        op: &str,
+    ) -> S3Error {
+        match op {
+            "GetBucketVersioning" => backend
+                .get_bucket_versioning(s3_request(dto::GetBucketVersioningInput {
+                    bucket: "data".into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err(),
+            "PutBucketVersioning" => backend
+                .put_bucket_versioning(s3_request(dto::PutBucketVersioningInput {
+                    bucket: "data".into(),
+                    versioning_configuration: dto::VersioningConfiguration {
+                        status: Some(dto::BucketVersioningStatus::from_static(
+                            dto::BucketVersioningStatus::ENABLED,
+                        )),
+                        mfa_delete: None,
+                    },
+                    checksum_algorithm: None,
+                    content_md5: None,
+                    expected_bucket_owner: None,
+                    mfa: None,
+                }))
+                .await
+                .unwrap_err(),
+            "ListObjectVersions" => backend
+                .list_object_versions(s3_request(dto::ListObjectVersionsInput {
+                    bucket: "data".into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap_err(),
+            other => panic!("unhandled op {other}"),
+        }
+    }
+
+    /// A disabled `versioning` toggle answers `NotImplemented` under each
+    /// operation's wire name — the decorator's own refusal, the family's
+    /// exact sentence, no handler involved.
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_disabled_versioning_toggle_refuses_the_three_versioning_rows() {
+        let caps = Capabilities {
+            versioning: false,
+            ..Default::default()
+        };
+        let (backend, _bucket) = setup_gated_with_caps(caps).await;
+        for op in [
+            "GetBucketVersioning",
+            "PutBucketVersioning",
+            "ListObjectVersions",
+        ] {
+            let err = versioning_refusal(&backend, op).await;
+            assert_eq!(err.code().as_str(), "NotImplemented", "{op}: {err:?}");
+            let expected = format!("{op} is disabled");
+            assert_eq!(err.message(), Some(expected.as_str()), "{op}: {err:?}");
+        }
+    }
+
+    /// The complement: with the toggle on the decorator forwards the same
+    /// three operations, so they reach the handler and answer the
+    /// unversioned fixture bucket — an empty state, an accepted write, an
+    /// empty listing — rather than the gate's `NotImplemented`.
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn an_enabled_versioning_toggle_reaches_the_handler() {
+        let (inner, bucket) = setup_with_caps(Default::default()).await;
+        let wrapped = CapabilityS3::new(inner, Default::default());
+        let out = wrapped
+            .get_bucket_versioning(s3_request(dto::GetBucketVersioningInput {
+                bucket: bucket.clone(),
+                ..Default::default()
+            }))
+            .await
+            .expect("GetBucketVersioning with the toggle on is not refused");
+        assert_eq!(out.output.status, None, "the fixture bucket is unversioned");
+        wrapped
+            .put_bucket_versioning(s3_request(dto::PutBucketVersioningInput {
+                bucket: bucket.clone(),
+                versioning_configuration: dto::VersioningConfiguration {
+                    status: Some(dto::BucketVersioningStatus::from_static(
+                        dto::BucketVersioningStatus::ENABLED,
+                    )),
+                    mfa_delete: None,
+                },
+                checksum_algorithm: None,
+                content_md5: None,
+                expected_bucket_owner: None,
+                mfa: None,
+            }))
+            .await
+            .expect("PutBucketVersioning with the toggle on is not refused");
+        let listed = wrapped
+            .list_object_versions(s3_request(dto::ListObjectVersionsInput {
+                bucket,
+                ..Default::default()
+            }))
+            .await
+            .expect("ListObjectVersions with the toggle on is not refused");
+        assert!(
+            listed.output.versions.unwrap_or_default().is_empty(),
+            "the fixture bucket holds no object version"
+        );
+    }
 }

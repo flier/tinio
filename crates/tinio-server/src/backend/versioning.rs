@@ -59,14 +59,15 @@ pub(crate) fn require_versioning<S: Storage>(
 // --- the wire helpers every object operation shares ---
 
 /// The `versionId` a request's raw query carries — the source for the two
-/// write handlers whose input does not surface it: `PutObjectInput` and
-/// `CreateMultipartUploadInput` carry a `version_id` field only under
-/// s3s's `minio` feature (which this workspace does not enable), and
-/// their non-`minio` deserializers drop the parameter. Only its presence
-/// is read — the guarded writes give the value no meaning (AWS defines
-/// none for either operation), and the fail-open rule keys on the request
-/// carrying it. A bare `versionId` (no `=`) reads as the empty value, the
-/// way the DTO-backed sites see it.
+/// write handlers whose input does not surface it: s3s ships two
+/// `PutObjectInput`s and two `CreateMultipartUploadInput`s, and only the
+/// ones behind `#[cfg(feature = "minio")]` carry a `version_id` field
+/// (the struct and the `deserialize_http` that parses `versionId` into it
+/// are gated together; this workspace enables only s3s's default
+/// features). Only its presence is read — the guarded writes give the
+/// value no meaning (AWS defines none for either operation), and the
+/// fail-open rule keys on the request carrying it. A bare `versionId` (no
+/// `=`) reads as the empty value, the way the DTO-backed sites see it.
 pub(crate) fn query_version_id(uri: &Uri) -> Option<&str> {
     uri.query()?.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -85,12 +86,18 @@ pub(crate) fn query_version_id(uri: &Uri) -> Option<&str> {
 /// `serialize_http` derives the status from the output's own shape), so
 /// that answer would render as a `200`. The error route is the one that
 /// reaches the wire, and it renders AWS's `MethodNotAllowed` body.
+///
+/// The map carries the body's own `content-type`: s3s's `serialize_error`
+/// writes the XML body first and then *assigns* this map over the
+/// response's headers (`ops/mod.rs`'s `res.headers = headers`), so a map
+/// without it would ship the XML body unlabelled.
 pub(crate) fn marker_error(id: Option<&version::Id>, last_modified: SystemTime) -> S3Error {
     let mut headers = HeaderMap::new();
     if let Some(value) = super::last_modified_header(last_modified) {
         headers.insert(LAST_MODIFIED, value);
     }
     set_version_headers(&mut headers, id, true);
+    headers.insert("content-type", HeaderValue::from_static("application/xml"));
     let mut err = s3_error!(MethodNotAllowed);
     err.set_headers(headers);
     err
@@ -245,11 +252,16 @@ impl<S: Storage> S3Backend<S> {
     /// `NoSuchKey`), so the marker is probed with the bounded per-key
     /// `VersionOps::current_version` — one exact-key read, never a
     /// `ListObjectVersions` page over the bucket.
+    ///
+    /// The map carries the body's `content-type` for the reason
+    /// [`marker_error`] states: it replaces the response's headers
+    /// wholesale.
     pub(crate) async fn no_such_object(&self, bucket: &bucket::Name, key: &object::Key) -> S3Error {
         let mut err = map_backend_error(StorageError::NoSuchKey(key.clone()));
         if self.miss_hides_a_marker(bucket, key).await {
             let mut headers = HeaderMap::new();
             headers.insert("x-amz-delete-marker", HeaderValue::from_static("true"));
+            headers.insert("content-type", HeaderValue::from_static("application/xml"));
             err.set_headers(headers);
         }
         err
@@ -278,6 +290,14 @@ impl<S: Storage> S3Backend<S> {
 
 #[cfg(feature = "versioning")]
 impl<S: Storage> S3Backend<S> {
+    /// The hard page ceiling for `op_list_object_versions` (2026-10-06
+    /// review): AWS documents a 1,000-key maximum for this listing, and the
+    /// ceiling is also what bounds the walk's memory — one page's entries
+    /// plus one window's rows — so a huge client `max-keys` cannot
+    /// materialize a bucket's whole history. A larger request is answered
+    /// as 1,000 (the echoed `max-keys` carries the effective value).
+    const VERSIONS_PAGE_MAX: usize = 1000;
+
     /// `GetBucketVersioning` — the bucket's versioning state.
     ///
     /// The wire carries two states; the third, unversioned, is the
@@ -412,7 +432,10 @@ impl<S: Storage> S3Backend<S> {
         // 1,000, a size below 1 is rejected unless the
         // `[s3] allow_zero_page_size` escape hatch restores the legacy
         // empty page, and the `[s3] max_keys` cap clamps the request
-        // (0 = no clamp). The echoed element carries the effective value.
+        // (0 = no clamp). This listing additionally applies its own hard
+        // ceiling (`Self::VERSIONS_PAGE_MAX`, AWS's documented maximum for
+        // the operation), which is also what bounds the walk's memory. The
+        // echoed element carries the effective value.
         let max_keys = clamp_page_size(
             normalize_page_size(
                 req.input.max_keys.unwrap_or(1000),
@@ -420,7 +443,8 @@ impl<S: Storage> S3Backend<S> {
                 self.caps.allow_zero_page_size,
             )?,
             self.caps.max_keys,
-        );
+        )
+        .min(Self::VERSIONS_PAGE_MAX);
         // An empty `delimiter=` means "no delimiter" — the boundary rule
         // has one home.
         let delimiter = normalize_delimiter(req.input.delimiter);
@@ -750,6 +774,15 @@ mod tests {
             .as_deref(),
             Some("true"),
         );
+        assert_eq!(
+            header(
+                err.headers().expect("the marker rides the 404"),
+                "content-type"
+            )
+            .as_deref(),
+            Some("application/xml"),
+            "the disclosed 404 still labels its XML body"
+        );
 
         // The plain HEAD carries the same disclosure.
         let err = backend
@@ -792,6 +825,11 @@ mod tests {
         assert_eq!(
             header(headers, "x-amz-version-id").as_deref(),
             Some(marker.as_str())
+        );
+        assert_eq!(
+            header(headers, "content-type").as_deref(),
+            Some("application/xml"),
+            "the 405 still labels its XML body"
         );
         assert!(
             !headers.contains_key("allow"),
@@ -1578,6 +1616,15 @@ mod tests {
                 .as_deref(),
                 Some("true"),
                 "the plain miss of a stacked-marker key discloses the marker"
+            );
+            assert_eq!(
+                header(
+                    err.headers().expect("the marker rides the 404"),
+                    "content-type"
+                )
+                .as_deref(),
+                Some("application/xml"),
+                "the disclosed 404 still labels its XML body"
             );
         }
     }
@@ -2401,6 +2448,28 @@ mod tests {
     /// through its resume pair (`Next*`) — never all four cursors: the echo
     /// pair carries the request's own back.
     #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_version_listing_page_is_capped_at_aws_maximum() {
+        let (backend, b) = versioned_setup(State::Enabled).await;
+        put(&backend, &b, "notes.txt", b"first").await;
+
+        let out = backend
+            .list_object_versions(s3_request(dto::ListObjectVersionsInput {
+                bucket: b.clone(),
+                max_keys: Some(100_000),
+                ..Default::default()
+            }))
+            .await
+            .expect("the listing serves")
+            .output;
+        assert_eq!(
+            out.max_keys,
+            Some(1000),
+            "the ceiling answers as 1,000 and the echo carries the effective value"
+        );
+        assert_eq!(out.is_truncated, Some(false));
+    }
+
     #[tokio::test]
     async fn list_object_versions_separates_versions_from_markers_newest_first() {
         let (backend, b) = versioned_setup(State::Enabled).await;

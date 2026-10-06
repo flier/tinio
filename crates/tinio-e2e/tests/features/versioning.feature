@@ -43,6 +43,7 @@ Feature: Object versioning
     When I send a "GET" request to "/data/notes.txt"
     Then the response status is 404
     And the response header "x-amz-delete-marker" is "true"
+    And the response header "content-type" is "application/xml"
     # The 404 above proves the marker hides the key; the listing proves the
     # version it hid is still there — the "keeps every version" half of the
     # scenario name.
@@ -69,6 +70,14 @@ Feature: Object versioning
     When I send a "GET" request to "/data/notes.txt"
     Then the response status is 404
     And the response header "x-amz-delete-marker" is "true"
+    And the response header "content-type" is "application/xml"
+    # A GET addressed at the marker itself is the 405 with the marker's own
+    # headers — and the XML error body's content type survives the header
+    # map the error carries (2026-10-06 review).
+    When I send a "GET" request to "/data/notes.txt?versionId={marker}"
+    Then the response status is 405
+    And the response header "x-amz-delete-marker" is "true"
+    And the response header "content-type" is "application/xml"
     # Deleting the marker itself is a version-addressed delete: the version it
     # hid serves again.
     When I send a "DELETE" request to "/data/notes.txt?versionId={marker}"

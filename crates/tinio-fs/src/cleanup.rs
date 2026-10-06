@@ -42,6 +42,7 @@ use crate::{
     },
     _store::version as rows,
     error::projected,
+    metrics::record_blocks_corrupt,
 };
 use crate::{
     _core::{
@@ -231,6 +232,77 @@ impl FsCleanup {
         self.multipart_grace
     }
 
+    /// Verify every stored block of every versioned bucket against its own
+    /// name — the design's optional pass for a start that followed an
+    /// unclean shutdown (2026-10-06 review): the sweep's read path trusts
+    /// the store, and this pass is where that trust is checked in the
+    /// background while serving continues. Report-only, never a repair; the
+    /// corrupt count feeds `tinio_storage_blocks_corrupt_total` and each
+    /// finding is logged.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    ///
+    /// use tinio_core::{
+    ///     cleanup::CleanupOptions,
+    ///     mode::AccessMode,
+    ///     pipeline::InlineRunner,
+    ///     storage::{
+    ///         DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+    ///     },
+    /// };
+    /// use tinio_fs::{FsCleanup, FsOptions, FsStorage};
+    /// use tokio::runtime::Runtime;
+    ///
+    /// let root = tempfile::tempdir().unwrap();
+    /// let options = FsOptions {
+    ///     follow_symlinks: false,
+    ///     state_dir: None,
+    ///     access: AccessMode::ReadWrite,
+    ///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
+    ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
+    ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+    ///     owner_uids: std::collections::HashMap::new(),
+    ///     io_pipeline: Arc::new(InlineRunner::default()),
+    ///     remove_pipeline: Arc::new(InlineRunner::default()),
+    ///     db_pipeline: Arc::new(InlineRunner::default()),
+    /// };
+    /// let storage = FsStorage::new(root.path(), options).unwrap();
+    /// let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+    /// Runtime::new().unwrap().block_on(async {
+    ///     let (checked, corrupt) = cleanup.verify_all_blocks().await.unwrap();
+    ///     assert_eq!(checked, 0, "an empty root has no blocks to verify");
+    ///     assert_eq!(corrupt, 0);
+    /// });
+    /// ```
+    #[cfg(feature = "versioning")]
+    pub async fn verify_all_blocks(&self) -> Result<(u64, u64), Error> {
+        let mut checked = 0u64;
+        let mut corrupt = 0u64;
+        for bucket in self.storage.versioned_buckets().await? {
+            let versions = self.storage.versions(&bucket);
+            let blocks = versions.blobs().blocks();
+            let mut walk = blocks.walk(None).await.map_err(projected)?;
+            while let Some(entry) = walk.next().await {
+                let entry = entry.map_err(projected)?;
+                checked += 1;
+                if let Some(finding) = verify_block(blocks, &entry).await? {
+                    corrupt += 1;
+                    tracing::warn!(
+                        bucket = %bucket,
+                        block = %entry.hash,
+                        finding = %finding,
+                        "a stored block failed verification"
+                    );
+                }
+            }
+        }
+        record_blocks_corrupt(corrupt);
+        Ok((checked, corrupt))
+    }
+
     /// Stage 1: full `tmp/` clear (no active writers at startup).
     async fn repair_tmp(&self, actions: &mut Vec<Result<RepairAction, Error>>) {
         let entries = match entries_of(&self.state_dir.join(TMP_DIR_NAME)).await {
@@ -337,7 +409,7 @@ impl FsCleanup {
     /// **Verification** ruling): every version row's blocks are probed
     /// against the store, every stored block against the rows (and read back
     /// and re-hashed against its own name by
-    /// [`Self::verify_bucket_blocks`]), and every `blobs/<bucket>/` subtree
+    /// [`Self::check_bucket_blocks`]), and every `blobs/<bucket>/` subtree
     /// against the buckets that exist. It
     /// reports and never repairs: a block referenced by no row is what the
     /// block sweep reclaims, a row whose block is missing is content
@@ -961,16 +1033,30 @@ impl Cleanup for FsCleanup {
 
     async fn repair(&self, kind: RepairKind) -> Result<ActionStream<Error>, Error> {
         let mut actions = Vec::new();
+        // FR-023: a read-only run writes nothing through the storage — and
+        // since the read-only amendment the run's state dir **is** the root's
+        // own `<root>/.tinio` (`FsStorage::resolve`), so every
+        // state-dir-writing stage below would write the served root itself.
+        // None of them may run for real; a dry-run pass still walks them (it
+        // records what it would clear and removes nothing), which is the
+        // shape the doctor's read-only check needs.
+        if self.access.is_read_only() && !self.dry_run {
+            tracing::debug!(
+                "read-only mode: skipping every state-dir-writing repair stage \
+                 (the state dir is the root's own .tinio)"
+            );
+            return Ok(Box::pin(stream::iter(actions)));
+        }
         self.repair_tmp(&mut actions).await;
         // The block store's own `tmp/` is the same class of residue as
-        // `tmp/` itself (a crashed stage), and the state dir is private
-        // state — so this stage runs in every mode, like `repair_tmp`.
+        // `tmp/` itself (a crashed stage).
         self.repair_block_residue(&mut actions).await;
-        // FR-023: the two stages that write the storage root are skipped
-        // read-only. A root previously served read-write may legitimately
-        // still hold an unpublished tombstone or staging residue — private
-        // state, deliberately left alone: the mode promises not to write
-        // the root, not to clean it.
+        // FR-023: the two stages that also write the served tree's own
+        // `.tinio` (unpublished delete tombstones and in-bucket staging
+        // residue) are skipped whenever the run is read-only, dry-run
+        // included. A root previously served read-write may legitimately
+        // still hold one — private state, deliberately left alone: the mode
+        // promises not to write the root, not to clean it.
         if self.access.is_read_only() {
             tracing::debug!(
                 "read-only mode: skipping the root-writing repair stages \
@@ -2200,28 +2286,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_repair_skips_the_root_writing_stages() {
-        // FR-023: read-only mode never writes the storage root — the two
-        // stages that touch it (the delete tombstones under
-        // `<root>/.tinio/deleting/` and the in-bucket `.tinio` staging
-        // residue) are skipped, while the state-dir stages still run.
+    async fn read_only_repair_writes_nothing_in_the_root_that_is_its_state_dir() {
+        // FR-023: read-only mode never writes the storage root — and the
+        // read-only run's state dir IS the root's own `<root>/.tinio`, so
+        // every state-dir stage (tmp, block staging, multipart residue,
+        // stale records) would write the root and must be skipped.
         let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                follow_symlinks: true,
-                compact_threshold_percent: 20,
-                state_dir: Some(state.path().to_path_buf()),
-                ..fs_options()
-            },
+        // The residue a crashed read-write run left in the root's own state
+        // dir: one temp file, one block staging file, one multipart residue
+        // tree — plus a tombstone and an in-bucket staging file.
+        fs::create_dir_all(root.path().join(".tinio/tmp"))
+            .await
+            .unwrap();
+        fs::write(root.path().join(".tinio/tmp/upload-leftover"), b"x")
+            .await
+            .unwrap();
+        fs::create_dir_all(root.path().join(".tinio/blobs/data/tmp"))
+            .await
+            .unwrap();
+        fs::write(
+            root.path().join(".tinio/blobs/data/tmp/block-leftover"),
+            b"y",
         )
+        .await
         .unwrap();
-
-        // Root-side residue: an unpublished delete-bucket tombstone.
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
+        fs::create_dir_all(root.path().join(".tinio/multipart/data/aaaa"))
+            .await
+            .unwrap();
+        fs::write(root.path().join(".tinio/multipart/data/aaaa/part"), b"z")
             .await
             .unwrap();
         let tombstone = tombstone::dir(root.path()).join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
@@ -2229,7 +2321,6 @@ mod tests {
         fs::write(tombstone.join("leftover.bin"), b"was-a-bucket")
             .await
             .unwrap();
-        // ... and an in-bucket staging file.
         fs::create_dir_all(root.path().join("data/.tinio"))
             .await
             .unwrap();
@@ -2237,12 +2328,14 @@ mod tests {
             .await
             .unwrap();
 
-        // State-dir residue: a leftover temp file.
-        fs::create_dir(state.path().join("tmp")).await.unwrap();
-        fs::write(state.path().join("tmp/upload-leftover"), b"x")
-            .await
-            .unwrap();
-
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                access: AccessMode::ReadOnly,
+                ..fs_options()
+            },
+        )
+        .unwrap();
         let cleanup = FsCleanup::new(
             &storage,
             CleanupOptions {
@@ -2253,20 +2346,39 @@ mod tests {
         let actions = collect(cleanup.repair(RepairKind::Startup).await.unwrap()).await;
 
         assert!(
-            !actions.iter().any(|a| a.description.contains("tombstone")),
-            "no root-writing stage may run: {actions:?}"
+            actions.is_empty(),
+            "no stage may run read-only: {actions:?}"
         );
+        for path in [
+            ".tinio/tmp/upload-leftover",
+            ".tinio/blobs/data/tmp/block-leftover",
+            ".tinio/multipart/data/aaaa/part",
+            "data/.tinio/aaaa",
+        ] {
+            assert!(
+                root.path().join(path).exists(),
+                "{path} must survive a read-only start"
+            );
+        }
         assert!(tombstone.exists(), "the tombstone is left alone");
-        assert!(
-            root.path().join("data/.tinio").exists(),
-            "the bucket staging residue is left alone"
+
+        // A dry-run pass (the doctor's read-only check) still reports what it
+        // would clear — and removes nothing.
+        let dry = FsCleanup::new(
+            &storage,
+            CleanupOptions {
+                dry_run: true,
+                access: AccessMode::ReadOnly,
+            },
         );
-        // The state-dir stages still run.
+        let reported = collect(dry.repair(RepairKind::Startup).await.unwrap()).await;
         assert!(
-            actions.iter().any(|a| a.description.contains("temp file")),
-            "{actions:?}"
+            reported
+                .iter()
+                .any(|a| a.description.contains("would clear")),
+            "a dry-run read-only pass still reports residue: {reported:?}"
         );
-        assert!(!state.path().join("tmp/upload-leftover").exists());
+        assert!(root.path().join(".tinio/tmp/upload-leftover").exists());
     }
 
     #[tokio::test]
@@ -2462,6 +2574,33 @@ mod tests {
             !versions.blobs().blocks().contains(&missing).await.unwrap(),
             "the report never re-creates a missing block"
         );
+    }
+
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn the_startup_verify_counts_corrupt_blocks() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let (b, _key, row) = versioned_fixture(&storage).await;
+
+        let cleanup = FsCleanup::new(&storage, CleanupOptions::default());
+        let (checked, corrupt) = cleanup.verify_all_blocks().await.unwrap();
+        assert!(checked >= 1, "the fixture's block is checked");
+        assert_eq!(corrupt, 0, "an intact store verifies clean");
+
+        // Corrupted bytes (same length): the digest check catches them.
+        let path = storage
+            .versions(&b)
+            .blobs()
+            .blocks()
+            .block_path(row.blob().hash());
+        let mut corrupted = fs::read(&path).await.unwrap();
+        corrupted[0] ^= 0xff;
+        fs::write(&path, &corrupted).await.unwrap();
+
+        let (checked_again, corrupt) = cleanup.verify_all_blocks().await.unwrap();
+        assert_eq!(checked_again, checked);
+        assert_eq!(corrupt, 1, "the corrupted block is counted");
     }
 
     #[cfg(feature = "versioning")]

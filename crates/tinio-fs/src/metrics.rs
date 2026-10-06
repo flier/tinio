@@ -48,6 +48,30 @@ static NONCURRENT_VERSIONS: LazyLock<IntGauge> = LazyLock::new(|| {
     .expect("register tinio_storage_noncurrent_versions_total")
 });
 
+/// Total bytes held by the versioned buckets' block stores, as the last sweep
+/// pass walked them — the walk that already stat'ed every block
+/// ([`Summary`]'s own `reclaimed_bytes` is what a pass dropped, this is what
+/// remains; the store has no hard cap, so this family is the capacity
+/// signal).
+static BLOCK_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "tinio_storage_block_bytes",
+        "Bytes held by the versioned buckets' block stores, as of the last sweep pass"
+    )
+    .expect("register tinio_storage_block_bytes")
+});
+
+/// Stored blocks that failed verification against their own name, cumulative
+/// across verify passes (the doctor's and the post-repair startup pass's) —
+/// each pass adds its findings, so the family answers "corrupt since start".
+static BLOCKS_CORRUPT: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "tinio_storage_blocks_corrupt_total",
+        "Stored blocks that failed verification against their own content hash, cumulative"
+    )
+    .expect("register tinio_storage_blocks_corrupt_total")
+});
+
 /// Record one sweep pass's reclamation: the counters add the pass's blocks and
 /// bytes, so the families answer "reclaimed since start", never "in the last
 /// pass".
@@ -59,6 +83,16 @@ pub(crate) fn record_sweep(summary: &Summary) {
 /// Record the noncurrent-version count the pass derived.
 pub(crate) fn record_noncurrent_versions(count: u64) {
     NONCURRENT_VERSIONS.set(i64::try_from(count).unwrap_or(i64::MAX));
+}
+
+/// Record the block-store size the pass measured.
+pub(crate) fn record_block_bytes(bytes: u64) {
+    BLOCK_BYTES.set(i64::try_from(bytes).unwrap_or(i64::MAX));
+}
+
+/// Record a verify pass's corrupt-block findings.
+pub(crate) fn record_blocks_corrupt(count: u64) {
+    BLOCKS_CORRUPT.inc_by(count);
 }
 
 #[cfg(test)]
@@ -84,6 +118,8 @@ mod tests {
         };
         record_sweep(&summary);
         record_noncurrent_versions(3);
+        record_block_bytes(16);
+        record_blocks_corrupt(1);
 
         let text = exposition();
         assert!(
@@ -97,6 +133,14 @@ mod tests {
         assert!(
             text.contains("tinio_storage_noncurrent_versions_total"),
             "the noncurrent-versions gauge is declared: {text}"
+        );
+        assert!(
+            text.contains("tinio_storage_block_bytes"),
+            "the block-store size gauge is declared: {text}"
+        );
+        assert!(
+            text.contains("tinio_storage_blocks_corrupt_total"),
+            "the corrupt-blocks counter is declared: {text}"
         );
     }
 }
