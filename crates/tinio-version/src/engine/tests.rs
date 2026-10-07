@@ -5,9 +5,9 @@ use crate::{
         blob::{BlockHash, BlockStore},
         bucket::Name,
         etag::ETag,
+        meta::version::Kind,
         version::State,
     },
-    _store::version::Kind,
     error::Error,
     ports::Current,
     testutil::{bucket, fixture, key, recorded},
@@ -36,7 +36,7 @@ async fn a_supersede_moves_the_outgoing_file_into_the_block_store_and_stamps_the
         .unwrap()
         .expect("a version row");
     assert_eq!(
-        (seq, row.id.as_str()),
+        (seq, row.id.as_ref().expect("a named version").as_str()),
         (1, "v1"),
         "the row carries the outgoing identity and sequence the slot recorded, never a fresh one"
     );
@@ -50,12 +50,12 @@ async fn a_supersede_moves_the_outgoing_file_into_the_block_store_and_stamps_the
         versions
             .blobs()
             .blocks()
-            .contains(row.blob().hash())
+            .contains(row.blob.hash())
             .await
             .unwrap(),
         "the content is in the block store"
     );
-    assert_eq!(row.blob().hash(), &BlockHash::of(b"first"));
+    assert_eq!(row.blob.hash(), &BlockHash::of(b"first"));
 }
 
 #[tokio::test]
@@ -80,7 +80,10 @@ async fn a_second_supersede_of_the_same_version_rewrites_the_same_row() {
         "one row, not two"
     );
     let (seq, row) = versions.latest(&bucket, &key).await.unwrap().unwrap();
-    assert_eq!((seq, row.id.as_str()), (1, "v1"));
+    assert_eq!(
+        (seq, row.id.as_ref().expect("a named version").as_str()),
+        (1, "v1")
+    );
 }
 
 #[tokio::test]
@@ -140,12 +143,12 @@ async fn a_supersede_race_retries_once_and_commits_the_version_that_was_current(
         .unwrap()
         .expect("the retry commits a row");
     assert_eq!(
-        (seq, row.id.as_str()),
+        (seq, row.id.as_ref().expect("a named version").as_str()),
         (2, "v2"),
         "the version that was actually current, not the one the first resolve named"
     );
     assert_eq!(
-        row.blob().hash(),
+        row.blob.hash(),
         &BlockHash::of(b"second"),
         "and the bytes it actually holds"
     );
@@ -196,7 +199,7 @@ async fn a_threaded_slot_supersedes_once_and_a_stale_one_recovers_on_the_retry()
     versions.supersede_with(&bucket, &key, &slot).await.unwrap();
     let (seq, row) = versions.latest(&bucket, &key).await.unwrap().unwrap();
     assert_eq!(
-        (seq, row.id.as_str()),
+        (seq, row.id.as_ref().expect("a named version").as_str()),
         (1, "v1"),
         "the threaded slot's identity and sequence are what the row carries"
     );
@@ -213,11 +216,11 @@ async fn a_threaded_slot_supersedes_once_and_a_stale_one_recovers_on_the_retry()
         .unwrap();
     let (seq, row) = versions.latest(&bucket, &key).await.unwrap().unwrap();
     assert_eq!(
-        (seq, row.id.as_str()),
+        (seq, row.id.as_ref().expect("a named version").as_str()),
         (2, "v2"),
         "the retry committed the moved slot's version"
     );
-    assert_eq!(row.blob().hash(), &BlockHash::of(b"second"));
+    assert_eq!(row.blob.hash(), &BlockHash::of(b"second"));
 }
 
 #[tokio::test]
@@ -278,12 +281,12 @@ async fn a_delete_marker_supersedes_to_a_marker_row_with_the_empty_blob_and_no_r
         .await
         .unwrap()
         .expect("a marker row");
-    assert_eq!((seq, row.id.as_str()), (3, "m1"));
-    assert_eq!(row.kind, Kind::Marker);
-    assert!(
-        row.blob().is_empty(),
-        "a marker's row carries the empty blob"
+    assert_eq!(
+        (seq, row.id.as_ref().expect("a named version").as_str()),
+        (3, "m1")
     );
+    assert_eq!(row.kind, Kind::Marker);
+    assert!(row.blob.is_empty(), "a marker's row carries the empty blob");
     assert_eq!(
         versions.blobs().blocks().len(),
         0,
@@ -319,7 +322,7 @@ async fn the_null_version_supersedes_at_sequence_zero() {
         .unwrap()
         .unwrap();
     assert_eq!(seq, 0, "the null version's sequence is zero");
-    assert_eq!(row.id, "null", "and its wire form is the literal");
+    assert_eq!(row.id, None, "the null version has no identity");
 }
 
 #[tokio::test]
@@ -409,7 +412,7 @@ async fn latest_answers_the_newest_sequence_of_that_key() {
 
     let (seq, row) = versions.latest(&bucket, &key).await.unwrap().unwrap();
     assert_eq!(
-        (seq, row.id.as_str()),
+        (seq, row.id.as_ref().expect("a named version").as_str()),
         (2, "v2"),
         "the highest sequence wins"
     );

@@ -14,37 +14,49 @@ mod multipart;
 mod objects;
 mod version;
 
+// The version-reference epoch's atomics: only the versioning paths use them.
+#[cfg(feature = "versioning")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::HashMap,
     fs::canonicalize,
     io::{self, ErrorKind},
     path::{Path, PathBuf, absolute},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
+// The content plane ([`crate::content`]) composes the same file-half
+// primitives the object ops do: the removal tail and the bucket emptiness
+// probe are re-exported because their modules are private to `backend`.
+pub(crate) use buckets::bucket_is_empty;
 use derive_more::Debug;
 use garde::Validate;
 use getset::{CopyGetters, Getters};
 use lockmap::Map;
 pub use objects::StagedBody;
+pub(crate) use objects::{prune_parents, remove_object_file};
 #[cfg(windows)]
 use soft_canonicalize::soft_canonicalize;
 use tokio::fs;
+// The publish plan's own type: the feature-off build has the file-backed
+// publish too, so the re-export is not gated (its module is).
+pub(crate) use version::Publication;
 
 #[cfg(feature = "versioning")]
 use crate::_blob::{LocalBlocks, Store as BlobStore};
 #[cfg(feature = "versioning")]
+use crate::_core::version::State;
+#[cfg(feature = "versioning")]
 use crate::_version::Versions;
+#[cfg(feature = "versioning")]
+use crate::content::FsContent;
 pub use crate::error::Error;
 #[cfg(feature = "versioning")]
 use crate::error::projected;
 pub(crate) use crate::error::{invalid_path, invalid_state_dir, invalid_value, root_not_directory};
 #[cfg(feature = "versioning")]
-use crate::version_adapter::{Files, Rows};
+use crate::version_adapter::Rows;
 use crate::{
     _core::{
         ETag, acl,
@@ -58,16 +70,16 @@ use crate::{
             META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN, Storage, no_such_bucket,
         },
         to_nanos,
-        version::{Id, State},
+        version::Id,
     },
-    _store::{
-        bucket, bucket_versioning, decode_acl_wire, decode_owner_wire, meta, object_part, upload,
-        version as version_rows, version_index,
+    _store_redb::{
+        bucket, bucket_versioning, decode_acl_wire, decode_owner_wire, object_meta, object_part,
+        upload, version as version_rows, version_index,
     },
     _util::{lockmap, path::contains_under_any_spelling},
     backend::version::stamp_superseded,
     bucket::Store as BucketStore,
-    database::{self, Handle, compact_if_needed},
+    database::{self, Driver, compact_if_needed},
     etag, fsutil,
     listing::FsListing,
     meta::Store as MetaStore,
@@ -287,7 +299,7 @@ pub struct FsStorage {
     /// kept here for cross-store single-transaction operations such as
     /// [`Self::remove_bucket_state`], and for the version adapter's tables).
     #[getset(get = "pub(crate)")]
-    handle: Arc<Handle>,
+    handle: Arc<Driver>,
     /// Atomic body writer (staging under `<state-dir>/tmp/`; the version
     /// adapter's materialize publishes through it).
     #[getset(get = "pub(crate)")]
@@ -325,6 +337,7 @@ pub struct FsStorage {
     /// against it instead of re-reading every row. Monotonic and
     /// process-local; every bump and every read is sequenced by the
     /// bucket mutation lock the referencing commits run under.
+    #[cfg(feature = "versioning")]
     #[getset(skip)]
     block_epoch: Arc<AtomicU64>,
 }
@@ -401,7 +414,7 @@ impl FsStorage {
             Self::read_only_source(&state_dir)?
         } else {
             // Compact strictly before sharing: `Database::compact` needs
-            // `&mut`, and once wrapped in `Arc<Handle>` the mutable
+            // `&mut`, and once wrapped in `Arc<Driver>` the mutable
             // reference is structurally impossible.
             let database::Open {
                 mut db,
@@ -418,7 +431,7 @@ impl FsStorage {
                 options.compact_threshold_percent,
             )?;
             tracing::info!(?compaction, "startup state-database compaction");
-            Handle::new(db)
+            Driver::new(db)
         };
         Self::from_resolved(canonical, state_dir, options, handle)
     }
@@ -451,7 +464,7 @@ impl FsStorage {
             let handle = Self::read_only_source(&state_dir)?;
             return Self::from_resolved(canonical, state_dir, options, handle);
         }
-        Self::from_resolved(canonical, state_dir, options, Handle::new(db))
+        Self::from_resolved(canonical, state_dir, options, Driver::new(db))
     }
 
     /// The read-only run's metadata source: the root's own database, opened
@@ -460,8 +473,8 @@ impl FsStorage {
     /// degrade). The **one** construction of the read-only arm, shared by
     /// [`FsStorage::new`] and [`FsStorage::new_from_db`], so no path can
     /// read a database the other would not.
-    fn read_only_source(state_dir: &Path) -> Result<Arc<Handle>, Error> {
-        match Handle::open_read_only(state_dir) {
+    fn read_only_source(state_dir: &Path) -> Result<Arc<Driver>, Error> {
+        match Driver::open_read_only(state_dir) {
             Ok(handle) => Ok(handle),
             Err(err) => {
                 // A failure — no database, a corrupt one, a format this
@@ -474,7 +487,7 @@ impl FsStorage {
                     state_dir = %state_dir.display(),
                     "the root's metadata database could not be read read-only; serving objects with an empty metadata view"
                 );
-                Ok(Handle::empty()?)
+                Ok(Driver::empty()?)
             }
         }
     }
@@ -494,6 +507,7 @@ impl FsStorage {
     /// under the same bucket mutation lock the referencing commits run in,
     /// then compare it after the walk: equal means no reference landed in
     /// between.
+    #[cfg(feature = "versioning")]
     pub(crate) fn block_epoch(&self) -> u64 {
         self.block_epoch.load(Ordering::SeqCst)
     }
@@ -501,6 +515,7 @@ impl FsStorage {
     /// Record that a version row was committed — every reference-adding
     /// path calls this inside its bucket mutation lock, after the row's
     /// transaction committed.
+    #[cfg(feature = "versioning")]
     pub(crate) fn bump_block_epoch(&self) {
         self.block_epoch.fetch_add(1, Ordering::SeqCst);
     }
@@ -641,7 +656,7 @@ impl FsStorage {
         canonical: PathBuf,
         state_dir: PathBuf,
         options: FsOptions,
-        handle: Arc<Handle>,
+        handle: Arc<Driver>,
     ) -> Result<Self, Error> {
         let FsOptions {
             follow_symlinks,
@@ -681,6 +696,7 @@ impl FsStorage {
             writer: AtomicWriter::new(&state_dir),
             bucket_mutation_locks: Map::new(),
             boundary_cache: BoundaryCache::new(),
+            #[cfg(feature = "versioning")]
             block_epoch: Arc::new(AtomicU64::new(0)),
             root: canonical,
             state_dir,
@@ -828,15 +844,16 @@ impl FsStorage {
     }
 
     /// The version state machine over `bucket`'s block store: the backend's
-    /// ports ([`Rows`], [`Files`]) and the shared blob engine over
+    /// contracts ([the row adapter](Rows), the content plane
+    /// [`FsContent`](crate::content::FsContent)) and the shared blob engine over
     /// [`LocalBlocks`] rooted at this bucket's own subtree — so a bucket
     /// deletion drops its blocks with the rest of its state, and no block
     /// outside the bucket is ever referenced.
     #[cfg(feature = "versioning")]
-    pub(crate) fn versions(&self, bucket: &Name) -> Versions<Rows, Files, LocalBlocks> {
+    pub(crate) fn versions(&self, bucket: &Name) -> Versions<Rows, FsContent, LocalBlocks> {
         Versions::new(
             Rows::new(self.clone()),
-            Files::new(self.clone()),
+            FsContent::for_engine(Arc::new(self.clone())),
             BlobStore::new(LocalBlocks::new(self.blobs_dir().join(bucket.as_ref()))),
         )
     }
@@ -960,8 +977,8 @@ impl FsStorage {
                     buckets.remove(&bucket)?;
                 }
                 {
-                    let mut meta = meta::Table::open(txn)?;
-                    meta.drain_bucket(&bucket)?;
+                    let mut object_meta = object_meta::Table::open(txn)?;
+                    object_meta.drain_bucket(&bucket)?;
                 }
                 {
                     let mut parts = object_part::Table::open(txn)?;
@@ -1063,11 +1080,11 @@ impl FsStorage {
                 };
                 drain_upload(txn, &bucket, &upload_id)?;
                 {
-                    let mut table = meta::Table::open(txn)?;
+                    let mut table = object_meta::Table::open(txn)?;
                     table.put(
                         &bucket,
                         &key,
-                        &meta::Stored {
+                        &object_meta::Stored {
                             version_id: version_id.clone(),
                             version_seq,
                             is_delete_marker: false,

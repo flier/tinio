@@ -41,12 +41,22 @@ use crate::{
         },
         to_nanos, version,
     },
-    _store::{meta, object_part},
-    backend::version::stamp_superseded,
+    _store_redb::{object_meta, object_part},
+    backend::version::{Publication, Published, stamp_superseded},
     fsutil,
     meta::{Content, Verdict, gate},
     write::AtomicWriter,
 };
+
+/// The bytes half of an object commit, as
+/// [`FsStorage::publish_object_file`] answers it.
+pub(crate) enum PublishedFile {
+    /// A folder marker: the directory exists and the commit is complete — a
+    /// marker holds no row, so this is the branch's whole answer.
+    Marker(Info),
+    /// A real object: its ETag and the version engine's publish stamp.
+    Object { etag: ETag, published: Published },
+}
 
 /// An empty body stream (a zero-byte object with no range).
 fn empty_stream() -> BodyStream {
@@ -146,6 +156,18 @@ impl StagedBody {
     /// explicit carried value, else the tee's streamed digest.
     pub(crate) fn checksum(&self) -> Option<&checksum::Recorded> {
         self.checksum.as_ref()
+    }
+
+    /// A staged body from the content contract's chunked stage: the temp
+    /// file (or `None` for the folder-marker sentinel) plus the ETag
+    /// computed while it was written, with no recorded checksum — the
+    /// contract's stage has no checksum channel.
+    pub(crate) fn staged(temp: Option<PathBuf>, etag: ETag) -> Self {
+        Self {
+            temp,
+            etag,
+            checksum: None,
+        }
     }
 }
 
@@ -368,8 +390,17 @@ impl FsStorage {
         bucket: &bucket::Name,
         key: &object::Key,
         path: &Path,
-        stored: &meta::Stored,
-    ) -> Result<(File, u64, SystemTime, meta::Stored, Option<version::Id>), Error> {
+        stored: &object_meta::Stored,
+    ) -> Result<
+        (
+            File,
+            u64,
+            SystemTime,
+            object_meta::Stored,
+            Option<version::Id>,
+        ),
+        Error,
+    > {
         let mut file = self.open_object(path, key).await?;
         let metadata = match file.metadata().await {
             Ok(metadata) => metadata,
@@ -490,7 +521,7 @@ impl FsStorage {
             File,
             u64,
             SystemTime,
-            meta::Stored,
+            object_meta::Stored,
             Option<version::Id>,
             bool,
         ),
@@ -511,7 +542,16 @@ impl FsStorage {
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-    ) -> Result<(File, u64, SystemTime, meta::Stored, Option<version::Id>), Error> {
+    ) -> Result<
+        (
+            File,
+            u64,
+            SystemTime,
+            object_meta::Stored,
+            Option<version::Id>,
+        ),
+        Error,
+    > {
         let (path, file, size, mtime, identity) = self.resolve_object_file(bucket, key).await?;
         let judged = self.meta_store.stored_entry(bucket, key).await?;
         // The staleness gate, from its one home in the meta store (the same
@@ -560,13 +600,13 @@ impl FsStorage {
     /// open file's stamp) and `version_id` the identity its gate left
     /// live; the row is **moved in**, because every site owns the row its
     /// resolver answered and the `Info` takes the row's elements — the
-    /// same division [`tinio_store::version::Row::info`] keeps for the
+    /// same division [`tinio_store_redb::version::Row::info`] keeps for the
     /// version rows, whose file size the caller passes likewise.
     pub(crate) fn info_of(
         key: &object::Key,
         size: u64,
         mtime: SystemTime,
-        row: meta::Stored,
+        row: object_meta::Stored,
         version_id: Option<version::Id>,
         records_versions: bool,
     ) -> Info {
@@ -683,30 +723,25 @@ impl FsStorage {
         .await
     }
 
-    /// The shared commit tail of the object write paths (`commit_object`
-    /// and the copy primitives): atomically publish a staged body onto
-    /// `key` under the mutation lock (the same re-checks and guards as a
-    /// plain commit), then write the object's `OBJECT_META` entry — the
-    /// interface-validated `tags`, the caller's `owner`/`acl` (the owner
-    /// rides its own row element; the stored ACL holds the grant set
-    /// only — `Stored.acl.owner` stays `None` by construction) and the
-    /// recorded `checksum` (the FULL_OBJECT tee digest of a plain
-    /// commit, or the copy's carried value — kind included) ride in the
-    /// same row — and remove any stale `OBJECT_PARTS` rows of the key in
-    /// ONE write transaction (a fresh object is single-part:
-    /// overwriting a previously multipart-completed object must not
-    /// leave its parts behind). Returns the committed object metadata.
-    #[allow(clippy::too_many_arguments)]
-    async fn commit_staged(
+    /// The bytes half of an object commit: under the bucket mutation lock,
+    /// either create the folder-marker directory or publish the staged temp
+    /// with the version engine's rename (its supersede commits the outgoing
+    /// version's row BEFORE the rename) and apply the unix ownership
+    /// hardening. The row describing the bytes is
+    /// [`Self::record_committed`]'s — [`Self::commit_staged`] calls both,
+    /// while the content contract's `publish` calls only this (publish is
+    /// the visibility point; nothing observes a half-published object).
+    pub(crate) async fn publish_object_file(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         staged: StagedBody,
-        tags: object::Tags,
         owner: Option<&acl::OwnerId>,
-        acl: &Acl,
-        checksum: Option<checksum::Recorded>,
-    ) -> Result<Info, Error> {
+        publication: Publication,
+    ) -> Result<PublishedFile, Error> {
+        // The owner is the unix dir/object hardening input only.
+        #[cfg(not(unix))]
+        let _ = owner;
         // The single resolve runs under the mutation lock (P5): the
         // pre-lock fail-fast pair was redundant — `stage_body` already
         // validated the key before the body streamed, and the
@@ -748,7 +783,7 @@ impl FsStorage {
             // this branch never runs a write plan, so the state is read
             // here — the one point read the marker path pays.
             let records_versions = self.records_versions(bucket).await?;
-            return Ok(Info {
+            return Ok(PublishedFile::Marker(Info {
                 key: key.clone(),
                 size: 0,
                 last_modified: mtime,
@@ -759,7 +794,7 @@ impl FsStorage {
                 acl: Acl::default_private(None),
                 version_id: None,
                 bucket_records_versions: records_versions,
-            });
+            }));
         }
         // A real object always arrives with a staged temp (the marker
         // branch above consumed the sentinel).
@@ -779,7 +814,10 @@ impl FsStorage {
         // and the rename, in one call every write path shares. A failed
         // publish removes the staged temp — a rejected write leaves no
         // residue.
-        let published = match self.publish_versioned(bucket, key, &temp).await {
+        let published = match self
+            .publish_versioned(bucket, key, &temp, publication)
+            .await
+        {
             Ok(published) => published,
             Err(err) => {
                 let _ = fs::remove_file(&temp).await;
@@ -802,6 +840,103 @@ impl FsStorage {
             let _ = fs::remove_file(&published.path).await;
             return Err(err.into());
         }
+        Ok(PublishedFile::Object { etag, published })
+    }
+
+    /// The bytes half of an object rename: resolve the live source (a
+    /// missing source answers `NoSuchKey`), ensure the destination's parent
+    /// chain (the unix dir hardening included), move the file and sync the
+    /// directories. The caller holds the bucket mutation lock and owns the
+    /// state move — `rename_object` migrates the rows, while the content
+    /// contract's `rename` moves the bytes alone.
+    pub(crate) async fn move_object_file(
+        &self,
+        bucket: &bucket::Name,
+        src: &object::Key,
+        dst: &object::Key,
+    ) -> Result<(PathBuf, u64, SystemTime, u64), Error> {
+        let (src_path, _file, size, mtime, identity) =
+            self.resolve_object_file(bucket, src).await?;
+        let bucket_dir = self.ensure_bucket(bucket).await?;
+        let dst_path = self.resolve_key(&bucket_dir, dst).await?;
+        // The file move: same-volume (one bucket), atomic, overwriting an
+        // existing destination. New ancestor directories are synced like
+        // the first commit into a new prefix (F03); the unix dir
+        // hardening (spec 2026-09-05 §5a) applies like a PUT's — the
+        // created prefix dirs take the bucket owner's mapped uid.
+        // Ownership of the OBJECT itself is preserved naturally (the
+        // inode moves — no chown, a rename is not a fresh object).
+        #[cfg(unix)]
+        let dir_owner_uid = self.bucket_owner_uid(bucket).await;
+        let created_parent = match dst_path.parent() {
+            Some(parent) => {
+                #[cfg(unix)]
+                use crate::fsutil::DirOwnerUid;
+                #[cfg(not(unix))]
+                use crate::fsutil::DirOwnerUid;
+
+                fsutil::ensure_dir(
+                    parent,
+                    #[cfg(unix)]
+                    DirOwnerUid(dir_owner_uid),
+                    #[cfg(not(unix))]
+                    DirOwnerUid,
+                )
+                .await?
+            }
+            None => false,
+        };
+        match fs::rename(&src_path, &dst_path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Err(no_such_key(src).into());
+            }
+            Err(err) => return Err(err.into()),
+        }
+        if let Some(parent) = dst_path.parent() {
+            if created_parent {
+                AtomicWriter::sync_ancestor_chain(parent, Some(&bucket_dir)).await;
+            } else {
+                AtomicWriter::sync_dir_warned(parent).await;
+            }
+        }
+        Ok((src_path, size, mtime, identity))
+    }
+
+    /// The shared commit tail of the object write paths (`commit_object`
+    /// and the copy primitives): atomically publish a staged body onto
+    /// `key` under the mutation lock (the same re-checks and guards as a
+    /// plain commit), then write the object's `OBJECT_META` entry — the
+    /// interface-validated `tags`, the caller's `owner`/`acl` (the owner
+    /// rides its own row element; the stored ACL holds the grant set
+    /// only — `Stored.acl.owner` stays `None` by construction) and the
+    /// recorded `checksum` (the FULL_OBJECT tee digest of a plain
+    /// commit, or the copy's carried value — kind included) ride in the
+    /// same row — and remove any stale `OBJECT_PARTS` rows of the key in
+    /// ONE write transaction (a fresh object is single-part:
+    /// overwriting a previously multipart-completed object must not
+    /// leave its parts behind). Returns the committed object metadata.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_staged(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        staged: StagedBody,
+        tags: object::Tags,
+        owner: Option<&acl::OwnerId>,
+        acl: &Acl,
+        checksum: Option<checksum::Recorded>,
+    ) -> Result<Info, Error> {
+        // The bytes half: the marker branch's answer is complete (a marker
+        // holds no row), while a real object's publish stamp is what the row
+        // below records.
+        let (etag, published) = match self
+            .publish_object_file(bucket, key, staged, owner, Publication::Versioned)
+            .await?
+        {
+            PublishedFile::Marker(info) => return Ok(info),
+            PublishedFile::Object { etag, published } => (etag, published),
+        };
         // The object is committed. The stale-part removal and the
         // outgoing version's stamp ride in the same transaction; what a
         // meta-write failure means is decided below (I7). The guard the
@@ -901,10 +1036,10 @@ impl FsStorage {
         };
         self.handle
             .write(move |txn| {
-                meta::Table::open(txn)?.put(
+                object_meta::Table::open(txn)?.put(
                     &bucket,
                     &key,
-                    &meta::Stored {
+                    &object_meta::Stored {
                         version_id: version_id.clone(),
                         version_seq,
                         is_delete_marker: false,
@@ -1111,11 +1246,9 @@ impl ObjectOps for FsStorage {
         }
         let _guard = self.lock_bucket_mutations(bucket).await;
         // The source must be a live object (a marker source is never an
-        // object — `NoSuchKey` like head).
-        let (src_path, _file, size, mtime, identity) =
-            self.resolve_object_file(bucket, src).await?;
-        let bucket_dir = self.ensure_bucket(bucket).await?;
-        let dst_path = self.resolve_key(&bucket_dir, dst).await?;
+        // object — `NoSuchKey` like head), and the move is the shared bytes
+        // half.
+        let (src_path, size, mtime, identity) = self.move_object_file(bucket, src, dst).await?;
         // The source's row is ensured before the move (a hand-dropped
         // source gets its etag healed — the moved row must be complete).
         let (ensured, _) = self
@@ -1131,47 +1264,6 @@ impl ObjectOps for FsStorage {
                 None,
             )
             .await?;
-        // The file move: same-volume (one bucket), atomic, overwriting an
-        // existing destination. New ancestor directories are synced like
-        // the first commit into a new prefix (F03); the unix dir
-        // hardening (spec 2026-09-05 §5a) applies like a PUT's — the
-        // created prefix dirs take the bucket owner's mapped uid.
-        // Ownership of the OBJECT itself is preserved naturally (the
-        // inode moves — no chown, a rename is not a fresh object).
-        #[cfg(unix)]
-        let dir_owner_uid = self.bucket_owner_uid(bucket).await;
-        let created_parent = match dst_path.parent() {
-            Some(parent) => {
-                #[cfg(unix)]
-                use crate::fsutil::DirOwnerUid;
-                #[cfg(not(unix))]
-                use crate::fsutil::DirOwnerUid;
-
-                fsutil::ensure_dir(
-                    parent,
-                    #[cfg(unix)]
-                    DirOwnerUid(dir_owner_uid),
-                    #[cfg(not(unix))]
-                    DirOwnerUid,
-                )
-                .await?
-            }
-            None => false,
-        };
-        match fs::rename(&src_path, &dst_path).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                return Err(no_such_key(src).into());
-            }
-            Err(err) => return Err(err.into()),
-        }
-        if let Some(parent) = dst_path.parent() {
-            if created_parent {
-                AtomicWriter::sync_ancestor_chain(parent, Some(&bucket_dir)).await;
-            } else {
-                AtomicWriter::sync_dir_warned(parent).await;
-            }
-        }
         // The state move in ONE transaction: the src `OBJECT_META` row →
         // dst (metadata — mtime, tags, checksum, owner, ACL — moves with
         // the record, a rename is not a fresh object), the src
@@ -1201,12 +1293,12 @@ impl ObjectOps for FsStorage {
                     // table in a transaction) — the two halves run in
                     // separate scopes.
                     let row = {
-                        let mut meta = meta::Table::open(txn)?;
-                        let Some(row) = meta.get(&bucket, &src)? else {
+                        let mut object_meta = object_meta::Table::open(txn)?;
+                        let Some(row) = object_meta.get(&bucket, &src)? else {
                             return Ok(None);
                         };
-                        meta.remove(&bucket, &src)?;
-                        meta.put(&bucket, &dst, &row)?;
+                        object_meta.remove(&bucket, &src)?;
+                        object_meta.put(&bucket, &dst, &row)?;
                         row
                     };
                     // The parts rows migrate with the record: list the

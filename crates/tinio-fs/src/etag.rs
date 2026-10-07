@@ -41,7 +41,7 @@ use tokio::fs::File;
 
 use crate::{
     _core::{ETag, object, pipeline},
-    _store::meta,
+    _store_redb::object_meta,
     Error, fsutil,
     meta::{composed_gate, composed_keep},
     write::CHUNK_SIZE,
@@ -135,7 +135,7 @@ pub(crate) struct ComputeTask {
     pub size: u64,
     /// The stored entry when the producer's gate found a stale one
     /// (P1 — the composed-ETag keep decision reads it).
-    pub stored: Option<meta::Stored>,
+    pub stored: Option<object_meta::Stored>,
     /// Whether the file may be opened through symlinks.
     pub follow_symlinks: bool,
 }
@@ -366,7 +366,7 @@ mod tests {
         key: &str,
         path: PathBuf,
         size: u64,
-        stored: Option<meta::Stored>,
+        stored: Option<object_meta::Stored>,
         follow_symlinks: bool,
     ) -> ComputeTask {
         ComputeTask {
@@ -422,7 +422,7 @@ mod tests {
         std_fs::write(&file, b"hello").unwrap();
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
-        let stored = meta::Stored {
+        let stored = object_meta::Stored {
             version_id: None,
             version_seq: 0,
             is_delete_marker: false,
@@ -462,7 +462,7 @@ mod tests {
         std_fs::write(&file, b"hello").unwrap();
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
-        let stored = meta::Stored {
+        let stored = object_meta::Stored {
             version_id: None,
             version_seq: 0,
             is_delete_marker: false,
@@ -498,7 +498,7 @@ mod tests {
         std_fs::write(&file, b"hello").unwrap();
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
-        let stored = meta::Stored {
+        let stored = object_meta::Stored {
             version_id: None,
             version_seq: 0,
             is_delete_marker: false,
@@ -542,7 +542,7 @@ mod tests {
         std_fs::write(&file, b"hello").unwrap();
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
-        let stored = meta::Stored {
+        let stored = object_meta::Stored {
             version_id: None,
             version_seq: 0,
             is_delete_marker: false,
@@ -582,7 +582,7 @@ mod tests {
         std_fs::write(&file, b"hello").unwrap();
         let metadata = std_fs::metadata(&file).unwrap();
         let composed = etag("5d41402abc4b2a76b9719d911017c592-2");
-        let stored = meta::Stored {
+        let stored = object_meta::Stored {
             version_id: None,
             version_seq: 0,
             is_delete_marker: false,

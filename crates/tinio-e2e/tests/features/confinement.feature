@@ -1026,8 +1026,12 @@ Feature: Confinement
   # than with a fallback of the launcher's. This is `design §12` bullet 4's leg, and the one the
   # plan records as having no leg on macOS: Windows has its own in Rust
   # (`crates/tinio-server/tests/sandbox_e2e_windows.rs`'s
-  # `a_child_that_never_reports_is_the_parents_own_error_frame`, induced by a directory junction),
-  # which §5 keeps where it is because that induction is Windows-only. What macOS's arm asserts
+  # `a_child_that_never_reports_is_the_parents_own_error_frame`, induced by a config file the
+  # container cannot read — re-induced 2026-10-07, when the directory junction it used to plant
+  # stopped refusing the child: the launcher resolves the root before it builds the exposure set,
+  # so the junction's target is what is granted and the child resolves to a granted path and
+  # serves), which §5 keeps where it is because that induction is Windows-only. What macOS's arm
+  # asserts
   # is `crates/tinio-cli/src/commands/start/run.rs`'s `launcher_exit`: the one frame this process
   # emits on its own behalf, and the child status it forwards beside it.
   #

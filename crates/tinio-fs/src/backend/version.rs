@@ -91,7 +91,7 @@ use tokio::fs;
 use crate::_core::storage::VersionOps;
 use crate::{
     _core::{bucket::Name, object, to_nanos, version::Marker},
-    _store::{Error as StoreError, version as rows},
+    _store_redb::{Error as StoreError, version as rows},
     _util::lockmap,
     Error, FsStorage, fsutil,
     write::AtomicWriter,
@@ -165,6 +165,27 @@ pub(crate) struct Plan {
     pub(crate) records_versions: bool,
 }
 
+/// How a publish treats the version tables: the fs write paths supersede the
+/// outgoing version on the way (its row committed before the rename — the
+/// engine's protocol step 3), while the content contract's [`ObjectContent::publish`]
+/// is the visibility point alone, so the row describing the bytes is the
+/// caller's own write after it returns.
+///
+/// [`ObjectContent::publish`]: crate::_core::content::ObjectContent::publish
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Publication {
+    /// Supersede the outgoing version, then rename: the write paths' shape.
+    Versioned,
+    /// The rename alone, with no row written: the content contract's shape,
+    /// with the bucket mutation lock the publish's own.
+    Bytes,
+    /// The rename alone under a bucket mutation lock the **caller** already
+    /// holds: the version engine's port. Taking the lock again on the task
+    /// that holds it is a deadlock, not a critical section, and the engine's
+    /// fs callers (the delete path's restore) hold it across the whole move.
+    BytesUnderLock,
+}
+
 /// One published write: the version branch's answer plus the landed file's
 /// stamp — everything the caller's own state transaction records.
 pub(crate) struct Published {
@@ -186,11 +207,12 @@ pub(crate) struct Published {
     /// Whether the bucket records versions — the plan's answer, carried to
     /// the committed [`Info`](crate::_core::object::Info).
     pub(crate) records_versions: bool,
-    /// The bucket mutation lock, held from before the version branch until
-    /// this value is dropped: the caller keeps it alive while it writes the
-    /// state row, so the branch, the rename and the stamp are one critical
-    /// section.
-    pub(crate) _guard: lockmap::Guard<Name>,
+    /// The bucket mutation lock this publish took, held from before the
+    /// version branch until this value is dropped: the caller keeps it alive
+    /// while it writes the state row, so the branch, the rename and the stamp
+    /// are one critical section. None for a publish under the caller's own
+    /// lock (Publication::BytesUnderLock).
+    pub(crate) _guard: Option<lockmap::Guard<Name>>,
 }
 
 impl FsStorage {
@@ -264,11 +286,29 @@ impl FsStorage {
         bucket: &Name,
         key: &object::Key,
         temp: &Path,
+        publication: Publication,
     ) -> Result<Published, Error> {
-        let guard = self.lock_bucket_mutations(bucket).await;
+        let guard = match publication {
+            Publication::Versioned | Publication::Bytes => {
+                Some(self.lock_bucket_mutations(bucket).await)
+            }
+            Publication::BytesUnderLock => None,
+        };
         let bucket_dir = self.ensure_bucket(bucket).await?;
         let target = self.resolve_key(&bucket_dir, key).await?;
-        let plan = self.plan_publish(bucket, key).await?;
+        // The contract's publish is the visibility point alone: the row
+        // describing the bytes is the caller's own write, after this returns,
+        // so its plan is the row-less one — no supersede, no sequence, no
+        // state read.
+        let plan = match publication {
+            Publication::Versioned => self.plan_publish(bucket, key).await?,
+            Publication::Bytes | Publication::BytesUnderLock => Plan {
+                marker: Marker::none(),
+                seq: 0,
+                superseded: None,
+                records_versions: false,
+            },
+        };
         // The unix dir hardening (spec 2026-09-05 §5a): a prefix dir
         // implicitly created by this write lands `0700` and chowned to the
         // bucket owner's mapped uid (the lookup runs once per publish).
@@ -323,6 +363,7 @@ mod enabled {
             acl::Acl,
             bucket::Name,
             from_nanos,
+            meta::VersionMeta,
             object::{self, Tags},
             storage,
             storage::VersionOps,
@@ -332,7 +373,9 @@ mod enabled {
                 State, wire_of,
             },
         },
-        _store::{bucket_versioning, meta, object_part, version as rows, version_index},
+        _store_redb::{
+            bucket_versioning, object_meta, object_part, version as rows, version_index,
+        },
         _version::{Current, Identity, Intent, Seqs, plan_write as write_plan},
         Error, FsStorage,
         backend::objects::{prune_parents, remove_object_file},
@@ -357,7 +400,7 @@ mod enabled {
             seq: u64,
             /// The `object_meta` row the gate was applied to (the raw row —
             /// the metadata elements the served version carries).
-            stored: Box<meta::Stored>,
+            stored: Box<object_meta::Stored>,
             /// The key path the gate resolved and judged, when the key has a
             /// file. The read arms open THIS path (one policy open) and
             /// describe it from the handle, so a version-addressed GET or
@@ -369,7 +412,7 @@ mod enabled {
         /// The key's current version is a delete marker: no file, an identity
         /// and a stamp in the `object_meta` row. A marker's recorded identity
         /// is the gated one (the gate has no content to compare it against).
-        Marker(Box<meta::Stored>),
+        Marker(Box<object_meta::Stored>),
         /// A noncurrent version: the version-table row is the whole truth —
         /// its content lives in the bucket's block store.
         Row(Box<rows::Row>),
@@ -413,7 +456,7 @@ mod enabled {
             &self,
             bucket: &Name,
             key: &object::Key,
-        ) -> Result<(Current, Option<meta::Stored>), Error> {
+        ) -> Result<(Current, Option<object_meta::Stored>), Error> {
             let judged = Rows::new(self.clone())
                 .current_with_row(bucket, key)
                 .await
@@ -582,7 +625,7 @@ mod enabled {
             // never as the marker's content. The superseded row is stamped in
             // this same transaction: the slot moves off it here, so it is
             // history from here (`Row::is_history`).
-            let stored = meta::Stored {
+            let stored = object_meta::Stored {
                 version_id: id.clone(),
                 version_seq: seq,
                 is_delete_marker: true,
@@ -599,7 +642,7 @@ mod enabled {
             let key = key.clone();
             self.handle()
                 .write(move |txn| {
-                    meta::Table::open(txn)?.put(&bucket, &key, &stored)?;
+                    object_meta::Table::open(txn)?.put(&bucket, &key, &stored)?;
                     stamp_superseded(txn, &bucket, &key, superseded)?;
                     Ok(())
                 })
@@ -670,54 +713,36 @@ mod enabled {
                 }
             }
             let wire = wire_of(version);
-            if let Some(seq) = self.index_seq(bucket, key, &wire).await?
-                && let Some(row) = self.row_at(bucket, key, seq).await?
-                && row.id == wire
-            {
-                return Ok(Found::Row(Box::new(row)));
-            }
-            Err(storage::no_such_version(wire).into())
-        }
-
-        /// The sequence the identity index holds for `(bucket, key, wire)`.
-        async fn index_seq(
-            &self,
-            bucket: &Name,
-            key: &object::Key,
-            wire: &str,
-        ) -> Result<Option<u64>, Error> {
+            // The identity index and the row it names from **one** read
+            // transaction (the `state_and_seqs` shape): the resolve used to
+            // pay one read for the index and another for the row, and both
+            // feed the same answer.
             let bucket = bucket.clone();
             let key = key.clone();
-            let wire = wire.to_owned();
-            self.handle()
+            let indexed = wire.clone();
+            let row = self
+                .handle()
                 .read(move |txn| {
-                    Ok(version_index::Table::open_readonly(txn)?.seq_of(
+                    let Some(seq) = version_index::Table::open_readonly(txn)?.seq_of(
                         bucket.as_ref().as_str(),
                         key.as_ref().as_str(),
-                        &wire,
-                    )?)
-                })
-                .map_err(Error::from)
-        }
-
-        /// One version row by its sequence.
-        async fn row_at(
-            &self,
-            bucket: &Name,
-            key: &object::Key,
-            seq: u64,
-        ) -> Result<Option<rows::Row>, Error> {
-            let bucket = bucket.clone();
-            let key = key.clone();
-            self.handle()
-                .read(move |txn| {
-                    Ok(rows::Table::open_readonly(txn)?.get(
+                        &indexed,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    let row = rows::Table::open_readonly(txn)?.get(
                         bucket.as_ref().as_str(),
                         key.as_ref().as_str(),
                         seq,
-                    )?)
+                    )?;
+                    Ok(row.filter(|row| row.id == indexed))
                 })
-                .map_err(Error::from)
+                .map_err(Error::from)?;
+            if let Some(row) = row {
+                return Ok(Found::Row(Box::new(row)));
+            }
+            Err(storage::no_such_version(wire).into())
         }
 
         /// The two newest version rows of the key, newest first — everything
@@ -800,6 +825,27 @@ mod enabled {
             let Some((seq, row)) = next else {
                 return self.clear_current(bucket, key).await;
             };
+            // The engine materializes a *contract* row, so the one the raw
+            // scan found is read back through the contract by the sequence it
+            // named. The scan itself stays raw: the successor decision needs
+            // the wire-level `is_history` and the bounded two-row prefix read
+            // that the contract's decoded rows do not expose.
+            let adapter = Rows::new(self.clone());
+            let Some(stored_row) = adapter
+                .get_version(bucket, key, seq)
+                .await
+                .map_err(projected)?
+            else {
+                tracing::warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    seq,
+                    "the version row vanished between the successor scan and the restore"
+                );
+                return Err(Error::Io(IoError::other(
+                    "a version row vanished between the successor scan and the restore",
+                )));
+            };
             if row.kind == rows::Kind::Marker {
                 // The marker that becomes current holds no content: re-stamp
                 // the slot, publish nothing.
@@ -814,7 +860,7 @@ mod enabled {
             // nothing for a row whose kind is `object` has lost the row's
             // blob: that is a case to answer with an error, never a panic.
             let Some(published) = versions
-                .materialize(bucket, key, &row)
+                .materialize(bucket, key, &stored_row)
                 .await
                 .map_err(projected)?
             else {
@@ -861,7 +907,7 @@ mod enabled {
             self.handle()
                 .write(move |txn| {
                     {
-                        let mut table = meta::Table::open(txn)?;
+                        let mut table = object_meta::Table::open(txn)?;
                         table.remove(&bucket, &key)?;
                     }
                     {
@@ -886,7 +932,7 @@ mod enabled {
             key: &object::Key,
             seq: u64,
             id: &str,
-            stored: meta::Stored,
+            stored: object_meta::Stored,
         ) -> Result<(), Error> {
             let bucket = bucket.clone();
             let key = key.clone();
@@ -894,7 +940,7 @@ mod enabled {
             self.handle()
                 .write(move |txn| {
                     {
-                        let mut table = meta::Table::open(txn)?;
+                        let mut table = object_meta::Table::open(txn)?;
                         table.put(&bucket, &key, &stored)?;
                     }
                     {
@@ -948,7 +994,7 @@ mod enabled {
     /// The `object_meta` row a restored marker takes: its identity and stamp,
     /// the empty-content ETag (`Row::stored` reads the row's own empty
     /// element), and no file match (a marker publishes nothing).
-    fn marker_row(seq: u64, row: &rows::Row) -> meta::Stored {
+    fn marker_row(seq: u64, row: &rows::Row) -> object_meta::Stored {
         row.stored(seq, 0, row.created, 0)
     }
 

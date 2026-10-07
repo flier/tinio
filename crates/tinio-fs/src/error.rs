@@ -115,7 +115,7 @@ impl Error {
     /// use tinio_fs::{Error, database};
     ///
     /// // The shared handle's arm answer, nested like every shared failure.
-    /// let refused: Error = database::Error::from(tinio_store::Error::ReadOnly).into();
+    /// let refused: Error = database::Error::from(tinio_store_redb::Error::ReadOnly).into();
     /// assert!(refused.is_read_only());
     ///
     /// // Anything else keeps propagating: only the read-only refusal is

@@ -40,7 +40,7 @@ use crate::{
         bucket::Name,
         version::State,
     },
-    _store::version as rows,
+    _store_redb::version as rows,
     error::projected,
     metrics::record_blocks_corrupt,
 };
@@ -1107,7 +1107,9 @@ mod tests {
     use crate::{
         _core::{
             acl::Acl,
-            bucket, object,
+            bucket,
+            meta::version::Stored,
+            object,
             pipeline::InlineRunner,
             storage::{BucketOps, ObjectOps},
         },
@@ -2426,7 +2428,7 @@ mod tests {
     /// A versioned bucket holding `notes.txt` overwritten once: `one` is a
     /// history row naming a stored block, `two` is current.
     #[cfg(feature = "versioning")]
-    async fn versioned_fixture(storage: &FsStorage) -> (Name, object::Key, rows::Row) {
+    async fn versioned_fixture(storage: &FsStorage) -> (Name, object::Key, Stored) {
         use crate::{_core::version::State, testutil};
 
         let (b, key) = testutil::versioned_bucket(storage, State::Enabled, &[b"one", b"two"]).await;
@@ -2509,7 +2511,7 @@ mod tests {
 
         // A row whose block the store does not hold, and a block no row
         // names: both are reported, neither is repaired.
-        let missing = *row.blob().hash();
+        let missing = *row.blob.hash();
         versions.blobs().blocks().remove(&missing).await.unwrap();
         let orphan = versions.blobs().put(body(b"orphan")).await.unwrap();
         let actions = collect(dry.repair(RepairKind::Full).await.unwrap()).await;
@@ -2593,7 +2595,7 @@ mod tests {
             .versions(&b)
             .blobs()
             .blocks()
-            .block_path(row.blob().hash());
+            .block_path(row.blob.hash());
         let mut corrupted = fs::read(&path).await.unwrap();
         corrupted[0] ^= 0xff;
         fs::write(&path, &corrupted).await.unwrap();
@@ -2618,7 +2620,7 @@ mod tests {
             },
         );
         // The stored block's path: the file name is the content hash.
-        let path = versions.blobs().blocks().block_path(row.blob().hash());
+        let path = versions.blobs().blocks().block_path(row.blob.hash());
         let stored = fs::read(&path).await.unwrap();
 
         // Corrupted bytes (same length): the digest check names the block.
@@ -2630,7 +2632,7 @@ mod tests {
             actions
                 .iter()
                 .any(|a| a.description.contains("does not hash to its own name")
-                    && a.description.contains(&row.blob().hash().to_hex())),
+                    && a.description.contains(&row.blob.hash().to_hex())),
             "the corruption is reported: {actions:?}"
         );
 

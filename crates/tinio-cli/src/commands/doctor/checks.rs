@@ -562,7 +562,7 @@ fn state_dir_finding(state: &StateDir) -> Finding {
 /// Whether the failure is "another process holds the store" — the one `database` failure that
 /// is a fact about this run rather than about the store. The predicate belongs to the crate
 /// that owns the error (`database::Error::is_already_open`), so this crate asks it instead of
-/// matching redb's message text or depending on `tinio-store` and `redb` to reach the
+/// matching redb's message text or depending on `tinio-store-redb` and `redb` to reach the
 /// variant.
 fn store_is_held(err: &Error) -> bool {
     matches!(err, Error::Fs(FsError::Database(inner)) if inner.is_already_open())

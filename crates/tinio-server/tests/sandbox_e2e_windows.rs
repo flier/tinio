@@ -23,13 +23,19 @@ mod common;
 #[path = "support/windows_e2e_harness.rs"]
 mod harness;
 
-use std::{fs, os::windows::process::ExitStatusExt as _, process::ExitStatus};
+use std::{fs, os::windows::process::ExitStatusExt as _, path::PathBuf, process::ExitStatus};
 
 use harness::{
-    Exit, Run, ace_count, answer, grant_event, host_ready, icacls, junction, seal_to_current_user,
-    step_event, wait_for_exit, without_ansi,
+    Exit, Run, ace_count, answer, current_user_sid, grant_event, host_ready, icacls,
+    seal_to_current_user, step_event, wait_for_exit, without_ansi,
 };
-use tinio_sandbox::Event;
+use tinio_sandbox::{
+    AccessMode, Event,
+    windows::{
+        acl::{self, Target},
+        testing,
+    },
+};
 
 /// **The ACE this run holds, while it runs and after the launcher's death — the half no step can
 /// read.**
@@ -227,26 +233,53 @@ fn a_restarted_launcher_takes_the_residue_over_and_a_clean_exit_keeps_it() {
 /// that function pin the *decision*, and only a spawned binary shows the write
 /// and the exit status.
 ///
-/// **The induction is a served root that is a directory junction, and the two
-/// processes meet different trees.** The launcher resolves the operator's path
-/// as the unconfined user: it canonicalises the junction to the directory it
-/// names, builds the exposure set from **that** path (the `resolve an exposed
-/// path` events carry it, and the junction's own spelling appears nowhere in the
-/// grant), writes the package SID's ACE there, and launches. The child is
-/// re-invoked with the launcher's own argv, so *its* first act is to
-/// canonicalise the **junction**, whose entry lives outside every exposure: the
-/// tree this fixture seals grants the calling user alone, a confined child's
-/// access check needs an ACE for a SID of its own, and `resolve_root` therefore
-/// answers the CLI's usage error (`exit 2`) — **before the dispatch**, which is
-/// why nothing reaches stdout from the child at all.
+/// **The induction is a configuration file inside the served root that the
+/// container cannot read, and the two processes therefore resolve different
+/// runs** — re-induced 2026-10-07, when the junction this leg used to plant
+/// stopped refusing the child (the two paragraphs below say what changed and what
+/// was tried). The file carries one explicit ACE naming the operator alone and
+/// inherits nothing, which is what the launcher's own grant cannot cover: the
+/// filesystem does not propagate an inheritable ACE into a protected object, so
+/// the path is one the exposure genuinely cannot reach even though it lies
+/// inside the granted root. The launcher, running unconfined, reads it and
+/// resolves **read-only** — its state directory is then the home-derived one,
+/// which its `resolve an exposed path` events name beside the root. The child is
+/// re-invoked with the launcher's own argv and reads the same file with the
+/// container's token, which satisfies no ACE on it: the resolution finds no file
+/// to read there and answers the default, so the child resolves **read-write**, whose state
+/// directory is `<root>/.tinio` — and the `.env` the fixture seeded there
+/// carries an empty `TINIO_STATE_DIR`, which the CLI refuses at its own parse.
+/// The child therefore dies in `command_line` — **before the dispatch**, which is
+/// why nothing reaches stdout from the child at all, and why this is a leg about
+/// the launcher's own frame rather than about the relay of the child's.
 ///
-/// **What each half of the fixture is load-bearing for.** The junction is what
-/// puts the child's path outside the exposure set, where a plain directory would
-/// have been granted; the seal is what makes the refusal a property of this leg
-/// rather than of the host's scratch tree (`harness::seal_to_current_user`
-/// carries the measurement and the reason). Neither is decoration: a fixture
-/// whose link did not take fails in `junction`'s own self-assertion, and a seal
-/// that did not take fails its read-back — not this leg's assertions.
+/// **What each half of the fixture is load-bearing for.** The config's ACE is
+/// what makes the two resolutions differ, and it is the half this leg's premise
+/// died of: with the file carrying the tree's inherited ACEs instead, the child
+/// reads it too, both processes resolve the same mode, and the run is a
+/// different leg (measured 2026-10-07 — the child then dies on the read-only
+/// state directory's own home lookup, `exit 1`). The `.env` is what the child
+/// refuses once its resolution is its own; the seal is what makes every
+/// refusal a property of this fixture rather than of the host's scratch tree
+/// (`harness::seal_to_current_user` carries the measurement and the reason).
+/// None is decoration: a fixture whose config still carries a
+/// container-satisfiable ACE fails the read-back below, and a seal that did not
+/// take fails the harness's own — not this leg's assertions.
+///
+/// **Two inductions that look right and are not, so a future reader does not
+/// reach for them.** A served root that is a **directory junction** is the one
+/// this leg used to carry: the launcher canonicalises it to the directory it
+/// names and grants *that*, so the child's own canonicalisation of the junction
+/// lands on a granted path, the server starts, and the leg times out — the ruled
+/// behaviour this induction was coupled to, and the coupling
+/// `docs/superpowers/plans/2026-09-25-sandbox-followups.md` §22 records. A
+/// **`.env` that the container cannot read** in the state directory does not work
+/// either, because `load_env_file` reads the path only `if path.exists()`, and a
+/// confined child's `exists` is false for an object it carries no ACE on: the file
+/// is skipped rather than refused, the child lives past the load, and the frame it
+/// then writes on its own behalf is the one this leg must not see (measured
+/// 2026-10-07: with the state directory a junction into a sealed directory, the
+/// child reached the storage open and framed its own `I/O error`).
 ///
 /// **The frame is the parent's, and there is exactly one of them.** The parent
 /// and the child never both frame one failure, and this is the half where the
@@ -263,12 +296,12 @@ fn a_restarted_launcher_takes_the_residue_over_and_a_clean_exit_keeps_it() {
 ///
 /// **Three reads say a child really ran**, each of them a different process's
 /// record: the launcher logged `CreateProcessW` (it got past the resolution and
-/// the grants), the child's own `tinio: …` refusal names the junction path on
-/// the stderr it inherited, and the launcher logged the child's exit with the
-/// code the frame renders. A launch that failed before spawning fails this leg
-/// instead of passing it: the parent's own refusals carry a different sentence
-/// (`run`'s serving arm frames the `Err` that `start::run` returns) and its
-/// pre-dispatch ones carry no frame at all.
+/// the grants), the child's own `tinio: …` refusal names the value it would not
+/// take (`TINIO_STATE_DIR`) on the stderr it inherited, and the launcher logged
+/// the child's exit with the code the frame renders. A launch that failed before
+/// spawning fails this leg instead of passing it: the parent's own refusals carry
+/// a different sentence (`run`'s serving arm frames the `Err` that `start::run`
+/// returns) and its pre-dispatch ones carry no frame at all.
 ///
 /// **Not covered here, and it is stated rather than implied.** The macOS arm of
 /// the same assertion — this leg is the Windows one, and the host that would run
@@ -281,30 +314,63 @@ fn a_restarted_launcher_takes_the_residue_over_and_a_clean_exit_keeps_it() {
 fn a_child_that_never_reports_is_the_parents_own_error_frame() {
     let dir = tempfile::tempdir().expect("temp dir");
     let tree = dir.path().join("tree");
-    let real = tree.join("real");
     let root = tree.join("root");
+    let state = root.join(".tinio");
     if !host_ready() {
         return;
     }
-    // The tree, then the link, then the seal: the standing entries are written
-    // over what is already inside the tree, so the junction ends up carrying the
-    // calling user's ACE alone — which is the state the child is refused in.
-    fs::create_dir_all(&real).expect("the directory the junction names");
-    fs::write(real.join("hello.txt"), b"hello").expect("seed an object");
-    junction(&root, &real);
+    // The state directory a read-write run would use, the operator's config, and
+    // the `.env` the confined child reads once its resolution is its own — see the
+    // doc block for why these three and not the root.
+    fs::create_dir_all(&state).expect("the state directory");
+    let config = state.join(".tinio.toml");
+    fs::write(&config, "[server]\nread_only = true\n").expect("the operator's config");
+    fs::write(state.join(".env"), "TINIO_STATE_DIR=\n").expect("the `.env` the child reads");
+
+    // The seal last-written is the config's own: `/inheritance:r` beside one explicit
+    // ACE naming the calling user, so that neither the seal nor the launcher's own
+    // grant — which propagates exactly the same way, and which is what the ruled
+    // behaviour this leg's old induction leaned on is about — can put an ACE a
+    // confined child could satisfy back onto the file.
     seal_to_current_user(&tree);
+    let spec = acl::grant_spec(&current_user_sid(), Target::File, AccessMode::ReadOnly);
+    testing::icacls(&config, &["/inheritance:r"]);
+    testing::icacls(&config, &["/grant:r", &spec, "/q"]);
+
+    // **The fixture's own read-back**, and the state it is read in is the one the
+    // child meets: a config a container can read is a different leg (the doc block's
+    // "the config's ACE is what makes the two resolutions differ").
+    let listing = testing::icacls(&config, &[]);
+    assert!(
+        !listing.contains("ALL APPLICATION PACKAGES")
+            && !listing.contains("S-1-15-2-")
+            && !listing.contains("S-1-15-3-"),
+        "the config still carries an ACE a confined child can satisfy, so the child would read \
+         the mode the launcher did and this leg would be about another run:\n{listing}"
+    );
 
     let mut run = Exit::spawn(&root, 0);
     let status = wait_for_exit(&mut run.launcher, &run.log, "the launcher");
+
+    // **The read-only run's state directory is outside the served root, and the
+    // fixture takes it back.** The path is the launcher's own record — the one
+    // exposure it resolved read-write — and the removal carries its ACE away with
+    // it, because the grant is on the directory. Best effort: what the run left
+    // behind is a residue on the operator's home, not this leg's assertion.
+    let log = without_ansi(&run.log_text());
+    if let Some(home_state) = read_write_exposure(&log) {
+        let _ = fs::remove_dir_all(&home_state);
+    }
 
     // The parent's own answer is the child's status, and the log is quoted with
     // the failure because the launcher's log is what an operator reads after it.
     assert_eq!(
         status.code(),
         Some(2),
-        "the launcher forwards the child's status: a confined child that cannot resolve the root \
-         it was launched with leaves the CLI's usage refusal (2), where a child that left no \
-         status at all would have had the launcher answering 1. The launcher's log:\n{}",
+        "the launcher forwards the child's status: a confined child that the launcher's own reads \
+         and its own grants cannot keep in step with it leaves the CLI's usage refusal (2), where a \
+         child that left no status at all would have had the launcher answering 1. The launcher's \
+         log:\n{}",
         run.log_text()
     );
 
@@ -330,8 +396,7 @@ fn a_child_that_never_reports_is_the_parents_own_error_frame() {
     // **A child ran**, and each half of the evidence is another process's record:
     // the launcher reached the launch, the launcher saw the child leave with the
     // code the frame renders, and the child's own refusal — in the child's own
-    // words, on the stderr it inherited — names the path its argv carried.
-    let log = without_ansi(&run.log_text());
+    // words, on the stderr it inherited — names the value it would not take.
     assert!(
         log.contains("CreateProcessW"),
         "the launcher never reached the launch, so this leg would be asserting on a parent that \
@@ -349,16 +414,34 @@ fn a_child_that_never_reports_is_the_parents_own_error_frame() {
          says so: {exited}\n{log}"
     );
     assert!(
-        log.contains(&format!(
-            "tinio: the storage root `{}` is not usable: ",
-            root.display()
-        )),
-        "the child's own refusal is on the stderr it inherits, and it names the operator's \
-         spelling — the junction the launcher resolved on its own side:\n{log}"
+        log.contains(
+            "tinio: error: invalid value '' for '--state-dir <PATH>': invalid value for \
+                     `TINIO_STATE_DIR`: must not be empty"
+        ),
+        "the child's own refusal is on the stderr it inherits, and it names the value it would not \
+         take — the `.env` the fixture left in the state directory the launcher's own resolution \
+         does not reach:\n{log}"
     );
-    assert!(
-        log.contains("— pass an existing DIR"),
-        "the child's refusal is `resolve_root`'s, whose remedy is the half an operator acts \
-         on:\n{log}"
-    );
+}
+
+/// The exposure a run resolved **read-write** whose path is not the served root —
+/// the home-derived state directory a read-only run serves out of.
+///
+/// Read off the launcher's own `resolve an exposed path` events rather than derived
+/// here: the path is a hash of the canonical root that only the product computes,
+/// and a second implementation of that rule is exactly the kind of second opinion
+/// this harness exists not to hold.
+///
+/// `None` when no such line is in the log, which the caller treats as "nothing to
+/// take back" — this is the residue's removal, not an assertion.
+fn read_write_exposure(log: &str) -> Option<PathBuf> {
+    let line = log.lines().find(|line| {
+        line.contains(r#"step="resolve an exposed path""#) && line.contains("access=ReadWrite")
+    })?;
+    let path = line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("path="))?;
+    // The resolved spelling is the verbatim `\\?\` form; `remove_dir_all` wants the
+    // plain one, which is what the rest of this file's paths are written in.
+    Some(PathBuf::from(path.strip_prefix(r"\\?\").unwrap_or(path)))
 }

@@ -33,15 +33,11 @@ use std::{
 };
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
-use tokio::{
-    sync::watch,
-    task::{spawn_blocking, yield_now},
-    time::sleep,
-};
+use tokio::{sync::watch, task::yield_now, time::sleep};
 
 use crate::{
     _core::{bucket, cleanup::CleanupOptions, mode::AccessMode, object, pipeline::Completion},
-    _store::meta,
+    _store_redb::object_meta,
     _util::pacing,
     FsCleanup,
     backend::FsStorage,
@@ -405,21 +401,13 @@ impl Scanner {
         // closure) re-panics the caller — the one documented policy
         // (F25): a panic is a bug, not a recoverable IO error; converting
         // it to `io::Error` would mask it as a self-healable recompute
-        // (consistent with `database::Handle` and `meta::md5_of_file`).
-        let snapshot: HashMap<object::Key, Option<meta::Stored>> = {
-            let meta = meta.clone();
-            let name = name.clone();
-            spawn_blocking(move || {
-                Ok::<_, Error>(
-                    meta.load_bucket(&name)?
-                        .into_iter()
-                        .map(|row| (row.key, row.stored))
-                        .collect(),
-                )
-            })
-            .await
-            .unwrap_or_else(|join| panic!("the snapshot-load task panicked: {join}"))?
-        };
+        // (consistent with `database::Driver` and `meta::md5_of_file`).
+        let snapshot: HashMap<object::Key, Option<object_meta::Stored>> = meta
+            .load_bucket(name)
+            .await?
+            .into_iter()
+            .map(|row| (row.key, row.stored))
+            .collect();
         let mut file_count = 0usize;
         let mut recomputed = 0usize;
         let mut reclaimed = 0usize;

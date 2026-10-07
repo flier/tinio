@@ -3,7 +3,7 @@
 //!
 //! All state lives in a redb database over the [`redb::InMemoryBackend`].
 //! The seven common tables (buckets, object_meta, uploads, parts,
-//! upload_checksums, part_checksums, object_parts) come from tinio-store —
+//! upload_checksums, part_checksums, object_parts) come from tinio-store-redb —
 //! row shapes, typed handles, and the scan/drain helpers are shared with
 //! the fs backend — plus three mem-local content tables (objects,
 //! part_data, part_meta) with no fs counterpart, keyed like the shared
@@ -32,10 +32,12 @@ use redb::ReadableTable;
 #[cfg(test)]
 use crate::_core::bucket::name;
 #[cfg(test)]
-use crate::_store::scan::for_each_pair;
+use crate::_store_redb::scan::for_each_pair;
 use crate::{
     _core::{Storage, bucket::Name, object},
-    _store::{bucket, ensure_all, objects, part_data, part_meta, store, table::TableDef, upload},
+    _store_redb::{
+        bucket, ensure_all, objects, part_data, part_meta, store, table::TableDef, upload,
+    },
     Error,
     error::{entity_too_large, no_such_bucket, no_such_upload},
 };

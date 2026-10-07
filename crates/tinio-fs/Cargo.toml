@@ -36,7 +36,7 @@ uuid = { workspace = true, features = ["v4"] }
 
 tinio-blob.workspace = true
 tinio-core.workspace = true
-tinio-store.workspace = true
+tinio-store-redb.workspace = true
 tinio-util.workspace = true
 tinio-version.workspace = true
 

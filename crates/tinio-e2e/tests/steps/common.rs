@@ -580,13 +580,16 @@ pub struct RestrictedRoot {
 impl RestrictedRoot {
     /// `chmod 0500` `path` and remember the mode to give back.
     fn restrict(path: &Path) -> Self {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::{
+            fs::{Permissions, metadata, set_permissions},
+            os::unix::fs::PermissionsExt as _,
+        };
 
-        let mode = std::fs::metadata(path)
+        let mode = metadata(path)
             .unwrap_or_else(|err| panic!("the served root `{}`: {err}", path.display()))
             .permissions()
             .mode();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500))
+        set_permissions(path, Permissions::from_mode(0o500))
             .unwrap_or_else(|err| panic!("chmod 0500 `{}`: {err}", path.display()));
         Self {
             path: path.to_path_buf(),
@@ -598,9 +601,12 @@ impl RestrictedRoot {
 #[cfg(unix)]
 impl Drop for RestrictedRoot {
     fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::{
+            fs::{Permissions, set_permissions},
+            os::unix::fs::PermissionsExt as _,
+        };
 
-        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+        let _ = set_permissions(&self.path, Permissions::from_mode(self.mode));
     }
 }
 

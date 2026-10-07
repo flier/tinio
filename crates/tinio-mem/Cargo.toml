@@ -14,7 +14,7 @@ thiserror.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 tinio-core.workspace = true
-tinio-store.workspace = true
+tinio-store-redb.workspace = true
 tinio-version = { workspace = true, optional = true }
 
 [features]

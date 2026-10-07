@@ -846,3 +846,39 @@ jobs:
       - *interop-example
       - *interop-cucumber
       - *upload-report
+
+  # The spike (spike/pg-meta) is the PostgreSQL gate D21 mandates, and it is a
+  # separate cargo workspace (the root Cargo.toml excludes `spike`; the spike's
+  # own Cargo.toml carries `[workspace]`). No job above can compile it, so when
+  # a required method was added to the tinio-core metadata contracts the spike
+  # stopped compiling while every workspace gate stayed green. This job is the
+  # one thing that closes that gap — a compile check only. It needs no
+  # database, no service container and no secrets: the full 8-leg gate (D21)
+  # runs against a live postgres:18-alpine and is the operator's manual run,
+  # never CI's.
+  #
+  # Un-gated (no `needs`), like fmt and semver: it is a seconds-long check on
+  # an independent workspace, so waiting behind `check`'s full workspace
+  # compile would defeat its purpose. The workflow has no path filters, so this
+  # runs on every push to main/dev and every pull request, exactly like the
+  # rest.
+  pg-meta-check:
+    name: Check (pg-meta spike compile)
+    runs-on: ubuntu-latest
+    steps:
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
+
+      # The root .cargo/config.toml pins clang + lld for
+      # x86_64-unknown-linux-gnu (cargo discovers it from this cwd), and the
+      # spike's build scripts/proc-macros link under it — hence *lld above,
+      # as in the `check` job.
+      # --manifest-path selects the spike's own workspace; its Cargo.lock is
+      # committed (spike/pg-meta/Cargo.lock), so the resolved dependency set is
+      # pinned. No --workspace/--profile ci: the spike is not a workspace
+      # member and carries no `ci` profile.
+      - name: check (pg-meta spike)
+        run: cargo check --manifest-path spike/pg-meta/Cargo.toml

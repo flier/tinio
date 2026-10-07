@@ -1,0 +1,36 @@
+[package]
+name = "tinio-store-redb"
+version.workspace = true
+edition.workspace = true
+description = "Shared redb implementation for the tinio storage backends: the table layer and the relocated database driver"
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+derive_more = { workspace = true, features = ["full"] }
+futures.workspace = true
+parse-display.workspace = true
+redb.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+
+tinio-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tinio-util = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[lints.clippy]
+absolute_paths = "warn"
+
+[lints.rust]
+unsafe_code = "forbid"

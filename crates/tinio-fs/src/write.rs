@@ -89,6 +89,78 @@ pub(crate) async fn md5_of_file(path: &Path) -> Result<([u8; 16], Metadata), Err
 /// assert_eq!(size, 5);
 /// assert_eq!(read(&target).unwrap(), b"hello");
 /// ```
+/// An incremental staged write: a temp file under `tmp/` plus the content
+/// MD5 computed while the bytes arrive. This is the one home of the staged
+/// temp-file rules — [`AtomicWriter::write_temp`]'s streamed stage and the
+/// content contract's chunked stage share it: a fresh `upload-<uuid>` name,
+/// `0600` on unix regardless of the umask, one MD5 over the bytes actually
+/// written, and the per-write content sync (D1) before the rename makes the
+/// name visible.
+#[derive(Debug)]
+pub(crate) struct StagedFile {
+    file: File,
+    temp: PathBuf,
+    /// `None` when a tee promises the digest (the etag cell) — the write
+    /// skips its own hash, exactly like a streamed stage.
+    hasher: Option<Md5>,
+    written: u64,
+}
+
+impl StagedFile {
+    /// Open a fresh temp file at `temp` (`0600` on unix) and hash its bytes
+    /// when `hash` is set.
+    async fn open(temp: PathBuf, hash: bool) -> Result<Self, Error> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(fsutil::FILE_MODE_PRIVATE);
+        let file = options.open(&temp).await?;
+        Ok(Self {
+            file,
+            temp,
+            hasher: hash.then(Md5::new),
+            written: 0,
+        })
+    }
+
+    /// Consume the handle and answer the temp path: the caller renames it
+    /// into place or removes it (an abandoned stage leaves no residue).
+    pub(crate) fn into_temp(self) -> PathBuf {
+        self.temp
+    }
+
+    /// Append one chunk. Bounded slices: a single oversized chunk never
+    /// buffers whole.
+    pub(crate) async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), Error> {
+        for slice in chunk.chunks(CHUNK_SIZE) {
+            self.file.write_all(slice).await?;
+            self.written += slice.len() as u64;
+            if let Some(hasher) = &mut self.hasher {
+                hasher.update(slice);
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush and sync the bytes (D1) and answer the temp path, the content
+    /// ETag and the byte count. `tee_etag` is the digest a tee promised when
+    /// the write was not hashed.
+    pub(crate) async fn finish(
+        mut self,
+        tee_etag: Option<[u8; 16]>,
+    ) -> Result<(PathBuf, ETag, u64), Error> {
+        self.file.flush().await?;
+        self.file.sync_all().await?;
+        let etag = match self.hasher {
+            Some(hasher) => ETag::Single(hasher.finalize().into()),
+            // The tee's MD5: the raw digest lands in the etag cell before
+            // the stream's final `None`, so the value is there.
+            None => ETag::Single(tee_etag.expect("the etag tee fills the cell at stream end")),
+        };
+        Ok((self.temp, etag, self.written))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AtomicWriter {
     /// `<state-dir>/tmp/` — the staging directory for in-flight writes.
@@ -193,6 +265,15 @@ impl AtomicWriter {
         }
     }
 
+    /// Open a fresh incremental staged temp under `tmp/` — the content
+    /// contract's chunked stage ([`StagedFile::write_chunk`]). The caller
+    /// renames it into place or discards it.
+    pub(crate) async fn stage_file(&self) -> Result<StagedFile, Error> {
+        self.ensure_tmp_dir().await?;
+        let temp = self.tmp_dir.join(format!("upload-{}", Uuid::new_v4()));
+        StagedFile::open(temp, true).await
+    }
+
     /// The stream+hash core: drain `body` into `temp` with bounded
     /// buffers, returning the content MD5 (from the tee's `etag` cell
     /// when promised — the write skips its own hash) and the number of
@@ -205,29 +286,17 @@ impl AtomicWriter {
         body: BodyStream,
         checksum: Option<&checksum::PartChecksum>,
     ) -> Result<(ETag, u64), Error> {
-        let mut file = {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            options.mode(fsutil::FILE_MODE_PRIVATE);
-            options.open(temp).await?
-        };
-        let mut hasher = (!checksum.is_some_and(|c| c.etag.is_some())).then(Md5::new);
-        let mut written = 0u64;
+        // The tee's `etag` cell promises the content MD5 (a part's ETag IS
+        // its content MD5) — the write then skips its own hash.
+        let hash = !checksum.is_some_and(|c| c.etag.is_some());
+        let mut staged = StagedFile::open(temp.to_path_buf(), hash).await?;
         let mut stream = pin!(body);
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             // Bound the copy: a single oversized chunk never buffers
             // whole — it is drained in bounded slices.
-            for slice in chunk.as_ref().chunks(CHUNK_SIZE) {
-                file.write_all(slice).await?;
-                written += slice.len() as u64;
-                if let Some(hasher) = &mut hasher {
-                    hasher.update(slice);
-                }
-            }
+            staged.write_chunk(chunk.as_ref()).await?;
         }
-        file.flush().await?;
         // D1 — content durability: the bytes must be on disk before the
         // rename makes the name visible (the rename's directory entry is
         // synced by `commit`). Also covers the multipart part files —
@@ -237,19 +306,9 @@ impl AtomicWriter {
         // deliberate tradeoff: parts are re-uploadable, so an operator
         // could drop this sync if the cost matters — the assemble-time
         // sync still covers the completed object (F26, documented).
-        file.sync_all().await?;
-        match hasher {
-            // The write was hashed inline.
-            Some(hasher) => Ok((ETag::Single(hasher.finalize().into()), written)),
-            // The tee's MD5: the raw digest lands in the etag cell before
-            // the stream's final `None`, so the value is there.
-            None => {
-                let digest = checksum
-                    .and_then(|c| c.etag_digest())
-                    .expect("the etag tee fills the cell at stream end");
-                Ok((ETag::Single(digest), written))
-            }
-        }
+        let tee_etag = checksum.and_then(|c| c.etag_digest());
+        let (_temp, etag, written) = staged.finish(tee_etag).await?;
+        Ok((etag, written))
     }
 
     /// Stage `len` bytes at `offset` of an already-open `source` into a

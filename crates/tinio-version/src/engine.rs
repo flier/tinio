@@ -3,9 +3,12 @@
 //! One rule every backend shares: **the current version is whatever that
 //! backend's object store holds**. The engine never invents a second
 //! authority for it — it reads the key's current slot through
-//! [`CurrentRows`], moves content through [`ContentPort`] and the shared blob
-//! engine, and records what it moved through [`VersionRows`]. Nothing here
-//! knows a path, a table or a file.
+//! [`CurrentRows`], moves content through the content contract
+//! ([`ObjectContent`](tinio_core::content::ObjectContent)) and the shared blob
+//! engine, and records what it moved through the persistence contracts
+//! ([`Metadata`](tinio_core::meta::Metadata) and
+//! [`VersionMeta`](tinio_core::meta::VersionMeta)). Nothing here knows a path,
+//! a table or a file.
 //!
 //! # The supersede protocol
 //!
@@ -13,7 +16,8 @@
 //!
 //! 1. The incoming content streams to the backend's stage as today — the
 //!    caller's path, outside this engine.
-//! 2. The outgoing content is read through [`ContentPort::open`] and written
+//! 2. The outgoing content is read through the content contract's
+//!    [`open`](tinio_core::content::ObjectContent::open) and written
 //!    into the block store in the same streaming pass. Blocks are
 //!    content-addressed and immutable, so a partial write is inert garbage,
 //!    never a torn blob.
@@ -46,99 +50,69 @@
 //! [`Error::SupersedeRace`] and writes no row — the blobs published by the
 //! failed attempts are unreferenced garbage the sweep reclaims.
 
+use std::time::SystemTime;
+
 use crate::{
     _blob::{LiveSet, Store},
     _core::{
+        ETag,
+        acl::Acl,
         blob::{BlobRef, BlockStore},
         bucket::Name,
-        object,
+        content::{ContentKey, ObjectContent, stage_body},
+        meta::{
+            Metadata, ObjectMeta, VersionMeta,
+            version::{Kind, Stored},
+        },
+        object, storage,
         version::State,
     },
-    _store::version::{Kind, Row},
     error::Error,
-    ports::{ContentPort, Current, CurrentRows, PublishedBody, Superseded, VersionRows},
+    ports::{Current, CurrentRows, PublishedBody},
 };
 
 /// How many resolve-read-verify attempts a supersede makes: the first try and
 /// the design's one retry against the moved slot.
 const SUPERSEDE_ATTEMPTS: usize = 2;
 
-/// The version state machine over one backend's ports and block store.
+/// Project a contract failure onto the engine's own error.
 ///
-/// `R` is the backend's rows (one type answers both [`VersionRows`] and
-/// [`CurrentRows`]), `C` its content port, and `B` the block store the shared
+/// Every contract method answers its implementation's error, which each
+/// contract requires to convert into [`storage::Error`]; the engine has one
+/// error type, so the conversion happens once, here.
+fn projected(err: impl Into<storage::Error>) -> Error {
+    Error::Storage(err.into())
+}
+
+/// The version state machine over one backend's contracts and block store.
+///
+/// `R` is the backend's rows — one type answering [`Metadata`],
+/// [`VersionMeta`] and the gated current slot ([`CurrentRows`]) — `C` its
+/// content plane ([`ObjectContent`]), and `B` the block store the shared
 /// blob engine runs over. The engine takes content **keys**, never paths: the
-/// content port is the only thing that knows where a key's content lives.
+/// content contract is the only thing that knows where a key's content lives.
 ///
 /// # Examples
 ///
-/// The protocol over an in-memory double: enable versioning, supersede the
-/// current version, and read the row back.
+/// Every call runs over one backend's contracts plus the shared blob engine;
+/// the crate's own tests drive this shape over the in-crate contract double.
 ///
-/// ```rust
-/// # use std::{collections::HashMap, sync::{Arc, Mutex}};
-/// # use async_trait::async_trait;
+/// ```no_run
 /// # use tinio_blob::{LocalBlocks, Store};
-/// # use tinio_core::{BodyStream, blob::BlockStore, bucket::{self, Name}, collect_body, object, storage, version::State};
-/// # use tinio_store::version::{self, Kind, Row};
-/// # use tinio_version::{ContentPort, Current, CurrentRows, PublishedBody, Superseded, VersionRows, Versions};
-/// #
-/// # #[derive(Clone, Default)]
-/// # struct Ports { state: Arc<Mutex<State>>, slot: Arc<Mutex<Current>>, rows: Arc<Mutex<HashMap<u64, Row>>>, file: Arc<Mutex<Option<Vec<u8>>>> }
-/// #
-/// # #[async_trait]
-/// # impl VersionRows for Ports {
-/// #     async fn state(&self, _: &Name) -> Result<State, storage::Error> { Ok(*self.state.lock().unwrap()) }
-/// #     async fn set_state(&self, _: &Name, state: State) -> Result<(), storage::Error> { *self.state.lock().unwrap() = state; Ok(()) }
-/// #     async fn put_version_row(&self, _: &Name, _: &object::Key, s: &Superseded) -> Result<(), storage::Error> {
-/// #         let kind = if s.is_delete_marker { Kind::Marker } else { Kind::Object };
-/// #         let id = s.id.as_ref().map_or_else(|| "null".to_owned(), |id| id.as_str().to_owned());
-/// #         self.rows.lock().unwrap().insert(s.seq, Row { id, blob: version::encode_blob(&s.blob), size: s.blob.len(), etag: String::new(), created: 0, became_noncurrent: 1, kind, tags: String::new(), checksum: String::new(), owner: String::new(), acl: String::new(), seq: s.seq });
-/// #         Ok(())
-/// #     }
-/// #     async fn remove_version_row(&self, _: &Name, _: &object::Key, seq: u64) -> Result<(), storage::Error> { self.rows.lock().unwrap().remove(&seq); Ok(()) }
-/// #     async fn latest(&self, _: &Name, _: &object::Key) -> Result<Option<(u64, Row)>, storage::Error> { Ok(self.rows.lock().unwrap().iter().max_by_key(|(seq, _)| **seq).map(|(seq, row)| (*seq, row.clone()))) }
-/// #     async fn bucket_rows(&self, _: &Name) -> Result<Vec<Row>, storage::Error> { Ok(self.rows.lock().unwrap().values().cloned().collect()) }
+/// # use tinio_core::{
+/// #     content::ObjectContent,
+/// #     meta::{Metadata, VersionMeta},
+/// # };
+/// # use tinio_version::{CurrentRows, Versions};
+/// # #[allow(dead_code)]
+/// # fn demo<R, C>(rows: R, content: C, path: &std::path::Path)
+/// # where
+/// #     R: Metadata + VersionMeta + CurrentRows,
+/// #     C: ObjectContent,
+/// # {
+/// let versions = Versions::new(rows, content, Store::new(LocalBlocks::new(path)));
+/// # let _ = versions;
 /// # }
-/// #
-/// # #[async_trait]
-/// # impl CurrentRows for Ports { async fn current(&self, _: &Name, _: &object::Key) -> Result<Current, storage::Error> { Ok(self.slot.lock().unwrap().clone()) } }
-/// #
-/// # #[async_trait]
-/// # impl ContentPort for Ports {
-/// #     async fn open(&self, _: &Name, _: &object::Key) -> Result<Option<BodyStream>, storage::Error> { Ok(self.file.lock().unwrap().clone().map(|bytes| Box::pin(futures::stream::once(async move { Ok(bytes.into()) })) as BodyStream)) }
-/// #     async fn publish(&self, _: &Name, _: &object::Key, body: BodyStream) -> Result<PublishedBody, storage::Error> { let bytes = collect_body(body).await.map_err(storage::io)?; let published = PublishedBody::from_content(&bytes); *self.file.lock().unwrap() = Some(bytes); Ok(published) }
-/// # }
-/// #
-/// # fn fixture() -> (tempfile::TempDir, Ports, Versions<Ports, Ports, LocalBlocks>) {
-/// #     let dir = tempfile::tempdir().unwrap();
-/// #     let ports = Ports::default();
-/// #     *ports.slot.lock().unwrap() = Current { exists: true, version: Some("v1".parse().unwrap()), is_delete_marker: false, seq: 1, degraded: false };
-/// #     *ports.file.lock().unwrap() = Some(b"first".to_vec());
-/// #     let versions = Versions::new(ports.clone(), ports.clone(), Store::new(LocalBlocks::new(dir.path())));
-/// #     (dir, ports, versions)
-/// # }
-/// #
-/// # let (_dir, _ports, versions) = fixture();
-/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
-/// let bucket = bucket::name("demo").unwrap();
-/// let key = object::key("notes.txt").unwrap();
-///
-/// versions.set_state(&bucket, State::Enabled).await.unwrap();
-/// assert_eq!(versions.state(&bucket).await.unwrap(), State::Enabled);
-///
-/// versions.supersede(&bucket, &key).await.unwrap();
-/// let (seq, row) = versions.latest(&bucket, &key).await.unwrap().expect("a version row");
-/// assert_eq!(seq, 1, "the sequence the current slot recorded");
-/// assert_eq!(row.id.as_str(), "v1", "the identity the current slot recorded");
-/// assert_eq!(row.size, 5);
-/// assert!(versions.blobs().blocks().contains(row.blob().hash()).await.unwrap());
-///
-/// let published = versions.materialize(&bucket, &key, &row).await.unwrap();
-/// assert_eq!(published.expect("content published").size, 5);
-/// versions.expire(&bucket, &key, seq).await.unwrap();
-/// assert!(versions.latest(&bucket, &key).await.unwrap().is_none());
-/// # });
 /// ```
 #[derive(Debug, Clone)]
 pub struct Versions<R, C, B> {
@@ -152,22 +126,26 @@ pub struct Versions<R, C, B> {
 
 impl<R, C, B> Versions<R, C, B>
 where
-    R: VersionRows + CurrentRows,
-    C: ContentPort,
+    R: Metadata + VersionMeta + CurrentRows,
+    C: ObjectContent,
     B: BlockStore,
 {
-    /// Serve the state machine over a backend's ports and block store.
+    /// Serve the state machine over a backend's contracts and block store.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// # use tinio_blob::{LocalBlocks, Store};
-    /// # use tinio_version::{ContentPort, CurrentRows, VersionRows, Versions};
+    /// # use tinio_core::{
+    /// #     content::ObjectContent,
+    /// #     meta::{Metadata, VersionMeta},
+    /// # };
+    /// # use tinio_version::{CurrentRows, Versions};
     /// # #[allow(dead_code)]
     /// # fn demo<R, C>(rows: R, content: C, path: &std::path::Path)
     /// # where
-    /// #     R: VersionRows + CurrentRows,
-    /// #     C: ContentPort,
+    /// #     R: Metadata + VersionMeta + CurrentRows,
+    /// #     C: ObjectContent,
     /// # {
     /// let versions = Versions::new(rows, content, Store::new(LocalBlocks::new(path)));
     /// # let _ = versions;
@@ -190,13 +168,13 @@ where
     ///
     /// ```no_run
     /// # use tinio_blob::LocalBlocks;
-    /// # use tinio_core::{bucket, object, version::*};
-    /// # use tinio_version::{ContentPort, CurrentRows, VersionRows, Versions};
+    /// # use tinio_core::{bucket, content::ObjectContent, meta::{Metadata, VersionMeta}, object, version::*};
+    /// # use tinio_version::{CurrentRows, Versions};
     /// # #[allow(dead_code)]
     /// # fn demo<R, C>(versions: &Versions<R, C, LocalBlocks>)
     /// # where
-    /// #     R: VersionRows + CurrentRows,
-    /// #     C: ContentPort,
+    /// #     R: Metadata + VersionMeta + CurrentRows,
+    /// #     C: ObjectContent,
     /// # {
     /// #     tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let bucket = bucket::name("demo").unwrap();
@@ -205,7 +183,7 @@ where
     /// # }
     /// ```
     pub async fn state(&self, bucket: &Name) -> Result<State, Error> {
-        Ok(self.rows.state(bucket).await?)
+        self.rows.bucket_state(bucket).await.map_err(projected)
     }
 
     /// Record the bucket's versioning state.
@@ -214,13 +192,13 @@ where
     ///
     /// ```no_run
     /// # use tinio_blob::LocalBlocks;
-    /// # use tinio_core::{bucket, object, version::*};
-    /// # use tinio_version::{ContentPort, CurrentRows, VersionRows, Versions};
+    /// # use tinio_core::{bucket, content::ObjectContent, meta::{Metadata, VersionMeta}, object, version::*};
+    /// # use tinio_version::{CurrentRows, Versions};
     /// # #[allow(dead_code)]
     /// # fn demo<R, C>(versions: &Versions<R, C, LocalBlocks>)
     /// # where
-    /// #     R: VersionRows + CurrentRows,
-    /// #     C: ContentPort,
+    /// #     R: Metadata + VersionMeta + CurrentRows,
+    /// #     C: ObjectContent,
     /// # {
     /// #     tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let bucket = bucket::name("demo").unwrap();
@@ -230,7 +208,10 @@ where
     /// # }
     /// ```
     pub async fn set_state(&self, bucket: &Name, state: State) -> Result<(), Error> {
-        Ok(self.rows.set_state(bucket, state).await?)
+        self.rows
+            .set_bucket_state(bucket, state)
+            .await
+            .map_err(projected)
     }
 
     /// The key's current slot, as the backend's own gate answers it: a
@@ -241,13 +222,13 @@ where
     ///
     /// ```no_run
     /// # use tinio_blob::LocalBlocks;
-    /// # use tinio_core::{bucket, object, version::*};
-    /// # use tinio_version::{ContentPort, CurrentRows, VersionRows, Versions};
+    /// # use tinio_core::{bucket, content::ObjectContent, meta::{Metadata, VersionMeta}, object, version::*};
+    /// # use tinio_version::{CurrentRows, Versions};
     /// # #[allow(dead_code)]
     /// # fn demo<R, C>(versions: &Versions<R, C, LocalBlocks>)
     /// # where
-    /// #     R: VersionRows + CurrentRows,
-    /// #     C: ContentPort,
+    /// #     R: Metadata + VersionMeta + CurrentRows,
+    /// #     C: ObjectContent,
     /// # {
     /// #     tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let bucket = bucket::name("demo").unwrap();
@@ -266,14 +247,17 @@ where
     /// Move the key's current version into history.
     ///
     /// The content the current slot points at is streamed into the block
-    /// store, and one [`VersionRows`] call commits its row and index entry.
+    /// store, and one [`VersionMeta::put_version`] call commits its row and
+    /// index entry.
+    ///
     /// The row's identity and sequence are the ones the
     /// current slot already records — this call never mints either — so
     /// re-running it after the crash window between its commit and the key
     /// path's overwrite rewrites the same row. Whether the row is stamped
     /// noncurrent here or by the caller's own state transaction is the
-    /// implementation's (`VersionRows::put_version_row`); readers ask
-    /// [`Row::is_history`](tinio_store::version::Row::is_history).
+    /// implementation's — this call commits the row before the slot moves off
+    /// it, and the trailing state transaction stamps it; readers ask
+    /// [`Stored::became_noncurrent`].
     ///
     /// This form reads the key's gated slot itself; a caller that already
     /// holds it (the write paths read it for their branch decision under the
@@ -300,20 +284,20 @@ where
     ///
     /// ```no_run
     /// # use tinio_blob::LocalBlocks;
-    /// # use tinio_core::{bucket, object, version::*};
-    /// # use tinio_version::{ContentPort, CurrentRows, VersionRows, Versions};
+    /// # use tinio_core::{bucket, content::ObjectContent, meta::{Metadata, VersionMeta}, object, version::*};
+    /// # use tinio_version::{CurrentRows, Versions};
     /// # #[allow(dead_code)]
     /// # fn demo<R, C>(versions: &Versions<R, C, LocalBlocks>)
     /// # where
-    /// #     R: VersionRows + CurrentRows,
-    /// #     C: ContentPort,
+    /// #     R: Metadata + VersionMeta + CurrentRows,
+    /// #     C: ObjectContent,
     /// # {
     /// #     tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let bucket = bucket::name("demo").unwrap();
     /// let key = object::key("notes.txt").unwrap();
     /// versions.supersede(&bucket, &key).await.unwrap();
     /// let (seq, row) = versions.latest(&bucket, &key).await.unwrap().unwrap();
-    /// assert_eq!((seq, row.id.as_str()), (1, "v1"));
+    /// assert_eq!((seq, row.id.as_ref().expect("a named version").as_str()), (1, "v1"));
     /// assert_eq!(
     ///     row.size, 5,
     ///     "the outgoing content moved into the block store"
@@ -324,6 +308,71 @@ where
     pub async fn supersede(&self, bucket: &Name, key: &object::Key) -> Result<(), Error> {
         let before = self.rows.current(bucket, key).await?;
         self.supersede_with(bucket, key, &before).await
+    }
+
+    /// The history row for the version `before` names.
+    ///
+    /// Its identity and sequence are the slot's — this call never mints either
+    /// — and its content address is the blob just stored. Its metadata wires
+    /// come from the object row the slot resolved against: the **recorded**
+    /// ETag (the composed `-N` form included, which no re-hash could
+    /// reproduce) plus the tags, checksum, owner and ACL, each reusing its wire
+    /// encoding. A slot with no object row (a marker whose slot is kept
+    /// elsewhere) contributes the empty wires and this call's clock.
+    ///
+    /// The row is written with `became_noncurrent: 0` — this call commits it
+    /// before the current slot moves off it, so it is not history yet, and the
+    /// trailing state transaction stamps it. A stamp the stored row already
+    /// carries is preserved regardless: the contract's
+    /// [`VersionMeta::put_version`] keeps the stored stamp and ignores the
+    /// caller's whenever a row already sits at `row.seq`, so the crash window's
+    /// adopted row is never un-stamped by the supersede that rewrites it. Every
+    /// other field is this call's, and the implementation's own rules (the
+    /// row-overwrite guard and the one-null-version convergence) are enforced
+    /// inside `put_version`'s transaction, not here.
+    async fn version_row(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        before: &Current,
+        blob: BlobRef,
+        kind: Kind,
+    ) -> Result<Stored, Error> {
+        let object = ObjectMeta::get(&self.rows, bucket, key)
+            .await
+            .map_err(|err| Error::Storage(err.into()))?;
+        let (etag, created, tags, checksum, owner, acl) = match object {
+            Some(row) => (
+                row.etag,
+                row.mtime,
+                row.tags,
+                row.checksum,
+                row.owner,
+                row.acl,
+            ),
+            None => (
+                ETag::EMPTY,
+                SystemTime::now(),
+                object::Tags::empty(),
+                None,
+                None,
+                Acl::default_private(None),
+            ),
+        };
+        Ok(Stored {
+            id: before.version.clone(),
+            size: blob.len(),
+            blob,
+            etag,
+            created,
+            became_noncurrent: 0,
+            kind,
+            tags,
+            checksum,
+            owner,
+            acl,
+            seq: before.seq,
+        })
     }
 
     /// [`Self::supersede`] with the key's gated slot already in hand — the
@@ -361,35 +410,48 @@ where
             let superseded = if before.is_delete_marker {
                 // A marker holds no content: its history row carries the empty
                 // blob, and the read is not attempted.
-                Some(Superseded {
-                    id: before.version.clone(),
-                    seq: before.seq,
-                    blob: BlobRef::empty(),
-                    is_delete_marker: true,
-                })
+                Some(
+                    self.version_row(bucket, key, &before, BlobRef::empty(), Kind::Marker)
+                        .await?,
+                )
             } else {
-                match self.content.open(bucket, key).await? {
-                    Some(body) => {
+                match self
+                    .content
+                    .open(bucket, &ContentKey::Object(key.clone()), None)
+                    .await
+                {
+                    Ok(body) => {
                         let blob = self
                             .blobs
                             .put(body)
                             .await
                             .map_err(|err| Error::Storage(err.into()))?;
-                        Some(Superseded {
-                            id: before.version.clone(),
-                            seq: before.seq,
-                            blob,
-                            is_delete_marker: false,
-                        })
+                        Some(
+                            self.version_row(bucket, key, &before, blob, Kind::Object)
+                                .await?,
+                        )
                     }
-                    None if before.is_null() => {
-                        // The null version holds no content (an out-of-band
-                        // removal): nothing is current to move into history,
-                        // so there is no disagreement to answer.
-                        empty_null = true;
+                    Err(err) => {
+                        // The content contract's `open` has no `None` arm
+                        // (D23): a key whose content is gone answers its own
+                        // not-found error, which projects onto the contract's
+                        // `NoSuchKey` for an object. That is the disagreement
+                        // the old absent answer was — the read found no content
+                        // to move into history — and the retry below is what
+                        // decides whether it was a race. Any other failure is a
+                        // real one and is answered as itself.
+                        let projected: storage::Error = err.into();
+                        if !matches!(projected, storage::Error::NoSuchKey(_)) {
+                            return Err(Error::Storage(projected));
+                        }
+                        if before.is_null() {
+                            // The null version holds no content (an out-of-band
+                            // removal): nothing is current to move into history,
+                            // so there is no disagreement to answer.
+                            empty_null = true;
+                        }
                         None
                     }
-                    None => None,
                 }
             };
             // Re-resolve through the gate: the recorded identity the read was
@@ -398,7 +460,10 @@ where
             let after = self.rows.current(bucket, key).await?;
             if after == before {
                 if let Some(superseded) = superseded {
-                    self.rows.put_version_row(bucket, key, &superseded).await?;
+                    self.rows
+                        .put_version(bucket, key, &superseded)
+                        .await
+                        .map_err(projected)?;
                     return Ok(());
                 }
                 if empty_null {
@@ -431,13 +496,13 @@ where
     ///
     /// ```no_run
     /// # use tinio_blob::LocalBlocks;
-    /// # use tinio_core::{bucket, object, version::*};
-    /// # use tinio_version::{ContentPort, CurrentRows, VersionRows, Versions};
+    /// # use tinio_core::{bucket, content::ObjectContent, meta::{Metadata, VersionMeta}, object, version::*};
+    /// # use tinio_version::{CurrentRows, Versions};
     /// # #[allow(dead_code)]
     /// # fn demo<R, C>(versions: &Versions<R, C, LocalBlocks>)
     /// # where
-    /// #     R: VersionRows + CurrentRows,
-    /// #     C: ContentPort,
+    /// #     R: Metadata + VersionMeta + CurrentRows,
+    /// #     C: ObjectContent,
     /// # {
     /// #     tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let bucket = bucket::name("demo").unwrap();
@@ -456,17 +521,36 @@ where
         &self,
         bucket: &Name,
         key: &object::Key,
-        entry: &Row,
+        entry: &Stored,
     ) -> Result<Option<PublishedBody>, Error> {
         if entry.kind == Kind::Marker {
             return Ok(None); // a marker holds no content to write back
         }
         let body = self
             .blobs
-            .open(&entry.blob(), None)
+            .open(&entry.blob, None)
             .await
             .map_err(|err| Error::Storage(err.into()))?;
-        Ok(Some(self.content.publish(bucket, key, body).await?))
+        // The staged pair, not a whole-body buffer: the blob's chunks stream
+        // into the backend's stage and the count is what **landed** there —
+        // the bytes the publish then makes visible, which is what a caller
+        // records in the restored version's row (the read path's staleness
+        // gate compares that row against the file).
+        let content_key = ContentKey::Object(key.clone());
+        let mut staged = self
+            .content
+            .stage(bucket, &content_key)
+            .await
+            .map_err(|err| Error::Storage(err.into()))?;
+        let size = stage_body(&mut staged, body).await?;
+        self.content
+            .publish(bucket, staged, &content_key)
+            .await
+            .map_err(|err| Error::Storage(err.into()))?;
+        Ok(Some(PublishedBody {
+            etag: entry.etag.clone(),
+            size,
+        }))
     }
 
     /// Drop one version: its row and its index entry, in one transaction.
@@ -479,13 +563,13 @@ where
     ///
     /// ```no_run
     /// # use tinio_blob::LocalBlocks;
-    /// # use tinio_core::{bucket, object, version::*};
-    /// # use tinio_version::{ContentPort, CurrentRows, VersionRows, Versions};
+    /// # use tinio_core::{bucket, content::ObjectContent, meta::{Metadata, VersionMeta}, object, version::*};
+    /// # use tinio_version::{CurrentRows, Versions};
     /// # #[allow(dead_code)]
     /// # fn demo<R, C>(versions: &Versions<R, C, LocalBlocks>)
     /// # where
-    /// #     R: VersionRows + CurrentRows,
-    /// #     C: ContentPort,
+    /// #     R: Metadata + VersionMeta + CurrentRows,
+    /// #     C: ObjectContent,
     /// # {
     /// #     tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let bucket = bucket::name("demo").unwrap();
@@ -497,15 +581,15 @@ where
     /// # }
     /// ```
     pub async fn expire(&self, bucket: &Name, key: &object::Key, seq: u64) -> Result<(), Error> {
-        Ok(self.rows.remove_version_row(bucket, key, seq).await?)
+        self.rows.expire(bucket, key, seq).await.map_err(projected)
     }
 
-    /// Drop several versions of one key in a single port call: the same
-    /// rows and index entries [`Self::expire`] drops, committed as one
-    /// transaction by a port that can, so a retention pass over a long
-    /// history pays one durable commit rather than one per version. The
-    /// caller has already resolved the sequences it means (the sweep holds
-    /// the whole history in hand); this call re-reads nothing.
+    /// Drop several versions of one key in one contract call: the same rows
+    /// and index entries [`Self::expire`] drops, committed as **one**
+    /// transaction. A retention pass over a long history pays one durable
+    /// commit — and one crash point — rather than one per version. The caller
+    /// has already resolved the sequences it means (the sweep holds the whole
+    /// history in hand); this call re-reads nothing.
     ///
     /// Idempotent like [`Self::expire`]. The content's blocks are not
     /// reclaimed here either: liveness is derived, and the block sweep
@@ -516,7 +600,10 @@ where
         key: &object::Key,
         seqs: &[u64],
     ) -> Result<(), Error> {
-        Ok(self.rows.remove_version_rows(bucket, key, seqs).await?)
+        self.rows
+            .expire_many(bucket, key, seqs)
+            .await
+            .map_err(projected)
     }
 
     /// The newest version row of `key` — its sequence and its row — or
@@ -527,13 +614,13 @@ where
     ///
     /// ```no_run
     /// # use tinio_blob::LocalBlocks;
-    /// # use tinio_core::{bucket, object, version::*};
-    /// # use tinio_version::{ContentPort, CurrentRows, VersionRows, Versions};
+    /// # use tinio_core::{bucket, content::ObjectContent, meta::{Metadata, VersionMeta}, object, version::*};
+    /// # use tinio_version::{CurrentRows, Versions};
     /// # #[allow(dead_code)]
     /// # fn demo<R, C>(versions: &Versions<R, C, LocalBlocks>)
     /// # where
-    /// #     R: VersionRows + CurrentRows,
-    /// #     C: ContentPort,
+    /// #     R: Metadata + VersionMeta + CurrentRows,
+    /// #     C: ObjectContent,
     /// # {
     /// #     tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let bucket = bucket::name("demo").unwrap();
@@ -544,7 +631,7 @@ where
     /// );
     /// versions.supersede(&bucket, &key).await.unwrap();
     /// let (seq, row) = versions.latest(&bucket, &key).await.unwrap().unwrap();
-    /// assert_eq!((seq, row.id.as_str()), (1, "v1"));
+    /// assert_eq!((seq, row.id.as_ref().expect("a named version").as_str()), (1, "v1"));
     /// # });
     /// # }
     /// ```
@@ -552,8 +639,8 @@ where
         &self,
         bucket: &Name,
         key: &object::Key,
-    ) -> Result<Option<(u64, Row)>, Error> {
-        Ok(self.rows.latest(bucket, key).await?)
+    ) -> Result<Option<(u64, Stored)>, Error> {
+        self.rows.latest(bucket, key).await.map_err(projected)
     }
 
     /// The bucket's live blocks: every block the decoded blob of every
@@ -564,13 +651,13 @@ where
     ///
     /// ```no_run
     /// # use tinio_blob::LocalBlocks;
-    /// # use tinio_core::{bucket, object, version::*};
-    /// # use tinio_version::{ContentPort, CurrentRows, VersionRows, Versions};
+    /// # use tinio_core::{bucket, content::ObjectContent, meta::{Metadata, VersionMeta}, object, version::*};
+    /// # use tinio_version::{CurrentRows, Versions};
     /// # #[allow(dead_code)]
     /// # fn demo<R, C>(versions: &Versions<R, C, LocalBlocks>)
     /// # where
-    /// #     R: VersionRows + CurrentRows,
-    /// #     C: ContentPort,
+    /// #     R: Metadata + VersionMeta + CurrentRows,
+    /// #     C: ObjectContent,
     /// # {
     /// #     tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// use tinio_core::blob::BlockHash;
@@ -587,8 +674,8 @@ where
     /// # }
     /// ```
     pub async fn live_blocks(&self, bucket: &Name) -> Result<LiveSet, Error> {
-        let rows = self.rows.bucket_rows(bucket).await?;
-        Ok(LiveSet::from_blobs(rows.into_iter().map(|row| row.blob())))
+        let rows = self.rows.bucket_rows(bucket).await.map_err(projected)?;
+        Ok(LiveSet::from_blobs(rows.into_iter().map(|row| row.blob)))
     }
 
     /// The blob engine this instance runs over — the write path's read side

@@ -12,7 +12,7 @@ use std::{
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tinio_core::{bucket, object};
-use tinio_fs::{_store::meta::Table, database, meta};
+use tinio_fs::{_store_redb::object_meta::Table, database, meta};
 use tokio::runtime::Runtime;
 
 /// Entries in the populated `OBJECT_META` table (inserted in one bulk

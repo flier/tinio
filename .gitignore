@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# The PostgreSQL spike gate is outside the workspace (P1 Task 2, D25).
+spike/**/target/
+
 # tinio private state (state dir of a served root must never be committed)
 .tinio/
 

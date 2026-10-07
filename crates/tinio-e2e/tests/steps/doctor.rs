@@ -225,7 +225,7 @@ async fn doctor_relocated_stale_state(world: &mut World) {
     doctor_stale_state(&dir, cli.root(), &control);
 }
 
-/// The marker `needs_compact` reads besides the ratio, set through `Handle::mark_compact_needed`
+/// The marker `needs_compact` reads besides the ratio, set through `Driver::mark_compact_needed`
 /// — the marker protocol's own public write half rather than the state table's, because a fixture
 /// must not be the second place the marker's storage shape is spelled out. A small temp-dir store
 /// never crosses the 64 MiB floor on the ratio alone, so this is the only way to make one that
@@ -234,7 +234,7 @@ async fn doctor_relocated_stale_state(world: &mut World) {
 async fn doctor_store_needs_compaction(world: &mut World) {
     let dir = doctor_state_dir(harness(world));
     let open = database::open(&dir).expect("the root's store");
-    database::Handle::new(open.db)
+    database::Driver::new(open.db)
         .mark_compact_needed(true)
         .await
         .expect("the compaction marker");

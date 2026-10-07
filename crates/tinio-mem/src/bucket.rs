@@ -18,7 +18,7 @@ use crate::{
         bucket::Name,
         cors, object, paginate_ordered,
     },
-    _store::{bucket, bucket::BucketRow, decode_acl_wire, decode_owner_wire, objects, upload},
+    _store_redb::{bucket, bucket::BucketRow, decode_acl_wire, decode_owner_wire, objects, upload},
     Error,
     error::{already_exists, no_such_bucket, not_empty},
     storage::MemoryStorage,

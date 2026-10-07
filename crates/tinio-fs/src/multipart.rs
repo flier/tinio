@@ -1,29 +1,30 @@
 //! Multipart upload storage (task T044, migrated to redb per
 //! meta-redb-spec).
 //!
-//! Upload records live in the `UPLOADS` table (`(bucket, upload_id)` →
-//! `(key, initiated_at, tags wire)` — the create-time object tags, spec
-//! 2026-08-31) and part ETags in `PARTS` (`(bucket, upload_id,
-//! part_number)` → etag hex) of `<state-dir>/meta.redb`. The file system
-//! keeps only the part contents at `<state-dir>/multipart/<bucket>/<upload_id>/part-<n>`
-//! (the upload directory is created by the first `put_part`, never by
-//! `create` — the orphan-cleanup TOCTOU order depends on it, §5.7).
-//! Assembly streams all parts into a temp file, then renames atomically
-//! onto the object path; the composed ETag `MD5-of-MD5s-N` matches the AWS
-//! reference composition. Parts survive restarts, so cross-restart
-//! completion/abort is legal (quickstart §7). The S3 5 MiB minimum for
-//! non-final parts is enforced authoritatively in [`Store::complete`]'s
-//! verify loop (EntityTooSmall) — part uploads themselves accept any
-//! size.
+//! The upload records live in the state database's `UPLOADS` /
+//! `UPLOAD_CHECKSUMS` and `PARTS` / `PART_CHECKSUMS` tables
+//! (`<state-dir>/meta.redb`). Their decode, key check, refusal
+//! projection, and one-transaction-per-method discipline are the shared
+//! contract implementation's (`RedbMetadata`) — this module is the
+//! file-system facade over it (Task 7).
+//!
+//! The file system keeps only the part contents at
+//! `<state-dir>/multipart/<bucket>/<upload_id>/part-<n>` (the upload
+//! directory is created by the first `put_part`, never by `create` — the
+//! orphan-cleanup TOCTOU order depends on it, §5.7). Assembly streams all
+//! parts into a temp file, then renames atomically onto the object path;
+//! the composed ETag `MD5-of-MD5s-N` matches the AWS reference
+//! composition. Parts survive restarts, so cross-restart completion/abort
+//! is legal (quickstart §7). The S3 5 MiB minimum for non-final parts is
+//! enforced authoritatively in [`Store::complete`]'s verify loop
+//! (EntityTooSmall) — part uploads themselves accept any size.
 //! The number of concurrently in-progress uploads is capped by
 //! `max_concurrent_uploads` (default `DEFAULT_MAX_CONCURRENT_UPLOADS`,
 //! `[s3] max_concurrent_uploads`).
 //!
-//! Redb transactions replace the old `upload.json` + `.etag` sidecar writes
-//! under an in-process lock: `complete`'s consume is one atomic
-//! UPLOADS+PARTS+checksums deletion; `list_parts` is DB-driven (a part whose PARTS
-//! record never committed is invisible — the client retransmits, and the
-//! point query recomputes from the file as a fallback, §5.6).
+//! `list_parts` stays DB-driven (a part whose PARTS record never committed
+//! is invisible — the client retransmits, and the point query recomputes
+//! from the file as a fallback, §5.6).
 
 // `put_part_copy` (the unix copy_file_range fast path) takes the std
 // handle — tokio's `File` stays for the async assembly reads below.
@@ -48,23 +49,16 @@ use crate::{
     _core::{
         BodyStream, ETag, acl,
         acl::Acl,
-        bucket, checksum, from_nanos,
+        bucket, checksum,
+        meta::{UploadMeta, upload as row},
         multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber, check_part_minimum},
-        object::{
-            OBJECT_TAGS_MAX, {self},
-        },
-        storage::{
-            self, DEFAULT_MAX_CONCURRENT_UPLOADS, Error::NoSuchUpload,
-            group_and_paginate_unordered, uploads_order,
-        },
+        object::{self},
+        storage::{self, DEFAULT_MAX_CONCURRENT_UPLOADS, Error::NoSuchUpload},
     },
-    _store::{
-        decode_acl_wire, decode_owner_wire, object_part, part, part_checksum, table::TableDef,
-        upload, upload_checksum,
-    },
+    _store_redb::{RedbMetadata, object_part, part, part_checksum, upload, upload_checksum},
     _util::lockmap::{Guard, Map},
     Error,
-    database::{self, Handle},
+    database::{self, Driver},
     fsutil,
     fsutil::ok_if_missing,
     path::MULTIPART_DIR_NAME,
@@ -88,9 +82,8 @@ type PartLocks = Map<(String, String)>;
 pub(crate) type CompletedPartRow = object_part::Stored;
 
 /// Delete one upload's `UPLOADS`/`UPLOAD_CHECKSUMS` + `PARTS`/
-/// `PART_CHECKSUMS` rows in the caller's write transaction (`complete`
-/// consume, `abort`, and the backend's `complete_object_state` share
-/// this).
+/// `PART_CHECKSUMS` rows in the caller's write transaction (`complete`'s
+/// consume and the backend's `complete_object_state` share this).
 pub(crate) fn drain_upload(
     txn: &mut redb::WriteTransaction,
     bucket: &bucket::Name,
@@ -100,30 +93,15 @@ pub(crate) fn drain_upload(
     drain_upload_rest(txn, bucket, upload_id)
 }
 
-/// The checked variant for `abort`: whether the upload exists with the
-/// given key AND the full drain, in ONE transaction — redb refuses a
-/// second `open_table` of `UPLOADS` in one transaction, so the check
-/// must share the handle with the drain's `UPLOADS` removal.
-pub(crate) fn drain_upload_checked(
-    txn: &mut redb::WriteTransaction,
-    bucket: &bucket::Name,
-    key: &object::Key,
-    upload_id: &str,
-) -> Result<bool, database::Error> {
-    let mut uploads = upload::Table::open(txn)?;
-    if !uploads.key_matches(bucket, key, upload_id)? {
-        return Ok(false);
-    }
-    uploads.remove(bucket, upload_id)?;
-    drop(uploads);
-    drain_upload_rest(txn, bucket, upload_id)?;
-    Ok(true)
-}
-
-/// The checksum + PARTS half of the drain, shared by [`drain_upload`]
-/// and [`drain_upload_checked`] — the four-table delete list has one
-/// home (a table added to the upload lifecycle must be drained in both
-/// places).
+/// The checksum + PARTS half of the drain, after [`drain_upload`] removed
+/// the `UPLOADS` row.
+///
+/// The four-table delete list has two homes on purpose: the contract's
+/// `drain_upload`/`drain_bucket` are the engine's and the facade's home,
+/// while this helper serves callers that must delete the rows inside the
+/// caller's own write transaction (the backend's completed-object state and
+/// the bucket teardown) and so cannot delegate to the contract. A table
+/// added to the upload lifecycle must be drained in both.
 fn drain_upload_rest(
     txn: &mut redb::WriteTransaction,
     bucket: &bucket::Name,
@@ -157,116 +135,6 @@ fn sort_uploads(uploads: &mut [MultipartUpload]) {
     uploads.sort_by(|a, b| {
         (a.key.as_ref(), a.upload_id.as_str()).cmp(&(b.key.as_ref(), b.upload_id.as_str()))
     });
-}
-
-/// Build a `MultipartUpload` from a stored `UPLOADS` row plus the
-/// `UPLOAD_CHECKSUMS` row (`None` = no checksum spec). Domain-invalid
-/// rows are skipped (`None` — self-healing; `list_uploads`/`walk_uploads`
-/// share this conversion); a domain-invalid checksum wire heals to
-/// `None` at the checksum table (F07); a domain-invalid tags wire heals
-/// to the empty set at the uploads table.
-#[allow(clippy::too_many_arguments)]
-fn upload_from_row(
-    bucket: &bucket::Name,
-    upload_id: &str,
-    key: &str,
-    initiated_at: u64,
-    tags: object::Tags,
-    owner: Option<acl::OwnerId>,
-    acl: Acl,
-    checksum: Option<checksum::Upload>,
-) -> Result<Option<MultipartUpload>, storage::Error> {
-    let Ok(key) = object::key(key) else {
-        return Ok(None);
-    };
-    if Uuid::parse_str(upload_id).is_err() {
-        return Ok(None);
-    }
-    Ok(Some(MultipartUpload {
-        upload_id: upload_id.to_owned(),
-        bucket: bucket.clone(),
-        key,
-        initiated_at: from_nanos(initiated_at),
-        checksum,
-        tags,
-        owner,
-        acl,
-    }))
-}
-
-/// One materialized upload row of the listings: `(bucket, upload_id,
-/// key, initiated_at, tags, owner, acl, checksum)` — the owner/ACL
-/// elements decoded here once (the tags precedent).
-type UploadRow = (
-    bucket::Name,
-    String,
-    String,
-    u64,
-    object::Tags,
-    Option<acl::OwnerId>,
-    Acl,
-    Option<checksum::Upload>,
-);
-
-/// The bucket's raw `UPLOADS` rows joined with each upload's checksum row
-/// (the F03 probe), in `(key, upload_id)` order — the composite order the
-/// pagination engine requires. Shared by the full-bucket listing and the
-/// paged one.
-fn materialize_upload_rows(
-    table: &upload::Table<
-        '_,
-        impl redb::ReadableTable<<upload::Def as TableDef>::Key, <upload::Def as TableDef>::Value>,
-    >,
-    checksums: &upload_checksum::Table<
-        '_,
-        impl redb::ReadableTable<
-            <upload_checksum::Def as TableDef>::Key,
-            <upload_checksum::Def as TableDef>::Value,
-        >,
-    >,
-    bucket: &bucket::Name,
-) -> Result<Vec<UploadRow>, database::Error> {
-    let mut rows = Vec::new();
-    table.for_bucket(
-        bucket.as_ref().as_str(),
-        |upload_id, (key, initiated_at, tags_wire, owner_wire, acl_wire)| {
-            let checksum_row = checksums.get(bucket.as_ref().as_str(), upload_id)?;
-            rows.push((
-                bucket.clone(),
-                upload_id.to_string(),
-                key.to_string(),
-                initiated_at,
-                object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX),
-                decode_owner_wire(owner_wire),
-                decode_acl_wire(acl_wire),
-                checksum_row,
-            ));
-            Ok(())
-        },
-    )?;
-    Ok(rows)
-}
-
-/// The rows→uploads conversion shared by the listings: domain-invalid
-/// rows are skipped (self-healing — the `None` of [`upload_from_row`]).
-fn uploads_from_rows(rows: Vec<UploadRow>) -> Result<Vec<MultipartUpload>, storage::Error> {
-    rows.into_iter()
-        .map(
-            |(bucket, upload_id, key, initiated_at, tags, owner, acl, checksum_row)| {
-                upload_from_row(
-                    &bucket,
-                    &upload_id,
-                    &key,
-                    initiated_at,
-                    tags,
-                    owner,
-                    acl,
-                    checksum_row,
-                )
-            },
-        )
-        .collect::<Result<Vec<_>, _>>()
-        .map(|rows| rows.into_iter().flatten().collect())
 }
 
 /// Multipart parts storage of a state dir.
@@ -327,7 +195,11 @@ fn uploads_from_rows(rows: Vec<UploadRow>) -> Result<Vec<MultipartUpload>, stora
 #[derive(Debug, Clone)]
 pub struct Store {
     /// The shared state-database handle (upload records + part ETags).
-    handle: Arc<database::Handle>,
+    handle: Arc<database::Driver>,
+    /// The contract's upload engine over that same handle: every record
+    /// read/write goes through it (Task 7's delegation — one home for the
+    /// decoded rows, the key check, and the refusal projection).
+    meta: Arc<RedbMetadata>,
     /// The cap on concurrently in-progress uploads (`[s3]
     /// max_concurrent_uploads`; default
     /// [`DEFAULT_MAX_CONCURRENT_UPLOADS`]). `create` counts the live
@@ -351,11 +223,12 @@ impl Store {
     /// Create a store over a shared state-database handle (the `FsStorage`
     /// construction path — one handle across all stores).
     pub(crate) fn from_handle(
-        handle: Arc<database::Handle>,
+        handle: Arc<database::Driver>,
         state_dir: &Path,
         max_concurrent_uploads: u32,
     ) -> Self {
         Self {
+            meta: Arc::new(RedbMetadata::from_driver(handle.shared())),
             handle,
             max_concurrent_uploads,
             root: state_dir.join(MULTIPART_DIR_NAME),
@@ -420,38 +293,25 @@ impl Store {
             owner: owner.cloned(),
             acl: acl.clone(),
         };
-        // Clone into the write closure (runs on the blocking pool, G3
-        // revision); `upload` stays owned for the return.
-        let bucket = bucket.clone();
-        let key = key.clone();
-        let upload_id = upload.upload_id.clone();
-        let initiated_at = upload.initiated_at;
-        let tags = tags.clone();
-        let checksum = checksum.clone();
-        let owner = owner.cloned();
-        let acl = acl.clone();
-        let owner_wire = owner
-            .as_ref()
-            .map_or_else(String::new, |o| o.as_str().to_string());
-        let acl_wire = acl.to_grants_wire();
-        self.handle
-            .write(move |txn| {
-                upload::Table::open(txn)?.put(
-                    &bucket,
-                    &upload_id,
-                    &key,
-                    initiated_at,
-                    &tags.to_wire(),
-                    &owner_wire,
-                    &acl_wire,
-                )?;
-                if let Some(spec) = &checksum {
-                    upload_checksum::Table::open(txn)?.put(&bucket, &upload_id, spec)?;
-                }
-                Ok(())
-            })
+        // The contract's `create` writes the UPLOADS row and the checksum
+        // spec's row in one transaction (the record layer's home; the
+        // blocking-pool dispatch is the driver's, G3).
+        self.meta
+            .create(
+                bucket,
+                &upload.upload_id,
+                &row::Row {
+                    upload_id: upload.upload_id.clone(),
+                    key: upload.key.clone(),
+                    initiated_at: upload.initiated_at,
+                    checksum: upload.checksum.clone(),
+                    tags: upload.tags.clone(),
+                    owner: upload.owner.clone(),
+                    acl: upload.acl.clone(),
+                },
+            )
             .await
-            .map_err(Error::from)?;
+            .map_err(database::map_contract_error)?;
         Ok(upload)
     }
 
@@ -463,44 +323,18 @@ impl Store {
         key: &object::Key,
         upload_id: &str,
     ) -> Result<MultipartUpload, Error> {
-        let bucket_txn = bucket.clone();
-        let key = key.clone();
-        let upload_id_owned = upload_id.to_string();
-        let found = self
-            .handle
-            .read(move |txn| {
-                let uploads = upload::Table::open_readonly(txn)?;
-                // One lookup: the row, present only when it records `key`.
-                let Some((stored_key, initiated_at, tags_wire, owner_wire, acl_wire)) =
-                    uploads.get_matching(&bucket_txn, &key, &upload_id_owned)?
-                else {
-                    return Ok(None);
-                };
-                let checksum_row = upload_checksum::Table::open_readonly(txn)?
-                    .get(bucket_txn.as_ref().as_str(), &upload_id_owned)?;
-                Ok(Some((
-                    stored_key,
-                    initiated_at,
-                    object::Tags::from_wire_limited(&tags_wire, OBJECT_TAGS_MAX),
-                    decode_owner_wire(&owner_wire),
-                    decode_acl_wire(&acl_wire),
-                    checksum_row,
-                )))
-            })
-            .map_err(Error::from)?;
-        let (stored_key, initiated_at, tags, owner, acl, checksum_row) =
-            found.ok_or_else(|| storage::no_such_upload(upload_id))?;
-        upload_from_row(
-            bucket,
-            upload_id,
-            &stored_key,
-            initiated_at,
-            tags,
-            owner,
-            acl,
-            checksum_row,
-        )?
-        .ok_or_else(|| storage::no_such_upload(upload_id).into())
+        // The contract's `get` does the one key-checked lookup (the decoded
+        // row, its checksum spec joined). The facade's identity guard: a
+        // client-supplied id may only name a UUID (as `create` allocates)
+        // — anything else answers NoSuchUpload rather than a record that
+        // no part path can address.
+        self.meta
+            .get(bucket, key, upload_id)
+            .await
+            .map_err(database::map_contract_error)?
+            .filter(|_| Uuid::parse_str(upload_id).is_ok())
+            .map(|row| row.to_upload(bucket))
+            .ok_or_else(|| storage::no_such_upload(upload_id).into())
     }
 
     /// Stream one part (number `1..=10000`) into the upload. `checksum`
@@ -605,54 +439,26 @@ impl Store {
             let _ = fs::remove_file(&temp).await;
             return Err(err.into());
         }
-        // One write transaction: the upload-existence check AND the PARTS
-        // upsert (no separate read transaction). An upload aborted while
-        // the body streamed answers NoSuchUpload and the renamed part is
-        // discarded (the empty directory is reclaimed by the orphan
-        // stage).
-        let bucket = bucket.clone();
-        let key = key.clone();
-        let upload_id_owned = upload_id.to_string();
-        let etag_owned = etag.clone();
-        let checksum_txn = checksum.clone();
-        let recorded = match self
-            .handle
-            .write(move |txn| {
-                let uploads = upload::Table::open(txn)?;
-                if !uploads.key_matches(&bucket, &key, &upload_id_owned)? {
-                    return Ok(false);
-                }
-                drop(uploads);
-                part::Table::open(txn)?.put(&bucket, &upload_id_owned, n, &etag_owned)?;
-                // The checksum row commits atomically with the part row:
-                // write the tee's digest, or clear a stale row from a
-                // previous upload of this part number (it would corrupt
-                // the Complete composition).
-                let mut checksums = part_checksum::Table::open(txn)?;
-                checksums.set(
-                    &bucket,
-                    &upload_id_owned,
-                    n,
-                    checksum_txn.as_ref().and_then(|c| c.digest.get()),
-                )?;
-                Ok(true)
-            })
+        // The contract's `put_part` re-checks the upload INSIDE the
+        // transaction that writes the PARTS + PART_CHECKSUMS rows: an
+        // upload aborted while the body streamed answers NoSuchUpload
+        // and the renamed part is discarded (the empty directory is
+        // reclaimed by the orphan stage).
+        if let Err(err) = self
+            .meta
+            .put_part(
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                &etag,
+                checksum.as_deref(),
+            )
             .await
         {
-            Ok(recorded) => recorded,
-            Err(err) => {
-                // The upload is gone (or a real DB failure) — remove the
-                // renamed part and the empty directory (best-effort; a
-                // racing abort already removed the dir).
-                let _ = fs::remove_file(&part).await;
-                let _ = fs::remove_dir(&dir).await;
-                return Err(Error::from(err));
-            }
-        };
-        if !recorded {
             let _ = fs::remove_file(&part).await;
             let _ = fs::remove_dir(&dir).await;
-            return Err(storage::no_such_upload(upload_id).into());
+            return Err(database::map_contract_error(err));
         }
         let metadata = fs::metadata(&part).await?;
         Ok(PartInfo {
@@ -689,77 +495,62 @@ impl Store {
         max_parts: usize,
     ) -> Result<(Vec<PartInfo>, bool, Option<u32>), Error> {
         let dir = self.upload_dir(bucket, upload_id)?;
-        // One read transaction: the upload check AND the committed PARTS
-        // rows of the page (raw rows from `marker + 1`, capped at
-        // `max_parts`, plus one lookahead for `truncated` — a page costs
-        // O(page) rows, not a full-upload scan). The ETags are parsed only
-        // for the emitted page (an invalid page row is skipped — corrupted
-        // rows are rare and self-healing; listing is DB-driven and does
-        // not fall back to the file, only the point query does, §5.5.7).
-        // `max_parts = 0` requests nothing, and no marker either (an
-        // exclusive-after marker would skip the first part of the next
-        // page forever).
-        let (found, page, truncated) = self
-            .handle
-            .read(|txn| {
-                let uploads = upload::Table::open_readonly(txn)?;
-                if !uploads.key_matches(bucket, key, upload_id)? {
-                    return Ok((false, Vec::new(), false));
-                }
-                if max_parts == 0 {
-                    return Ok((true, Vec::new(), false));
-                }
-                // The marker is exclusive — but `u32::MAX` has no
-                // successor: saturating the start would re-include the
-                // marker part itself. (Unreachable via S3's 1..=10000
-                // range; this layer does not rely on that.)
-                let Some(start) = marker.map_or(Some(0), |m| m.checked_add(1)) else {
-                    return Ok((true, Vec::new(), false));
-                };
-                let (recorded, truncated) = part::Table::open_readonly(txn)?
-                    .list_from(bucket, upload_id, start, max_parts)?;
-                // Join the `PART_CHECKSUMS` row of each part. Probed once
-                // per page: an upload with no checksum rows at all (the
-                // checksum feature off ⇒ the table is guaranteed empty)
-                // skips the per-part point reads — one probe read instead
-                // of one per part (F03).
-                let checksums = part_checksum::Table::open_readonly(txn)?;
-                let checksums = part_checksum::Table::has_upload(
-                    &checksums,
-                    bucket.as_ref().as_str(),
-                    upload_id,
-                )?
-                .then(|| part_checksum::Table::open_readonly(txn))
-                .transpose()?;
-                let page = recorded
-                    .into_iter()
-                    .map(|(n, hex)| {
-                        let checksum = checksums
-                            .as_ref()
-                            .map(|table| table.get(bucket.as_ref().as_str(), upload_id, n))
-                            .transpose()?
-                            .flatten();
-                        Ok((n, hex, checksum))
-                    })
-                    .collect::<Result<Vec<_>, database::Error>>()?;
-                Ok((true, page, truncated))
-            })
-            .map_err(Error::from)?;
-        if !found {
+        // The identity check and the page are two contract calls: `get`
+        // does the key check (an absent or key-mismatched upload answers
+        // NoSuchUpload) and `list_parts_page` does the page — committed
+        // `PARTS` rows from the raw lower bound, capped at `max_parts`,
+        // plus one lookahead for `truncated`, so a page costs O(page) rows
+        // and not a full-upload scan, with the `PART_CHECKSUMS` join the
+        // contract owns. This layer keeps only the marker arithmetic (the
+        // exclusive marker's `+1`, which must express every raw `u32`: the
+        // `u32::MAX` boundary has no successor) and pass 2's file stat.
+        // The ETags are parsed by the contract for the emitted page (an
+        // invalid page row is skipped — corrupted rows are rare and
+        // self-healing; listing is DB-driven and does not fall back to the
+        // file, only the point query does, §5.5.7).
+        if self
+            .meta
+            .get(bucket, key, upload_id)
+            .await
+            .map_err(database::map_contract_error)?
+            .is_none()
+        {
             return Err(storage::no_such_upload(upload_id).into());
         }
-        // The resume marker: the last RAW row of the page (before pass-2
+        // The marker is exclusive — but `u32::MAX` has no successor:
+        // saturating the start would re-include the marker part itself.
+        // (Unreachable via S3's 1..=10000 range; this layer does not rely on
+        // that.) `max_parts = 0` requests nothing, and no marker either (an
+        // exclusive-after marker would skip the first part of the next page
+        // forever) — the contract answers that empty, untruncated page.
+        let Some(start) = marker.map_or(Some(0), |m| m.checked_add(1)) else {
+            return Ok((Vec::new(), false, None));
+        };
+        let page = self
+            .meta
+            .list_parts_page(bucket, upload_id, start, max_parts)
+            .await
+            .map_err(database::map_contract_error)?;
+        // The resume marker: the last row the page SERVED (before pass-2
         // filtering) — a page that survives filtering is the same thing,
         // and a truncated page whose parts all vanished still advances
-        // the client past them.
-        let raw_last = page.last().map(|(n, _, _)| *n);
+        // the client past them. A truncated page that served *nothing* has
+        // no served row to name: every raw row of it carried a
+        // domain-invalid ETag and self-healed away, so the contract's raw
+        // last number is the marker then. That page is unreachable through
+        // storage's own writes (they validate ETags) — an out-of-band
+        // tamper — but a markerless truncated page would send the client
+        // back to the same page forever, so the fallback rides here.
+        let served_last = page.rows.last().map(|row| row.number);
+        let raw_last = if page.more && served_last.is_none() {
+            page.raw_last
+        } else {
+            served_last
+        };
         // Pass 2: size/mtime from the part files of this page only.
-        let mut parts = Vec::with_capacity(page.len());
-        for (n, hex, checksum) in page {
-            let Ok(etag) = ETag::new(&hex) else {
-                continue;
-            };
-            let path = part_path(&dir, n);
+        let mut parts = Vec::with_capacity(page.rows.len());
+        for row in page.rows {
+            let path = part_path(&dir, row.number);
             let metadata = match fs::metadata(&path).await {
                 Ok(metadata) => metadata,
                 // A part can vanish between the passes (a concurrent
@@ -768,14 +559,14 @@ impl Store {
                 Err(err) => return Err(err.into()),
             };
             parts.push(PartInfo {
-                part_number: n.into(),
+                part_number: row.number.into(),
                 size: metadata.len(),
-                etag,
+                etag: row.etag,
                 last_modified: metadata.modified()?,
-                checksum,
+                checksum: row.checksum,
             });
         }
-        Ok((parts, truncated, raw_last))
+        Ok((parts, page.more, raw_last))
     }
 
     /// The ETag of one part: the `PARTS` record, or recomputed streaming
@@ -844,36 +635,31 @@ impl Store {
             self.require_upload(bucket, key, upload_id).await?;
             return Err(storage::no_parts().into());
         }
-        // One read transaction: the upload check AND the `PARTS` rows of
-        // the requested parts only (point lookups — no full-upload scan;
-        // the verify loop below looks each part up here instead of opening
-        // a transaction per part). The `PART_CHECKSUMS` row of each part
-        // joins in the same transaction (spec 2026-08-31 — the rows
-        // commit atomically with the part rows, so the join is consistent
-        // with the verified ETag).
-        let (found, records) = self
-            .handle
-            .read(|txn| {
-                let uploads = upload::Table::open_readonly(txn)?;
-                if !uploads.key_matches(bucket, key, upload_id)? {
-                    return Ok((false, HashMap::new()));
-                }
-                let table = part::Table::open_readonly(txn)?;
-                let checksums = part_checksum::Table::open_readonly(txn)?;
-                let mut records = HashMap::with_capacity(parts.len());
-                for part in parts {
-                    let n = u32::from(part.part_number);
-                    if let Some(hex) = table.get_hex(bucket, upload_id, n)? {
-                        let checksum_row = checksums.get(bucket.as_ref().as_str(), upload_id, n)?;
-                        records.insert(n, (hex, checksum_row));
-                    }
-                }
-                Ok((true, records))
-            })
-            .map_err(Error::from)?;
-        if !found {
+        // The contract's completion-time join: the upload's key check AND
+        // the requested parts' PARTS + PART_CHECKSUMS rows in one read
+        // transaction (the rows commit atomically with the part rows, so
+        // the join is consistent with the verified ETag). `None` is the
+        // key mismatch.
+        let numbers: Vec<PartNumber> = parts.iter().map(|part| part.part_number).collect();
+        let Some(joined) = self
+            .meta
+            .part_records(bucket, key, upload_id, &numbers)
+            .await
+            .map_err(database::map_contract_error)?
+        else {
             return Err(storage::no_such_upload(upload_id).into());
-        }
+        };
+        // The verify loop's point map: `n -> (stored ETag, checksum row)`;
+        // a part with no PARTS row (or a domain-invalid stored ETag the
+        // join dropped) reads as absent — the crash-window recompute
+        // fallback, §5.6.
+        let records: HashMap<u32, (ETag, Option<checksum::Part>)> = numbers
+            .iter()
+            .zip(joined)
+            .filter_map(|(n, record)| {
+                record.map(|record| (u32::from(*n), (record.etag, record.checksum)))
+            })
+            .collect();
         // Verify: strictly ascending, each part exists with a matching
         // ETag (the `PARTS` row, or the file recompute when the row is
         // missing — the crash-window fallback, §5.6).
@@ -905,7 +691,7 @@ impl Store {
             // the assembly copy fails the assembly's re-hash →
             // InvalidPart — never an undersized commit.
             check_part_minimum(n, metadata.len(), index + 1 == parts.len())?;
-            let stored = match records.get(&n).and_then(|(hex, _)| ETag::new(hex).ok()) {
+            let stored = match records.get(&n).map(|(etag, _)| etag.clone()) {
                 // A domain-invalid record (or no record — the crash-window
                 // fallback): recompute from the file, §5.6.
                 None => match md5_of_file(&path).await {
@@ -1049,18 +835,19 @@ impl Store {
         bucket: &bucket::Name,
         upload_id: &str,
     ) -> Result<(), Error> {
-        let bucket = bucket.clone();
-        let upload_id = upload_id.to_string();
-        self.handle
-            .write(move |txn| drain_upload(txn, &bucket, &upload_id))
+        self.meta
+            .drain_upload(bucket, upload_id)
             .await
-            .map_err(Error::from)
+            .map_err(database::map_contract_error)
     }
 
-    /// Abort an upload: one transaction deletes its `UPLOADS` /
-    /// `UPLOAD_CHECKSUMS` + `PARTS` / `PART_CHECKSUMS` records, then the
-    /// part directory is removed best-effort. `NoSuchUpload` when the
-    /// upload does not exist.
+    /// Abort an upload — one transaction, then the best-effort directory
+    /// removal. The contract's `drain_upload_checked` does the identity
+    /// (key) check and the `UPLOADS` / `UPLOAD_CHECKSUMS` + `PARTS` /
+    /// `PART_CHECKSUMS` deletion in **one transaction**, so a racing
+    /// complete cannot slip between the check and the removal; an absent
+    /// or key-mismatched upload projects to `NoSuchUpload` and nothing is
+    /// drained.
     pub async fn abort(
         &self,
         bucket: &bucket::Name,
@@ -1068,24 +855,15 @@ impl Store {
         upload_id: &str,
     ) -> Result<(), Error> {
         // The dir path (UUID-validated) is needed for the best-effort
-        // removal. One write transaction: the existence + key check and
-        // the full drain are atomic — [`drain_upload_checked`] holds the
-        // `UPLOADS` handle for the check (redb refuses a second
-        // `open_table` of `UPLOADS` in one transaction). The checksum
-        // rows must drain in the SAME txn — an abort that left them
-        // behind would orphan them forever.
+        // removal — resolved before the drain (a non-UUID id is not an
+        // upload at all) and used after it: the records are gone either
+        // way, so a failed removal is residue the orphan stage reclaims,
+        // never a client-visible error.
         let dir = self.upload_dir(bucket, upload_id)?;
-        let bucket = bucket.clone();
-        let key = key.clone();
-        let upload_id_owned = upload_id.to_string();
-        let found = self
-            .handle
-            .write(move |txn| drain_upload_checked(txn, &bucket, &key, &upload_id_owned))
+        self.meta
+            .drain_upload_checked(bucket, key, upload_id)
             .await
-            .map_err(Error::from)?;
-        if !found {
-            return Err(storage::no_such_upload(upload_id).into());
-        }
+            .map_err(database::map_contract_error)?;
         let _ = fs::remove_dir_all(&dir).await;
         Ok(())
     }
@@ -1097,52 +875,50 @@ impl Store {
     /// the backend's `list_multipart_uploads` pages through
     /// [`Self::list_uploads_page`] instead (item 7e).
     pub async fn list_uploads(&self, bucket: &bucket::Name) -> Result<Vec<MultipartUpload>, Error> {
-        let rows: Vec<UploadRow> = self
-            .handle
-            .read(|txn| {
-                let table = upload::Table::open_readonly(txn)?;
-                let checksums = upload_checksum::Table::open_readonly(txn)?;
-                materialize_upload_rows(&table, &checksums, bucket)
-            })
-            .map_err(Error::from)?;
-        let mut uploads = uploads_from_rows(rows)?;
+        let mut uploads = self
+            .meta
+            .list_uploads(bucket)
+            .await
+            .map_err(database::map_contract_error)?;
+        // The facade's identity guard (see [`Self::get_upload`]): only a
+        // UUID id can name a part path.
+        uploads.retain(|upload| Uuid::parse_str(&upload.upload_id).is_ok());
         sort_uploads(&mut uploads);
         Ok(uploads)
     }
 
     /// One page of the bucket's in-progress uploads per the S3
-    /// ListMultipartUploads semantics — the **bounded-memory pagination**
-    /// (item 7e, data-path review 2026-08-27): the old full-bucket `Vec`
-    /// + in-memory sort + engine pagination is gone.
-    ///
-    /// The bucket's `UPLOADS` rows are keyed by upload id — arbitrary
-    /// relative to the composite `key\0upload_id` page order — so every
-    /// row of the bucket is examined, but only the page is held in
-    /// memory. That is exactly the engine's **unordered** variant
-    /// ([`group_and_paginate_unordered`] — the shared bounded max-heap
-    /// keeps the `max + 1` smallest distinct entries after the marker;
-    /// F35: one home for the marker/rollup/truncation/resume rules,
-    /// page size, token, and order identical to the ordered engine over
-    /// a key-sorted stream). This method supplies only the row
-    /// materialization: domain validation and the prefix filter (the
-    /// engine receives only matching keys — non-matching keys must not
-    /// become object entries).
-    ///
-    /// The redb read transaction is SHORT (F18): it only materializes
-    /// the bucket's raw rows — the pagination runs after the
-    /// transaction is released, so concurrent put_part/complete commits
-    /// never pin old pages for the scan's duration (the exact
-    /// held-open-window pattern the scanner was changed to eliminate).
-    /// The materialization runs on the blocking pool (`read_blocking` —
-    /// the P3 pattern): never on a request thread.
+    /// ListMultipartUploads semantics. The record materialization and the
+    /// pagination are the contract's (`UploadMeta::list_uploads_page`):
+    /// one short read transaction on the blocking pool, then the shared
+    /// unordered engine (F18/F35 — the marker, rollup, truncation, and
+    /// resume rules have one home).
     ///
     /// `marker` is the composite `key\0upload_id` order (the backend
-    /// builds it from the S3 `key-marker`/`upload-id-marker` pair; a
-    /// bare key marker uses the sentinel upload id). `max_uploads = 0`
-    /// returns an empty, untruncated page with no marker (an
-    /// exclusive-after marker would skip the first entry of the next
-    /// page forever). Returns `(uploads, common_prefixes, truncated,
-    /// next)` — `next` is the composite resume marker when truncated.
+    /// builds it from the S3 `key-marker`/`upload-id-marker` pair; a bare
+    /// key marker uses the sentinel upload id). `max_uploads = 0` returns
+    /// an empty, untruncated page with no marker. Returns `(uploads,
+    /// common_prefixes, truncated, next)` — `next` is the composite
+    /// resume marker when truncated.
+    ///
+    /// The facade's identity guard (see [`Self::get_upload`]) is applied
+    /// to the page the contract served: only a UUID id can name a part
+    /// path, and the contract's decode deliberately does not validate the
+    /// id, so a tampered or corrupt `UPLOADS` row is dropped here — the
+    /// same rule the two unpaged listings apply.
+    ///
+    /// The guard drops entries from the served page, **after** the
+    /// contract's marker arithmetic: `truncated`/`next` remain the raw
+    /// page's. The resume protocol survives that because `next` is the raw
+    /// page's last composite order and the marker is exclusive-after —
+    /// every valid row at or below `next` was served (the page holds the
+    /// `max` smallest entries after the marker), so a client resuming on
+    /// `next` can neither re-see a served upload nor skip a live one. What
+    /// it can see is a page shorter than `max_uploads` (in principle
+    /// empty) while `truncated` is true; the next request then advances
+    /// past `next` as usual. Filtering *before* the arithmetic would mean
+    /// materializing only UUID rows, which is the contract's business, not
+    /// this facade's.
     pub async fn list_uploads_page(
         &self,
         bucket: &bucket::Name,
@@ -1151,39 +927,13 @@ impl Store {
         marker: Option<&str>,
         max_uploads: usize,
     ) -> Result<(Vec<MultipartUpload>, Vec<String>, bool, Option<String>), Error> {
-        if max_uploads == 0 {
-            return Ok((Vec::new(), Vec::new(), false, None));
-        }
-        let bucket = bucket.clone();
-        let bucket_txn = bucket.clone();
-        // F18: one SHORT read transaction — materialize the bucket's raw
-        // rows (upload id, key, initiated-at) and release the txn before
-        // any pagination work.
-        let rows: Vec<UploadRow> = self
-            .handle
-            .read_blocking(move |txn| {
-                let table = upload::Table::open_readonly(txn)?;
-                let checksums = upload_checksum::Table::open_readonly(txn)?;
-                materialize_upload_rows(&table, &checksums, &bucket_txn)
-            })
+        let (mut uploads, common_prefixes, truncated, next) = self
+            .meta
+            .list_uploads_page(bucket, prefix, delimiter, marker, max_uploads)
             .await
-            .map_err(Error::from)?;
-        // Domain validation (same as `list_uploads` — invalid rows are
-        // not entries) and the prefix filter, then the shared unordered
-        // engine does the pagination.
-        let uploads: Vec<MultipartUpload> = uploads_from_rows(rows)?
-            .into_iter()
-            .filter(|u| u.key.starts_with(prefix))
-            .collect();
-        Ok(group_and_paginate_unordered(
-            uploads,
-            prefix,
-            delimiter,
-            marker,
-            max_uploads,
-            |u| u.key.as_ref(),
-            |u| uploads_order(&u.key, &u.upload_id),
-        ))
+            .map_err(database::map_contract_error)?;
+        uploads.retain(|upload| Uuid::parse_str(&upload.upload_id).is_ok());
+        Ok((uploads, common_prefixes, truncated, next))
     }
 
     /// The latest part mtime of an upload (`UNIX_EPOCH` when no parts exist
@@ -1206,13 +956,10 @@ impl Store {
     /// Whether a bucket has any in-progress upload (bucket-delete check:
     /// in-progress uploads make the bucket non-empty).
     pub async fn has_uploads(&self, bucket: &bucket::Name) -> Result<bool, Error> {
-        self.handle
-            .read(|txn| {
-                upload::Table::open_readonly(txn)?
-                    .has_bucket(bucket)
-                    .map_err(Into::into)
-            })
-            .map_err(Error::from)
+        self.meta
+            .has_uploads(bucket)
+            .await
+            .map_err(database::map_contract_error)
     }
 
     /// Remove the whole multipart state of a bucket: one transaction
@@ -1223,11 +970,10 @@ impl Store {
     #[cfg(test)]
     pub async fn remove_bucket(&self, bucket: &bucket::Name) -> Result<(), Error> {
         let dir = self.root.join(&**bucket);
-        let bucket = bucket.clone();
-        self.handle
-            .write(move |txn| drain_bucket_uploads(txn, &bucket))
+        self.meta
+            .drain_bucket(bucket)
             .await
-            .map_err(Error::from)?;
+            .map_err(database::map_contract_error)?;
         ok_if_missing(fs::remove_dir_all(&dir).await)?;
         Ok(())
     }
@@ -1235,35 +981,13 @@ impl Store {
     /// Upload records of every bucket, in `(key, upload_id)` order — the
     /// sweep's idle-expiry walk.
     pub async fn walk_uploads(&self) -> Result<Vec<MultipartUpload>, Error> {
-        let rows: Vec<UploadRow> = self
-            .handle
-            .read(|txn| {
-                let table = upload::Table::open_readonly(txn)?;
-                let checksums = upload_checksum::Table::open_readonly(txn)?;
-                let mut rows = Vec::new();
-                table.for_each(
-                    |b, upload_id, key, initiated_at, tags_wire, owner_wire, acl_wire| {
-                        let Ok(bucket) = bucket::name(b) else {
-                            return Ok(());
-                        };
-                        let checksum_row = checksums.get(b, upload_id)?;
-                        rows.push((
-                            bucket,
-                            upload_id.to_string(),
-                            key.to_string(),
-                            initiated_at,
-                            object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX),
-                            decode_owner_wire(owner_wire),
-                            decode_acl_wire(acl_wire),
-                            checksum_row,
-                        ));
-                        Ok(())
-                    },
-                )?;
-                Ok(rows)
-            })
-            .map_err(Error::from)?;
-        let mut uploads = uploads_from_rows(rows)?;
+        let mut uploads = self
+            .meta
+            .walk_uploads()
+            .await
+            .map_err(database::map_contract_error)?;
+        // The facade's identity guard (see [`Self::get_upload`]).
+        uploads.retain(|upload| Uuid::parse_str(&upload.upload_id).is_ok());
         sort_uploads(&mut uploads);
         Ok(uploads)
     }
@@ -1327,16 +1051,13 @@ impl Store {
         upload_id: &str,
     ) -> Result<PathBuf, Error> {
         let dir = self.upload_dir(bucket, upload_id)?;
-        let valid = self
-            .handle
-            .read(|txn| {
-                let table = upload::Table::open_readonly(txn)?;
-                table
-                    .key_matches(bucket, key, upload_id)
-                    .map_err(Into::into)
-            })
-            .map_err(Error::from)?;
-        if valid {
+        if self
+            .meta
+            .get(bucket, key, upload_id)
+            .await
+            .map_err(database::map_contract_error)?
+            .is_some()
+        {
             Ok(dir)
         } else {
             Err(storage::no_such_upload(upload_id).into())
@@ -1371,6 +1092,19 @@ impl Store {
         }
         Ok(self.root.join(&**bucket).join(upload_id))
     }
+
+    /// The content plane's part mapping: the same layout every multipart
+    /// call uses (`<state>/multipart/<bucket>/<upload_id>/<n>`, the upload
+    /// id validated as the UUID the create allocated — a client-supplied
+    /// id never reaches the filesystem unvalidated).
+    pub(crate) fn part_file(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        number: u32,
+    ) -> Result<PathBuf, Error> {
+        Ok(part_path(&self.upload_dir(bucket, upload_id)?, number))
+    }
 }
 
 /// Create a store rooted at `<state_dir>/multipart/` over its **own**
@@ -1389,7 +1123,7 @@ impl Store {
 #[inline]
 pub fn store(state_dir: &Path) -> Result<Store, Error> {
     Ok(Store::from_handle(
-        Handle::open(state_dir)?,
+        Driver::new(database::open(state_dir)?.db),
         state_dir,
         DEFAULT_MAX_CONCURRENT_UPLOADS,
     ))
@@ -1407,7 +1141,7 @@ mod tests {
             acl::Acl,
             checksum::Algorithm,
             multipart::MIN_PART_BYTES,
-            storage::{Error as StorageError, group_and_paginate_ordered},
+            storage::{Error as StorageError, group_and_paginate_ordered, uploads_order},
         },
         _util::testing::body,
         testutil,
@@ -1552,6 +1286,63 @@ mod tests {
             }
         }
         assert_eq!(combos, 80, "the matrix ran");
+    }
+
+    /// A tampered `UPLOADS` row whose id is not a UUID never reaches the
+    /// listings: only a UUID id can name a part path, so the facade drops
+    /// it — the paged listing exactly as the two unpaged ones. The row here
+    /// is a direct database write (the API can never produce one).
+    #[tokio::test]
+    async fn the_paged_listing_drops_a_non_uuid_upload_row() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let live = store
+            .create(
+                &b,
+                &object::key("a.txt").unwrap(),
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        let tampered = "../../tampered";
+        {
+            let bucket = b.clone();
+            let tampered = tampered.to_string();
+            store
+                .handle
+                .write(move |txn| {
+                    upload::Table::open(txn)?
+                        .insert((&*bucket, tampered.as_str()), ("a.txt", 0, "", "", ""))
+                        .map_err(|e| database::Error::Redb(e.into()))?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        let listed = store.list_uploads(&b).await.unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|upload| upload.upload_id.as_str())
+                .collect::<Vec<_>>(),
+            [live.upload_id.as_str()],
+            "the unpaged listing drops the tampered row"
+        );
+        let (page, _, truncated, _) = store
+            .list_uploads_page(&b, "", None, None, 100)
+            .await
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(
+            page.iter()
+                .map(|upload| upload.upload_id.as_str())
+                .collect::<Vec<_>>(),
+            [live.upload_id.as_str()],
+            "and so does the paged one"
+        );
     }
 
     #[tokio::test]
@@ -2391,6 +2182,64 @@ mod tests {
             }
         }
         assert!(saw_no_such_upload, "the abort never landed mid-assembly");
+    }
+
+    /// The corrupt-ETag resume delta, from the consumer side (the redb pin
+    /// owns the contract answer; this pins what fs *does* with it): a truncated
+    /// page whose raw rows all carry a domain-invalid ETag serves no part, and
+    /// the resume marker must still name the raw read's last number — a
+    /// markerless truncated page sends the client back to the same page
+    /// forever. Only out-of-band tampering reaches this page (`put_part` takes
+    /// a validated `&ETag`), through the same raw-table seam the sibling tests
+    /// use.
+    #[tokio::test]
+    async fn a_truncated_page_of_invalid_etags_still_names_a_resume_marker() {
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let upload = store
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        // Three raw `PARTS` rows carrying an invalid ETag wire and no part
+        // files: pass 2 skips missing files, so the page logic sees the raw
+        // rows — a two-part page whose truncation probe is the third row.
+        let bucket = b.clone();
+        let upload_id = upload.upload_id.clone();
+        store
+            .handle
+            .write(move |txn| {
+                let mut parts = part::Table::open(txn).unwrap();
+                for number in [1u32, 2, 3] {
+                    parts
+                        .insert((&*bucket, upload_id.as_str(), number), "not-an-etag")
+                        .map_err(|e| database::Error::Redb(e.into()))?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (parts, truncated, marker) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 2)
+            .await
+            .unwrap();
+        assert!(
+            parts.is_empty(),
+            "every raw row self-heals away, so the page serves nothing: {parts:?}"
+        );
+        assert!(truncated, "the raw read saw a row beyond the page");
+        assert_eq!(
+            marker,
+            Some(2),
+            "the marker is the raw read's last number — a markerless truncated page loops"
+        );
     }
 
     #[tokio::test]

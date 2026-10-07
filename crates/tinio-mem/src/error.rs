@@ -2,7 +2,7 @@
 //!
 //! [`Error`] is a superset of [`storage::Error`]: contract failures wrap
 //! that type; redb failures wrap [`DatabaseError`], the alias of the
-//! shared five-variant redb error core in tinio-store. `#[from]` converts
+//! shared five-variant redb error core in tinio-store-redb. `#[from]` converts
 //! [`storage::Error`] automatically. Projection onto the contract unwraps
 //! `Storage` and maps [`DatabaseError`] onto [`Error::Io`].
 
@@ -35,7 +35,7 @@ pub enum Error {
 }
 
 /// A redb failure: the shared five-variant mapping core
-/// ([`tinio_store::error::Error`]). The alias keeps the historical name.
+/// ([`tinio_store_redb::error::Error`]). The alias keeps the historical name.
 ///
 /// # Examples
 ///
@@ -46,7 +46,7 @@ pub enum Error {
 /// let err = Error::Database(DatabaseError::from(ValueTooLarge(1)));
 /// assert!(matches!(err, Error::Database(DatabaseError::Storage(_))));
 /// ```
-pub use crate::_store::Error as DatabaseError;
+pub use crate::_store_redb::Error as DatabaseError;
 
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {

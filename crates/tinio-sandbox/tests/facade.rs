@@ -284,8 +284,16 @@ fn the_launcher_surface_is_re_exported() {
     // header). The defaults themselves moved beside the selection they describe, in `src/lib.rs`.
     #[cfg(target_os = "macos")]
     {
-        let _: tinio_sandbox::macos::Mechanism = tinio_sandbox::macos::Mechanism::SandboxExec;
-        let _: tinio_sandbox::macos::Options = tinio_sandbox::macos::Options::default();
+        // The two names bound below, imported the way a consumer writes them (the
+        // `tinio_sandbox::macos` doctest in `src/lib.rs` is the same line) — and the
+        // import belongs inside the gate: `clippy::absolute_paths` governs every path of
+        // more than two segments, so an unimported `tinio_sandbox::macos::…` is an error
+        // under this crate's `[lints.clippy]`, while an import here cannot be unused on a
+        // target that never compiles this block.
+        use tinio_sandbox::macos::{Mechanism, Options};
+
+        let _: Mechanism = Mechanism::SandboxExec;
+        let _: Options = Options::default();
     }
 }
 

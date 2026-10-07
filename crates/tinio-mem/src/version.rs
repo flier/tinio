@@ -56,7 +56,7 @@
 //! suspended deletes keep one marker and add no history row.
 //!
 //! The shared tables (`versions`, `version_index`, `bucket_versioning`) are
-//! `tinio_store`'s — the same ones `tinio-fs` opens — and the write path's
+//! `tinio_store_redb`'s — the same ones `tinio-fs` opens — and the write path's
 //! **policy is the shared `tinio_version::plan_write`**, imported rather than
 //! copied: the decision (whether to supersede, which identity and sequence
 //! the incoming version takes, the one-null-row convergence, the marker's
@@ -97,7 +97,7 @@ use futures::stream::iter;
 // the feature off the body answers the constant `false` and the shared
 // state table is never opened.
 #[cfg(feature = "versioning")]
-use crate::_store::bucket_versioning;
+use crate::_store_redb::bucket_versioning;
 // The feature-off `VersionOps` impl below is the only user, so the gate is
 // the import's too: the feature-on build (whose impl lives in `enabled`)
 // does not carry an unused import.
@@ -212,8 +212,8 @@ mod enabled {
                 State, wire_of,
             },
         },
-        _store::{
-            bucket, bucket_versioning, meta, objects,
+        _store_redb::{
+            bucket, bucket_versioning, object_meta, objects,
             scan::{drain_pair, for_each_pair},
             version as stored, version_index,
         },
@@ -232,11 +232,11 @@ mod enabled {
     pub(crate) mod blobs {
         use redb::TableDefinition;
 
-        use crate::_store::table::{self, TableDef};
+        use crate::_store_redb::table::{self, TableDef};
 
         /// The per-table marker: the table definition for the shared handle
         /// arms (opening, ensuring and the read/write split are
-        /// `tinio_store::table`'s; a mem-local table cannot add inherent
+        /// `tinio_store_redb::table`'s; a mem-local table cannot add inherent
         /// methods to that handle, so this module's accessors are the
         /// `put_blob` / `get_blob` free functions beside it).
         pub enum Def {}
@@ -368,7 +368,7 @@ mod enabled {
         /// The `object_meta` row — the current version's metadata. Absent
         /// when the current version is a delete marker, or when the key has
         /// no current version.
-        meta: Option<meta::Stored>,
+        object_meta: Option<object_meta::Stored>,
         /// Whether the object row exists (the current object version's
         /// content; always written in the same transaction as its meta row).
         content: bool,
@@ -382,10 +382,10 @@ mod enabled {
         /// (`Row::is_history` — a current delete marker, carrying no index
         /// entry).
         fn current(&self) -> Option<Current> {
-            if let Some(meta) = &self.meta
+            if let Some(object_meta) = &self.object_meta
                 && self.content
             {
-                return Some(Current::Object(Box::new(meta.clone())));
+                return Some(Current::Object(Box::new(object_meta.clone())));
             }
             self.rows
                 .iter()
@@ -433,7 +433,7 @@ mod enabled {
     enum Current {
         /// An object version: its content is the object row, its metadata
         /// and identity the meta row.
-        Object(Box<meta::Stored>),
+        Object(Box<object_meta::Stored>),
         /// A delete marker: a version row stamped current, holding no
         /// content.
         Marker(Box<stored::Row>),
@@ -443,7 +443,7 @@ mod enabled {
     fn peek(txn: &redb::ReadTransaction, bucket: &Name, key: &object::Key) -> Result<Peek, Error> {
         let b = bucket.as_ref().as_str();
         let k = key.as_ref().as_str();
-        let meta = meta::Table::open_readonly(txn)?.get(b, k)?;
+        let object_meta = object_meta::Table::open_readonly(txn)?.get(b, k)?;
         let content = objects::Table::open_readonly(txn)?.get(b, k)?.is_some();
         let mut rows = Vec::new();
         stored::Table::open_readonly(txn)?.for_key(b, k, |row| {
@@ -451,7 +451,7 @@ mod enabled {
             Ok(())
         })?;
         Ok(Peek {
-            meta,
+            object_meta,
             content,
             rows,
         })
@@ -465,7 +465,7 @@ mod enabled {
     ) -> Result<Peek, Error> {
         let b = bucket.as_ref().as_str();
         let k = key.as_ref().as_str();
-        let meta = meta::Table::open(txn)?.get(b, k)?;
+        let object_meta = object_meta::Table::open(txn)?.get(b, k)?;
         let content = objects::Table::open(txn)?.get(b, k)?.is_some();
         let mut rows = Vec::new();
         stored::Table::open(txn)?.for_key(b, k, |row| {
@@ -473,7 +473,7 @@ mod enabled {
             Ok(())
         })?;
         Ok(Peek {
-            meta,
+            object_meta,
             content,
             rows,
         })
@@ -485,7 +485,7 @@ mod enabled {
         /// `object_meta` row the resolver judged matched, carried with the
         /// answer so a caller never re-reads it and never re-derives that the
         /// answer was the current slot.
-        Current(Box<meta::Stored>),
+        Current(Box<object_meta::Stored>),
         /// One version row — a noncurrent version, or the current marker.
         Row(Box<stored::Row>),
     }
@@ -497,14 +497,14 @@ mod enabled {
     /// entry may name a superseded version while a newer null version is
     /// current.
     fn resolve(peek: &Peek, index_seq: Option<u64>, version: Option<&Id>) -> Option<Found> {
-        if let Some(meta) = &peek.meta
+        if let Some(object_meta) = &peek.object_meta
             && peek.content
             && match version {
-                Some(id) => meta.version_id.as_ref() == Some(id),
-                None => meta.version_id.is_none(),
+                Some(id) => object_meta.version_id.as_ref() == Some(id),
+                None => object_meta.version_id.is_none(),
             }
         {
-            return Some(Found::Current(Box::new(meta.clone())));
+            return Some(Found::Current(Box::new(object_meta.clone())));
         }
         let wire = wire_of(version);
         if let Some(row) = peek
@@ -530,7 +530,7 @@ mod enabled {
     enum Target {
         /// The current version, with the `object_meta` row the resolver
         /// judged.
-        Current(Box<meta::Stored>),
+        Current(Box<object_meta::Stored>),
         /// One content version row.
         Row(Box<stored::Row>),
     }
@@ -637,7 +637,7 @@ mod enabled {
                 // supersede and the object-meta encoder use: the recorded
                 // ETag, not a hash of the bytes, so a multipart-composed
                 // `MD5-of-MD5s-N` value survives the supersede verbatim.
-                let (etag, tags, checksum, owner, acl) = meta::wires(Some(&meta));
+                let (etag, tags, checksum, owner, acl) = object_meta::wires(Some(&meta));
                 stored::Row {
                     id: wire_of(meta.version_id.as_ref()),
                     blob: stored::encode_blob(&BlobRef::single(hash, data.len() as u64)),
@@ -748,8 +748,8 @@ mod enabled {
             objects.remove(b, k)?;
             removed
         };
-        meta::Table::open(txn)?.remove(b, k)?;
-        crate::_store::object_part::Table::open(txn)?.remove_key(b, k)?;
+        object_meta::Table::open(txn)?.remove(b, k)?;
+        crate::_store_redb::object_part::Table::open(txn)?.remove_key(b, k)?;
         Ok(-(removed as i64))
     }
 
@@ -798,7 +798,7 @@ mod enabled {
         // The version row's recorded ETag rides the rebuilt row: the
         // materialized version keeps the value it was written with, composed
         // form included.
-        meta::Table::open(txn)?.put(b, k, &row.stored(seq, row.size, row.created, 0))?;
+        object_meta::Table::open(txn)?.put(b, k, &row.stored(seq, row.size, row.created, 0))?;
         // The bytes the rebuilt object row now holds, plus whatever the blob
         // release answers (its bytes are the row's own `size`; the copy above
         // is what replaces them).
@@ -1042,7 +1042,7 @@ mod enabled {
         /// it.
         key: String,
         /// The current slot's gated row.
-        slot: Option<meta::Stored>,
+        slot: Option<object_meta::Stored>,
         /// The key's version rows, ascending sequence.
         rows: Vec<stored::Row>,
     }
@@ -1077,9 +1077,9 @@ mod enabled {
         budget: usize,
     ) -> Result<Window, Error> {
         let from = cursor.as_bound();
-        let mut slots: BTreeMap<String, Option<meta::Stored>> = BTreeMap::new();
+        let mut slots: BTreeMap<String, Option<object_meta::Stored>> = BTreeMap::new();
         {
-            let table = meta::Table::open_readonly(txn)?;
+            let table = object_meta::Table::open_readonly(txn)?;
             table.for_bucket_gated_from(bucket, from, |key, slot| {
                 if slots.len() == budget {
                     return Ok(false);
@@ -1274,7 +1274,7 @@ mod enabled {
     /// other, never a key's second "latest").
     fn entries_of(
         key: &object::Key,
-        slot: Option<&meta::Stored>,
+        slot: Option<&object_meta::Stored>,
         rows: &[stored::Row],
     ) -> Vec<version::Entry> {
         let mut entries: Vec<version::Entry> = Vec::new();
@@ -1539,9 +1539,9 @@ mod enabled {
                 if key.is_reserved() || key.is_folder_marker() {
                     return Ok(CurrentVersion::Absent);
                 }
-                let meta = meta::Table::open_readonly(txn)?
+                let object_meta = object_meta::Table::open_readonly(txn)?
                     .get(bucket.as_ref().as_str(), key.as_ref().as_str())?;
-                if meta.is_some() {
+                if object_meta.is_some() {
                     return Ok(CurrentVersion::Object);
                 }
                 let newest = stored::Table::open_readonly(txn)?.newest(
@@ -1649,7 +1649,7 @@ mod enabled {
                 let index = index_seq_mut(txn, bucket, key, version)?;
                 match locate(resolve(&peek, index, version), version)? {
                     Target::Current(_) => {
-                        meta::Table::open(txn)?
+                        object_meta::Table::open(txn)?
                             .put_tags(b, k, &tags)?
                             .ok_or_else(|| no_such_key(key))?;
                         Ok(())
@@ -1721,10 +1721,10 @@ mod enabled {
                             owner: None,
                             grants: acl.grants.clone(),
                         };
-                        meta::Table::open(txn)?.put(
+                        object_meta::Table::open(txn)?.put(
                             b,
                             k,
-                            &meta::Stored {
+                            &object_meta::Stored {
                                 acl: fresh,
                                 ..*stored
                             },
@@ -1769,7 +1769,7 @@ mod tests {
                 storage::{self, VersionOps},
                 version::{self, HeadResult, ListParams, ReadResult, State},
             },
-            _store::{scan::for_each_pair, version as stored},
+            _store_redb::{scan::for_each_pair, version as stored},
             _util::testing::{body, read_body},
             Error, MemoryOptions, MemoryStorage,
         };

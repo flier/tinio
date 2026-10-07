@@ -39,59 +39,31 @@
 //!   check because the identity wire cannot separate two null versions, which
 //!   share it by construction.
 
-use std::{
-    io::{Error as IoError, ErrorKind},
-    path::PathBuf,
-    time::SystemTime,
-};
+use std::{io::ErrorKind, path::PathBuf, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use tokio::fs;
 
 use crate::{
     _core::{
-        BodyStream,
-        bucket::Name,
-        object, storage, to_nanos,
-        version::{State, wire_of},
+        ETag, MultipartUpload, acl,
+        bucket::{self, Name},
+        checksum, cors,
+        meta::{
+            BucketMeta, Metadata, ObjectMeta, UploadMeta, VersionMeta, bucket as bucket_row,
+            object as object_row, upload as upload_row,
+            version::{Current as RowCurrent, Stored},
+        },
+        multipart, object, storage,
+        version::{self, State},
     },
-    _store::{bucket_versioning, meta, version as rows, version_index},
-    _version::{
-        ContentPort, Current, CurrentRows, PublishedBody, Superseded, VersionRows, converges_null,
-    },
+    _store_redb::{RedbMetadata, bucket_versioning, object_meta},
+    _version::{Current, CurrentRows},
     Error, FsStorage,
     error::contract,
     fsutil,
     meta::{Content, Verdict, gate},
 };
-
-/// The refusal of a supersede that would overwrite a row naming a **different**
-/// version — a different identity, kind or content: an I/O-class contract
-/// error (`ErrorKind::Other`, never a not-found) naming the key, the sequence
-/// and the identity sitting there.
-///
-/// The reachable state behind this refusal is the null-versus-null shape: a
-/// committed row at sequence 0 and a current null version whose content
-/// differs from it — the identity wire cannot tell the two null versions
-/// apart, so only the content address can. A row still describing the current
-/// version is not this state: the gate reports content the row no longer
-/// matches (an out-of-band edit or removal) as the null version, whose
-/// supersede is a no-op while it holds no content.
-fn row_conflict(bucket: &Name, key: &object::Key, seq: u64, existing: &str) -> storage::Error {
-    // The context goes to the log, not the wire (2026-10-06 review): the
-    // client answers the family's generic internal error, while an operator
-    // gets the bucket, key, sequence and the identity sitting there.
-    tracing::warn!(
-        bucket = %bucket,
-        key = %key,
-        seq,
-        existing,
-        "refusing to overwrite a version row that names a different version"
-    );
-    storage::io(IoError::other(
-        "a version row conflicts with the version being superseded",
-    ))
-}
 
 /// The key's current slot as the gate left it: the port's [`Current`],
 /// the `object_meta` row the gate judged, and the key path the gate resolved
@@ -105,7 +77,7 @@ pub(crate) struct Judged {
     /// The gated slot — the port's answer.
     pub(crate) current: Current,
     /// The judged `object_meta` row (`None` when none records the key).
-    pub(crate) stored: Option<meta::Stored>,
+    pub(crate) stored: Option<object_meta::Stored>,
     /// The resolved key path, when the key has a file (`None` for a marker's
     /// slot or a file removed out of band — the states with nothing to
     /// open). Opening it is the caller's, so a metadata-only caller never
@@ -113,19 +85,29 @@ pub(crate) struct Judged {
     pub(crate) path: Option<PathBuf>,
 }
 
-/// The fs implementation of [`VersionRows`] and [`CurrentRows`]: the state
-/// database's version tables, and the key's gated current slot.
+/// The fs implementation of the contracts the engine runs on — [`Metadata`],
+/// [`VersionMeta`] and the surviving [`CurrentRows`] — plus the fs's own
+/// gated current slot: the state database's version tables reached through the
+/// contract implementation, and the key's gated slot.
 #[derive(Debug, Clone)]
 pub(crate) struct Rows {
     /// The backend this adapter serves (its state-database handle, its meta
     /// store and its path mapping).
     storage: FsStorage,
+    /// The contract implementation over the same state database: every
+    /// forwarded call runs through it, so the two-table transactions and the
+    /// version-index rules have exactly one home.
+    engine: Arc<RedbMetadata>,
 }
 
 impl Rows {
     /// Serve a backend's rows.
     pub(crate) fn new(storage: FsStorage) -> Self {
-        Self { storage }
+        // The contract implementation the storage's meta facade already holds
+        // over this same driver, cloned rather than rebuilt: a per-call
+        // `Rows` shares one engine handle instead of allocating a second.
+        let engine = storage.meta_store().engine();
+        Self { storage, engine }
     }
 
     /// The key's gated current slot — the port's [`CurrentRows::current`]
@@ -233,355 +215,644 @@ impl CurrentRows for Rows {
 }
 
 #[async_trait]
-impl VersionRows for Rows {
-    async fn state(&self, bucket: &Name) -> Result<State, storage::Error> {
-        let bucket = bucket.clone();
-        self.storage
-            .handle()
-            .read(move |txn| {
-                Ok(bucket_versioning::Table::open_readonly(txn)?
-                    .get(&bucket)?
-                    .unwrap_or_default())
-            })
-            .map_err(contract)
-    }
-
-    async fn set_state(&self, bucket: &Name, state: State) -> Result<(), storage::Error> {
-        let bucket = bucket.clone();
-        self.storage
-            .handle()
-            .write(move |txn| {
-                bucket_versioning::Table::open(txn)?.set(&bucket, state)?;
-                Ok(())
-            })
-            .await
-            .map_err(contract)
-    }
-
-    async fn put_version_row(
-        &self,
-        bucket: &Name,
-        key: &object::Key,
-        superseded: &Superseded,
-    ) -> Result<(), storage::Error> {
-        let bucket = bucket.clone();
-        let key = key.clone();
-        let seq = superseded.seq;
-        let superseded = superseded.clone();
-        let (reported_bucket, reported_key) = (bucket.clone(), key.clone());
-        let conflicted = self
-            .storage
-            .handle()
-            .write(move |txn| {
-                // The outgoing version's metadata rides in the object-meta row
-                // this transaction reads — full per-version parity (the
-                // recorded ETag — the composed `-N` form included, which no
-                // re-hash could reproduce — plus tags, checksum, owner, ACL,
-                // each reusing its wire encoding) and the stamp the version
-                // was written with. A missing row (a marker whose slot is kept
-                // elsewhere) contributes the empty wires and this
-                // transaction's clock.
-                let stored = {
-                    let table = meta::Table::open(txn)?;
-                    table.get(&bucket, &key)?
-                };
-                let now = to_nanos(SystemTime::now());
-                let (etag, tags, checksum, owner, acl) = meta::wires(stored.as_ref());
-                // The row is committed **before** the key path is
-                // overwritten, so it is not history yet: `became_noncurrent`
-                // stays `0` (the crash window's adopted row — its version is
-                // still the current one), and the write's own state
-                // transaction stamps it when the current slot moves off it
-                // (`Row::is_history`). A re-supersede keeps whatever stamp the
-                // row already carries: the adoption path rewrites its own row,
-                // and a stamped row must never be un-stamped by it.
-                let existing = {
-                    let table = rows::Table::open(txn)?;
-                    table.get(&bucket, &key, seq)?
-                };
-                let stamp = existing
-                    .as_ref()
-                    .map_or(0, |existing| existing.became_noncurrent);
-                let row = rows::Row {
-                    id: wire_of(superseded.id.as_ref()),
-                    blob: rows::encode_blob(&superseded.blob),
-                    size: superseded.blob.len(),
-                    etag,
-                    created: stored.as_ref().map_or(now, |stored| stored.mtime),
-                    became_noncurrent: stamp,
-                    kind: if superseded.is_delete_marker {
-                        rows::Kind::Marker
-                    } else {
-                        rows::Kind::Object
-                    },
-                    tags,
-                    checksum,
-                    owner,
-                    acl,
-                    seq: superseded.seq,
-                };
-                // The row at this sequence may only be rewritten by the same
-                // version (the crash-window adoption path re-runs a supersede
-                // whose row is already committed). A *different* version
-                // there — a different identity or kind, or the same identity
-                // and kind naming different content (the null-vs-null shape,
-                // where the identity wire alone cannot tell two versions
-                // apart) — is another version's committed row: overwriting it
-                // would replace that version's content with this one's and
-                // drop its blob out of the live set — silent, unrecoverable
-                // loss. Refuse, and name the state. The content address is
-                // compared by its blob (hash + shape) and its byte count.
-                if let Some(existing) = &existing
-                    && (existing.id != row.id
-                        || existing.kind != row.kind
-                        || existing.blob != row.blob
-                        || existing.size != row.size)
-                {
-                    return Ok(Some(existing.id.clone()));
-                }
-                // The null-version convergence (AWS's one-null-version model):
-                // a key holds at most one `null`-id row, so the index's single
-                // `null` entry always names it and no older row is stranded.
-                // When this supersede commits the null identity and an older
-                // null-id row already sits in history, that row is replaced —
-                // removed with its index entry in this same transaction —
-                // rather than a second null-id row being added: the index is
-                // keyed by the identity and names only one of them, so the
-                // older row would be permanently unaddressable (and would stay
-                // so after the pointed-at row expired). The row at this
-                // supersede's own sequence is never touched — that is the
-                // crash-window adoption path above. The trigger is the write
-                // plan's one rule, never a second spelling of it.
-                if converges_null(superseded.id.as_ref()) {
-                    // The key holds at most one null-id row (the convergence
-                    // rule this transaction enforces), so the index's single
-                    // `null` entry names the row to displace — one point
-                    // read, never a walk of the key's whole history. An entry
-                    // naming this supersede's own sequence is the crash-window
-                    // adoption of its own row: nothing to displace.
-                    let stale = {
-                        let index = version_index::Table::open(txn)?;
-                        index.seq_of(bucket.as_ref().as_str(), key.as_ref().as_str(), &row.id)?
-                    };
-                    if let Some(seq) = stale
-                        && seq != row.seq
-                    {
-                        {
-                            let mut table = rows::Table::open(txn)?;
-                            table.remove(&bucket, &key, seq)?;
-                        }
-                        {
-                            let mut index = version_index::Table::open(txn)?;
-                            index.remove_pointing_at(&bucket, &key, &row.id, seq)?;
-                        }
-                    }
-                }
-                // One transaction, one table handle at a time (the shared
-                // handle borrows the transaction exclusively): the row and its
-                // index entry commit together or not at all.
-                {
-                    let mut table = rows::Table::open(txn)?;
-                    table.put(&bucket, &key, &row)?;
-                }
-                {
-                    let mut index = version_index::Table::open(txn)?;
-                    index.put(&bucket, &key, &row.id, row.seq)?;
-                }
-                Ok(None)
-            })
-            .await
-            .map_err(contract)?;
-        match conflicted {
-            Some(existing) => Err(row_conflict(
-                &reported_bucket,
-                &reported_key,
-                seq,
-                &existing,
-            )),
-            None => {
-                // The committed row may name a block: record the reference
-                // so a concurrent sweep's epoch check sees it. Every caller
-                // holds the bucket mutation lock across this commit, and
-                // this runs after the transaction landed.
-                self.storage.bump_block_epoch();
-                Ok(())
-            }
-        }
-    }
-
-    async fn remove_version_row(
-        &self,
-        bucket: &Name,
-        key: &object::Key,
-        seq: u64,
-    ) -> Result<(), storage::Error> {
-        let bucket = bucket.clone();
-        let key = key.clone();
-        self.storage
-            .handle()
-            .write(move |txn| {
-                // The index entry is keyed by the identity, so the row is read
-                // in the same transaction that drops it — the two never
-                // disagree. The entry goes only when it points at this row:
-                // two rows can share the null identity, and expiring one must
-                // not retire the other's entry. Idempotent: a sequence that
-                // holds no row is `Ok`.
-                let id = {
-                    let table = rows::Table::open(txn)?;
-                    table.get(&bucket, &key, seq)?.map(|row| row.id)
-                };
-                let Some(id) = id else {
-                    return Ok(());
-                };
-                {
-                    let mut table = rows::Table::open(txn)?;
-                    table.remove(&bucket, &key, seq)?;
-                }
-                {
-                    let mut index = version_index::Table::open(txn)?;
-                    index.remove_pointing_at(&bucket, &key, &id, seq)?;
-                }
-                Ok(())
-            })
-            .await
-            .map_err(contract)
-    }
-
-    /// One transaction for the whole list: the retention sweep's batch. The
-    /// index entries are read and dropped with their rows in that same
-    /// transaction, so the two never disagree, and a crash leaves every
-    /// listed row or none of them.
-    async fn remove_version_rows(
-        &self,
-        bucket: &Name,
-        key: &object::Key,
-        seqs: &[u64],
-    ) -> Result<(), storage::Error> {
-        let bucket = bucket.clone();
-        let key = key.clone();
-        let seqs = seqs.to_vec();
-        self.storage
-            .handle()
-            .write(move |txn| {
-                for seq in seqs {
-                    let id = {
-                        let table = rows::Table::open(txn)?;
-                        table.get(&bucket, &key, seq)?.map(|row| row.id)
-                    };
-                    let Some(id) = id else {
-                        continue; // idempotent: a sequence holding no row is Ok
-                    };
-                    {
-                        let mut table = rows::Table::open(txn)?;
-                        table.remove(&bucket, &key, seq)?;
-                    }
-                    {
-                        let mut index = version_index::Table::open(txn)?;
-                        index.remove_pointing_at(&bucket, &key, &id, seq)?;
-                    }
-                }
-                Ok(())
-            })
-            .await
-            .map_err(contract)
-    }
-
-    async fn latest(
-        &self,
-        bucket: &Name,
-        key: &object::Key,
-    ) -> Result<Option<(u64, rows::Row)>, storage::Error> {
-        let bucket = bucket.clone();
-        let key = key.clone();
-        self.storage
-            .handle()
-            .read(move |txn| Ok(rows::Table::open_readonly(txn)?.latest(&bucket, &key)?))
-            .map_err(contract)
-    }
-
-    async fn bucket_rows(&self, bucket: &Name) -> Result<Vec<rows::Row>, storage::Error> {
-        let bucket = bucket.clone();
-        self.storage
-            .handle()
-            .read_blocking(move |txn| {
-                let table = rows::Table::open_readonly(txn)?;
-                let mut out = Vec::new();
-                table.for_bucket_of(bucket.as_ref(), |_, row| {
-                    out.push(row);
-                    Ok(())
-                })?;
-                Ok(out)
-            })
-            .await
-            .map_err(contract)
-    }
+impl Metadata for Rows {
+    type Error = storage::Error;
 }
 
-/// The fs implementation of [`ContentPort`]: the key's content at its key
-/// path, streamed out and published through the atomic writer.
-#[derive(Debug, Clone)]
-pub(crate) struct Files {
-    /// The backend this adapter serves.
-    storage: FsStorage,
-}
-
-impl Files {
-    /// Serve a backend's content.
-    pub(crate) fn new(storage: FsStorage) -> Self {
-        Self { storage }
+#[async_trait]
+impl BucketMeta for Rows {
+    async fn created_at(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Option<SystemTime>, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::created_at(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
     }
 
-    /// The key's target path, with the backend's usual guards: the bucket
-    /// must exist, and the symlink policy and containment proof run exactly
-    /// as they do on the object paths.
-    async fn target(&self, bucket: &Name, key: &object::Key) -> Result<PathBuf, Error> {
-        let dir = self.storage.ensure_bucket(bucket).await?;
-        self.storage.resolve_key(&dir, key).await
+    async fn load_many(
+        &self,
+        buckets: &[bucket::Name],
+    ) -> Result<Vec<Option<SystemTime>>, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::load_many(&self.engine, buckets)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn load_all(&self) -> Result<Vec<(String, SystemTime)>, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::load_all(&self.engine)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn row(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Option<bucket_row::Row>, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::row(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn owners(
+        &self,
+        buckets: &[bucket::Name],
+    ) -> Result<Vec<Option<acl::OwnerId>>, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::owners(&self.engine, buckets)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record(
+        &self,
+        bucket: &bucket::Name,
+        created: SystemTime,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::record(&self.engine, bucket, created)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn create(
+        &self,
+        bucket: &bucket::Name,
+        row: &bucket_row::Row,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::create(&self.engine, bucket, row)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_if_absent(
+        &self,
+        bucket: &bucket::Name,
+        now: SystemTime,
+    ) -> Result<SystemTime, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::record_if_absent(&self.engine, bucket, now)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_full(
+        &self,
+        bucket: &bucket::Name,
+        row: &bucket_row::Row,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::record_full(&self.engine, bucket, row)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_tags(
+        &self,
+        bucket: &bucket::Name,
+        tags: &object::Tags,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::set_tags(&self.engine, bucket, tags)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_tags_or_create(
+        &self,
+        bucket: &bucket::Name,
+        tags: &object::Tags,
+        now: SystemTime,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::set_tags_or_create(&self.engine, bucket, tags, now)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn clear_tags(&self, bucket: &bucket::Name) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::clear_tags(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_acl(
+        &self,
+        bucket: &bucket::Name,
+        owner: Option<&acl::OwnerId>,
+        grants: &acl::AclGrants,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::set_acl(&self.engine, bucket, owner, grants)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_grants_or_create(
+        &self,
+        bucket: &bucket::Name,
+        grants: &acl::AclGrants,
+        now: SystemTime,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::set_grants_or_create(&self.engine, bucket, grants, now)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_cors(
+        &self,
+        bucket: &bucket::Name,
+        config: &cors::Config,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::set_cors(&self.engine, bucket, config)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn clear_cors(&self, bucket: &bucket::Name) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::clear_cors(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn remove(&self, bucket: &bucket::Name) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::remove(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn remove_if_empty(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::remove_if_empty(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
     }
 }
 
 #[async_trait]
-impl ContentPort for Files {
-    async fn open(
+impl ObjectMeta for Rows {
+    async fn get(
         &self,
-        bucket: &Name,
+        bucket: &bucket::Name,
         key: &object::Key,
-    ) -> Result<Option<BodyStream>, storage::Error> {
-        let target = self.target(bucket, key).await.map_err(contract)?;
-        let file = match fs::File::open(&target).await {
-            Ok(file) => file,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(contract(err)),
-        };
-        let len = file.metadata().await.map_err(contract)?.len();
-        // The whole file, streamed in bounded chunks by the shared helper the
-        // read path serves ranges with — the supersede never buffers the
-        // object whole (constitution V). The end-of-body policy matches the
-        // read path: the range is a clamp on the file served as-is.
-        Ok(Some(
-            fsutil::file_stream(file, 0, len.saturating_sub(1), fsutil::ShortRead::EndBody).await,
-        ))
+    ) -> Result<Option<object_row::Row>, <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::get(&self.engine, bucket, key)
+            .await
+            .map_err(Into::into)
     }
 
-    async fn publish(
+    async fn put(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        row: &object_row::Row,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::put(&self.engine, bucket, key, row)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn put_guarded(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        row: &object_row::Row,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::put_guarded(&self.engine, bucket, key, row)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn put_with_parts(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        row: &object_row::Row,
+        parts: &[object_row::PartRow],
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::put_with_parts(&self.engine, bucket, key, row, parts)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn parts(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<Vec<object_row::PartRow>, <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::parts(&self.engine, bucket, key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn put_preserving(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        identity: &object_row::Identity,
+    ) -> Result<object_row::Preserved, <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::put_preserving(&self.engine, bucket, key, identity)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn move_(
+        &self,
+        bucket: &bucket::Name,
+        from: &object::Key,
+        to: &object::Key,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::move_(&self.engine, bucket, from, to)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_tags(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        tags: &object::Tags,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::set_tags(&self.engine, bucket, key, tags)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn clear_tags(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::clear_tags(&self.engine, bucket, key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn ensure_tags(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        tags: &object::Tags,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::ensure_tags(&self.engine, bucket, key, tags)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_acl(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        owner: Option<&acl::OwnerId>,
+        grants: &acl::AclGrants,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::set_acl(&self.engine, bucket, key, owner, grants)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn put_batch(
+        &self,
+        bucket: &bucket::Name,
+        rows: &[(object::Key, object_row::Row)],
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::put_batch(&self.engine, bucket, rows)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn remove(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::remove(&self.engine, bucket, key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn remove_many(
+        &self,
+        bucket: &bucket::Name,
+        keys: &[object::Key],
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::remove_many(&self.engine, bucket, keys)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn load(
+        &self,
+        bucket: &bucket::Name,
+        keys: &[object::Key],
+    ) -> Result<Vec<Option<object_row::Row>>, <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::load(&self.engine, bucket, keys)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn walk(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Vec<(object::Key, object_row::Row)>, <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::walk(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn walk_healing(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Vec<(object::Key, Option<object_row::Row>)>, <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::walk_healing(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn drain_bucket(&self, bucket: &bucket::Name) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as ObjectMeta>::drain_bucket(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[async_trait]
+impl UploadMeta for Rows {
+    async fn create(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &upload_row::Row,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::create(&self.engine, bucket, upload_id, row)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+    ) -> Result<Option<upload_row::Row>, <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::get(&self.engine, bucket, key, upload_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn put_part(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+        number: multipart::PartNumber,
+        etag: &ETag,
+        checksum: Option<&checksum::PartChecksum>,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::put_part(
+            &self.engine,
+            bucket,
+            key,
+            upload_id,
+            number,
+            etag,
+            checksum,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn list_parts(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        from: multipart::PartNumber,
+    ) -> Result<Vec<upload_row::PartRow>, <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::list_parts(&self.engine, bucket, upload_id, from)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn list_parts_page(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        from: u32,
+        max: usize,
+    ) -> Result<upload_row::PartsPage, <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::list_parts_page(&self.engine, bucket, upload_id, from, max)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn part_records(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+        numbers: &[multipart::PartNumber],
+    ) -> Result<Option<Vec<Option<upload_row::PartRecord>>>, <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::part_records(&self.engine, bucket, key, upload_id, numbers)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn list_uploads(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Vec<MultipartUpload>, <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::list_uploads(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn list_uploads_page(
+        &self,
+        bucket: &bucket::Name,
+        prefix: &str,
+        delimiter: Option<&str>,
+        marker: Option<&str>,
+        max_uploads: usize,
+    ) -> Result<(Vec<MultipartUpload>, Vec<String>, bool, Option<String>), <Self as Metadata>::Error>
+    {
+        <RedbMetadata as UploadMeta>::list_uploads_page(
+            &self.engine,
+            bucket,
+            prefix,
+            delimiter,
+            marker,
+            max_uploads,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn has_uploads(&self, bucket: &bucket::Name) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::has_uploads(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn walk_uploads(&self) -> Result<Vec<MultipartUpload>, <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::walk_uploads(&self.engine)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn drain_upload(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::drain_upload(&self.engine, bucket, upload_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn drain_upload_checked(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::drain_upload_checked(&self.engine, bucket, key, upload_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn drain_bucket(&self, bucket: &bucket::Name) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::drain_bucket(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[async_trait]
+impl VersionMeta for Rows {
+    type Error = storage::Error;
+
+    async fn bucket_state(&self, bucket: &bucket::Name) -> Result<State, Self::Error> {
+        <RedbMetadata as VersionMeta>::bucket_state(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_bucket_state(
+        &self,
+        bucket: &bucket::Name,
+        state: State,
+    ) -> Result<(), Self::Error> {
+        <RedbMetadata as VersionMeta>::set_bucket_state(&self.engine, bucket, state)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn current_slot(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<Option<RowCurrent>, Self::Error> {
+        <RedbMetadata as VersionMeta>::current_slot(&self.engine, bucket, key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn advance_slot(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        id: Option<version::Id>,
+        seq: u64,
+    ) -> Result<(), Self::Error> {
+        <RedbMetadata as VersionMeta>::advance_slot(&self.engine, bucket, key, id, seq)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_version(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seq: u64,
+    ) -> Result<Option<Stored>, Self::Error> {
+        <RedbMetadata as VersionMeta>::get_version(&self.engine, bucket, key, seq)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn latest(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<Option<(u64, Stored)>, Self::Error> {
+        <RedbMetadata as VersionMeta>::latest(&self.engine, bucket, key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn bucket_rows(&self, bucket: &bucket::Name) -> Result<Vec<Stored>, Self::Error> {
+        <RedbMetadata as VersionMeta>::bucket_rows(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn list_versions(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<Vec<Stored>, Self::Error> {
+        <RedbMetadata as VersionMeta>::list_versions(&self.engine, bucket, key)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn expire(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seq: u64,
+    ) -> Result<(), Self::Error> {
+        <RedbMetadata as VersionMeta>::expire(&self.engine, bucket, key, seq)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn expire_many(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seqs: &[u64],
+    ) -> Result<(), Self::Error> {
+        <RedbMetadata as VersionMeta>::expire_many(&self.engine, bucket, key, seqs)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn drain_bucket(&self, bucket: &bucket::Name) -> Result<(), Self::Error> {
+        <RedbMetadata as VersionMeta>::drain_bucket(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn version_seq_of(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        id: Option<&version::Id>,
+    ) -> Result<Option<u64>, Self::Error> {
+        <RedbMetadata as VersionMeta>::version_seq_of(&self.engine, bucket, key, id)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The one call the fs adds to the engine's own: the commit bumps the
+    /// version-reference epoch the sweeper validates its live set against.
+    async fn put_version(
         &self,
         bucket: &Name,
         key: &object::Key,
-        body: BodyStream,
-    ) -> Result<PublishedBody, storage::Error> {
-        let target = self.target(bucket, key).await.map_err(contract)?;
-        // The existing temp-and-rename path: a reader never sees a torn
-        // object, and a failed publish leaves the key path untouched. The
-        // writer answers the content MD5 it computed while streaming and
-        // the byte count it wrote, so the caller describes the restored
-        // version without a second read of the file it just wrote.
-        let (etag, size) = self
-            .storage
-            .writer()
-            .write(&target, body)
+        row: &Stored,
+    ) -> Result<(), <Self as VersionMeta>::Error> {
+        <RedbMetadata as VersionMeta>::put_version(&self.engine, bucket, key, row)
             .await
-            .map_err(contract)?;
-        Ok(PublishedBody { etag, size })
+            .map_err(Into::<storage::Error>::into)?;
+        self.storage.bump_block_epoch();
+        Ok(())
     }
 }
 
@@ -640,10 +911,12 @@ mod tests {
             ETag, acl,
             blob::{BlobRef, BlockHash, BlockStore},
             bucket,
+            meta::version::{Kind, Stored},
             object::Tags,
             storage::VersionOps,
             to_nanos, version,
         },
+        _store_redb::{version as rows, version_index},
         testutil,
     };
 
@@ -679,7 +952,7 @@ mod tests {
         let path = target(storage, bucket, key).await;
         fs::write(&path, bytes).await.unwrap();
         let metadata = std_fs::metadata(&path).unwrap();
-        let stored = meta::Stored {
+        let stored = object_meta::Stored {
             version_id: id.map(|id| version::Id::new(id).unwrap()),
             version_seq: seq,
             is_delete_marker: false,
@@ -697,7 +970,7 @@ mod tests {
         storage
             .handle()
             .write(move |txn| {
-                meta::Table::open(txn)?.put(&bucket, &key, &stored)?;
+                object_meta::Table::open(txn)?.put(&bucket, &key, &stored)?;
                 Ok(())
             })
             .await
@@ -714,7 +987,7 @@ mod tests {
         id: Option<&str>,
         seq: u64,
     ) {
-        let stored = meta::Stored {
+        let stored = object_meta::Stored {
             version_id: id.map(|id| version::Id::new(id).unwrap()),
             version_seq: seq,
             is_delete_marker: true,
@@ -732,11 +1005,31 @@ mod tests {
         storage
             .handle()
             .write(move |txn| {
-                meta::Table::open(txn)?.put(&bucket, &key, &stored)?;
+                object_meta::Table::open(txn)?.put(&bucket, &key, &stored)?;
                 Ok(())
             })
             .await
             .unwrap();
+    }
+
+    /// The contract row a version commit carries: the identity, sequence,
+    /// content address and kind a test plants. The metadata elements are the
+    /// writer's, so a test that asserts on them builds its own row.
+    fn stored(id: Option<&str>, seq: u64, blob: BlobRef, kind: Kind) -> Stored {
+        Stored {
+            id: id.map(|id| version::Id::new(id).unwrap()),
+            blob: blob.clone(),
+            size: blob.len(),
+            etag: ETag::EMPTY,
+            created: SystemTime::now(),
+            became_noncurrent: 0,
+            kind,
+            tags: Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: acl::Acl::default_private(None),
+            seq,
+        }
     }
 
     #[tokio::test]
@@ -755,14 +1048,14 @@ mod tests {
             .unwrap()
             .expect("a version row");
         assert_eq!(
-            (seq, row.id.as_str()),
+            (seq, row.id.as_ref().expect("a named version").as_str()),
             (1, "v1"),
             "the row carries the identity and sequence the meta row recorded"
         );
         assert_eq!(row.size, 5);
-        assert_eq!(row.kind, rows::Kind::Object);
+        assert_eq!(row.kind, Kind::Object);
         assert_eq!(
-            row.etag(),
+            row.etag,
             ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
             "the row carries the ETag the object_meta row recorded (here deliberately \
              not the content's MD5), never a hash of the bytes"
@@ -777,11 +1070,9 @@ mod tests {
             row.became_noncurrent, 0,
             "the row is not stamped until the current slot moves off it"
         );
-        assert!(
-            !row.is_history(rows::Slot::At(1)),
-            "the adopted row is the current version's own row"
-        );
-        let block = versions.blobs().blocks().block_path(row.blob().hash());
+        // (The slot-aware `is_history` predicate is the raw table row's; the
+        // contract row's half of it is the stamp asserted just above.)
+        let block = versions.blobs().blocks().block_path(row.blob.hash());
         assert!(
             block.starts_with(storage.blobs_dir()),
             "the block lives under the bucket's own state-dir subtree: {}",
@@ -791,7 +1082,7 @@ mod tests {
             versions
                 .blobs()
                 .blocks()
-                .contains(row.blob().hash())
+                .contains(row.blob.hash())
                 .await
                 .unwrap(),
             "the content is in the block store"
@@ -811,8 +1102,12 @@ mod tests {
 
         let (seq, row) = versions.latest(&bucket, &key).await.unwrap().unwrap();
         assert_eq!(
-            (seq, row.id.as_str(), row.kind),
-            (1, "v1", rows::Kind::Object)
+            (
+                seq,
+                row.id.as_ref().expect("a named version").as_str(),
+                row.kind
+            ),
+            (1, "v1", Kind::Object)
         );
         assert_eq!(row.size, 5);
     }
@@ -845,9 +1140,9 @@ mod tests {
             after, before,
             "nothing was current to preserve: the committed version's row is byte-identical"
         );
-        assert_eq!(after.kind, rows::Kind::Object);
+        assert_eq!(after.kind, Kind::Object);
         assert_eq!(
-            after.blob(),
+            after.blob,
             BlobRef::single(BlockHash::of(b"first"), 5),
             "and its content still reads"
         );
@@ -863,15 +1158,10 @@ mod tests {
         let (_root, storage, bucket, key) = fixture().await;
         let rows = Rows::new(storage.clone());
         let committed = BlobRef::single(BlockHash::of(b"first"), 5);
-        rows.put_version_row(
+        rows.put_version(
             &bucket,
             &key,
-            &Superseded {
-                id: None,
-                seq: 0,
-                blob: committed.clone(),
-                is_delete_marker: false,
-            },
+            &stored(None, 0, committed.clone(), Kind::Object),
         )
         .await
         .unwrap();
@@ -879,15 +1169,15 @@ mod tests {
         // The same identity, kind and byte count — a different content
         // address (`first` and `secnd` are both five bytes).
         let err = rows
-            .put_version_row(
+            .put_version(
                 &bucket,
                 &key,
-                &Superseded {
-                    id: None,
-                    seq: 0,
-                    blob: BlobRef::single(BlockHash::of(b"secnd"), 5),
-                    is_delete_marker: false,
-                },
+                &stored(
+                    None,
+                    0,
+                    BlobRef::single(BlockHash::of(b"secnd"), 5),
+                    Kind::Object,
+                ),
             )
             .await
             .unwrap_err();
@@ -910,12 +1200,12 @@ mod tests {
             .unwrap()
             .expect("the committed row survives");
         assert_eq!(
-            (row.seq, row.id.as_str(), row.kind),
-            (0, "null", rows::Kind::Object)
+            (row.seq, row.id.as_ref().map(version::Id::as_str), row.kind),
+            (0, None, Kind::Object),
+            "the null version's identity reads as absent, never as its wire"
         );
         assert_eq!(
-            row.blob(),
-            committed,
+            row.blob, committed,
             "the committed version's content still reads"
         );
     }
@@ -938,9 +1228,10 @@ mod tests {
             .expect("an object row publishes content");
         assert_eq!(published.size, 5, "the publish answers the byte count");
         assert_eq!(
-            published.etag,
-            ETag::from_content(b"first"),
-            "and the content MD5 its write path computed while streaming"
+            published.etag, row.etag,
+            "the version's recorded ETag — the row's authoritative value, so a \
+             multipart-composed form survives the restore — never a re-hash of \
+             the bytes the publish streamed"
         );
 
         assert_eq!(fs::read(&path).await.unwrap(), b"first");
@@ -1007,7 +1298,7 @@ mod tests {
         // marker the API never created.
         let (_root, storage, bucket, key) = fixture().await;
         let versions = storage.versions(&bucket);
-        let stored = meta::Stored {
+        let stored = object_meta::Stored {
             version_id: Some(version::Id::new("z1").unwrap()),
             version_seq: 1,
             is_delete_marker: false,
@@ -1025,7 +1316,7 @@ mod tests {
         storage
             .handle()
             .write(move |txn| {
-                meta::Table::open(txn)?.put(&write_bucket, &write_key, &stored)?;
+                object_meta::Table::open(txn)?.put(&write_bucket, &write_key, &stored)?;
                 Ok(())
             })
             .await
@@ -1051,11 +1342,8 @@ mod tests {
         versions.supersede(&bucket, &key).await.unwrap();
 
         let (seq, row) = versions.latest(&bucket, &key).await.unwrap().unwrap();
-        assert_eq!(
-            (seq, row.id.as_str()),
-            (0, "null"),
-            "the gated slot is the null version"
-        );
+        assert_eq!(seq, 0, "the gated slot is the null version");
+        assert!(row.id.is_none(), "and its identity is the null version's");
         assert_eq!(row.size, 18);
     }
 
@@ -1068,9 +1356,12 @@ mod tests {
         versions.supersede(&bucket, &key).await.unwrap();
 
         let (seq, row) = versions.latest(&bucket, &key).await.unwrap().unwrap();
-        assert_eq!((seq, row.id.as_str()), (3, "m1"));
-        assert_eq!(row.kind, rows::Kind::Marker);
-        assert!(row.blob().is_empty(), "a marker carries the empty blob");
+        assert_eq!(
+            (seq, row.id.as_ref().expect("a named version").as_str()),
+            (3, "m1")
+        );
+        assert_eq!(row.kind, Kind::Marker);
+        assert!(row.blob.is_empty(), "a marker carries the empty blob");
         assert!(
             versions
                 .live_blocks(&bucket)
@@ -1151,7 +1442,7 @@ mod tests {
         };
 
         // A sequence the key never used: nothing drops.
-        rows.remove_version_row(&bucket, &key, 7).await.unwrap();
+        rows.expire(&bucket, &key, 7).await.unwrap();
         assert!(
             rows.latest(&bucket, &key).await.unwrap().is_some(),
             "the committed row is untouched"
@@ -1159,12 +1450,12 @@ mod tests {
         assert_eq!(indexed(&storage), Some(1), "its index entry rides");
 
         // The row that IS there still drops, with its index entry...
-        rows.remove_version_row(&bucket, &key, 1).await.unwrap();
+        rows.expire(&bucket, &key, 1).await.unwrap();
         assert!(rows.latest(&bucket, &key).await.unwrap().is_none());
         assert_eq!(indexed(&storage), None);
 
         // ...and repeating it takes the missing-row branch again.
-        rows.remove_version_row(&bucket, &key, 1).await.unwrap();
+        rows.expire(&bucket, &key, 1).await.unwrap();
     }
 
     #[tokio::test]
@@ -1176,27 +1467,27 @@ mod tests {
         // unaddressable once the pointed-at row expires.
         let (_root, storage, bucket, key) = fixture().await;
         let rows = Rows::new(storage.clone());
-        rows.put_version_row(
+        rows.put_version(
             &bucket,
             &key,
-            &Superseded {
-                id: None,
-                seq: 0,
-                blob: BlobRef::single(BlockHash::of(b"first"), 5),
-                is_delete_marker: false,
-            },
+            &stored(
+                None,
+                0,
+                BlobRef::single(BlockHash::of(b"first"), 5),
+                Kind::Object,
+            ),
         )
         .await
         .unwrap();
-        rows.put_version_row(
+        rows.put_version(
             &bucket,
             &key,
-            &Superseded {
-                id: None,
-                seq: 3,
-                blob: BlobRef::single(BlockHash::of(b""), 0),
-                is_delete_marker: true,
-            },
+            &stored(
+                None,
+                3,
+                BlobRef::single(BlockHash::of(b""), 0),
+                Kind::Marker,
+            ),
         )
         .await
         .unwrap();

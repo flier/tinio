@@ -59,8 +59,8 @@ use crate::{
         from_nanos, object, storage,
         version::{self, Entry, ListParams, Listing},
     },
-    _store::{
-        meta::{self, Stored},
+    _store_redb::{
+        object_meta::{self, Stored},
         version as rows,
     },
     Error, FsStorage,
@@ -261,7 +261,7 @@ fn read_window(
     // The current slots: one gated row per key, in key order.
     let mut slots: BTreeMap<String, Option<Stored>> = BTreeMap::new();
     {
-        let table = meta::Table::open_readonly(txn)?;
+        let table = object_meta::Table::open_readonly(txn)?;
         table.for_bucket_gated_from(bucket, from, |key, stored| {
             if slots.len() == budget {
                 return Ok(false);

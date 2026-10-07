@@ -224,6 +224,8 @@ pub fn install() -> Result<Handles, Error> {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn register_wakes(writer: &Arc<UnixStream>) -> Result<(), Error> {
+    use rustix::io::write;
+
     writer.set_nonblocking(true).map_err(signal_error)?;
     for signal in [SIGTERM, SIGINT, SIGHUP] {
         let writer = Arc::clone(writer);
@@ -233,7 +235,7 @@ fn register_wakes(writer: &Arc<UnixStream>) -> Result<(), Error> {
         // argues in full.
         unsafe {
             register(signal, move || {
-                let _ = rustix::io::write(&*writer, &[signal as u8]);
+                let _ = write(&*writer, &[signal as u8]);
             })
         }
         .map_err(signal_error)?;
@@ -365,10 +367,14 @@ fn install_console_handler(stopper: watch::Sender<bool>) -> Result<(), Error> {
 mod tests {
     use std::{
         sync::{Arc, mpsc},
+        thread,
         time::Duration,
     };
 
-    use rustix::process::{Signal, getpid, kill_process};
+    use rustix::{
+        io::write,
+        process::{Signal, getpid, kill_process},
+    };
     use tokio::time::timeout;
 
     use super::*;
@@ -422,9 +428,9 @@ mod tests {
         // instead of hanging on it.
         let (sent, filled) = mpsc::channel();
         let filler = Arc::clone(&writer);
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             let mut wrote = 0usize;
-            while rustix::io::write(&*filler, b"F").is_ok() {
+            while write(&*filler, b"F").is_ok() {
                 wrote += 1;
             }
             let _ = sent.send(wrote);

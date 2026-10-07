@@ -16,19 +16,22 @@ use tokio::fs;
 use super::{Error, FsStorage};
 #[cfg(not(unix))]
 use crate::_core::storage::ObjectOps;
-use crate::_core::{
-    BodyStream, acl,
-    acl::Acl,
-    bucket, checksum,
-    multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
-    object::{self, Info},
-    storage::{
-        ByteRange, ListPartsParams, ListUploadsParams, MultipartOps, PartsListing, UploadsListing,
-        access_denied, invalid_key, key_marker_order, split_uploads_order,
-    },
-};
 #[cfg(unix)]
 use crate::fsutil;
+use crate::{
+    _core::{
+        BodyStream, acl,
+        acl::Acl,
+        bucket, checksum,
+        multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
+        object::{self, Info},
+        storage::{
+            ByteRange, ListPartsParams, ListUploadsParams, MultipartOps, PartsListing,
+            UploadsListing, access_denied, invalid_key, key_marker_order, split_uploads_order,
+        },
+    },
+    backend::version::Publication,
+};
 
 /// The unix fast path of the part-copy primitive: `copy_file_range` the
 /// source's (range of) bytes into a staged part file, then the store's
@@ -238,7 +241,10 @@ impl MultipartOps for FsStorage {
         // until this completion's state transaction is done. A failure here
         // (deleted bucket, swapped symlink) must not strand the assembled
         // temp in `tmp/` — remove it on the error path.
-        let published = match self.publish_versioned(bucket, key, &temp).await {
+        let published = match self
+            .publish_versioned(bucket, key, &temp, Publication::Versioned)
+            .await
+        {
             Ok(published) => published,
             Err(err) => {
                 let _ = fs::remove_file(&temp).await;
@@ -262,16 +268,9 @@ impl MultipartOps for FsStorage {
         // completion idempotently.
         #[cfg(unix)]
         if !self.owner_uids.is_empty() {
-            use crate::_store::decode_owner_wire;
-            let stored_owner = self
-                .handle
-                .read(|txn| {
-                    let uploads = crate::_store::upload::Table::open_readonly(txn)?;
-                    Ok(uploads
-                        .get_matching(bucket, key, upload_id)?
-                        .and_then(|(_, _, _, owner_wire, _)| decode_owner_wire(&owner_wire)))
-                })
-                .map_err(Error::from)?;
+            // The row's create-time owner through the metadata facade (D23's
+            // `UploadMeta::get`) — no raw table read from the bytes layer.
+            let stored_owner = self.meta_store.upload_owner(bucket, key, upload_id).await?;
             if let Some(uid) = self.owner_uid(stored_owner.as_ref())
                 && let Err(err) = fsutil::chown_file(target, uid).await
             {
@@ -1105,7 +1104,7 @@ mod tests {
                 storage::VersionOps,
                 version::{self, ListParams, ReadResult},
             },
-            _store::version::Slot,
+            _store_redb::version::Slot,
         };
 
         let (_root, storage) = storage();
@@ -1208,7 +1207,7 @@ mod tests {
         let rows = storage
             .handle()
             .read(|txn| {
-                let table = crate::_store::version::Table::open_readonly(txn)?;
+                let table = crate::_store_redb::version::Table::open_readonly(txn)?;
                 let mut out = Vec::new();
                 table.for_key(b.as_ref().as_str(), k.as_ref().as_str(), |row| {
                     out.push(row);

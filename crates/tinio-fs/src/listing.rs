@@ -901,7 +901,7 @@ mod tests {
                 ListObjectsParams,
             },
         },
-        _store::meta::Table,
+        _store_redb::object_meta::Table,
         _util::testing,
         database,
         testutil::{GatedRunner, LossyRunner, PacedRunner, files, link_directory, wait_for},

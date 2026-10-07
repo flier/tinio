@@ -29,7 +29,10 @@ use crate::{
 /// residue (FR-020 — the reserved segment is never served or listed, so
 /// a crashed/failed cross-volume commit's staging dir must not make the
 /// bucket undeletable; the startup repair clears it).
-async fn bucket_is_empty(storage: &FsStorage, name: &bucket::Name) -> Result<bool, Error> {
+pub(crate) async fn bucket_is_empty(
+    storage: &FsStorage,
+    name: &bucket::Name,
+) -> Result<bool, Error> {
     if storage.multipart_store().has_uploads(name).await? {
         return Ok(false);
     }
@@ -50,14 +53,36 @@ async fn bucket_is_empty(storage: &FsStorage, name: &bucket::Name) -> Result<boo
     Ok(true)
 }
 
-#[async_trait]
-impl BucketOps for FsStorage {
-    async fn create_bucket(
+impl FsStorage {
+    /// The directory half of a bucket create: prove the name is free, create
+    /// the directory and apply the unix ownership/mode hardening (FAIL-CLOSED:
+    /// a hardening failure removes the just-created directory).
+    ///
+    /// This shape takes the bucket mutation lock itself because the content
+    /// contract's `create_bucket` has no `BUCKETS` record — the directory is
+    /// its whole create. `BucketOps::create_bucket` spans the directory
+    /// **and** its record, so it takes that same lock and calls
+    /// `Self::create_bucket_dir_locked`; a second acquisition there would
+    /// deadlock (the lock map hands out one `tokio` mutex per bucket name).
+    pub(crate) async fn create_bucket_dir(
         &self,
         name: &bucket::Name,
         owner: Option<&acl::OwnerId>,
-        acl: &Acl,
     ) -> Result<(), Error> {
+        let _guard = self.lock_bucket_mutations(name).await;
+        self.create_bucket_dir_locked(name, owner).await
+    }
+
+    /// `create_bucket_dir`'s body under the **caller's** bucket mutation
+    /// guard (the caller's doc says which one holds it and why).
+    async fn create_bucket_dir_locked(
+        &self,
+        name: &bucket::Name,
+        owner: Option<&acl::OwnerId>,
+    ) -> Result<(), Error> {
+        // The owner is the unix dir-hardening input only.
+        #[cfg(not(unix))]
+        let _ = owner;
         // The lexical mapping: the validation supplements (the reserved
         // `.tinio` refusal — FR-020 — and the Windows charset/aliasing
         // refusal — F21, the same clean `InvalidBucketName` the object
@@ -77,10 +102,15 @@ impl BucketOps for FsStorage {
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
-        // The directory creation and its `BUCKETS` record are one
-        // critical section against `delete_bucket` (a delete must never
-        // remove a bucket a create just reported as created).
-        let _guard = self.lock_bucket_mutations(name).await;
+        // The directory creation runs under the caller's guard. For
+        // `BucketOps::create_bucket` that guard spans this directory **and**
+        // its `BUCKETS` record — one critical section against
+        // `delete_bucket` (a delete must never remove a bucket a create just
+        // reported as created) and against `put_bucket_acl`'s
+        // owner-preserving read-modify-write (the C1 lost update: the
+        // create's record upsert would otherwise land between its read and
+        // its write). The tags/CORS setters take no bucket mutation lock, so
+        // this section does not cover them.
         match fs::create_dir(&dir).await {
             Ok(()) => {}
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {
@@ -115,13 +145,15 @@ impl BucketOps for FsStorage {
                 return Err(err.into());
             }
         }
-        self.bucket_store
-            .record_full(name, SystemTime::now(), owner, acl)
-            .await?;
         Ok(())
     }
 
-    async fn delete_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
+    /// The bucket teardown: unpublish the directory (the tombstone rename),
+    /// drop the bucket's rows and derived state — `remove_bucket_state` owns
+    /// the `BUCKETS` row and the version/blob tables — and hand the tree to
+    /// the removal pipeline. This is the whole of `delete_bucket`, shared with
+    /// the content contract's `remove_bucket`.
+    pub(crate) async fn unpublish_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
         // The emptiness check and the unpublish rename are one critical
         // section against every write into this bucket: a concurrent
         // PUT's rename cannot land in a directory about to disappear
@@ -160,6 +192,36 @@ impl BucketOps for FsStorage {
         // does not wait; a leftover is reclaimed by doctor / the scanner.
         tombstone::reclaim(Arc::clone(&self.remove_pipeline), dest);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl BucketOps for FsStorage {
+    async fn create_bucket(
+        &self,
+        name: &bucket::Name,
+        owner: Option<&acl::OwnerId>,
+        acl: &Acl,
+    ) -> Result<(), Error> {
+        // The directory first (the namespace), then its record: the two are
+        // one logical create, and a record failure leaves the directory the
+        // next create reports as taken (the pre-existing rule). The guard
+        // must span BOTH: it is what `put_bucket_acl`'s owner-preserving
+        // read-modify-write serializes against (the C1 lost update — this
+        // record upsert can otherwise slip between its read and its write).
+        let _guard = self.lock_bucket_mutations(name).await;
+        self.create_bucket_dir_locked(name, owner).await?;
+        self.bucket_store
+            .record_full(name, SystemTime::now(), owner, acl)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
+        // The whole teardown is the content plane's (shared with the content
+        // contract's `remove_bucket`); the `BUCKETS` row goes with the rest of
+        // the state, inside `unpublish_bucket`.
+        self.unpublish_bucket(name).await
     }
 
     async fn head_bucket(&self, name: &bucket::Name) -> Result<Bucket, Error> {
@@ -279,6 +341,12 @@ impl BucketOps for FsStorage {
     }
 
     async fn put_bucket_tags(&self, name: &bucket::Name, tags: &object::Tags) -> Result<(), Error> {
+        // The bucket's mutation lock, the `put_bucket_acl` shape: the tags
+        // write is element-targeted, but a concurrent `create_bucket`'s
+        // create-time record is a full-row upsert — unserialized it can land
+        // after this write and leave the bucket untagged (the same C1 lost
+        // update, on the tag element).
+        let _guard = self.lock_bucket_mutations(name).await;
         self.ensure_bucket(name).await?;
         self.bucket_store.set_tags(name, tags).await
     }
@@ -286,7 +354,10 @@ impl BucketOps for FsStorage {
     async fn delete_bucket_tags(&self, name: &bucket::Name) -> Result<(), Error> {
         // S3 semantics: idempotent — a missing bucket is Ok (the
         // contract's delete-object/bucket leniency). The row's creation
-        // time is preserved; a row-less bucket has nothing to clear.
+        // time is preserved; a row-less bucket has nothing to clear. The
+        // bucket's mutation lock, the `put_bucket_acl` shape: the clear must
+        // not race a create's create-time record (the same C1 window).
+        let _guard = self.lock_bucket_mutations(name).await;
         self.bucket_store.clear_tags(name).await
     }
 
@@ -309,7 +380,10 @@ impl BucketOps for FsStorage {
         // delete-tagging idempotent leniency does NOT extend here (the
         // CORS spec mandates `NoSuchBucket` for a missing bucket); a
         // bucket that simply has no configuration clears to the same
-        // state (idempotent). The row's creation time is preserved.
+        // state (idempotent). The row's creation time is preserved. The
+        // bucket's mutation lock, the `put_bucket_acl` shape: the clear must
+        // not race a create's create-time record (the same C1 window).
+        let _guard = self.lock_bucket_mutations(name).await;
         self.ensure_bucket(name).await?;
         self.bucket_store.clear_cors(name).await
     }
@@ -324,6 +398,21 @@ impl BucketOps for FsStorage {
     }
 
     async fn put_bucket_acl(&self, name: &bucket::Name, grants: &AclGrants) -> Result<(), Error> {
+        // The bucket's mutation lock, the `put_bucket_tags` shape: the ACL
+        // write is element-targeted, but a concurrent `create_bucket`'s
+        // create-time record is a full-row upsert — unserialized it can land
+        // after this write and replace the grants and the recorded owner
+        // with the create-time row. The store's setter itself no longer
+        // holds a cross-transaction read-modify-write to guard:
+        // `set_grants_or_create` reads the row, replaces the grants and
+        // carries the recorded owner over **inside one write transaction**
+        // (the contract's setter replaces both ACL elements), so no writer
+        // can slip between its read and its write. The owner is what the
+        // lock protects — it drives GetBucketAcl and the ListBuckets owner
+        // filter (the C1 lost-update review pinned this section; the
+        // setter's in-transaction carry-over since closed its read-write
+        // half).
+        let _guard = self.lock_bucket_mutations(name).await;
         self.ensure_bucket(name).await?;
         self.bucket_store.set_acl(name, grants).await
     }
@@ -353,7 +442,7 @@ mod tests {
             },
             version::State,
         },
-        _store::version as version_rows,
+        _store_redb::version as version_rows,
         _util::testing::{assert_conformance, body, etag},
         database,
         testutil::{
@@ -1166,6 +1255,140 @@ mod tests {
             head.creation_time <= SystemTime::now(),
             "the creation time must survive the ACL put"
         );
+    }
+
+    #[tokio::test]
+    async fn put_bucket_acl_waits_for_the_bucket_mutation_lock() {
+        // Review round 1, C1: the ACL write carries the recorded owner back
+        // into the row, so it must be serialized with the owner's writer —
+        // `create_bucket`, which holds this same per-bucket lock across its
+        // directory-plus-record critical section. This pins that the ACL
+        // path really sits inside that lock (without it, a create can commit
+        // its owner between the store's owner read and its ACL write, and
+        // the write clears it).
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let held = storage.lock_bucket_mutations(&b).await;
+        let storage_put = storage.clone();
+        let bp = b.clone();
+        let mut put = tokio::spawn(async move {
+            storage_put
+                .put_bucket_acl(&bp, &vec![all_users_read_grant()])
+                .await
+        });
+        wait_for_lock_waiter().await;
+        assert!(
+            timeout(Duration::from_millis(50), &mut put).await.is_err(),
+            "the ACL write must wait for the bucket's mutation lock"
+        );
+        drop(held);
+        put.await.unwrap().unwrap();
+        assert_eq!(
+            storage.get_bucket_acl(&b).await.unwrap().grants,
+            vec![all_users_read_grant()]
+        );
+    }
+
+    #[tokio::test]
+    async fn put_bucket_tags_waits_for_the_bucket_mutation_lock() {
+        // The tags write is element-targeted, but a `create_bucket`'s
+        // create-time record is a full-row upsert: unserialized, the record
+        // can land after this write and leave the bucket untagged (the C1
+        // lost update `put_bucket_acl` pins for the owner element). This
+        // pins that the tags path sits inside the same per-bucket lock.
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let tags = object::Tags::from_pairs([("team".into(), "core".into())]).unwrap();
+        let held = storage.lock_bucket_mutations(&b).await;
+        let storage_put = storage.clone();
+        let bp = b.clone();
+        let put_tags = tags.clone();
+        let mut put =
+            tokio::spawn(async move { storage_put.put_bucket_tags(&bp, &put_tags).await });
+        wait_for_lock_waiter().await;
+        assert!(
+            timeout(Duration::from_millis(50), &mut put).await.is_err(),
+            "the tags write must wait for the bucket's mutation lock"
+        );
+        drop(held);
+        put.await.unwrap().unwrap();
+        assert_eq!(storage.get_bucket_tags(&b).await.unwrap(), tags);
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_tags_waits_for_the_bucket_mutation_lock() {
+        // The clear rewrites an existing row's tag element; it must not race
+        // a create's create-time record either (the same C1 window).
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let tags = object::Tags::from_pairs([("team".into(), "core".into())]).unwrap();
+        storage.put_bucket_tags(&b, &tags).await.unwrap();
+        let held = storage.lock_bucket_mutations(&b).await;
+        let storage_clear = storage.clone();
+        let bp = b.clone();
+        let mut clear = tokio::spawn(async move { storage_clear.delete_bucket_tags(&bp).await });
+        wait_for_lock_waiter().await;
+        assert!(
+            timeout(Duration::from_millis(50), &mut clear)
+                .await
+                .is_err(),
+            "the tag clear must wait for the bucket's mutation lock"
+        );
+        drop(held);
+        clear.await.unwrap().unwrap();
+        assert_eq!(
+            storage.get_bucket_tags(&b).await.unwrap(),
+            object::Tags::empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_cors_waits_for_the_bucket_mutation_lock() {
+        // The CORS clear rewrites an existing row's CORS element; it must not
+        // race a create's create-time record either (the same C1 window).
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let config = cors::Config {
+            rules: vec![cors::Rule {
+                id: Some("one".into()),
+                allowed_methods: vec!["GET".into()],
+                allowed_origins: vec!["*".into()],
+                allowed_headers: None,
+                expose_headers: None,
+                max_age_seconds: None,
+            }],
+        };
+        storage.put_bucket_cors(&b, &config).await.unwrap();
+        let held = storage.lock_bucket_mutations(&b).await;
+        let storage_clear = storage.clone();
+        let bp = b.clone();
+        let mut clear = tokio::spawn(async move { storage_clear.delete_bucket_cors(&bp).await });
+        wait_for_lock_waiter().await;
+        assert!(
+            timeout(Duration::from_millis(50), &mut clear)
+                .await
+                .is_err(),
+            "the CORS clear must wait for the bucket's mutation lock"
+        );
+        drop(held);
+        clear.await.unwrap().unwrap();
+        assert!(storage.get_bucket_cors(&b).await.unwrap().is_none());
     }
 
     #[tokio::test]

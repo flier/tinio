@@ -23,7 +23,9 @@ use crate::{
         multipart::ObjectPart,
         now_nanos, object, version,
     },
-    _store::{bucket, bucket_versioning, meta, object_part, objects, scan::for_each_pair},
+    _store_redb::{
+        bucket, bucket_versioning, object_meta, object_part, objects, scan::for_each_pair,
+    },
     Error,
     error::{access_denied, invalid_key, no_such_bucket, no_such_key},
     storage::{MemoryStorage, check_bucket},
@@ -63,7 +65,7 @@ impl MemoryStorage {
                 let b = bucket.as_ref().as_str();
                 let k = key.as_ref().as_str();
                 let row = {
-                    let mut table = meta::Table::open(txn)?;
+                    let mut table = object_meta::Table::open(txn)?;
                     if table.put_tags(b, k, tags)?.is_none() {
                         return Ok(None);
                     }
@@ -180,7 +182,7 @@ impl MemoryStorage {
             // checksum (accepted and dropped), like the fs backend's
             // marker commit. (The `mut` is the versioning branch's.)
             #[cfg_attr(not(feature = "versioning"), allow(unused_mut))]
-            let mut stored = meta::Stored {
+            let mut stored = object_meta::Stored {
                 version_id: None,
                 version_seq: 0,
                 is_delete_marker: false,
@@ -199,7 +201,7 @@ impl MemoryStorage {
                 stored.version_seq = version_seq;
             }
             {
-                let mut table = meta::Table::open(txn)?;
+                let mut table = object_meta::Table::open(txn)?;
                 table.put(b, k, &stored)?;
             }
             {
@@ -344,13 +346,13 @@ impl ObjectOps for MemoryStorage {
             // per request).
             let records_versions = records_versions(txn, bucket)?;
             let objects = objects::Table::open_readonly(txn)?;
-            let meta = meta::Table::open_readonly(txn)?;
+            let object_meta = object_meta::Table::open_readonly(txn)?;
             // The meta row is the existence gate; the shared validation decodes
             // the 6-tuple (etag, size, mtime, file identity 0, tags wire,
             // checksum wire) and self-heals a garbage tags/checksum element to
             // empty/`None` (a garbage etag row reads as missing — the caller
             // recomputes, the mem self-heal of a domain-invalid row).
-            let stored = meta
+            let stored = object_meta
                 .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
                 .ok_or_else(|| no_such_key(key))?;
             let size = stored.size;
@@ -390,8 +392,8 @@ impl ObjectOps for MemoryStorage {
                 return Err(no_such_key(key));
             }
             let records_versions = records_versions(txn, bucket)?;
-            let meta = meta::Table::open_readonly(txn)?;
-            let stored = meta
+            let object_meta = object_meta::Table::open_readonly(txn)?;
+            let stored = object_meta
                 .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
                 .ok_or_else(|| no_such_key(key))?;
             Ok(object::Info {
@@ -455,8 +457,8 @@ impl ObjectOps for MemoryStorage {
                         objects.remove(b, k)?;
                     }
                     {
-                        let mut meta = meta::Table::open(txn)?;
-                        meta.remove(b, k)?;
+                        let mut object_meta = object_meta::Table::open(txn)?;
+                        object_meta.remove(b, k)?;
                     }
                     // The retained part list dies with the object (one
                     // transaction — a delete must not orphan the rows).
@@ -545,8 +547,10 @@ impl ObjectOps for MemoryStorage {
             // (file identity included) ride verbatim (re-encoded canonically
             // from the validated row; rows are API-written).
             let stored = {
-                let meta = meta::Table::open(txn)?;
-                meta.get(b, src_key)?.ok_or_else(|| no_such_key(src))?
+                let object_meta = object_meta::Table::open(txn)?;
+                object_meta
+                    .get(b, src_key)?
+                    .ok_or_else(|| no_such_key(src))?
             };
             {
                 let mut objects = objects::Table::open(txn)?;
@@ -554,9 +558,9 @@ impl ObjectOps for MemoryStorage {
                 objects.remove(b, src_key)?;
             }
             {
-                let mut meta = meta::Table::open(txn)?;
-                meta.put(b, dst_key, &stored)?;
-                meta.remove(b, src_key)?;
+                let mut object_meta = object_meta::Table::open(txn)?;
+                object_meta.put(b, dst_key, &stored)?;
+                object_meta.remove(b, src_key)?;
             }
             // The retained part rows migrate with the record: list the src's
             // rows, clear the dst's stale rows (an overwritten destination's
@@ -611,8 +615,9 @@ impl ObjectOps for MemoryStorage {
             if key.is_reserved() || key.is_folder_marker() {
                 return Err(no_such_key(key));
             }
-            let meta = meta::Table::open_readonly(txn)?;
-            let Some(stored) = meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())? else {
+            let object_meta = object_meta::Table::open_readonly(txn)?;
+            let Some(stored) = object_meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())?
+            else {
                 return Err(no_such_key(key));
             };
             Ok(stored.tags)
@@ -667,8 +672,9 @@ impl ObjectOps for MemoryStorage {
         // grant set (the row form keeps them apart — the shared
         // decode-home rule).
         self.db.read(|txn| {
-            let meta = meta::Table::open_readonly(txn)?;
-            meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())?
+            let object_meta = object_meta::Table::open_readonly(txn)?;
+            object_meta
+                .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
                 .map(|stored| Acl {
                     owner: stored.owner.clone(),
                     grants: stored.acl.grants.clone(),
@@ -692,14 +698,15 @@ impl ObjectOps for MemoryStorage {
         };
         self.db
             .write(|txn| -> Result<bool, Error> {
-                let mut meta = meta::Table::open(txn)?;
-                let Some(row) = meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())? else {
+                let mut object_meta = object_meta::Table::open(txn)?;
+                let Some(row) = object_meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())?
+                else {
                     return Ok(false);
                 };
-                meta.put(
+                object_meta.put(
                     bucket.as_ref().as_str(),
                     key.as_ref().as_str(),
-                    &meta::Stored { acl: fresh, ..row },
+                    &object_meta::Stored { acl: fresh, ..row },
                 )?;
                 Ok(true)
             })
@@ -723,8 +730,8 @@ impl ObjectOps for MemoryStorage {
             if key.is_reserved() || key.is_folder_marker() {
                 return Err(no_such_key(key));
             }
-            let meta = meta::Table::open_readonly(txn)?;
-            if meta
+            let object_meta = object_meta::Table::open_readonly(txn)?;
+            if object_meta
                 .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
                 .is_none()
             {
@@ -752,7 +759,7 @@ impl ObjectOps for MemoryStorage {
             // The page's objects all carry the bucket's state — one read
             // for the page, the carrier's value on every row.
             let records_versions = records_versions(txn, &params.bucket)?;
-            let meta = meta::Table::open_readonly(txn)?;
+            let object_meta = object_meta::Table::open_readonly(txn)?;
             let bucket_str = params.bucket.as_ref().as_str();
             // The shared per-bucket walk starts at the prefix lower bound
             // (rows below it cannot affect the rollups or the marker — the
@@ -767,7 +774,7 @@ impl ObjectOps for MemoryStorage {
             // and handed to the pagination engine (the engine protocol).
             let mut rows: Vec<object::Info> = Vec::new();
             for_each_pair(
-                meta.deref(),
+                object_meta.deref(),
                 (bucket_str, params.prefix.as_str()),
                 |b, _| b == bucket_str,
                 |_, raw_key, value| -> Result<(), Error> {
@@ -780,7 +787,7 @@ impl ObjectOps for MemoryStorage {
                     if !key.as_ref().starts_with(&params.prefix) {
                         return Ok(());
                     }
-                    let Some(stored) = meta::validate(value) else {
+                    let Some(stored) = object_meta::validate(value) else {
                         return Ok(()); // a garbage-etag row is treated as missing
                     };
                     rows.push(object::Info {

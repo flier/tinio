@@ -75,7 +75,7 @@ mod tests {
         },
         _util::testing::etag,
         Error,
-        database::Handle,
+        database::Driver,
         meta::Store,
     };
 
@@ -122,7 +122,7 @@ mod tests {
                 .unwrap();
             txn.commit().unwrap();
         }
-        Store::from_handle(Handle::new(db))
+        Store::from_handle(Driver::new(db))
     }
 
     #[test]

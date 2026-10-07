@@ -3,7 +3,7 @@
 ## Imports
 
 - Top `use`; never inline. `super::server` → `server::Config`. Nest `foo::{Bar, dto::{self, Baz}}`. 3+/2-seg: drop qualifier unless generic/prefix/collision. `clippy::absolute_paths`. Glob `Error::*` only `error.rs`/tests.
-- `tinio_*` → `_`+rest: `lib.rs` `#[doc(hidden)] pub extern crate tinio_core as _core;` (`#[cfg(feature)]`; test `#[cfg(test)] extern crate`). In-crate `crate::{_core::{...}, path}`; else `tinio_fs::`. `tokio::fs` except sync/`spawn_blocking`/no-async-API/`Metadata`.
+- `tinio_*` → `_`+rest: `lib.rs` `#[doc(hidden)] pub extern crate tinio_store_redb as _store_redb;` (`#[cfg(feature)]`; test `#[cfg(test)] extern crate`). In-crate `crate::{_core::{...}, path}`; else `tinio_fs::`. `tokio::fs` except sync/`spawn_blocking`/no-async-API/`Metadata`.
 
 ## Types & defaults
 
@@ -29,7 +29,7 @@
 
 ## Error
 
-- Per-crate `Error`; private `mod error`; qualify (`storage::Error`). Wrap `Storage(#[from])`; redb `tinio_store::error::Error` (thiserror `#[from]`, display verbatim; fs `Redb`/mem `DatabaseError`; hop `Error::Redb(e.into())`); extras → `Io`. ctor `already_exists(name)`.
+- Per-crate `Error`; private `mod error`; qualify (`storage::Error`). Wrap `Storage(#[from])`; redb `tinio_store_redb::error::Error` (thiserror `#[from]`, display verbatim; fs `Redb`/mem `DatabaseError`; hop `Error::Redb(e.into())`); extras → `Io`. ctor `already_exists(name)`.
 
 ## Async traits
 
@@ -42,6 +42,7 @@
 ## Doc examples
 
 - Public item: doc comment + runnable rustdoc example; exempt classes are a closed list — owner constitution III (`.specify/memory/constitution.md`).
+- `no_run` waives the runnable rule only when a runnable example would have to mock more than ten required trait methods: at or below ten the double stays a readable illustration, above it the example is a reimplementation (the `Versions` case needs 69, ~90 lines, and `format_code_in_doc_comments` would then have to keep every line rustfmt-exact). A `no_run` example MUST still say in prose what it would have demonstrated, and the bound is not a licence — a small entry point has no such excuse: `plan_write`, a free function over `Intent`/`State`/`Current`/`Seqs` with no trait to mock, is the in-repo counter-example.
 
 ## Docs & scripts
 

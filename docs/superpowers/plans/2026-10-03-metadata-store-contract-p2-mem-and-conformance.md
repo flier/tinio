@@ -58,7 +58,7 @@
 ### Task 2: mem content and multipart onto the contracts
 
 **Files:**
-- Modify: `crates/tinio-mem/src/storage.rs` (the content tables move behind `RedbContent`), `crates/tinio-mem/src/multipart.rs` (`MultipartOps` bodies through `UploadMeta` + `ObjectContent` for the assembled object and its parts), `crates/tinio-mem/src/version.rs` (its version-row access through `VersionMeta` — the ten `VersionOps` bodies stay as they are for P4), `crates/tinio-store-redb/src/impls/content.rs` if P1's Task 8 left an object-byte shape that only mem needs
+- Modify: `crates/tinio-mem/src/storage.rs` (the content tables move behind `RedbContent`), `crates/tinio-mem/src/multipart.rs` (`MultipartOps` bodies through `UploadMeta` + `ObjectContent` for the assembled object and its parts), `crates/tinio-mem/src/version.rs` (its version-row access through `VersionMeta` — the ten `VersionOps` bodies stay as they are for P4), `crates/tinio-store-redb/src/content.rs` if P1's Task 8 left an object-byte shape that only mem needs
 - Test: the part-order and accounting tests below
 
 **Interfaces:**
@@ -102,3 +102,5 @@
 - mem's write order is the contract's, not a mem choice: publish the bytes, then the row. A reversal is Review Focus 5's defect and the tests above are what catch it.
 - Do not add a mem-local metadata helper to avoid a contract call: the second consumer is what proves the contract is implementable outside redb's call sites.
 - If a method the migration needs is missing, add it to the contract **and** its leg to the shared suite in the same task, then use it from both consumers.
+
+**Carried into P4.** Two contract decisions were raised while closing P1 out and deliberately not decided there. They belong to the ops wave, and are recorded in `plans/2026-10-03-tinio-ops-p4.md` under "Carried into P4".

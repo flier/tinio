@@ -1,0 +1,24 @@
+# The PostgreSQL 18 the spike's gate runs against (P1 Task 2, D21/D25).
+# The image postgres:18-alpine is expected to be present locally; the default
+# "missing" pull policy never fetches it again.
+services:
+  pg-meta:
+    image: postgres:18-alpine
+    container_name: tinio-pg-meta-spike
+    environment:
+      POSTGRES_USER: tinio
+      POSTGRES_PASSWORD: tinio
+      POSTGRES_DB: tinio
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    ports:
+      - "55432:5432"
+    volumes:
+      - pg-meta-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tinio -d tinio"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pg-meta-data:

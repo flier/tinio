@@ -2,20 +2,20 @@
 //!
 //! One rule every backend shares: **the current version is whatever that
 //! backend's object store holds**. The engine in [`Versions`] never invents a
-//! second authority for it, and it knows nothing about paths, tables or
-//! files: it is written against three narrow ports it declares itself
-//! ([`VersionRows`], [`CurrentRows`], [`ContentPort`]) plus the shared blob
-//! engine over the backend's block store. A backend implements the ports; the
-//! state machine, the crash-safety order and the supersede race are inherited
-//! unchanged.
+//! second authority for it, and it knows nothing about paths, tables or files:
+//! it is written against the persistence contracts
+//! ([`Metadata`](tinio_core::meta::Metadata) and
+//! [`VersionMeta`](tinio_core::meta::VersionMeta)), the content contract
+//! ([`ObjectContent`](tinio_core::content::ObjectContent)) and the shared blob
+//! engine over the backend's block store. A backend implements the contracts;
+//! the state machine, the crash-safety order and the supersede race are
+//! inherited unchanged.
 //!
-//! The ports mirror the persistence contracts this work line is heading for —
-//! `VersionRows` becomes `VersionMeta`, `ContentPort` becomes
-//! `ObjectContent` — so the swap is a type substitution plus one error
-//! projection at each call site. `CurrentRows` has no contract counterpart
-//! (the metadata contract's point read deliberately does not gate) and stays
-//! a backend port; the block plane needs no port at all, because the engine
-//! holds [`Store`](tinio_blob::Store) directly.
+//! [`CurrentRows`] is the one port that stays: the metadata contract's point
+//! read deliberately does not gate, while the engine must only ever see the
+//! backend's **gated** current (the F01/F04 staleness rule a read applies).
+//! The block plane needs no port at all, because the engine holds
+//! [`Store`](tinio_blob::Store) directly.
 //!
 //! The write path's **decision** is a pure function, not a port:
 //! [`plan_write`] answers whether to supersede, which identity and sequence
@@ -32,8 +32,6 @@
 pub extern crate tinio_blob as _blob;
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
-#[doc(hidden)]
-pub extern crate tinio_store as _store;
 
 mod engine;
 mod error;
@@ -51,5 +49,5 @@ pub use self::{
     engine::Versions,
     error::Error,
     plan::{Identity, Intent, Plan, Seqs, converges_null, plan_write},
-    ports::{ContentPort, Current, CurrentRows, PublishedBody, Superseded, VersionRows},
+    ports::{Current, CurrentRows, PublishedBody},
 };

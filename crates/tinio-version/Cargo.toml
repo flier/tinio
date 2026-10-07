@@ -2,7 +2,7 @@
 name = "tinio-version"
 version.workspace = true
 edition.workspace = true
-description = "The shared version state machine for tinio: supersede, materialize and the version rows, over narrow ports each backend implements"
+description = "The shared version state machine for tinio: supersede, materialize and the version rows, over the persistence and content contracts"
 publish = false
 
 [dependencies]
@@ -11,15 +11,12 @@ thiserror.workspace = true
 
 tinio-blob.workspace = true
 tinio-core.workspace = true
-tinio-store.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
 futures.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
-
-tinio-util = { workspace = true, features = ["testing"] }
 
 [lints.clippy]
 absolute_paths = "warn"

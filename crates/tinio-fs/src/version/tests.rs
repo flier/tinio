@@ -17,7 +17,7 @@ use crate::{
         storage::{self, BucketOps, ObjectOps, VersionOps},
         version::{self, ListParams},
     },
-    _store::{meta::Stored, version as rows},
+    _store_redb::{object_meta::Stored, version as rows},
     _util::testing::conformance_versioning,
     FsStorage,
     database::Error as DatabaseError,
@@ -1358,7 +1358,7 @@ async fn the_whole_version_lifecycle_runs_over_the_real_state_dir() {
             blob::{BlockHash, BlockStore},
             version::{IdMarker, ReadResult},
         },
-        _store::{bucket_versioning, version_index},
+        _store_redb::{bucket_versioning, version_index},
         database::Error as DatabaseError,
         sweep::{Options as SweepOptions, Sweeper},
     };
@@ -1809,7 +1809,7 @@ async fn the_orphan_passes_leave_a_current_delete_marker_alone() {
             cleanup::{Cleanup, CleanupOptions},
             mode::AccessMode,
         },
-        _store::version_index,
+        _store_redb::version_index,
         FsCleanup, Scanner, ScannerOptions,
     };
 

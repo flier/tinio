@@ -14,7 +14,7 @@
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
 #[doc(hidden)]
-pub extern crate tinio_store as _store;
+pub extern crate tinio_store_redb as _store_redb;
 #[cfg(test)]
 extern crate tinio_util as _util;
 /// The shared write-path decision, compiled with the `versioning` feature

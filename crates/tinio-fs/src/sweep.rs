@@ -33,7 +33,7 @@ use crate::{
         bucket::Name,
         from_nanos, object,
     },
-    _store::{meta, version as rows},
+    _store_redb::{object_meta, version as rows},
     error::projected,
     metrics::{record_block_bytes, record_noncurrent_versions, record_sweep},
 };
@@ -643,7 +643,7 @@ impl Sweeper {
                 // absent too) has no current version: every one of its rows
                 // is history.
                 let mut slots: BTreeMap<String, rows::Slot> = BTreeMap::new();
-                meta::Table::open_readonly(txn)?.for_bucket_gated(
+                object_meta::Table::open_readonly(txn)?.for_bucket_gated(
                     scanned.as_ref(),
                     |key, stored| {
                         slots.insert(

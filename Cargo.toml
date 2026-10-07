@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["vendor/soft-canonicalize"]
+exclude = ["vendor/soft-canonicalize", "spike"]
 
 [workspace.package]
 version = "0.1.0"
@@ -111,7 +111,7 @@ tinio-sandbox-macos = { path = "crates/tinio-sandbox-macos" }
 tinio-sandbox-windows = { path = "crates/tinio-sandbox-windows" }
 tinio-select = { path = "crates/tinio-select" }
 tinio-server = { path = "crates/tinio-server", default-features = false }
-tinio-store = { path = "crates/tinio-store" }
+tinio-store-redb = { path = "crates/tinio-store-redb" }
 tinio-util = { path = "crates/tinio-util" }
 tinio-version = { path = "crates/tinio-version" }
 tinio-winsec = { path = "crates/tinio-winsec" }

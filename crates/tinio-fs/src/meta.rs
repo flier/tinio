@@ -55,11 +55,15 @@ use crate::{
         acl::{Acl, AclGrants},
         checksum,
         etag::ETag,
-        from_nanos, object, to_nanos, version,
+        from_nanos,
+        meta::ObjectMeta,
+        object, storage, to_nanos, version,
     },
-    _store::{bucket_versioning, meta, object_part},
+    _store_redb::{
+        RedbMetadata, bucket_versioning, meta::object as object_impl, object_meta, object_part,
+    },
     Error, bucket,
-    database::{Error as DatabaseError, Handle, for_bucket_strict},
+    database::{self, Driver, Error as DatabaseError, corrupt_meta, map_contract_error},
     etag::{self, HashBuffer},
 };
 
@@ -83,7 +87,7 @@ pub(crate) const COMPOSED_MTIME_JITTER: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 pub struct TagRow {
     /// The row the tag write left behind (its other elements verbatim).
-    pub(crate) row: meta::Stored,
+    pub(crate) row: object_meta::Stored,
     /// Whether the bucket records versions (read off the same write
     /// transaction's state table).
     pub(crate) records_versions: bool,
@@ -231,7 +235,7 @@ pub(crate) enum Verdict {
 /// including what a **missing** file means (the row's recorded marker flag,
 /// read and never inferred from the row's shape — a zero-byte object's row is
 /// shape-identical to a marker's where the filesystem has no identity).
-pub(crate) fn gate(stored: &meta::Stored, content: Content) -> Verdict {
+pub(crate) fn gate(stored: &object_meta::Stored, content: Content) -> Verdict {
     match content {
         Content::Present {
             size,
@@ -308,7 +312,7 @@ pub struct GatedMeta {
     /// The row's key.
     pub key: object::Key,
     /// The validated stored entry, when present and valid.
-    pub stored: Option<meta::Stored>,
+    pub stored: Option<object_meta::Stored>,
 }
 
 /// One entry of a [`Store::set_batch`] write batch (pipeline-spec.md
@@ -327,6 +331,13 @@ pub struct BatchEntry {
     /// The file identity at hash time (`0` marks an unavailable platform
     /// identity; see `fsutil::file_identity`).
     pub identity: u64,
+}
+
+/// The strict walk's corrupt-row failure as the shared traversal's callback: a
+/// named `fn` because the helper takes a higher-ranked closure and the generic
+/// `corrupt_meta` item does not satisfy it.
+fn corrupt_row(key: &str, source: storage::Error) -> DatabaseError {
+    corrupt_meta(key, source)
 }
 
 /// The ETag metadata store of a state dir.
@@ -359,14 +370,28 @@ pub struct BatchEntry {
 pub struct Store {
     /// The shared state-database handle (the redb single writer replaces
     /// the old in-process lock).
-    handle: Arc<Handle>,
+    handle: Arc<Driver>,
+    /// The engine's `ObjectMeta` implementation over the same database —
+    /// the delegated row reads ([Self::get], [Self::tags]) run through it.
+    engine: Arc<RedbMetadata>,
 }
 
 impl Store {
     /// Create a store over a shared state-database handle (the `FsStorage`
     /// construction path — one handle across all stores).
-    pub(crate) fn from_handle(handle: Arc<Handle>) -> Self {
-        Self { handle }
+    pub(crate) fn from_handle(handle: Arc<Driver>) -> Self {
+        Self {
+            engine: Arc::new(RedbMetadata::from_driver(handle.shared())),
+            handle,
+        }
+    }
+
+    /// The engine's `ObjectMeta` implementation over this store's database —
+    /// the shared handle the version adapter's `Rows` clones instead of
+    /// building a second one over the same driver (one database, many facade
+    /// views).
+    pub(crate) fn engine(&self) -> Arc<RedbMetadata> {
+        Arc::clone(&self.engine)
     }
 
     /// The stored [`meta::Stored`] of `key` — the hot-path read, without
@@ -384,10 +409,10 @@ impl Store {
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-    ) -> Result<Option<meta::Stored>, Error> {
+    ) -> Result<Option<object_meta::Stored>, Error> {
         self.handle
             .read(|txn| {
-                meta::Table::open_readonly(txn)?
+                object_meta::Table::open_readonly(txn)?
                     .get(bucket, key)
                     .map_err(Into::into)
             })
@@ -401,15 +426,40 @@ impl Store {
         bucket: &bucket::Name,
         key: &object::Key,
     ) -> Result<Option<Record>, Error> {
-        let Some(stored) = self.stored_entry(bucket, key).await? else {
+        let Some(row) = ObjectMeta::get(&*self.engine, bucket, key)
+            .await
+            .map_err(map_contract_error)?
+        else {
             return Ok(None);
         };
         Ok(Some(Record {
             key: key.clone(),
-            etag: stored.etag,
-            size: stored.size,
-            mtime: stored.mtime,
+            etag: row.etag,
+            size: row.size,
+            mtime: to_nanos(row.mtime),
         }))
+    }
+
+    /// The create-time owner of an upload row, if the upload exists and
+    /// records `key` — the unix ownership hardening's input for a completed
+    /// assembly (D23's `UploadMeta::get`, never a raw table read; the
+    /// completion reads the owner from the row its own transaction then
+    /// consumes, so the interface never re-ferries it).
+    #[cfg(unix)]
+    pub async fn upload_owner(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        upload_id: &str,
+    ) -> Result<Option<acl::OwnerId>, Error> {
+        // Imported here: the method is unix-only, so a module-level import
+        // would be unused on the other platforms.
+        use crate::_core::meta::UploadMeta;
+
+        let row = UploadMeta::get(&*self.engine, bucket, key, upload_id)
+            .await
+            .map_err(map_contract_error)?;
+        Ok(row.and_then(|row| row.owner))
     }
 
     /// The ETag of `key` when the stored entry still matches the object
@@ -506,7 +556,7 @@ impl Store {
         identity: u64,
         follow_symlinks: bool,
         stale: Option<&version::Id>,
-    ) -> Result<(meta::Stored, bool), Error> {
+    ) -> Result<(object_meta::Stored, bool), Error> {
         // The replaced row is kept in hand for the whole call: the tail's
         // read-only stand-in carries its elements over exactly as the
         // rewrite's own read would have (`not_written_back`), so the two
@@ -549,7 +599,7 @@ impl Store {
                     .await
                     .or_else(|err| not_written_back(Some(&stored), stale, err))?;
                 return Ok((
-                    meta::Stored {
+                    object_meta::Stored {
                         etag: stored.etag,
                         size,
                         mtime: to_nanos(mtime),
@@ -586,7 +636,7 @@ impl Store {
             .await
             .or_else(|err| not_written_back(previous.as_ref(), stale, err))?;
         Ok((
-            meta::Stored {
+            object_meta::Stored {
                 etag,
                 size,
                 mtime: to_nanos(mtime),
@@ -678,7 +728,7 @@ impl Store {
         identity: u64,
         stale: Option<&version::Id>,
     ) -> Result<Carried, Error> {
-        // The closure runs on the blocking pool (`Handle::write` is
+        // The closure runs on the blocking pool (`Driver::write` is
         // async, G3 revision) — clone the borrowed captures into it.
         let bucket = bucket.clone();
         let key = key.clone();
@@ -686,7 +736,7 @@ impl Store {
         let stale = stale.cloned();
         self.handle
             .write(move |txn| {
-                let mut table = meta::Table::open(txn)?;
+                let mut table = object_meta::Table::open(txn)?;
                 let row = table.get(&bucket, &key)?;
                 // The carry-over rule, from its one home (`carried`): the
                 // row this transaction re-read is the one the write
@@ -696,7 +746,7 @@ impl Store {
                 table.put(
                     &bucket,
                     &key,
-                    &meta::Stored {
+                    &object_meta::Stored {
                         etag: etag.clone(),
                         size,
                         mtime: to_nanos(mtime),
@@ -724,9 +774,9 @@ impl Store {
         bucket: &bucket::Name,
         key: &object::Key,
     ) -> Result<object::Tags, Error> {
-        Ok(self
-            .stored_entry(bucket, key)
-            .await?
+        Ok(ObjectMeta::get(&*self.engine, bucket, key)
+            .await
+            .map_err(map_contract_error)?
             .map_or_else(object::Tags::empty, |row| row.tags))
     }
 
@@ -752,7 +802,7 @@ impl Store {
         self.handle
             .write_if(move |txn| {
                 let row = {
-                    let mut table = meta::Table::open(txn)?;
+                    let mut table = object_meta::Table::open(txn)?;
                     if table.put_tags(&bucket, &key, &tags)?.is_none() {
                         return Ok(None);
                     }
@@ -810,7 +860,7 @@ impl Store {
                     .get(bucket.as_ref().as_str())?
                     .unwrap_or_default()
                     .records_versions();
-                let mut table = meta::Table::open(txn)?;
+                let mut table = object_meta::Table::open(txn)?;
                 // A row that appeared during the hash keeps its checksum,
                 // owner, ACL and current-version identity (the
                 // etag/size/mtime/identity are the hash-time ones — the row
@@ -828,7 +878,7 @@ impl Store {
                             )
                         },
                     );
-                let stored = meta::Stored {
+                let stored = object_meta::Stored {
                     etag: etag.clone(),
                     size,
                     mtime: to_nanos(mtime),
@@ -866,7 +916,7 @@ impl Store {
         self.handle
             .write_if(move |txn| {
                 let row = {
-                    let mut table = meta::Table::open(txn)?;
+                    let mut table = object_meta::Table::open(txn)?;
                     if table.clear_tags(&bucket, &key)?.is_none() {
                         return Ok(None);
                     }
@@ -926,7 +976,7 @@ impl Store {
         };
         self.handle
             .write_if(move |txn| {
-                let mut table = meta::Table::open(txn)?;
+                let mut table = object_meta::Table::open(txn)?;
                 let Some(row) = table.get(&bucket, &key)? else {
                     // Nothing to change — no commit (no fsync).
                     return Ok(None);
@@ -936,7 +986,7 @@ impl Store {
                 table.put(
                     &bucket,
                     &key,
-                    &meta::Stored {
+                    &object_meta::Stored {
                         acl: fresh.clone(),
                         ..row
                     },
@@ -995,7 +1045,7 @@ impl Store {
         let bucket = bucket.clone();
         self.handle
             .write(move |txn| {
-                let mut table = meta::Table::open(txn)?;
+                let mut table = object_meta::Table::open(txn)?;
                 for entry in &entries {
                     let row = table.get(&bucket, &entry.key)?;
                     let tags = row
@@ -1011,7 +1061,7 @@ impl Store {
                     table.put(
                         &bucket,
                         &entry.key,
-                        &meta::Stored {
+                        &object_meta::Stored {
                             etag: entry.etag.clone(),
                             size: entry.size,
                             mtime: to_nanos(entry.mtime),
@@ -1041,7 +1091,7 @@ impl Store {
         let key = key.clone();
         self.handle
             .write(move |txn| {
-                meta::Table::open(txn)?.remove(&bucket, &key)?;
+                object_meta::Table::open(txn)?.remove(&bucket, &key)?;
                 object_part::Table::open(txn)?.remove_key(&bucket, &key)?;
                 Ok(())
             })
@@ -1075,7 +1125,7 @@ impl Store {
                 // table in a transaction); the two tables are drained in
                 // separate passes — the handle borrows cannot overlap.
                 {
-                    let mut table = meta::Table::open(txn)?;
+                    let mut table = object_meta::Table::open(txn)?;
                     for key in &keys {
                         table.remove(&bucket, key)?;
                     }
@@ -1109,10 +1159,10 @@ impl Store {
         &self,
         bucket: &bucket::Name,
         keys: impl IntoIterator<Item = &'a object::Key>,
-    ) -> Result<Vec<Option<meta::Stored>>, Error> {
+    ) -> Result<Vec<Option<object_meta::Stored>>, Error> {
         self.handle
             .read(|txn| {
-                let table = meta::Table::open_readonly(txn)?;
+                let table = object_meta::Table::open_readonly(txn)?;
                 keys.into_iter()
                     .map(|key| table.get(bucket, key))
                     .collect::<Result<Vec<_>, _>>()
@@ -1140,9 +1190,11 @@ impl Store {
     /// identical snapshot semantics, but the short-lived transaction is
     /// released before the walk, so the DB pipeline's commits never
     /// collide with a pinned read transaction.
-    pub fn load_bucket(&self, bucket: &bucket::Name) -> Result<Vec<GatedMeta>, Error> {
+    pub async fn load_bucket(&self, bucket: &bucket::Name) -> Result<Vec<GatedMeta>, Error> {
+        let bucket = bucket.clone();
         self.handle
-            .read(|txn| self.load_bucket_in(txn, bucket))
+            .read_blocking(move |txn| Self::load_bucket_in(txn, &bucket))
+            .await
             .map_err(Into::into)
     }
 
@@ -1154,11 +1206,10 @@ impl Store {
     /// from one transaction this way, so its two tables are one point in
     /// time and one dispatch.
     pub(crate) fn load_bucket_in(
-        &self,
         txn: &redb::ReadTransaction,
         bucket: &bucket::Name,
     ) -> Result<Vec<GatedMeta>, DatabaseError> {
-        let table = meta::Table::open_readonly(txn)?;
+        let table = object_meta::Table::open_readonly(txn)?;
         let mut out = Vec::new();
         table.for_bucket_gated(bucket, |key, stored| {
             out.push(GatedMeta { key, stored });
@@ -1175,21 +1226,24 @@ impl Store {
     /// **Async via the blocking pool (P3, data-path review 2026-08-27)**:
     /// the walk is a full-bucket table scan (row-by-row validation +
     /// allocation), so the closure + read transaction run on the tokio
-    /// blocking pool through `Handle::read_blocking` — the
+    /// blocking pool through `Driver::read_blocking` — the
     /// same G3 hop shape as the write path — and never block a runtime
     /// worker's request tasks.
     pub async fn walk(&self, bucket: &bucket::Name) -> Result<Vec<Record>, Error> {
         let bucket = bucket.clone();
         self.handle
             .read_blocking(move |txn| {
-                let table = meta::Table::open_readonly(txn)?;
+                let table = object_meta::Table::open_readonly(txn)?;
                 let mut out = Vec::new();
-                for_bucket_strict(&table, &bucket, |key, etag, size, mtime| {
+                object_impl::for_bucket_strict(&table, &bucket, corrupt_row, |key, stored| {
+                    if !object_meta::orphan_candidate(stored.is_delete_marker) {
+                        return Ok(()); // a current delete marker is not an orphan candidate
+                    }
                     out.push(Record {
                         key,
-                        etag,
-                        size,
-                        mtime,
+                        etag: stored.etag,
+                        size: stored.size,
+                        mtime: stored.mtime,
                     });
                     Ok(())
                 })?;
@@ -1207,7 +1261,7 @@ impl Store {
         let bucket = bucket.clone();
         self.handle
             .write(move |txn| {
-                meta::Table::open(txn)?
+                object_meta::Table::open(txn)?
                     .drain_bucket(&bucket)
                     .map_err(Into::into)
             })
@@ -1257,7 +1311,7 @@ struct Carried {
 /// field, and its identity is not this reader's to clear. A row that was
 /// not there ([`None`], or an absent `previous`) leaves every element at
 /// its default.
-fn carried(row: Option<&meta::Stored>, stale: Option<&version::Id>) -> Carried {
+fn carried(row: Option<&object_meta::Stored>, stale: Option<&version::Id>) -> Carried {
     let Some(row) = row else {
         return Carried {
             tags: object::Tags::empty(),
@@ -1293,7 +1347,7 @@ fn carried(row: Option<&meta::Stored>, stale: Option<&version::Id>) -> Carried {
 /// that is *not* the read-only refusal propagates unchanged: a read-only
 /// run degrades, it does not swallow real failures.
 fn not_written_back(
-    previous: Option<&meta::Stored>,
+    previous: Option<&object_meta::Stored>,
     stale: Option<&version::Id>,
     err: Error,
 ) -> Result<Carried, Error> {
@@ -1317,7 +1371,9 @@ fn not_written_back(
 /// `meta.redb`).
 #[inline]
 pub fn store(state_dir: &Path) -> Result<Store, Error> {
-    Ok(Store::from_handle(Handle::open(state_dir)?))
+    Ok(Store::from_handle(Driver::new(
+        database::open(state_dir)?.db,
+    )))
 }
 
 #[cfg(test)]
@@ -1335,7 +1391,7 @@ mod tests {
             acl::{Acl, AclGrants},
             bucket, object, version,
         },
-        _store::meta::{Stored, Table},
+        _store_redb::object_meta::{Stored, Table},
         _util::testing::etag,
         database, fsutil, meta, testutil,
     };
@@ -1861,6 +1917,7 @@ mod tests {
         // transaction semantics, both forms of the gating load — R1).
         let walked: Vec<Option<Stored>> = store
             .load_bucket(&b)
+            .await
             .unwrap()
             .into_iter()
             .map(|row| row.stored)
@@ -1982,7 +2039,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let rows = store.load_bucket(&b).unwrap();
+        let rows = store.load_bucket(&b).await.unwrap();
         let seen: Vec<(&str, Option<u64>)> = rows
             .iter()
             .map(|r| (&*r.key, r.stored.as_ref().map(|s| s.file_identity)))
@@ -2031,7 +2088,7 @@ mod tests {
         }
         let store = meta::store(state.path()).unwrap();
         let b = bucket::name("data").unwrap();
-        let rows = store.load_bucket(&b).unwrap();
+        let rows = store.load_bucket(&b).await.unwrap();
         let seen: Vec<(&str, bool)> = rows.iter().map(|r| (&*r.key, r.stored.is_some())).collect();
         assert_eq!(seen, [("a.txt", true), ("bad-etag.txt", false)]);
         assert_eq!(rows[1].key.as_ref(), "bad-etag.txt");

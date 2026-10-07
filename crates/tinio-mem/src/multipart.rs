@@ -20,8 +20,8 @@ use crate::{
         key_marker_order, multipart::check_part_minimum, now_nanos, object,
         object::OBJECT_TAGS_MAX, split_uploads_order, uploads_order,
     },
-    _store::{
-        bucket, decode_acl_wire, decode_owner_wire, meta, object_part, objects, part,
+    _store_redb::{
+        bucket, decode_acl_wire, decode_owner_wire, object_meta, object_part, objects, part,
         part_checksum, part_data, part_meta, upload, upload_checksum,
     },
     Error,
@@ -525,7 +525,7 @@ impl MultipartOps for MemoryStorage {
                 }
                 // (The `mut` is the versioning branch's, like `write_object`'s.)
                 #[cfg_attr(not(feature = "versioning"), allow(unused_mut))]
-                let mut stored = meta::Stored {
+                let mut stored = object_meta::Stored {
                     version_id: None,
                     version_seq: 0,
                     is_delete_marker: false,
@@ -544,7 +544,7 @@ impl MultipartOps for MemoryStorage {
                     stored.version_seq = version_seq;
                 }
                 {
-                    let mut obj_meta = meta::Table::open(txn)?;
+                    let mut obj_meta = object_meta::Table::open(txn)?;
                     obj_meta.put(b, k, &stored)?;
                 }
                 {

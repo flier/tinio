@@ -2,6 +2,7 @@
 
 **Date**: 2026-09-03
 **Status**: approved — brainstorming + grilling 2026-09-03 (Q1–Q9; the redb error-conversion extraction was folded into scope at grilling Q5=B — see Decisions); factual review pass 2026-09-03 (code citations corrected against the tree; `thiserror` added to the crate's dependencies; the on-disk-format guard made a new schema-assertion test — no pre-existing test pins table names/arities)
+**Rename pointer (2026-10-03)**: the crate this record calls `tinio-store` is now `tinio-store-redb` — owner `docs/superpowers/specs/2026-10-03-metadata-store-contract-design.md` D5; this record is otherwise unchanged.
 **Scope**: a new workspace crate hosts the redb table schema, row types, wire codecs, per-prefix scan/drain helpers, and the redb error-conversion core duplicated between the tinio-fs and tinio-mem backends; tinio-fs relocates code with no on-disk format change; tinio-mem re-keys every table (shared and content) to tinio-fs's tuple-key convention and aliases its `DatabaseError` onto the shared error type. Not touched: per-backend ops semantics, the fs file layer, the fs database machinery (handle/open/compact/STATE), the per-crate crate-level error enums, mem byte-limit accounting.
 
 ## Background
