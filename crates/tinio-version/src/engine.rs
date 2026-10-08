@@ -188,6 +188,13 @@ where
 
     /// Record the bucket's versioning state.
     ///
+    /// The unguarded flip is deliberate: this engine is generic over its row
+    /// plane, and a backend whose bucket rows materialize lazily (or a
+    /// harness driving synthetic state) would be refused by the guarded
+    /// variant. A consumer that needs the guard against a racing teardown
+    /// calls [`VersionMeta::set_bucket_state_guarded`] directly — mem does,
+    /// because its bucket rows always exist first.
+    ///
     /// # Examples
     ///
     /// ```no_run

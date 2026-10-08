@@ -35,6 +35,13 @@ Domain glossary for the tinio workspace. English only. This file is a glossary �
 - **Capability toggle** — a server configuration switch that enables/disables an S3 operation or feature (multipart, copy, list v1/v2, delete-objects, checksum validation).
 - **Read-only mode** — the served plane's write policy (FR-023): every mutating S3 operation answers `AccessDenied` and the storage root is never written, so a genuinely read-only filesystem can be served. **Tool state** — state file, control socket, logs, auto-created config — relocates from `<root>/.tinio/` to `~/.tinio/roots/<hash>/` (`TINIO_STATE_DIR` overrides the location), while the storage's metadata source stays the root's own `<root>/.tinio/meta.redb`, opened read-only: metadata written by an earlier read-write run — tags, ACLs, CORS, upload records and the version history — is served, and an open that fails (no database, a corrupt one, a format this build refuses, or a read-write server holding the same root) degrades the run to serving current versions with an empty metadata view.
 
+## Persistence contracts
+
+- **Metadata contract** — the four `tinio-core` traits every backend implements over its own transport: `Metadata` (the row error, aggregating `BucketMeta`/`ObjectMeta`/`UploadMeta`), `VersionMeta` (version rows, the bucket's versioning state, the key's current slot) and `ObjectContent` (object and part bytes); `BlockStore` is the block plane beside them. Used generically, never as `dyn`.
+- **Backend handle** — the shared implementation a consumer holds concretely and delegates to (`RedbMetadata`, `RedbContent`); the consumer maps the contract error at its facade and never redeclares a row.
+- **Visibility point** — `ObjectContent::publish` returns only once the bytes are visible; the metadata row that describes them is written after it. A staged write is invisible by construction.
+- **Byte accounting decorator** — the `ObjectContent` wrapper that owns a backend's byte limits and total (`CountingContent`), so no operation body counts bytes itself.
+
 ## CLI and management plane
 
 - **Management plane** — the control surface beside the S3 data plane (FR-018): one local channel (a unix socket or a Windows named pipe) or one configured TCP HTTP(S) listener, carrying `/status`, `/stop`, `/metrics` and `/openapi.json` under the token rule its bind address selects.

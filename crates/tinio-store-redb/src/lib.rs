@@ -125,6 +125,14 @@ impl RedbMetadata {
     pub fn driver(&self) -> Arc<Driver> {
         Arc::clone(&self.driver)
     }
+
+    /// The shared store handle behind the driver — the handle a backend
+    /// whose own tables live in this database (tinio-mem's version blobs and
+    /// part-stat rows) keeps beside this implementation, so both serve one
+    /// database ([`Driver::store_handle`]).
+    pub fn store_handle(&self) -> Arc<store::Handle> {
+        self.driver.store_handle()
+    }
 }
 
 impl Metadata for RedbMetadata {

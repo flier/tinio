@@ -35,7 +35,7 @@ use crate::{
 
 /// The key a content-plane call addresses: an object key, or one multipart
 /// part's key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ContentKey {
     /// One object's bytes.
     Object(object::Key),
@@ -81,6 +81,24 @@ pub struct ContentEntry {
     pub identity: u64,
     /// The backend's modification time (`None` = the store keeps none).
     pub mtime: Option<SystemTime>,
+}
+
+/// The identity of one publish, minted by the caller: what
+/// [`ObjectContent::remove_if_tagged`] matches against.
+///
+/// Two writers can publish byte-identical content at one key — an empty body
+/// matches an empty body — and a byte comparison cannot tell their publishes
+/// apart. A plane that records the tag answers the stale compensation's
+/// `false` instead of deleting the later writer's bytes; a plane that keeps no
+/// identity falls back to the byte compare, documented per method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PublishId(u64);
+
+impl PublishId {
+    /// The identity with the given value.
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
 }
 
 /// The staged half of a write: the handle [`ObjectContent::stage`] answers, into
@@ -192,6 +210,119 @@ pub trait ObjectContent: Send + Sync + 'static {
 
     /// Remove `key`'s bytes (idempotent).
     async fn remove(&self, bucket: &bucket::Name, key: &ContentKey) -> Result<(), Self::Error>;
+
+    /// Remove every key's bytes (idempotent; an empty batch removes
+    /// nothing).
+    ///
+    /// The default is one [`remove`](Self::remove) per key, which is what a
+    /// backend whose bytes live one file per key wants. A backend whose
+    /// bytes share one store overrides it to commit the batch together —
+    /// the caller's rows are already gone by then, so a partial batch would
+    /// leave bytes nothing can reach (D23's byte plane).
+    async fn remove_many(
+        &self,
+        bucket: &bucket::Name,
+        keys: &[ContentKey],
+    ) -> Result<(), Self::Error> {
+        for key in keys {
+            self.remove(bucket, key).await?;
+        }
+        Ok(())
+    }
+
+    /// Remove `key`'s bytes only while they are still `expected`.
+    ///
+    /// The guard a failed write's compensation needs. Two writers can publish
+    /// the same key, and the one whose row write was refused must not delete
+    /// the bytes the other published in its place — a plain
+    /// [`remove`](Self::remove) cannot tell them apart.
+    ///
+    /// Answers whether the bytes were removed. `false` covers both "they
+    /// differ" and "there are none": absence is not an error, the idempotence
+    /// [`remove`](Self::remove) has. The default reads the bytes back and
+    /// compares, then removes; a backend whose bytes and comparison share one
+    /// store overrides it to compare and remove in one commit.
+    ///
+    /// The default cannot tell a backend's own "no such key" error from a real
+    /// read fault — a failed [`open`](Self::open) and a failed stream read both
+    /// answer `false`, the safe direction for a removal: the bytes are left
+    /// where they are. A backend that needs that distinction keeps its
+    /// override, where the compare and the removal share the store's own error
+    /// type — the shared store's and the decorator's both do.
+    async fn remove_if_matches(
+        &self,
+        bucket: &bucket::Name,
+        key: &ContentKey,
+        expected: &[u8],
+    ) -> Result<bool, Self::Error> {
+        let Ok(body) = self.open(bucket, key, None).await else {
+            return Ok(false);
+        };
+        let mut stored = Vec::new();
+        let mut body = body;
+        while let Some(chunk) = futures::StreamExt::next(&mut body).await {
+            // The stream's error is an `io::Error`, which the contract's
+            // associated type is not required to accept: there is no portable
+            // way to hand it back, and inventing one would widen every
+            // implementation's error. Unreadable bytes are therefore "not
+            // mine", the safe direction for a removal guard.
+            let Ok(bytes) = chunk else {
+                return Ok(false);
+            };
+            stored.extend_from_slice(&bytes);
+        }
+        if stored != expected {
+            return Ok(false);
+        }
+        self.remove(bucket, key).await?;
+        Ok(true)
+    }
+
+    /// Publish the staged bytes at `key`, tagged with `id` — the identity a
+    /// later [`remove_if_tagged`](Self::remove_if_tagged) matches.
+    ///
+    /// The default drops the tag and delegates to
+    /// [`publish`](Self::publish): a plane that keeps no per-publish identity
+    /// has nowhere to record it, and its [`remove_if_tagged`](Self::remove_if_tagged)
+    /// falls back to the byte compare with the same blind spot for
+    /// byte-identical bodies — documented, not silently different. `id` must
+    /// be unique per publish at least across the window a compensation lives
+    /// in (one publish and the row write that follows it).
+    async fn publish_tagged(
+        &self,
+        bucket: &bucket::Name,
+        staged: Self::Staged,
+        key: &ContentKey,
+        id: PublishId,
+    ) -> Result<(), Self::Error> {
+        // A plane without publish identity has nowhere to keep the tag.
+        let _ = id;
+        self.publish(bucket, staged, key).await
+    }
+
+    /// Remove `key`'s bytes only while they are still the publish `id` named.
+    ///
+    /// The guard that closes [`remove_if_matches`](Self::remove_if_matches)'s
+    /// blind spot: two publishes of byte-identical content are indistinguishable
+    /// by their bytes, so a stale writer's compensation must match the
+    /// *publish*, not the content. `expected` is the fallback the compare uses
+    /// on a plane that keeps no identity.
+    ///
+    /// The default ignores the tag and answers exactly
+    /// [`remove_if_matches`](Self::remove_if_matches) — a plane that dropped
+    /// the tag at publish keeps the byte compare's blind spot, documented
+    /// rather than silent. A plane that records the tag answers `false` for a
+    /// stale one even when the bytes are equal.
+    async fn remove_if_tagged(
+        &self,
+        bucket: &bucket::Name,
+        key: &ContentKey,
+        expected: &[u8],
+        id: PublishId,
+    ) -> Result<bool, Self::Error> {
+        let _ = id;
+        self.remove_if_matches(bucket, key, expected).await
+    }
 
     /// Rename an object's bytes. `Err` when the source holds nothing — the
     /// metadata move is the caller's, and a rename that moved no bytes must not

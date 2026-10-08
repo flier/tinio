@@ -6,7 +6,9 @@
 //! whole suite) plus the per-category `assert_bucket_meta_conformance`,
 //! `assert_object_meta_conformance` and `assert_upload_meta_conformance` (the
 //! leg a category-implementation task runs beside its own module),
-//! `assert_version_conformance` and `assert_content_conformance`. Crates enable the `testing` feature in their
+//! `assert_version_conformance`, `assert_guarded_write_conformance` (the two
+//! opt-in guarded writers, deliberately outside the aggregate) and
+//! `assert_content_conformance`. Crates enable the `testing` feature in their
 //! dev-dependencies: backend crates run the suite against a freshly constructed
 //! backend, and any test target may use the shared helpers beside it — the
 //! facade's doctor legs consume [`json_keys`]:

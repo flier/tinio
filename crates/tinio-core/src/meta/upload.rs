@@ -266,6 +266,28 @@ pub trait UploadMeta: Send + Sync + 'static {
     where
         Self: Metadata;
 
+    /// Upsert the upload state **only when the bucket row exists**: the
+    /// check runs inside the write transaction, so a concurrent
+    /// [`BucketMeta::remove_if_empty`](crate::meta::BucketMeta::remove_if_empty)
+    /// cannot be raced by a create, and the refusal projects to
+    /// [`crate::storage::Error::NoSuchBucket`].
+    ///
+    /// [`create`](UploadMeta::create) stays unguarded: not every backend can
+    /// answer a bucket-row check inside the upload write (a bucket plane whose
+    /// rows materialize lazily would refuse a bucket it has never written a
+    /// row for), so the guard is opt-in and the default is the plain upsert.
+    async fn create_guarded(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &Row,
+    ) -> Result<(), <Self as Metadata>::Error>
+    where
+        Self: Metadata,
+    {
+        UploadMeta::create(self, bucket, upload_id, row).await
+    }
+
     /// The upload state, present only when the upload exists **and** records
     /// `key`.
     async fn get(

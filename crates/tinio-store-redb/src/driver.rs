@@ -138,8 +138,10 @@ impl WriteHistogram {
 #[derive(Debug)]
 pub struct Driver {
     /// The shared store handle: the database arm, its transactions and
-    /// the closure-passing read/write pattern.
-    db: store::Handle,
+    /// the closure-passing read/write pattern. Shared behind an `Arc` so a
+    /// backend can hold the same handle beside the driver
+    /// ([`Driver::store_handle`]).
+    db: Arc<store::Handle>,
     /// The write-lock histograms (pipeline-spec.md §4).
     hist: WriteHistogram,
 }
@@ -201,9 +203,21 @@ impl Driver {
 
     fn wrap(db: store::Handle) -> Arc<Self> {
         Arc::new(Self {
-            db,
+            db: Arc::new(db),
             hist: WriteHistogram::default(),
         })
+    }
+
+    /// The shared store handle this driver runs its transactions through.
+    ///
+    /// A backend whose **own** tables live in the same database (tinio-mem's
+    /// version blobs and part-stat rows) shares this handle with the
+    /// contract implementations instead of opening a second database — one
+    /// database, so a mem-local table's write and the contract row's write
+    /// run against the same state. The fs backend opens its own handle (its
+    /// blocking-pool hop and histograms live there).
+    pub fn store_handle(&self) -> Arc<store::Handle> {
+        Arc::clone(&self.db)
     }
 
     /// Run `f` against a read transaction — every arm reads.

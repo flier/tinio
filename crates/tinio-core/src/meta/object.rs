@@ -320,6 +320,10 @@ pub trait ObjectMeta: Send + Sync + 'static {
         Self: Metadata;
 
     /// The object row **and its retained part list** in one transaction.
+    ///
+    /// The writer asserts the bucket row inside that transaction (a bucket
+    /// with no row refuses and projects that refusal), so it cannot be raced by
+    /// a `remove_if_empty` — the same guard [`ObjectMeta::put_guarded`] carries.
     async fn put_with_parts(
         &self,
         bucket: &bucket::Name,
@@ -343,6 +347,9 @@ pub trait ObjectMeta: Send + Sync + 'static {
     /// The row's content-derived elements refreshed and the recorded elements
     /// (`tags`, `checksum`, `owner`, `acl`) carried over — the read-path
     /// heal. The answer is what the row records after the refresh.
+    ///
+    /// It materializes a row, so it carries the same in-transaction bucket-row
+    /// assertion as [`ObjectMeta::put_guarded`].
     async fn put_preserving(
         &self,
         bucket: &bucket::Name,

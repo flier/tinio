@@ -2,7 +2,7 @@
 //! implements [`tinio_core::meta`] and [`tinio_core::content`] must satisfy,
 //! driven through the contracts' own methods only.
 //!
-//! Six entry points — a backend calls the ones it implements:
+//! Seven entry points — a backend calls the ones it implements:
 //!
 //! - [`assert_metadata_conformance`] — the aggregate: [`BucketMeta`],
 //!   [`ObjectMeta`] and [`UploadMeta`] over a [`Metadata`] store: ordering,
@@ -16,7 +16,13 @@
 //!   writes, plus both traversals.
 //! - [`assert_upload_meta_conformance`] — [`UploadMeta`]'s legs alone.
 //! - [`assert_version_conformance`] — [`VersionMeta`]'s state machine, the
-//!   version rows and the current slot.
+//!   version rows and the current slot ([`Metadata`] joins the bound because
+//!   the slot writer itself probes the bucket row).
+//! - [`assert_guarded_write_conformance`] — the two **opt-in** guarded writers
+//!   ([`UploadMeta::create_guarded`], [`VersionMeta::set_bucket_state_guarded`]).
+//!   Deliberately outside the aggregate: both are defaulted, and a backend that
+//!   takes the default (a lazy-row or out-of-process store) would fail a leg it
+//!   never claimed.
 //! - [`assert_content_conformance`] — [`ObjectContent`]'s staged write and
 //!   its visibility point, the ranged read, the move/copy/remove primitives,
 //!   the content walk and the content-plane bucket lifecycle.
@@ -49,7 +55,7 @@ use crate::_core::{
     acl::{Acl, AclGrants, OwnerId},
     blob::{BlobRef, BlockHash},
     bucket,
-    content::{ContentEntry, ContentKey, ObjectContent, StagedObject, stage_body},
+    content::{ContentEntry, ContentKey, ObjectContent, PublishId, StagedObject, stage_body},
     cors,
     meta::{
         BucketMeta, Metadata, ObjectMeta, UploadMeta, bucket as bucket_row,
@@ -250,24 +256,56 @@ where
     upload_legs(store).await;
 }
 
+/// Assert the two **opt-in** guarded writers: [`UploadMeta::create_guarded`]
+/// and [`VersionMeta::set_bucket_state_guarded`], each re-checking the bucket
+/// row inside the write transaction it commits.
+///
+/// They stay out of the aggregate suites on purpose. Both methods are
+/// defaulted, and the default forwards to the unguarded write: a backend whose
+/// bucket rows materialize lazily — or one that is not this process's redb at
+/// all, the pg spike being the live example — takes the default and would fail
+/// a leg it never claimed. A backend that overrides them (redb's own
+/// implementation, and therefore tinio-mem and tinio-fs, which sit on it)
+/// calls this beside the aggregate.
+///
+/// # Panics
+///
+/// On the first violated rule; the message names the rule.
+pub async fn assert_guarded_write_conformance<S>(store: &S)
+where
+    S: Metadata + UploadMeta + VersionMeta,
+{
+    guarded_create_leg(store).await;
+    guarded_state_leg(store).await;
+}
+
 /// Assert every rule [`VersionMeta`] carries.
 ///
-/// The bound is [`VersionMeta`] alone: its own associated error carries every
-/// leg, including the bucket-wide [`VersionMeta::drain_bucket`].
+/// The bound pairs the version plane with [`Metadata`] for one reason: the slot
+/// writer is a guarded writer (it probes the bucket row inside its own write
+/// transaction), so the legs plant the row a live bucket has before they drive
+/// it. The guarded *state write* is not asserted here — it is opt-in and lives
+/// in [`assert_guarded_write_conformance`].
 ///
 /// # Panics
 ///
 /// On the first violated rule; the message names the rule.
 pub async fn assert_version_conformance<V>(store: &V)
 where
-    V: VersionMeta,
+    V: Metadata + VersionMeta,
 {
     let bucket = bucket_name("conf-version");
     let k = key("v.txt");
     let v1 = version::Id::new("v1").expect("a valid version id");
     let v2 = version::Id::new("v2").expect("a valid version id");
+    // The bucket row every guarded writer probes. It is not a state row: the
+    // unversioned leg below still sees a bucket with no versioning state.
+    BucketMeta::create(store, &bucket, &bucket_at(t0()))
+        .await
+        .unwrap();
 
-    // The state machine: a bucket with no row is Unversioned, and the
+    // The state machine: a bucket with no versioning state row is
+    // Unversioned (the bucket row planted above is not one), and the
     // transitions round-trip.
     assert_eq!(
         store.bucket_state(&bucket).await.unwrap(),
@@ -580,6 +618,11 @@ where
         .await
         .unwrap();
     let other = bucket_name("conf-version-other");
+    // The version writers probe the bucket row like every other guarded
+    // writer, so the legs plant it first.
+    BucketMeta::create(store, &other, &bucket_at(t0()))
+        .await
+        .unwrap();
     store
         .put_version(&other, &k3, &version_row(1, Some(v1.clone()), Kind::Object))
         .await
@@ -615,6 +658,109 @@ where
         store.bucket_rows(&bucket).await.unwrap().is_empty(),
         "a second drain of a bucket with no rows is a no-op"
     );
+}
+
+/// The guarded upload create's leg (see [`assert_guarded_write_conformance`]).
+async fn guarded_create_leg<M>(store: &M)
+where
+    M: Metadata + UploadMeta,
+{
+    // The guarded create: the bucket row is checked inside the writing
+    // transaction, so a create cannot be raced by a `remove_if_empty` (the
+    // TOCTOU-free upsert). A bucket with no row refuses and projects the
+    // refusal without writing an upload row; one with a row lands and reads
+    // back.
+    let target = key("conf-upload-guarded.txt");
+    let guarded = bucket_name("conf-upload-guarded");
+    let absent = bucket_name("conf-upload-guarded-absent");
+    let state = upload::Row {
+        upload_id: "conf-upload-guarded".to_owned(),
+        key: target.clone(),
+        initiated_at: t0(),
+        checksum: None,
+        tags: object::Tags::empty(),
+        owner: None,
+        acl: Acl::default_private(None),
+    };
+    let refused = match store
+        .create_guarded(&absent, "conf-upload-guarded", &state)
+        .await
+    {
+        Ok(()) => panic!("create_guarded must refuse a bucket with no row"),
+        Err(err) => err.into(),
+    };
+    assert!(
+        matches!(refused, storage::Error::NoSuchBucket(_)),
+        "create_guarded's refusal must project to NoSuchBucket, got {refused:?}"
+    );
+    assert!(
+        UploadMeta::get(store, &absent, &target, "conf-upload-guarded")
+            .await
+            .unwrap()
+            .is_none(),
+        "the refused guarded create wrote no upload row"
+    );
+    BucketMeta::create(store, &guarded, &bucket_at(t0()))
+        .await
+        .unwrap();
+    store
+        .create_guarded(&guarded, "conf-upload-guarded", &state)
+        .await
+        .unwrap();
+    assert_eq!(
+        UploadMeta::get(store, &guarded, &target, "conf-upload-guarded")
+            .await
+            .unwrap()
+            .expect("the guarded create just landed")
+            .upload_id,
+        "conf-upload-guarded"
+    );
+    UploadMeta::drain_bucket(store, &guarded).await.unwrap();
+    BucketMeta::remove(store, &guarded).await.unwrap();
+}
+
+/// The guarded version-state write's leg (see
+/// [`assert_guarded_write_conformance`]).
+async fn guarded_state_leg<V>(store: &V)
+where
+    V: Metadata + VersionMeta,
+{
+    // The guarded state write: the bucket row is checked inside the writing
+    // transaction, so the write cannot be raced by a `remove_if_empty` (the
+    // TOCTOU-free half of the bucket half). A bucket with no row refuses and
+    // projects the refusal without writing a state row; one with a row lands
+    // and reads back.
+    let guarded = bucket_name("conf-version-guarded");
+    let absent = bucket_name("conf-version-guarded-absent");
+    let refused = match store
+        .set_bucket_state_guarded(&absent, version::State::Enabled)
+        .await
+    {
+        Ok(()) => panic!("set_bucket_state_guarded must refuse a bucket with no row"),
+        Err(err) => err.into(),
+    };
+    assert!(
+        matches!(refused, storage::Error::NoSuchBucket(_)),
+        "set_bucket_state_guarded's refusal must project to NoSuchBucket, got {refused:?}"
+    );
+    assert_eq!(
+        store.bucket_state(&absent).await.unwrap(),
+        version::State::Unversioned,
+        "the refused guarded write wrote no state row"
+    );
+    BucketMeta::create(store, &guarded, &bucket_at(t0()))
+        .await
+        .unwrap();
+    store
+        .set_bucket_state_guarded(&guarded, version::State::Enabled)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.bucket_state(&guarded).await.unwrap(),
+        version::State::Enabled,
+        "the guarded write on a live bucket lands"
+    );
+    BucketMeta::remove(store, &guarded).await.unwrap();
 }
 
 /// Assert every rule [`ObjectContent`] carries.
@@ -765,6 +911,118 @@ where
     store.remove(&bucket, &c_key).await.unwrap();
     store.remove(&bucket, &c_key).await.unwrap();
     assert!(store.open(&bucket, &c_key, None).await.is_err());
+
+    // A batch removal (D23's byte plane): every key in one call, idempotent,
+    // and an empty batch removes nothing. The default arm loops `remove`; a
+    // backend whose bytes share one store commits the batch together.
+    let batch_a = ContentKey::Object(key("batch-a.bin"));
+    let batch_b = ContentKey::Object(key("batch-b.bin"));
+    let batch_part = ContentKey::Part {
+        upload_id: "0c3b7d11-8a4e-4c62-b0d5-7f2e91a4c508".to_owned(),
+        number: part(1),
+    };
+    let mut staged = store.stage(&bucket, &batch_a).await.unwrap();
+    staged.write(Bytes::from_static(b"batch-a")).await.unwrap();
+    store.publish(&bucket, staged, &batch_a).await.unwrap();
+    let mut staged = store.stage(&bucket, &batch_b).await.unwrap();
+    staged.write(Bytes::from_static(b"batch-b")).await.unwrap();
+    store.publish(&bucket, staged, &batch_b).await.unwrap();
+    let mut staged = store.stage(&bucket, &batch_part).await.unwrap();
+    staged
+        .write(Bytes::from_static(b"batch-part"))
+        .await
+        .unwrap();
+    store.publish(&bucket, staged, &batch_part).await.unwrap();
+    store.remove_many(&bucket, &[]).await.unwrap();
+    assert!(
+        store.open(&bucket, &batch_a, None).await.is_ok(),
+        "an empty batch removes nothing"
+    );
+    let batch = [batch_a.clone(), batch_b.clone(), batch_part.clone()];
+    store.remove_many(&bucket, &batch).await.unwrap();
+    for target in &batch {
+        assert!(
+            store.open(&bucket, target, None).await.is_err(),
+            "remove_many removes every key it was given"
+        );
+    }
+    store.remove_many(&bucket, &batch).await.unwrap();
+
+    // A conditional removal: the compensation of a write whose row write was
+    // refused must not delete bytes a later writer published in its place.
+    let guarded = ContentKey::Object(key("guarded.bin"));
+    let mut staged = store.stage(&bucket, &guarded).await.unwrap();
+    staged.write(Bytes::from_static(b"mine")).await.unwrap();
+    store.publish(&bucket, staged, &guarded).await.unwrap();
+    assert!(
+        !store
+            .remove_if_matches(&bucket, &guarded, b"")
+            .await
+            .unwrap(),
+        "an empty expectation never matches bytes that exist"
+    );
+    assert!(
+        !store
+            .remove_if_matches(&bucket, &guarded, b"theirs")
+            .await
+            .unwrap(),
+        "different bytes are left alone"
+    );
+    assert_eq!(
+        read(store, &bucket, &guarded, None).await,
+        b"mine",
+        "…and the mismatch removed nothing"
+    );
+    assert!(
+        store
+            .remove_if_matches(&bucket, &guarded, b"mine")
+            .await
+            .unwrap(),
+        "the bytes the caller published are removed"
+    );
+    assert!(
+        store.open(&bucket, &guarded, None).await.is_err(),
+        "…and they are gone"
+    );
+    assert!(
+        !store
+            .remove_if_matches(&bucket, &guarded, b"mine")
+            .await
+            .unwrap(),
+        "absent bytes answer false, never an error"
+    );
+
+    // A tagged publish carries the identity a compensation matches: every
+    // plane answers the live id's removal (a plane that records the tag
+    // compares it, a plane that keeps none falls back to the bytes — its
+    // stale-id blind spot is the trait's documented default, and the
+    // recording plane's own suite leg lives with its decorator).
+    let tagged = ContentKey::Object(key("tagged.bin"));
+    let tag = PublishId::new(1);
+    let mut staged = store.stage(&bucket, &tagged).await.unwrap();
+    staged.write(Bytes::from_static(b"tagged")).await.unwrap();
+    store
+        .publish_tagged(&bucket, staged, &tagged, tag)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .remove_if_tagged(&bucket, &tagged, b"tagged", tag)
+            .await
+            .unwrap(),
+        "the live publish's own id removes its bytes"
+    );
+    assert!(
+        store.open(&bucket, &tagged, None).await.is_err(),
+        "…and they are gone"
+    );
+    assert!(
+        !store
+            .remove_if_tagged(&bucket, &tagged, b"tagged", tag)
+            .await
+            .unwrap(),
+        "an already-spent tag answers false, never an error"
+    );
 
     // Part bytes count as content too.
     assert!(

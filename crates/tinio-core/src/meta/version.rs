@@ -353,6 +353,24 @@ pub trait VersionMeta: Send + Sync + 'static {
         state: State,
     ) -> Result<(), Self::Error>;
 
+    /// Record the bucket's versioning state **only when the bucket row
+    /// exists**: the check runs inside the write transaction, so a concurrent
+    /// [`BucketMeta::remove_if_empty`](crate::meta::BucketMeta::remove_if_empty)
+    /// cannot be raced by a state write, and the refusal projects to
+    /// [`crate::storage::Error::NoSuchBucket`].
+    ///
+    /// [`set_bucket_state`](VersionMeta::set_bucket_state) stays unguarded — a
+    /// bucket plane whose rows materialize lazily would refuse a bucket it has
+    /// never written a row for — so the guard is opt-in and the default is the
+    /// plain write.
+    async fn set_bucket_state_guarded(
+        &self,
+        bucket: &bucket::Name,
+        state: State,
+    ) -> Result<(), Self::Error> {
+        VersionMeta::set_bucket_state(self, bucket, state).await
+    }
+
     /// The key's current slot, or `None` when the key has **nothing recorded** —
     /// no slot state, so no identity and no version row to resolve a kind from.
     /// A key whose slot is recorded always answers `Some`, and the returned
@@ -410,7 +428,10 @@ pub trait VersionMeta: Send + Sync + 'static {
     ///
     /// A key with **no** `object_meta` row gets one materialized to carry the
     /// slot columns, its content-derived elements (ETag, size, mtime, file
-    /// identity) starting empty — the deliberate rule, not an accident. A
+    /// identity) starting empty — the deliberate rule, not an accident, and it
+    /// holds **within a bucket that has its own row**: an implementation that
+    /// guards its writers refuses a bucket with no row rather than
+    /// materializing state for it. A
     /// recorded slot is object-row state whether or not content sits behind it
     /// (a **delete marker** is exactly this: a recorded slot with no bytes), so
     /// an object-row read ([`ObjectMeta::get`](super::ObjectMeta::get),

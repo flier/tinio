@@ -314,6 +314,82 @@ impl ObjectContent for RedbContent {
         }
     }
 
+    async fn remove_many(&self, bucket: &bucket::Name, keys: &[ContentKey]) -> Result<(), Error> {
+        // One commit for the batch: the rows that named these bytes are
+        // already gone, so a batch that stopped half-way would leave bytes
+        // nothing can reach.
+        let bucket = bucket.to_string();
+        let keys = keys.to_vec();
+        self.driver
+            .write(move |txn| {
+                for key in &keys {
+                    match key {
+                        ContentKey::Object(key) => {
+                            let key = key.to_string();
+                            ObjectsTable::open(txn)?.remove(&bucket, &key)?;
+                        }
+                        ContentKey::Part { upload_id, number } => {
+                            PartDataTable::open(txn)?.remove(
+                                &bucket,
+                                upload_id,
+                                u32::from(*number),
+                            )?;
+                        }
+                    }
+                }
+                Ok::<(), Error>(())
+            })
+            .await
+    }
+
+    async fn remove_if_matches(
+        &self,
+        bucket: &bucket::Name,
+        key: &ContentKey,
+        expected: &[u8],
+    ) -> Result<bool, Error> {
+        // The read, the comparison and the removal share one commit: the
+        // writer this guard exists for publishes between them, and a
+        // compare outside the write transaction would let it slip into the
+        // window and lose the bytes it just published.
+        let bucket = bucket.to_string();
+        let key = key.clone();
+        let expected = expected.to_vec();
+        self.driver
+            .write(move |txn| {
+                let matches = match &key {
+                    ContentKey::Object(key) => {
+                        let key = key.to_string();
+                        let table = ObjectsTable::open(txn)?;
+                        let stored = table.get(&bucket, &key)?;
+                        stored.is_some_and(|guard| guard.value() == expected.as_slice())
+                    }
+                    ContentKey::Part { upload_id, number } => {
+                        let table = PartDataTable::open(txn)?;
+                        let stored = table.get(&bucket, upload_id, u32::from(*number))?;
+                        stored.is_some_and(|guard| guard.value() == expected.as_slice())
+                    }
+                };
+                if matches {
+                    match &key {
+                        ContentKey::Object(key) => {
+                            let key = key.to_string();
+                            ObjectsTable::open(txn)?.remove(&bucket, &key)?;
+                        }
+                        ContentKey::Part { upload_id, number } => {
+                            PartDataTable::open(txn)?.remove(
+                                &bucket,
+                                upload_id,
+                                u32::from(*number),
+                            )?;
+                        }
+                    }
+                }
+                Ok::<bool, Error>(matches)
+            })
+            .await
+    }
+
     async fn rename(
         &self,
         bucket: &bucket::Name,

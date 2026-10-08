@@ -29,9 +29,11 @@ pub enum Error {
     /// A contract-domain failure.
     #[error(transparent)]
     Storage(#[from] storage::Error),
-    /// A redb database failure.
+    /// A redb database failure (a refused contract failure unwraps to
+    /// [`Error::Storage`] through the [`From<DatabaseError>`](Error::from)
+    /// impl, so a refusal stays visible as its projection).
     #[error(transparent)]
-    Database(#[from] DatabaseError),
+    Database(DatabaseError),
 }
 
 /// A redb failure: the shared five-variant mapping core
@@ -47,6 +49,20 @@ pub enum Error {
 /// assert!(matches!(err, Error::Database(DatabaseError::Storage(_))));
 /// ```
 pub use crate::_store_redb::Error as DatabaseError;
+
+impl From<DatabaseError> for Error {
+    fn from(err: DatabaseError) -> Self {
+        // The refused arm carries the contract failure itself, and rides
+        // through verbatim: a refusal is visible as a projection (D22), so
+        // `remove_if_empty`'s `NoSuchBucket`/`NotEmpty`, `create`'s
+        // `AlreadyExists` and the tag/ACL presence outcomes must not
+        // degrade to `Io` behind the database arm.
+        match err {
+            DatabaseError::Refused(err) => Error::Storage(err),
+            err => Error::Database(err),
+        }
+    }
+}
 
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
@@ -107,12 +123,23 @@ pub(crate) fn invalid_key(key: String) -> Error {
 }
 
 /// The entity already exists (e.g. bucket creation on an existing name).
+///
+/// The bucket create path takes its refusal from the contract now
+/// (`BucketMeta::create` answers `AlreadyExists`), so this constructor's
+/// only callers are the error tests.
+#[cfg(test)]
 #[inline]
 pub(crate) fn already_exists(name: &bucket::Name) -> Error {
     Error::Storage(storage::already_exists(name))
 }
 
 /// The bucket still contains objects and cannot be deleted.
+///
+/// The teardown raises this refusal through `storage::not_empty` directly: it
+/// elides the contract's `remove_if_empty` to keep the occupancy probe, the
+/// row drops and the byte release in one transaction (ruling 2026-10-08).
+/// This wrapper therefore serves the error tests only.
+#[cfg(test)]
 #[inline]
 pub(crate) fn not_empty(name: &bucket::Name) -> Error {
     Error::Storage(storage::not_empty(name))

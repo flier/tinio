@@ -584,6 +584,19 @@ impl UploadMeta for Rows {
             .map_err(Into::into)
     }
 
+    /// The guarded create, delegated like every other upload write: the
+    /// engine's own transaction reads the bucket row before it writes.
+    async fn create_guarded(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &upload_row::Row,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::create_guarded(&self.engine, bucket, upload_id, row)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn get(
         &self,
         bucket: &bucket::Name,
@@ -738,6 +751,18 @@ impl VersionMeta for Rows {
         state: State,
     ) -> Result<(), Self::Error> {
         <RedbMetadata as VersionMeta>::set_bucket_state(&self.engine, bucket, state)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The guarded state write, delegated like every other version write: the
+    /// engine's own transaction reads the bucket row before it writes.
+    async fn set_bucket_state_guarded(
+        &self,
+        bucket: &bucket::Name,
+        state: State,
+    ) -> Result<(), Self::Error> {
+        <RedbMetadata as VersionMeta>::set_bucket_state_guarded(&self.engine, bucket, state)
             .await
             .map_err(Into::into)
     }
@@ -908,7 +933,7 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            ETag, acl,
+            BucketOps, ETag, acl,
             blob::{BlobRef, BlockHash, BlockStore},
             bucket,
             meta::version::{Kind, Stored},
@@ -923,13 +948,15 @@ mod tests {
     /// A storage with a `demo` bucket directory, its name and a key.
     async fn fixture() -> (tempfile::TempDir, FsStorage, Name, object::Key) {
         let (root, storage) = testutil::storage();
-        fs::create_dir(root.path().join("demo")).await.unwrap();
-        (
-            root,
-            storage,
-            bucket::name("demo").unwrap(),
-            object::key("notes.txt").unwrap(),
-        )
+        let bucket = bucket::name("demo").unwrap();
+        // The bucket through the production path: the directory is only half of
+        // a bucket, and the metadata row it records is what every guarded
+        // writer — the version rows these tests exercise included — probes.
+        storage
+            .create_bucket(&bucket, None, &acl::Acl::default_private(None))
+            .await
+            .unwrap();
+        (root, storage, bucket, object::key("notes.txt").unwrap())
     }
 
     /// The key's target path.

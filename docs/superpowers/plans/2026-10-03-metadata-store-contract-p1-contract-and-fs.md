@@ -345,7 +345,7 @@ The method list is a working surface (D10): a later task adds a method when a mi
 - **P1 (this plan) owns**: the four contracts' method block and rows, the conformance suite's creation and every leg except the mem runs, the PostgreSQL spike gate (its schema seed and findings), the `tinio-store-redb` rename and driver relocation, the metadata/version/content implementations, the engine re-point, the pre-change fixture, and the fs migration.
 - **P2** owns: the `tinio-mem` migration, its conformance run, cleanup and the doc sync.
 - **P3/P4/P5** own: `tinio-store-pg`, `tinio-ops` and `tinio-pg` (their specs own their models).
-- **The spec** owns every decision, the contract properties and the topology; **`2026-09-03-shared-store-table-layer-design.md`** owns the table set and the codecs (its arity table is stale against the landed 5/8/5 tuples — a correction line beside it is part of P2's doc sync).
+- **The spec** owns every decision, the contract properties and the topology; **`2026-09-03-shared-store-table-layer-design.md`** owns the table set and the codecs (its arity table is stale against the landed 5/5/11 tuples — a correction line beside it is part of P2's doc sync).
 
 ## Notes for the executor
 

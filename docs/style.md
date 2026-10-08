@@ -29,7 +29,7 @@
 
 ## Error
 
-- Per-crate `Error`; private `mod error`; qualify (`storage::Error`). Wrap `Storage(#[from])`; redb `tinio_store_redb::error::Error` (thiserror `#[from]`, display verbatim; fs `Redb`/mem `DatabaseError`; hop `Error::Redb(e.into())`); extras → `Io`. ctor `already_exists(name)`.
+- Per-crate `Error`; private `mod error`; qualify (`storage::Error`). Wrap `Storage(#[from])`; redb `tinio_store_redb::error::Error` (display verbatim; fs `Redb`/mem `DatabaseError`); extras → `Io`. **The refused arm unwraps before the database arm** (`Refused(err) => Storage(err)`, fs `map_contract_error`, mem a manual `From<DatabaseError>`) — a `#[from]` hop would degrade `AlreadyExists`/`NoSuchBucket`/`NotEmpty` to `Io` (design 2026-10-03 D22). ctor `already_exists(name)`.
 
 ## Async traits
 

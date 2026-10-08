@@ -35,6 +35,7 @@ use crate::{
         version::{self as contract, Id, State},
     },
     Error, RedbMetadata,
+    bucket::Table as BucketTable,
     bucket_versioning::Table as StateTable,
     object_meta::{Stored as ObjectRow, Table as ObjectTable},
     version::{Kind as RowKind, Row as VersionRow, Table as VersionTable},
@@ -112,6 +113,10 @@ fn empty_object_row() -> ObjectRow {
 impl VersionMeta for RedbMetadata {
     type Error = Error;
 
+    /// A bucket with no row — or one torn down inside this read's own window —
+    /// answers `Unversioned` rather than refusing: the read half of the state
+    /// write's TOCTOU window. Harmless, because a read writes nothing; the
+    /// write half is [`VersionMeta::set_bucket_state_guarded`].
     async fn bucket_state(&self, bucket: &bucket::Name) -> Result<State, Error> {
         let bucket = bucket.to_string();
         self.driver.read(move |txn| {
@@ -121,10 +126,35 @@ impl VersionMeta for RedbMetadata {
         })
     }
 
+    /// The unguarded state write — the contract's default. A teardown that
+    /// commits between the caller's bucket check and this transaction leaves
+    /// its state row behind for a bucket that is gone;
+    /// [`VersionMeta::set_bucket_state_guarded`] is the variant that closes
+    /// that window.
     async fn set_bucket_state(&self, bucket: &bucket::Name, state: State) -> Result<(), Error> {
         let bucket = bucket.to_string();
         self.driver
             .write(move |txn| StateTable::open(txn)?.set(&bucket, state))
+            .await
+    }
+
+    /// The guarded state write: the bucket row is read in the transaction that
+    /// writes the state row, so a concurrent `remove_if_empty` cannot race it
+    /// (D22's refusal projection, the `put_guarded` shape).
+    async fn set_bucket_state_guarded(
+        &self,
+        bucket: &bucket::Name,
+        state: State,
+    ) -> Result<(), Error> {
+        let refusal = storage::no_such_bucket(bucket);
+        let bucket = bucket.to_string();
+        self.driver
+            .write(move |txn| -> Result<(), Error> {
+                if !BucketTable::open(txn)?.exists(&bucket)? {
+                    return Err(Error::Refused(refusal));
+                }
+                StateTable::open(txn)?.set(&bucket, state)
+            })
             .await
     }
 
@@ -161,10 +191,17 @@ impl VersionMeta for RedbMetadata {
         id: Option<Id>,
         seq: u64,
     ) -> Result<(), Error> {
+        let refusal = storage::no_such_bucket(bucket);
         let bucket = bucket.to_string();
         let key = key.to_string();
         self.driver
             .write(move |txn| {
+                // The bucket row is probed in this transaction, first, exactly
+                // as the object-row guarded writers probe it: the advance is a
+                // write, and a materialized object row is not less of one.
+                if !BucketTable::open(txn)?.exists(&bucket)? {
+                    return Err(Error::Refused(refusal));
+                }
                 // The slot is the version-row fact the contract resolves the
                 // marker from, so the bit is derived here — in the advancing
                 // transaction — never carried by the caller.
@@ -218,6 +255,7 @@ impl VersionMeta for RedbMetadata {
         key: &object::Key,
         row: &Stored,
     ) -> Result<(), Error> {
+        let refusal = storage::no_such_bucket(bucket);
         let bucket = bucket.to_string();
         let key = key.to_string();
         let encoded = table_row(row);
@@ -229,6 +267,12 @@ impl VersionMeta for RedbMetadata {
         let conflicted = self
             .driver
             .write(move |txn| -> Result<Option<String>, Error> {
+                // The version-row write is a guarded write too: the bucket row
+                // is probed in this transaction, first, exactly as the
+                // object-row guarded writers probe it.
+                if !BucketTable::open(txn)?.exists(&bucket)? {
+                    return Err(Error::Refused(refusal));
+                }
                 // The row-overwrite guard: the row already at this sequence may
                 // only be rewritten by the **same** version — the crash-window
                 // adoption path re-runs a supersede whose row is already
@@ -454,7 +498,7 @@ impl VersionMeta for RedbMetadata {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::SystemTime};
 
     use redb::WriteTransaction;
     use tinio_util::testing::metadata::assert_version_conformance;
@@ -464,14 +508,22 @@ mod tests {
             ETag,
             blob::{BlobRef, BlockHash},
             bucket,
-            meta::{ObjectMeta, VersionMeta, version::Current},
-            object,
+            meta::{BucketMeta, ObjectMeta, VersionMeta, bucket as bucket_row, version::Current},
+            object, storage,
             version::Id,
         },
         Driver, Error, RedbMetadata,
         object_meta::{Stored as ObjectStored, Table as ObjectTable},
         version::{Kind as RowKind, Row as VersionRow, Table as VersionTable, encode_blob},
     };
+
+    /// Plant the bucket row the guarded writers probe. The bucket plane's own
+    /// conformance leg lives in `assert_bucket_meta_conformance`.
+    async fn bucket_with(store: &RedbMetadata, bucket: &bucket::Name) {
+        BucketMeta::create(store, bucket, &bucket_row::Row::at(SystemTime::UNIX_EPOCH))
+            .await
+            .unwrap();
+    }
 
     /// The suite's version leg against a fresh in-memory implementation.
     #[tokio::test]
@@ -489,6 +541,7 @@ mod tests {
         let store = RedbMetadata::in_memory().unwrap();
         let bucket = bucket::name("slot-columns").unwrap();
         let key = object::key("a.txt").unwrap();
+        bucket_with(&store, &bucket).await;
 
         // A delete-marker version row at sequence 1, planted through the
         // table layer: this leg reads the object row, not the index.
@@ -608,6 +661,7 @@ mod tests {
         let store = RedbMetadata::in_memory().unwrap();
         let bucket = bucket::name("monotonic").unwrap();
         let key = object::key("a.txt").unwrap();
+        bucket_with(&store, &bucket).await;
 
         store
             .advance_slot(&bucket, &key, Some(Id::new("v5").unwrap()), 5)
@@ -650,6 +704,7 @@ mod tests {
         let store = RedbMetadata::in_memory().unwrap();
         let bucket = bucket::name("fabricated").unwrap();
         let key = object::key("a.txt").unwrap();
+        bucket_with(&store, &bucket).await;
 
         let before = ObjectMeta::get(&store, &bucket, &key).await.unwrap();
         assert!(before.is_none(), "no slot, no row");
@@ -663,6 +718,47 @@ mod tests {
         assert_eq!(recorded.version_seq, 7);
     }
 
+    /// The slot writer probes the bucket row in its own transaction, exactly as
+    /// `put_guarded` and `set_bucket_state_guarded` do: a concurrent
+    /// `remove_if_empty` cannot be raced into having the advance materialize an
+    /// object row (and its slot columns) for a bucket that is gone.
+    #[tokio::test]
+    async fn advance_slot_refuses_a_bucket_with_no_row() {
+        let store = RedbMetadata::in_memory().unwrap();
+        let bucket = bucket::name("slot-refusal").unwrap();
+        let key = object::key("a.txt").unwrap();
+
+        let refusal: storage::Error = store
+            .advance_slot(&bucket, &key, Some(Id::new("v1").unwrap()), 1)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(
+            matches!(refusal, storage::Error::NoSuchBucket(_)),
+            "{refusal:?}"
+        );
+        assert!(
+            ObjectMeta::get(&store, &bucket, &key)
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused advance writes no object row"
+        );
+        assert!(
+            store.get_version(&bucket, &key, 1).await.unwrap().is_none(),
+            "and no version row"
+        );
+
+        bucket_with(&store, &bucket).await;
+        store
+            .advance_slot(&bucket, &key, Some(Id::new("v1").unwrap()), 1)
+            .await
+            .unwrap();
+        let recorded = raw_row(&store.driver(), &bucket, &key);
+        assert_eq!(recorded.version_id.as_ref().map(Id::as_str), Some("v1"));
+        assert_eq!(recorded.version_seq, 1);
+    }
+
     /// A rewrite of the same version keeps the **stored** stamp and ignores the
     /// caller's; a free sequence stores the caller's stamp. This is the stamp
     /// source the engine no longer reads for itself.
@@ -671,6 +767,7 @@ mod tests {
         let store = RedbMetadata::in_memory().unwrap();
         let bucket = bucket::name("stamp").unwrap();
         let key = object::key("a.txt").unwrap();
+        bucket_with(&store, &bucket).await;
         let (name, stored_key) = (bucket.to_string(), key.to_string());
 
         // The row already stored at sequence 4, stamped noncurrent.
@@ -715,6 +812,52 @@ mod tests {
         let fresh = store.get_version(&bucket, &key, 5).await.unwrap();
         let fresh = fresh.expect("the new row");
         assert_eq!(fresh.became_noncurrent, 42);
+    }
+
+    /// The version-row write probes the bucket row in its own transaction,
+    /// exactly as the object-row guarded writers do: a version row is not less
+    /// of a row than the object row beside it.
+    #[tokio::test]
+    async fn put_version_refuses_a_bucket_with_no_row() {
+        let store = RedbMetadata::in_memory().unwrap();
+        let bucket = bucket::name("version-refusal").unwrap();
+        let key = object::key("a.txt").unwrap();
+        let planted = VersionRow {
+            id: "v1".to_owned(),
+            blob: encode_blob(&BlobRef::single(BlockHash::of(b"x"), 1)),
+            size: 1,
+            etag: String::new(),
+            created: 0,
+            became_noncurrent: 0,
+            kind: RowKind::Object,
+            tags: String::new(),
+            checksum: String::new(),
+            owner: String::new(),
+            acl: String::new(),
+            seq: 1,
+        };
+        let row = super::contract_row(&planted).expect("a decodable row");
+
+        let refusal: storage::Error = store
+            .put_version(&bucket, &key, &row)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(
+            matches!(refusal, storage::Error::NoSuchBucket(_)),
+            "{refusal:?}"
+        );
+        assert!(
+            store.get_version(&bucket, &key, 1).await.unwrap().is_none(),
+            "a refused version write leaves no row"
+        );
+
+        bucket_with(&store, &bucket).await;
+        store.put_version(&bucket, &key, &row).await.unwrap();
+        assert!(
+            store.get_version(&bucket, &key, 1).await.unwrap().is_some(),
+            "the version row lands once the bucket row exists"
+        );
     }
 
     /// The `object_meta` row as the table layer sees it.

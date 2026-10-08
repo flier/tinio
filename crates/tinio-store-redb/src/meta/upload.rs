@@ -15,7 +15,7 @@
 //! transaction. A refused identity (`NoSuchUpload`) projects through
 //! [`Error::Refused`] (D22).
 
-use redb::ReadTransaction;
+use redb::{ReadTransaction, WriteTransaction};
 
 use crate::{
     _core::{
@@ -27,6 +27,7 @@ use crate::{
         multipart, object, storage,
     },
     Error, RedbMetadata,
+    bucket::Table as BucketTable,
     part::Table as PartTable,
     part_checksum::Table as PartChecksumTable,
     upload::Table as UploadTable,
@@ -107,34 +108,65 @@ fn join_parts(
     Ok(rows)
 }
 
+/// One upload row and its checksum spec, written through the caller's
+/// transaction: the shared body of [`UploadMeta::create`] and
+/// [`UploadMeta::create_guarded`].
+fn put_upload_row(
+    txn: &mut WriteTransaction,
+    bucket: &str,
+    upload_id: &str,
+    row: &Row,
+) -> Result<(), Error> {
+    let wires = row.to_raw();
+    UploadTable::open(txn)?.put(
+        bucket,
+        upload_id,
+        wires.key.as_ref(),
+        row.initiated_at,
+        &wires.tags,
+        &wires.owner,
+        &wires.grants,
+    )?;
+    // The spec's own row commits with the upload row: write it, or clear a
+    // stale row of an id being reused.
+    let mut specs = UploadChecksumTable::open(txn)?;
+    match &row.checksum {
+        Some(spec) => specs.put(bucket, upload_id, spec)?,
+        None => specs.remove(bucket, upload_id)?,
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl UploadMeta for RedbMetadata {
     async fn create(&self, bucket: &bucket::Name, upload_id: &str, row: &Row) -> Result<(), Error> {
         let bucket = bucket.to_string();
         let upload_id = upload_id.to_string();
-        let wires = row.to_raw();
-        let key = wires.key.as_ref().to_owned();
-        let initiated_at = row.initiated_at;
-        let checksum = row.checksum.clone();
+        let row = row.clone();
         self.driver
-            .write(move |txn| {
-                UploadTable::open(txn)?.put(
-                    &bucket,
-                    &upload_id,
-                    &key,
-                    initiated_at,
-                    &wires.tags,
-                    &wires.owner,
-                    &wires.grants,
-                )?;
-                // The spec's own row commits with the upload row: write it,
-                // or clear a stale row of an id being reused.
-                let mut specs = UploadChecksumTable::open(txn)?;
-                match &checksum {
-                    Some(spec) => specs.put(&bucket, &upload_id, spec)?,
-                    None => specs.remove(&bucket, &upload_id)?,
+            .write(move |txn| put_upload_row(txn, &bucket, &upload_id, &row))
+            .await
+    }
+
+    /// The guarded create: the bucket row is read in the transaction that
+    /// writes the upload row, so a concurrent `remove_if_empty` cannot race
+    /// it (D22's refusal projection, the `put_guarded` shape).
+    async fn create_guarded(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &Row,
+    ) -> Result<(), Error> {
+        let refusal = storage::no_such_bucket(bucket);
+        let bucket = bucket.to_string();
+        let upload_id = upload_id.to_string();
+        let row = row.clone();
+        self.driver
+            .write(move |txn| -> Result<(), Error> {
+                if BucketTable::open(txn)?.row(&bucket)?.is_none() {
+                    return Err(Error::Refused(refusal));
                 }
-                Ok(())
+                put_upload_row(txn, &bucket, &upload_id, &row)
             })
             .await
     }

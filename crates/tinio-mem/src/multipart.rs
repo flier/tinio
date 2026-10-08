@@ -1,48 +1,150 @@
-//! The `MultipartOps` implementation for [`MemoryStorage`].
+//! The MultipartOps implementation for MemoryStorage.
 //!
-//! Multipart uploads over the `uploads` + `parts` tables. Assembly,
-//! completion, and abort each run in one write transaction; part keys are
-//! zero-padded so string order equals part-number order.
+//! Upload rows and part rows are the shared UploadMeta contract's
+//! (MemoryStorage::metadata); a part's bytes cross the shared object-content
+//! plane behind mem's accounting decorator (MemoryStorage::content, addressed
+//! by a ContentKey::Part). The write order is the contract's: a part's bytes are
+//! published before its PARTS row is written, so a completion that reads part
+//! rows never finds a row whose bytes are absent, and a refused row write takes
+//! the published bytes back out through the decorator so the accounting
+//! follows. The mem-local part_meta table keeps the size/mtime pair the content
+//! contract carries for objects only (D23 has no part stat): it is a stat
+//! plane, not a byte plane, and never passes through the counter.
 
 use std::{sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
-use redb::ReadableTable;
+use bytes::Bytes;
 use uuid::Uuid;
 
 #[cfg(feature = "versioning")]
-use crate::version::prepare_publish;
+use crate::_core::{meta::VersionMeta, version::Id};
+use crate::counting::report;
+#[cfg(feature = "versioning")]
+use crate::version;
+use crate::version::check_bucket_write;
 use crate::{
     _core::{
         BodyStream, CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps,
-        MultipartUpload, PartInfo, PartNumber, PartsListing, UploadsListing, acl, acl::Acl,
-        bucket::Name, checksum, collect_body, from_nanos, group_and_paginate_unordered,
-        key_marker_order, multipart::check_part_minimum, now_nanos, object,
-        object::OBJECT_TAGS_MAX, split_uploads_order, uploads_order,
+        MultipartUpload, PartInfo, PartNumber, PartsListing, UploadsListing, acl,
+        acl::Acl,
+        bucket::Name,
+        checksum, collect_body,
+        content::{ContentKey, ObjectContent, StagedObject},
+        from_nanos, key_marker_order,
+        meta::{ObjectMeta, UploadMeta, object as object_row, upload::Row as UploadRow},
+        multipart::{check_part_minimum, part_number},
+        now_nanos, object, split_uploads_order, storage,
     },
-    _store_redb::{
-        bucket, decode_acl_wire, decode_owner_wire, object_meta, object_part, objects, part,
-        part_checksum, part_data, part_meta, upload, upload_checksum,
-    },
+    _store_redb::part_meta,
     Error,
-    error::{
-        access_denied, invalid_etag, invalid_key, invalid_part, no_parts, no_such_bucket,
-        no_such_upload,
-    },
-    storage::{MemoryStorage, check_bucket, check_upload},
+    error::{access_denied, invalid_key, invalid_part, no_parts, no_such_upload},
+    storage::MemoryStorage,
 };
 
-/// One in-progress upload of the lazy `list_multipart_uploads` scan — the
-/// engine's item without the bucket. `params.bucket` is attached when the
-/// page is built: one clone per emitted upload, not per scanned row.
-struct UploadRow {
-    key: object::Key,
-    upload_id: String,
-    initiated_at: u64,
-    tags: object::Tags,
-    owner: Option<acl::OwnerId>,
-    acl: Acl,
-    checksum: Option<checksum::Upload>,
+impl MemoryStorage {
+    /// One upload's stored part numbers, ascending, restricted to the API's
+    /// representable range: a stored number outside it has no content-plane key
+    /// (nothing could have published one), so the consume skips it.
+    ///
+    /// Known deviation: the contract's list_parts self-heals a row whose
+    /// stored ETag is domain-invalid away, so such a row's content-plane bytes
+    /// are never removed by a consume; only external tampering can produce it.
+    async fn part_numbers(&self, bucket: &Name, upload_id: &str) -> Result<Vec<PartNumber>, Error> {
+        Ok(self
+            .metadata()
+            .list_parts(bucket, upload_id, part_number(1).map_err(Error::from)?)
+            .await?
+            .into_iter()
+            .filter_map(|row| part_number(row.number).ok())
+            .collect())
+    }
+
+    /// Put `bytes` back under a part key whose publish this call already
+    /// overwrote: the refusal compensation of `upload_part`. The bytes were
+    /// readable a moment ago, so the object cap cannot refuse them; an error
+    /// here is the store failing.
+    async fn restore_part(
+        &self,
+        bucket: &Name,
+        key: &ContentKey,
+        bytes: Vec<u8>,
+    ) -> Result<(), Error> {
+        let mut staged = self.content().stage(bucket, key).await?;
+        staged.write(Bytes::from(bytes)).await?;
+        self.content().publish(bucket, staged, key).await
+    }
+
+    /// The consumed parts' stat sizes (the mem-local stat plane) in one
+    /// snapshot: the bytes a version-recording completion releases, which is
+    /// the credit its single-transaction object write checks the cap against.
+    /// A number without a stat row counts as nothing (only external tampering
+    /// can produce one).
+    #[cfg(feature = "versioning")]
+    fn consumed_bytes(
+        &self,
+        bucket: &Name,
+        upload_id: &str,
+        numbers: &[PartNumber],
+    ) -> Result<u64, Error> {
+        let b = bucket.as_ref().as_str();
+        self.db.read(|txn| {
+            let meta = part_meta::Table::open_readonly(txn)?;
+            let mut credit = 0u64;
+            for number in numbers {
+                if let Some((size, _)) = meta.get(b, upload_id, u32::from(*number))? {
+                    credit = credit.saturating_add(size);
+                }
+            }
+            Ok(credit)
+        })
+    }
+
+    /// The state machine's hook for a completion on a bucket that records no
+    /// versions, with the history's fresh bytes metered in the SAME transaction:
+    /// the supersede's blobs are billed before the commit, so a cap refusal takes
+    /// the version rows and the blobs back together. A blob committed but never
+    /// billed would be a cap a client could reach again and again — and the plain
+    /// path's hook delta only grows when the bucket's state flips to Enabled
+    /// between the caller's read and this transaction. The transaction opens with
+    /// the in-transaction bucket probe (the atomic half the early existence check
+    /// cannot be), and the accounting lock is held ACROSS it — the decorator's
+    /// lock is not reentrant — so the meter is the unlocked variant.
+    #[cfg(feature = "versioning")]
+    async fn prepare_completion_publish(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        now: u64,
+    ) -> Result<(Option<Id>, u64, bool), Error> {
+        let guard = self.content().lock_accounting().await;
+        let done = self
+            .db
+            .write(|txn| -> Result<(Option<Id>, u64, bool), Error> {
+                // The in-transaction bucket probe: redb serializes write
+                // transactions, so a teardown committed before this one is visible
+                // here and the hook aborts whole instead of writing version rows for
+                // a bucket that is gone.
+                version::check_bucket_write(txn, bucket)?;
+                let (version_id, version_seq, history_bytes, records_versions) =
+                    version::prepare_publish(txn, bucket, key, now)?;
+                self.adjust_total_with_credit_unlocked(history_bytes, 0)?;
+                Ok((version_id, version_seq, records_versions))
+            })?;
+        drop(guard);
+        Ok(done)
+    }
+
+    /// Drop every stat row an upload's parts left in the mem-local plane. The
+    /// contract's own drain cannot know this table, and it must leave with the
+    /// rows (the baseline drained it inside the same transaction). One write
+    /// transaction for the whole upload.
+    fn drain_part_meta(&self, bucket: &Name, upload_id: &str) -> Result<(), Error> {
+        self.db.write(|txn| -> Result<(), Error> {
+            part_meta::Table::open(txn)?.drain_upload(bucket.as_ref().as_str(), upload_id)?;
+            Ok(())
+        })
+    }
 }
 
 #[async_trait]
@@ -56,12 +158,12 @@ impl MultipartOps for MemoryStorage {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
     ) -> Result<MultipartUpload, Error> {
-        // Bucket existence first, like the fs backend and every S3 op: a
-        // reserved/marker key on a missing bucket answers NoSuchBucket,
-        // not AccessDenied/InvalidKey (cross-backend error-code parity).
-        if !self.has_bucket(bucket)? {
-            return Err(no_such_bucket(bucket));
-        }
+        // The pre-check is for error ORDER only: a reserved or marker key on
+        // a missing bucket answers NoSuchBucket, exactly like the baseline
+        // (the authoritative bucket check is the guarded create below, which
+        // re-reads the row inside its own write transaction and closes the
+        // race window this probe leaves).
+        self.ensure_bucket(bucket).await?;
         if key.is_reserved() {
             return Err(access_denied(key));
         }
@@ -72,9 +174,9 @@ impl MultipartOps for MemoryStorage {
             return Err(invalid_key(key.to_string()));
         }
         let initiated_at = SystemTime::now();
-        let upload = MultipartUpload {
-            upload_id: Uuid::new_v4().to_string(),
-            bucket: bucket.clone(),
+        let upload_id = Uuid::new_v4().to_string();
+        let row = UploadRow {
+            upload_id: upload_id.clone(),
             key: key.clone(),
             initiated_at,
             checksum: checksum.clone(),
@@ -82,36 +184,21 @@ impl MultipartOps for MemoryStorage {
             owner: owner.cloned(),
             acl: acl.clone(),
         };
-        self.db.write(|txn| -> Result<MultipartUpload, Error> {
-            {
-                let buckets = bucket::Table::open(txn)?;
-                if buckets.get(bucket.as_ref().as_str())?.is_none() {
-                    return Err(no_such_bucket(bucket));
-                }
-            }
-            let b = upload.bucket.as_ref().as_str();
-            let k = upload.key.as_ref().as_str();
-            {
-                let mut uploads = upload::Table::open(txn)?;
-                uploads.put(
-                    b,
-                    &upload.upload_id,
-                    k,
-                    initiated_at,
-                    &tags.to_wire(),
-                    &upload
-                        .owner
-                        .as_ref()
-                        .map_or_else(String::new, |o| o.as_str().to_string()),
-                    &upload.acl.to_grants_wire(),
-                )?;
-            }
-            // The create-time checksum spec, persisted alongside the
-            // UPLOADS row (spec 2026-08-31).
-            if let Some(ref spec) = checksum {
-                upload_checksum::Table::open(txn)?.put(b, &upload.upload_id, spec)?;
-            }
-            Ok(upload)
+        // One contract transaction writes the upload row and its checksum
+        // spec, and refuses when the bucket row is gone: the guard closes the
+        // window the removed pre-check left open.
+        self.metadata()
+            .create_guarded(bucket, &upload_id, &row)
+            .await?;
+        Ok(MultipartUpload {
+            upload_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            initiated_at,
+            checksum,
+            tags,
+            owner: owner.cloned(),
+            acl: acl.clone(),
         })
     }
 
@@ -121,38 +208,17 @@ impl MultipartOps for MemoryStorage {
         key: &object::Key,
         upload_id: &str,
     ) -> Result<MultipartUpload, Error> {
-        if !self.has_bucket(bucket)? {
-            return Err(no_such_bucket(bucket));
-        }
+        self.ensure_bucket(bucket).await?;
         if key.is_reserved() {
             return Err(access_denied(key));
         }
-        self.db.read(|txn| {
-            // One `UPLOADS` row fetch serves the existence check, the
-            // stored-key identity match, `initiated_at`, and the create-time
-            // tags (`get_matching` filters on the stored key — a `(bucket,
-            // upload_id)` point get plus `key` verification). The tags
-            // element self-heals on a domain-invalid wire (empty — like the
-            // checksum spec below).
-            let uploads = upload::Table::open_readonly(txn)?;
-            let Some((_stored_key, initiated, tags_wire, owner_wire, acl_wire)) =
-                uploads.get_matching(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id)?
-            else {
-                return Err(no_such_upload(upload_id));
-            };
-            let checksums = upload_checksum::Table::open_readonly(txn)?;
-            let checksum = checksums.get(bucket.as_ref().as_str(), upload_id)?;
-            Ok(MultipartUpload {
-                upload_id: upload_id.to_string(),
-                bucket: bucket.clone(),
-                key: key.clone(),
-                initiated_at: from_nanos(initiated),
-                checksum,
-                tags: object::Tags::from_wire_limited(&tags_wire, OBJECT_TAGS_MAX),
-                owner: decode_owner_wire(&owner_wire),
-                acl: decode_acl_wire(&acl_wire),
-            })
-        })
+        // One contract read serves the existence check, the stored-key
+        // identity match, initiated_at, the create-time tags and the checksum
+        // spec (the row is present only when it records this key).
+        let row = UploadMeta::get(&**self.metadata(), bucket, key, upload_id)
+            .await?
+            .ok_or_else(|| no_such_upload(upload_id))?;
+        Ok(row.to_upload(bucket))
     }
 
     async fn upload_part(
@@ -164,73 +230,121 @@ impl MultipartOps for MemoryStorage {
         body: BodyStream,
         checksum: Option<Arc<checksum::PartChecksum>>,
     ) -> Result<PartInfo, Error> {
-        // Fast-fail on a missing bucket before buffering the body (the write
-        // transaction re-checks, closing the race).
-        if !self.has_bucket(bucket)? {
-            return Err(no_such_bucket(bucket));
-        }
+        // Fast-fail on a missing bucket before buffering the body.
+        self.ensure_bucket(bucket).await?;
         let data = collect_body(body).await?;
-        // Enforce the per-part size limit before opening the write
-        // transaction (fast fail).
-        self.check_object_size(data.len() as u64)?;
-        // The tee's MD5: a part's ETag IS its content MD5 — the raw
-        // digest in the etag cell replaces the second hash over the
-        // buffer (filled by the stream end, which `collect_body` drained).
+        // The tee's MD5: a part's ETag IS its content MD5 — the raw digest
+        // replaces the second hash over the buffer.
         let etag = match checksum.as_ref().and_then(|c| c.etag_digest()) {
             Some(digest) => ETag::Single(digest),
             None => ETag::from_content(&data),
         };
         let now = now_nanos();
-        self.db.write(|txn| -> Result<i64, Error> {
-            let b = bucket.as_ref().as_str();
-            {
-                let uploads = upload::Table::open(txn)?;
-                check_upload(&uploads, upload_id, bucket, key)?;
-            }
-            let n = u32::from(part_number);
-            // The shared handles borrow the write transaction exclusively,
-            // so each table is a separate pass (the fs pattern).
-            let old_len = {
-                let part_data = part_data::Table::open(txn)?;
-                part_data
-                    .get(b, upload_id, n)?
-                    .map(|guard| guard.value().len() as u64)
-                    .unwrap_or(0)
+        let size = data.len() as u64;
+        let content_key = ContentKey::Part {
+            upload_id: upload_id.to_owned(),
+            number: part_number,
+        };
+        // The bytes this number already holds, read BEFORE the publish below
+        // overwrites them: the row write can be refused, and the refusal must
+        // not leave the surviving PARTS row without its bytes. Missing bytes
+        // (InvalidPart) mean there is nothing to restore and the compensation
+        // removes the new publish instead; any other read failure is the
+        // store's own.
+        let previous = match self.content().open(bucket, &content_key, None).await {
+            Ok(stored) => Some(collect_body(stored).await?),
+            Err(Error::Storage(storage::Error::InvalidPart(_))) => None,
+            Err(err) => return Err(err),
+        };
+        // The contract's order: the bytes first. The staged write is where
+        // max_object_bytes refuses (a refused stage publishes nothing) and
+        // publish is the visibility point.
+        // The published bytes are kept so the compensation below can name
+        // exactly what this call published (a later writer's bytes under the
+        // same key must not be mistaken for them).
+        let published = Bytes::from(data);
+        // The publish's identity, recorded with the bytes: a later writer can
+        // publish the same bytes under this number (an empty part), and the
+        // refusal's compensation must still tell its own publish from theirs.
+        let publish_id = self.content().mint_publish_id();
+        let mut staged = self.content().stage(bucket, &content_key).await?;
+        staged.write(published.clone()).await?;
+        self.content()
+            .publish_tagged(bucket, staged, &content_key, publish_id)
+            .await?;
+        // The row the bytes describe: one contract transaction that re-checks
+        // the upload's stored key, so the row and its bytes cannot disagree.
+        if let Err(err) = self
+            .metadata()
+            .put_part(
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                &etag,
+                checksum.as_deref(),
+            )
+            .await
+        {
+            // The publish above already replaced this number's bytes, so the
+            // refusal has to put the plane back in step. When the number still
+            // has a PARTS row (the usual refusal: the upload records another
+            // key), its old bytes go back — the single-transaction baseline's
+            // rollback, rebuilt through the content plane. When the row is
+            // gone (a concurrent abort or complete drained the upload), the
+            // fresh publish is dropped instead: restoring bytes no row names
+            // would leak them. A store failing mid-compensation cannot do
+            // better, and the caller still sees the row write's refusal.
+            let rowed = self
+                .metadata()
+                .list_parts(bucket, upload_id, part_number)
+                .await
+                .is_ok_and(|rows| {
+                    rows.first()
+                        .is_some_and(|row| row.number == u32::from(part_number))
+                });
+            let compensated = match previous {
+                Some(bytes) if rowed => self.restore_part(bucket, &content_key, bytes).await,
+                _ => {
+                    self.roll_back_publish(bucket, &content_key, &published, publish_id, "PARTS")
+                        .await
+                }
             };
-            let delta = data.len() as i64 - old_len as i64;
-            self.adjust_total(delta)?;
-            // The part's bytes, etag row, and stat row commit in the same
-            // transaction: the etag lives in the shared `PARTS` table, the
-            // size/mtime pair in the local `part_meta` (the fs split).
-            {
-                let mut part_data = part_data::Table::open(txn)?;
-                part_data.put(b, upload_id, n, &data)?;
+            if let Err(failure) = compensated {
+                // A compensation that itself fails is reported here; the drop
+                // half books its own release in the same failure — its error arm
+                // releases the part's remembered length — so the caller must not
+                // release again on top: a part's stored length IS its ledger
+                // entry, and subtracting it twice would bill the total below the
+                // bytes the plane still holds. A failed RESTORE is the other
+                // case: the row survives, its key still names bytes, and the
+                // entry the publish just left is that key's own length — so
+                // nothing may be released for it either.
+                report(format_args!(
+                    "part compensation after a refused PARTS row failed: {failure}"
+                ));
             }
-            {
-                let mut parts = part::Table::open(txn)?;
-                parts.put(b, upload_id, n, &etag)?;
-            }
-            {
-                let mut meta = part_meta::Table::open(txn)?;
-                meta.put(b, upload_id, n, data.len() as u64, now)?;
-            }
-            // The checksum row commits atomically with the part row:
-            // write the tee's digest, or clear a stale row from a
-            // previous upload of this part number (it would corrupt the
-            // Complete composition).
-            {
-                let mut checksums = part_checksum::Table::open(txn)?;
-                checksums.set(b, upload_id, n, checksum.as_ref().and_then(|c| c.digest.get()))?;
-            }
-            Ok(delta)
-        })
-        // The in-memory backend's commit cannot fail (no disk path — an
-        // abort-only transaction is the only failure mode), so no
-        // rollback_total compensation is needed here.
-        ?;
+            return Err(err.into());
+        }
+        // The stat row (mem's own plane): written after the PARTS row, so a
+        // listed part never lacks its bytes.
+        self.db.write(|txn| -> Result<(), Error> {
+            // The in-transaction bucket probe every raw write here opens with:
+            // a teardown that committed first must not leave this stat row
+            // behind for a bucket that is gone.
+            check_bucket_write(txn, bucket)?;
+            part_meta::Table::open(txn)?.put(
+                bucket.as_ref().as_str(),
+                upload_id,
+                u32::from(part_number),
+                size,
+                now,
+            )?;
+            Ok(())
+        })?;
         Ok(PartInfo {
             part_number,
-            size: data.len() as u64,
+            size,
             etag,
             last_modified: from_nanos(now),
             // The digest committed atomically with the part row.
@@ -239,108 +353,66 @@ impl MultipartOps for MemoryStorage {
     }
 
     async fn list_parts(&self, params: ListPartsParams) -> Result<PartsListing, Error> {
-        self.db.read(|txn| {
-            {
-                // Bucket existence first (the fs backend answers NoSuchBucket
-                // before anything else).
-                let buckets = bucket::Table::open_readonly(txn)?;
-                check_bucket(&buckets, &params.bucket)?;
-            }
-            {
-                let uploads = upload::Table::open_readonly(txn)?;
-                check_upload(&uploads, &params.upload_id, &params.bucket, &params.key)?;
-            }
-            // `max_parts = 0` requests nothing — and no marker either, since
-            // an exclusive-after marker would skip the first part of the next
-            // page forever (the fs backend and the engine agree).
-            if params.max_parts == 0 {
-                return Ok(PartsListing {
-                    parts: Vec::new(),
-                    truncated: false,
-                    next_part_number_marker: None,
-                });
-            }
-            let b = params.bucket.as_ref().as_str();
-            let id = params.upload_id.as_str();
-            // The page's committed `PARTS` rows (raw rows from the marker,
-            // capped at `max_parts` plus one lookahead — a page costs O(page)
-            // reads, not O(total parts)); size/mtime join from the local
-            // `part_meta` rows (the fs PARTS + stat join shape), the checksum
-            // rows from the shared `PART_CHECKSUMS` rows on the identical
-            // tuple key. The sync scan runs inline on the async executor by
-            // design (mem is the reference backend, rows are owned copies,
-            // and the redb read txn is MVCC — no lock is held).
-            let parts = part::Table::open_readonly(txn)?;
-            let start = params.part_number_marker.map_or(0, |m| m.saturating_add(1));
-            let (recorded, truncated) = parts.list_from(b, id, start, params.max_parts)?;
-            // The resume marker is the last RAW part number (a truncated page
-            // whose parts all vanished to a join skip still advances the
-            // client — the fs contract).
-            let raw_last = recorded.last().map(|(n, _)| *n);
+        // Bucket existence first (the fs backend answers NoSuchBucket before
+        // anything else).
+        self.ensure_bucket(&params.bucket).await?;
+        // The upload's existence and its recorded key in one contract read.
+        if UploadMeta::get(
+            &**self.metadata(),
+            &params.bucket,
+            &params.key,
+            &params.upload_id,
+        )
+        .await?
+        .is_none()
+        {
+            return Err(no_such_upload(&params.upload_id));
+        }
+        // max_parts = 0 requests nothing — and no marker either, since an
+        // exclusive-after marker would skip the first part of the next page
+        // forever (the fs backend and the engine agree).
+        if params.max_parts == 0 {
+            return Ok(PartsListing {
+                parts: Vec::new(),
+                truncated: false,
+                next_part_number_marker: None,
+            });
+        }
+        let start = params
+            .part_number_marker
+            .map_or(0, |marker| marker.saturating_add(1));
+        // The page's PARTS rows with the PART_CHECKSUMS join, in one contract
+        // read transaction.
+        let page = self
+            .metadata()
+            .list_parts_page(&params.bucket, &params.upload_id, start, params.max_parts)
+            .await?;
+        // The stat join (mem's own plane) for exactly the page's rows, one
+        // read transaction.
+        let b = params.bucket.as_ref().as_str();
+        let id = params.upload_id.as_str();
+        let metas: Vec<Option<(u64, u64)>> = self.db.read(|txn| {
             let meta = part_meta::Table::open_readonly(txn)?;
-            // The size/mtime join runs as one contiguous walk from the marker
-            // (the `part_meta` rows share the `(bucket, upload_id,
-            // part_number)` ordering) merged against the sorted page — a page
-            // costs O(page) reads, not O(page) B-tree descents. A part row
-            // without its stat row is skipped (the fs contract).
-            let mut meta_rows = meta
-                .range((b, id, start)..)
-                .map_err(|e| Error::Database(e.into()))?;
-            let mut meta_cursor: Option<(u32, (u64, u64))> = None;
-            // The stored part checksums join per row (spec 2026-08-31).
-            // Probed once: an upload with no checksum rows at all (the
-            // checksum feature off ⇒ the table is guaranteed empty) skips
-            // the per-part point reads — one probe read instead of one per
-            // part (F03).
-            let checksums = part_checksum::Table::open_readonly(txn)?;
-            let checksums =
-                part_checksum::Table::has_upload(&checksums, b, id)?.then_some(checksums);
-            let mut parts_out: Vec<PartInfo> = Vec::new();
-            for (n, hex) in recorded {
-                // An invalid etag row is skipped (self-healing — the fs path
-                // skips vanished part files the same way).
-                let Ok(etag) = hex.parse::<ETag>() else {
-                    continue;
-                };
-                while meta_cursor.is_none_or(|(mn, _)| mn < n) {
-                    match meta_rows.next() {
-                        Some(item) => {
-                            let (mk, mv) = item.map_err(|e| Error::Database(e.into()))?;
-                            let (mb, mid, mn) = mk.value();
-                            if mb != b || mid != id {
-                                break;
-                            }
-                            meta_cursor = Some((mn, mv.value()));
-                        }
-                        None => break,
-                    }
-                }
-                let Some((mn, (size, mtime))) = meta_cursor else {
-                    continue; // a part row without its stat row is skipped
-                };
-                if mn != n {
-                    continue;
-                }
-                meta_cursor = None;
-                let checksum = checksums
-                    .as_ref()
-                    .map(|table| table.get(b, id, n))
-                    .transpose()?
-                    .flatten();
-                parts_out.push(PartInfo {
-                    part_number: n.into(),
-                    size,
-                    etag,
-                    last_modified: from_nanos(mtime),
-                    checksum,
-                });
-            }
-            let next = if truncated { raw_last } else { None };
-            Ok(PartsListing {
-                parts: parts_out,
-                truncated,
-                next_part_number_marker: next,
-            })
+            page.rows
+                .iter()
+                .map(|row| Ok(meta.get(b, id, row.number)?))
+                .collect::<Result<Vec<_>, Error>>()
+        })?;
+        let mut parts = Vec::with_capacity(page.rows.len());
+        for (row, stat) in page.rows.iter().zip(metas) {
+            // A part row without its stat row is skipped (the fs contract).
+            let Some((size, mtime)) = stat else {
+                continue;
+            };
+            parts.push(row.to_info(size, from_nanos(mtime)).map_err(Error::from)?);
+        }
+        // The resume marker is the last RAW part number (a truncated page
+        // whose rows all vanished to a join skip still advances the client).
+        let next = if page.more { page.raw_last } else { None };
+        Ok(PartsListing {
+            parts,
+            truncated: page.more,
+            next_part_number_marker: next,
         })
     }
 
@@ -352,267 +424,213 @@ impl MultipartOps for MemoryStorage {
         parts: &[CompletedPart],
         checksum: Option<checksum::Recorded>,
     ) -> Result<object::Info, Error> {
-        self.db.write(|txn| -> Result<object::Info, Error> {
-            {
-                // Bucket existence first (the fs backend answers
-                // NoSuchBucket before anything else — NoParts only for a
-                // real upload).
-                let buckets = bucket::Table::open(txn)?;
-                check_bucket(&buckets, bucket)?;
+        // Bucket existence first (the fs backend answers NoSuchBucket before
+        // anything else — NoParts only for a real upload).
+        self.ensure_bucket(bucket).await?;
+        if parts.is_empty() {
+            return Err(no_parts());
+        }
+        // The create-time tags, owner and ACL applied at completion come from
+        // the upload row — read, never re-ferried through the interface. The
+        // contract's get is the identity check on the stored key and the row
+        // fetch in one lookup.
+        let upload = UploadMeta::get(&**self.metadata(), bucket, key, upload_id)
+            .await?
+            .ok_or_else(|| no_such_upload(upload_id))?;
+        // The completion-time records (stored ETag and checksum, in the
+        // requested order) and the stat rows; the outer None of part_records
+        // is an upload whose key does not match.
+        let numbers: Vec<PartNumber> = parts.iter().map(|part| part.part_number).collect();
+        let records = self
+            .metadata()
+            .part_records(bucket, key, upload_id, &numbers)
+            .await?
+            .ok_or_else(|| no_such_upload(upload_id))?;
+        let b = bucket.as_ref().as_str();
+        let metas: Vec<Option<(u64, u64)>> = self.db.read(|txn| {
+            let meta = part_meta::Table::open_readonly(txn)?;
+            numbers
+                .iter()
+                .map(|number| Ok(meta.get(b, upload_id, u32::from(*number))?))
+                .collect::<Result<Vec<_>, Error>>()
+        })?;
+        // Verify and assemble before the first write: a refused completion
+        // (NoParts, InvalidPart, PartTooSmall) leaves the upload exactly as it
+        // was.
+        let mut data = Vec::new();
+        let mut retained = Vec::with_capacity(parts.len());
+        let mut infos = Vec::with_capacity(parts.len());
+        let mut prev = 0u32;
+        for (index, part) in parts.iter().enumerate() {
+            let n = u32::from(part.part_number);
+            if n <= prev {
+                return Err(invalid_part(n));
             }
-            if parts.is_empty() {
-                return Err(no_parts());
+            prev = n;
+            let Some(record) = records[index].as_ref() else {
+                return Err(invalid_part(n));
+            };
+            // A part row without its stat row reads as absent (the fs split).
+            let Some((size, mtime)) = metas[index] else {
+                return Err(invalid_part(n));
+            };
+            // The S3 non-final minimum (the shared rule), enforced against the
+            // part state this commit consumes.
+            check_part_minimum(n, size, index + 1 == parts.len())?;
+            if record.etag != part.etag {
+                return Err(invalid_part(n));
             }
-            // The create-time tags applied at completion come from the
-            // UPLOADS row this transaction consumes (spec 2026-08-31) — read
-            // here, never re-ferried through the interface. `get_matching`
-            // is the identity check on the shared `(bucket, upload_id)` key
-            // (the stored key must equal the requested key) and the row fetch
-            // in one lookup. A garbage wire self-heals to the empty set (the
-            // table's read-path discipline).
-            let b = bucket.as_ref().as_str();
-            let k = key.as_ref().as_str();
-            let (tags, owner, acl) = {
-                let uploads = upload::Table::open(txn)?;
-                let Some((_, _, tags_wire, owner_wire, acl_wire)) =
-                    uploads.get_matching(b, k, upload_id)?
-                else {
-                    return Err(no_such_upload(upload_id));
-                };
-                (
-                    object::Tags::from_wire_limited(&tags_wire, OBJECT_TAGS_MAX),
-                    decode_owner_wire(&owner_wire),
-                    decode_acl_wire(&acl_wire),
-                )
+            // The part bytes cross the same content seam as the object bytes;
+            // a stored row whose bytes are absent answers InvalidPart (the
+            // bytes-first order makes that state unreachable for a live row).
+            let content_key = ContentKey::Part {
+                upload_id: upload_id.to_owned(),
+                number: part.part_number,
             };
-            let (data, etag, now, version_id, history_bytes, records_versions) = {
-                // The retained OBJECT_PARTS rows: each listed part's size and
-                // its stored checksum row (written by upload_part in the same
-                // transaction as the part row), in part order — joined in
-                // this transaction, before the part records are consumed
-                // (spec 2026-08-31). The three small part tables are read in
-                // separate passes (the shared handles borrow the write
-                // transaction exclusively); the per-part rows are materialized
-                // owned (the redb guards cannot outlive the passes). The part
-                // **bytes** are not materialized up front: one `PART_DATA`
-                // walk from `(bucket, upload_id, 0)` feeds the assembly
-                // `extend` per guard, so the peak holds the assembled `data`
-                // only (not both bodies and data — a multipart complete peak
-                // is ~1× the object, not 2×).
-                let (data, etag, retained) = {
-                    let metas: Vec<(u64, u64)> = {
-                        let stored_meta = part_meta::Table::open(txn)?;
-                        parts
-                            .iter()
-                            .map(|part| {
-                                let n = u32::from(part.part_number);
-                                stored_meta
-                                    .get(b, upload_id, n)?
-                                    .ok_or_else(|| invalid_part(n))
-                            })
-                            .collect::<Result<Vec<_>, Error>>()?
-                    };
-                    let hexes: Vec<String> = {
-                        let stored_parts = part::Table::open(txn)?;
-                        parts
-                            .iter()
-                            .map(|part| {
-                                let n = u32::from(part.part_number);
-                                stored_parts
-                                    .get_hex(b, upload_id, n)?
-                                    .ok_or_else(|| invalid_part(n))
-                            })
-                            .collect::<Result<Vec<_>, Error>>()?
-                    };
-                    let checksum_rows: Vec<Option<checksum::Part>> = {
-                        let stored_checksums = part_checksum::Table::open(txn)?;
-                        parts
-                            .iter()
-                            .map(|part| {
-                                stored_checksums
-                                    .get(b, upload_id, u32::from(part.part_number))
-                                    .map_err(|e| e.into())
-                            })
-                            .collect::<Result<Vec<_>, Error>>()?
-                    };
-                    let mut data = Vec::new();
-                    let mut infos: Vec<PartInfo> = Vec::new();
-                    let mut retained: Vec<object_part::Stored> = Vec::new();
-                    let mut prev = 0u32;
-                    let part_data = part_data::Table::open(txn)?;
-                    let mut part_rows = part_data
-                        .range((b, upload_id, 0)..)
-                        .map_err(|e| Error::Database(e.into()))?;
-                    for (index, part) in parts.iter().enumerate() {
-                        let n = u32::from(part.part_number);
-                        if n <= prev {
-                            return Err(invalid_part(n));
-                        }
-                        prev = n;
-                        let (size, mtime) = metas[index];
-                        // The S3 non-final minimum (shared
-                        // `check_part_minimum`), enforced authoritatively IN
-                        // this transaction — the size and the bytes it
-                        // describes come from the same snapshot the commit
-                        // composes (the S3 layer additionally pre-checks its
-                        // own listing snapshot; a concurrent upload_part
-                        // cannot interleave with a write txn).
-                        check_part_minimum(n, size, index + 1 == parts.len())?;
-                        let stored_etag: ETag = hexes[index].parse().map_err(invalid_etag)?;
-                        if stored_etag != part.etag {
-                            return Err(invalid_part(n));
-                        }
-                        infos.push(PartInfo {
-                            part_number: part.part_number,
-                            size,
-                            etag: stored_etag,
-                            last_modified: from_nanos(mtime),
-                            checksum: None,
-                        });
-                        // The part bytes join as a contiguous walk from
-                        // `(bucket, upload_id, 0)` — no `bodies` collection,
-                        // so the assembly peak holds `data` only. Bytes copy
-                        // while the range guard is in scope (the cursor cannot
-                        // hold a borrow across the next `next()`).
-                        let mut found = false;
-                        for item in &mut part_rows {
-                            let (pk, pv) = item.map_err(|e| Error::Database(e.into()))?;
-                            let (pb, pid, pn) = pk.value();
-                            if pb != b || pid != upload_id || pn > n {
-                                break;
-                            }
-                            if pn < n {
-                                continue;
-                            }
-                            data.extend_from_slice(pv.value());
-                            found = true;
-                            break;
-                        }
-                        if !found {
-                            return Err(invalid_part(n));
-                        }
-                        retained.push(object_part::Stored {
-                            part_number: n,
-                            size,
-                            checksum: checksum_rows[index].clone(),
-                        });
-                    }
-                    let etag =
-                        ETag::composed_from_parts(&infos).expect("parts checked non-empty above");
-                    (data, etag, retained)
-                };
-                let now = now_nanos();
-                // The publish hook every write path runs (spec 2026-10-03,
-                // **Write paths**: "the same protocol serves ...
-                // `CompleteMultipartUpload`'s publish"): the outgoing version
-                // moves into history before the object row below replaces it,
-                // and the completion records the identity and sequence the
-                // state machine answers — a fresh identity on an enabled
-                // bucket, the null version (sequence 0, or the key's next
-                // while a superseded null's row occupies 0) for a suspended
-                // one, nothing at all for an unversioned bucket.
-                #[cfg(feature = "versioning")]
-                let (version_id, version_seq, history_bytes, records_versions) =
-                    prepare_publish(txn, bucket, key, now)?;
-                #[cfg(not(feature = "versioning"))]
-                let (history_bytes, records_versions) = (0i64, false);
-                // The object row: the completion's tags and the
-                // interface-computed composite checksum ride in the same
-                // transaction as the object bytes (the backend never hashes).
-                {
-                    let mut objects = objects::Table::open(txn)?;
-                    objects.put(b, k, &data)?;
-                }
-                // (The `mut` is the versioning branch's, like `write_object`'s.)
-                #[cfg_attr(not(feature = "versioning"), allow(unused_mut))]
-                let mut stored = object_meta::Stored {
-                    version_id: None,
-                    version_seq: 0,
-                    is_delete_marker: false,
-                    etag: etag.clone(),
-                    size: data.len() as u64,
-                    mtime: now,
-                    file_identity: 0,
-                    tags: tags.clone(),
-                    checksum: checksum.clone(),
-                    owner: owner.clone(),
-                    acl: acl.clone(),
-                };
-                #[cfg(feature = "versioning")]
-                {
-                    stored.version_id = version_id;
-                    stored.version_seq = version_seq;
-                }
-                {
-                    let mut obj_meta = object_meta::Table::open(txn)?;
-                    obj_meta.put(b, k, &stored)?;
-                }
-                {
-                    let mut uploads = upload::Table::open(txn)?;
-                    uploads.remove(b, upload_id)?;
-                }
-                {
-                    let mut cs = upload_checksum::Table::open(txn)?;
-                    cs.remove(b, upload_id)?;
-                }
-                // The four part tables drain under the upload's tuple prefix
-                // (complete consume; the fs `drain_upload` parity) — one
-                // scoped handle per table.
-                {
-                    let mut part_data = part_data::Table::open(txn)?;
-                    part_data.drain_upload(b, upload_id)?;
-                }
-                {
-                    let mut stored_parts = part::Table::open(txn)?;
-                    stored_parts.drain_upload(b, upload_id)?;
-                }
-                {
-                    let mut stored_meta = part_meta::Table::open(txn)?;
-                    stored_meta.drain_upload(b, upload_id)?;
-                }
-                {
-                    let mut stored_checksums = part_checksum::Table::open(txn)?;
-                    stored_checksums.drain_upload(b, upload_id)?;
-                }
-                {
-                    // The retained part list: replace any stale rows of the
-                    // key, then insert this completion's parts (a re-completed
-                    // key must not accumulate rows).
-                    let mut parts_table = object_part::Table::open(txn)?;
-                    parts_table.remove_key(b, k)?;
-                    for part in retained {
-                        parts_table.put(b, k, &part)?;
-                    }
-                }
-                (
-                    data,
-                    etag,
-                    now,
-                    stored.version_id,
-                    history_bytes,
-                    records_versions,
-                )
-            };
-            // The assembled object replaces the parts byte-for-byte (the
-            // tracked total is unchanged), but the per-object limit still
-            // applies to the assembled size — and the publish above may have
-            // moved the outgoing version into the history's blob table: those
-            // bytes are fresh storage, metered here inside the transaction so
-            // a limit breach aborts the whole completion.
-            self.check_object_size(data.len() as u64)?;
-            self.adjust_total(history_bytes)?;
-            Ok(object::Info {
-                key: key.clone(),
-                size: data.len() as u64,
-                last_modified: from_nanos(now),
-                etag,
-                tags,
-                checksum,
-                owner,
-                acl,
-                version_id,
-                bucket_records_versions: records_versions,
+            let body = self.content().open(bucket, &content_key, None).await?;
+            data.extend_from_slice(&collect_body(body).await?);
+            infos.push(PartInfo {
+                part_number: part.part_number,
+                size,
+                etag: record.etag.clone(),
+                last_modified: from_nanos(mtime),
+                checksum: record.checksum.clone(),
+            });
+            retained.push(object_row::PartRow {
+                number: n,
+                size,
+                checksum: record.checksum.clone(),
+            });
+        }
+        let etag = ETag::composed_from_parts(&infos).expect("parts checked non-empty above");
+        let now = now_nanos();
+        let size = data.len() as u64;
+        let object_key = ContentKey::Object(key.clone());
+        // The row the object's bytes describe: built once, written by whichever
+        // write path this bucket takes, so both carry the same facts.
+        let row = object_row::Row {
+            etag: etag.clone(),
+            size,
+            mtime: from_nanos(now),
+            identity: 0,
+            tags: upload.tags.clone(),
+            checksum: checksum.clone(),
+            owner: upload.owner.clone(),
+            acl: upload.acl.clone(),
+        };
+        // The upload's own part numbers, read before its rows go: the part
+        // bytes leave only after they can no longer be listed, and for a
+        // version-recording bucket they are the credit the object's size is
+        // admitted against.
+        let consumed = self.part_numbers(bucket, upload_id).await?;
+        let part_keys: Vec<ContentKey> = consumed
+            .iter()
+            .map(|number| ContentKey::Part {
+                upload_id: upload_id.to_owned(),
+                number: *number,
             })
+            .collect();
+        // A bucket that records versions takes the single-transaction core (the
+        // object put path's shape): the outgoing version, the assembled bytes,
+        // the OBJECT_META row, the retained OBJECT_PARTS rows and the fresh
+        // identity land in ONE transaction, so a cap refusal aborts the whole
+        // completion and leaves the upload, its parts and its history as they
+        // were. The state is read ahead only to pick the path; the core's own
+        // transaction re-reads it, so a flip between the two is still decided
+        // by the write.
+        #[cfg(feature = "versioning")]
+        let (version_id, records_versions) =
+            if VersionMeta::bucket_state(self.metadata().as_ref(), bucket)
+                .await
+                .map_err(Error::from)?
+                .records_versions()
+            {
+                // The credit: the bytes this completion releases, read from the
+                // mem-local stat plane before any of it moves. The accounting lock
+                // is held ACROSS the transaction because the core meters inside it
+                // and the decorator's lock is not reentrant: everything inside uses
+                // the unlocked entry points.
+                let credit = self.consumed_bytes(bucket, upload_id, &consumed)?;
+                let guard = self.content().lock_accounting().await;
+                // The assembled body is written raw by the core, so the
+                // single-object cap is checked here (never the total: the core's
+                // meter owns that, with the credit above).
+                self.check_object_bytes_unlocked(size)?;
+                let done = self.db.write(|txn| {
+                    version::complete_versioned(
+                        self, txn, bucket, key, now, &data, &row, &retained, credit,
+                    )
+                })?;
+                drop(guard);
+                (done.version_id, done.records_versions)
+            } else {
+                // A bucket that records no versions keeps the contract's order: the
+                // assembled bytes are staged first (where max_object_bytes refuses,
+                // before any version state moves), then the state machine's hook
+                // runs — in ONE transaction, with the history's fresh bytes metered
+                // inside it — and is the authority on what this write records (the
+                // state can flip between the read above and the write), and the
+                // bytes publish as the row's predecessor.
+                let mut staged = self.content().stage(bucket, &object_key).await?;
+                staged.write(Bytes::from(data)).await?;
+                let (version_id, version_seq, records_versions) =
+                    self.prepare_completion_publish(bucket, key, now).await?;
+                // The publish's cap check forgives the consumed parts (the credit)
+                // while the total still counts them until the batch release below:
+                // the total is exact at the end of the consume, not at the publish.
+                self.content()
+                    .publish_replacing(bucket, staged, &object_key, &part_keys)
+                    .await?;
+                self.metadata()
+                    .put_with_parts(bucket, key, &row, &retained)
+                    .await?;
+                // The slot the completion made current: only a version-recording
+                // bucket moves it (the hook's own answer).
+                if records_versions {
+                    self.metadata()
+                        .advance_slot(bucket, key, version_id.clone(), version_seq)
+                        .await?;
+                }
+                (version_id, records_versions)
+            };
+        // Without the versioning feature no bucket records an identity, so
+        // there is no state to read and every bucket takes this path.
+        #[cfg(not(feature = "versioning"))]
+        let (version_id, records_versions) = {
+            let mut staged = self.content().stage(bucket, &object_key).await?;
+            staged.write(Bytes::from(data)).await?;
+            self.content()
+                .publish_replacing(bucket, staged, &object_key, &part_keys)
+                .await?;
+            self.metadata()
+                .put_with_parts(bucket, key, &row, &retained)
+                .await?;
+            (None, false)
+        };
+        // The consume: one contract transaction drains the upload row, its
+        // checksum row and every part row (idempotent, the fs drain parity), the
+        // mem-local stat plane leaves with them, and the part bytes leave LAST
+        // in one batch through the decorator — the release that makes the
+        // credited bytes real, exactly once.
+        //
+        // Known deviation: the drain is a contract transaction of its own, so a
+        // completion is not one transaction end to end; the object write has
+        // already committed, and the in-memory backend has no crash surface
+        // between it and the consume.
+        self.metadata().drain_upload(bucket, upload_id).await?;
+        self.drain_part_meta(bucket, upload_id)?;
+        self.content().remove_many(bucket, &part_keys).await?;
+        Ok(object::Info {
+            key: key.clone(),
+            size,
+            last_modified: from_nanos(now),
+            etag,
+            tags: upload.tags,
+            checksum,
+            owner: upload.owner,
+            acl: upload.acl,
+            version_id,
+            bucket_records_versions: records_versions,
         })
     }
 
@@ -622,46 +640,29 @@ impl MultipartOps for MemoryStorage {
         key: &object::Key,
         upload_id: &str,
     ) -> Result<(), Error> {
-        let removed = self.db.write(|txn| -> Result<u64, Error> {
-            {
-                // Bucket existence first (the fs backend answers
-                // NoSuchBucket before anything else).
-                let buckets = bucket::Table::open(txn)?;
-                check_bucket(&buckets, bucket)?;
-            }
-            let b = bucket.as_ref().as_str();
-            {
-                let mut uploads = upload::Table::open(txn)?;
-                check_upload(&uploads, upload_id, bucket, key)?;
-                uploads.remove(b, upload_id)?;
-            }
-            {
-                let mut cs = upload_checksum::Table::open(txn)?;
-                cs.remove(b, upload_id)?;
-            }
-            let part_bytes = {
-                let mut part_data = part_data::Table::open(txn)?;
-                // The byte accounting walks the removed rows before the drain.
-                let removed = part_data.total_len(b, upload_id)?;
-                part_data.drain_upload(b, upload_id)?;
-                removed
-            };
-            {
-                let mut stored_meta = part_meta::Table::open(txn)?;
-                stored_meta.drain_upload(b, upload_id)?;
-            }
-            {
-                let mut stored_parts = part::Table::open(txn)?;
-                stored_parts.drain_upload(b, upload_id)?;
-            }
-            {
-                let mut stored_checksums = part_checksum::Table::open(txn)?;
-                stored_checksums.drain_upload(b, upload_id)?;
-            }
-            Ok(part_bytes)
-        })?;
-        // An abort only shrinks the total; it cannot exceed a limit.
-        let _ = self.adjust_total(-(removed as i64));
+        // Bucket existence first (the fs backend answers NoSuchBucket before
+        // anything else).
+        self.ensure_bucket(bucket).await?;
+        // The identity check and the drain in ONE contract transaction, so a
+        // racing complete cannot slip between them: an absent or
+        // key-mismatched upload refuses with NoSuchUpload and drains nothing.
+        let numbers = self.part_numbers(bucket, upload_id).await?;
+        self.metadata()
+            .drain_upload_checked(bucket, key, upload_id)
+            .await?;
+        // The mem-local stat plane leaves with the rows (the contract's drain
+        // cannot know it).
+        self.drain_part_meta(bucket, upload_id)?;
+        // The bytes leave only after their rows, in one batch through the
+        // decorator, so the accounting follows exactly once.
+        let part_keys: Vec<ContentKey> = numbers
+            .into_iter()
+            .map(|number| ContentKey::Part {
+                upload_id: upload_id.to_owned(),
+                number,
+            })
+            .collect();
+        self.content().remove_many(bucket, &part_keys).await?;
         Ok(())
     }
 
@@ -669,98 +670,38 @@ impl MultipartOps for MemoryStorage {
         &self,
         params: ListUploadsParams,
     ) -> Result<UploadsListing, Error> {
-        self.db.read(|txn| {
-            {
-                let buckets = bucket::Table::open_readonly(txn)?;
-                if buckets.get(params.bucket.as_ref().as_str())?.is_none() {
-                    return Err(no_such_bucket(&params.bucket));
-                }
-            }
-            let uploads = upload::Table::open_readonly(txn)?;
-            // The create-time checksum specs use the identical
-            // `(bucket, upload_id)` key — join them per row (spec
-            // 2026-08-31).
-            let checksums = upload_checksum::Table::open_readonly(txn)?;
-            let b = params.bucket.as_ref().as_str();
-            // The resume marker (composite `key\0upload_id`; a bare key
-            // marker sorts after every upload of that key) is computed before
-            // the walk (T02).
-            let marker = key_marker_order(
-                params.key_marker.as_deref(),
-                params.upload_id_marker.as_deref(),
-            );
-            // The bucket's upload rows walk via the shared `for_bucket` scan
-            // (`(bucket, "")` lower bound, keep boundary); the prefix filter
-            // and the delimiter grouping run in the shared unordered engine
-            // (the fs `list_uploads_page` shape). A tampered key row is
-            // skipped, never a panic; a corrupt checksum row self-heals to a
-            // checksum-less upload (F07). The sync scan runs inline on the
-            // async executor by design (mem is the reference backend, rows
-            // are owned copies, and the redb read txn is MVCC — no lock is
-            // held).
-            let mut rows: Vec<UploadRow> = Vec::new();
-            uploads.for_bucket(
-                b,
-                |upload_id, (key, initiated_at, tags_wire, owner_wire, acl_wire)| {
-                    if !key.starts_with(&params.prefix) {
-                        return Ok(());
-                    }
-                    let Ok(key) = object::key(key) else {
-                        return Ok(()); // tampered row — skipped like list_objects
-                    };
-                    let checksum = checksums.get(b, upload_id)?;
-                    rows.push(UploadRow {
-                        key,
-                        upload_id: upload_id.to_string(),
-                        initiated_at,
-                        tags: object::Tags::from_wire_limited(tags_wire, OBJECT_TAGS_MAX),
-                        owner: decode_owner_wire(owner_wire),
-                        acl: decode_acl_wire(acl_wire),
-                        checksum,
-                    });
-                    Ok(())
-                },
-            )?;
-            // The resume marker pairs the key with the upload id, so a page
-            // can position inside a same-key group (S3 `upload-id-marker`); a
-            // bare key marker skips the whole key group — the conversion has
-            // one home in tinio-core (shared with the fs backend).
-            let (page, common_prefixes, truncated, next) = group_and_paginate_unordered(
-                rows,
+        self.ensure_bucket(&params.bucket).await?;
+        // The resume marker (composite key plus upload_id; a bare key marker
+        // sorts after every upload of that key) is computed before the walk.
+        let marker = key_marker_order(
+            params.key_marker.as_deref(),
+            params.upload_id_marker.as_deref(),
+        );
+        // One contract read: the prefix filter, the delimiter rollup, the
+        // marker and the truncation/resume rules are the shared engine's.
+        let (uploads, common_prefixes, truncated, next) = self
+            .metadata()
+            .list_uploads_page(
+                &params.bucket,
                 &params.prefix,
                 params.delimiter.as_deref(),
                 marker.as_deref(),
                 params.max_uploads,
-                |u| u.key.as_ref(),
-                |u| uploads_order(&u.key, &u.upload_id),
-            );
-            let uploads = page
-                .into_iter()
-                .map(|u| MultipartUpload {
-                    upload_id: u.upload_id,
-                    bucket: params.bucket.clone(),
-                    key: u.key,
-                    initiated_at: from_nanos(u.initiated_at),
-                    checksum: u.checksum,
-                    tags: u.tags,
-                    owner: u.owner,
-                    acl: u.acl,
-                })
-                .collect();
-            let (next_key, next_upload_id) = match next {
-                Some(next) => {
-                    let (key, upload_id) = split_uploads_order(&next);
-                    (Some(key.to_string()), upload_id.map(str::to_string))
-                }
-                None => (None, None),
-            };
-            Ok(UploadsListing {
-                uploads,
-                common_prefixes,
-                truncated,
-                next_key_marker: next_key,
-                next_upload_id_marker: next_upload_id,
-            })
+            )
+            .await?;
+        let (next_key, next_upload_id) = match next {
+            Some(next) => {
+                let (key, upload_id) = split_uploads_order(&next);
+                (Some(key.to_string()), upload_id.map(str::to_string))
+            }
+            None => (None, None),
+        };
+        Ok(UploadsListing {
+            uploads,
+            common_prefixes,
+            truncated,
+            next_key_marker: next_key,
+            next_upload_id_marker: next_upload_id,
         })
     }
 }
@@ -773,13 +714,18 @@ mod tests {
             BucketOps, CompletedPart, ListUploadsParams, MultipartOps, ObjectOps, PartInfo,
             acl::Acl,
             bucket,
+            content::ContentKey,
             multipart::{MIN_PART_BYTES, part_number},
             object,
             storage::Error::*,
         },
-        _util::testing::{body, read_body},
+        _util::testing::{
+            body,
+            metadata::{assert_content_conformance, assert_upload_meta_conformance},
+            read_body,
+        },
         MemoryOptions,
-        testutil::checksum_tee,
+        testutil::{checksum_tee, publish_tagged_bytes},
     };
 
     fn completed(part: &PartInfo) -> CompletedPart {
@@ -797,6 +743,573 @@ mod tests {
             .await
             .unwrap();
         (storage, name)
+    }
+
+    /// A refused PARTS row write must not leave the number's OLD row without
+    /// bytes: the publish above has already overwritten them, so the refusal
+    /// path puts them back. The single-transaction baseline rolled the whole
+    /// part write back; Review Focus 5's invariant is that a live row always
+    /// has its bytes.
+    #[tokio::test]
+    async fn a_refused_part_row_write_keeps_the_row_and_its_bytes_together() {
+        let (storage, b) = with_bucket().await;
+        let key = object::key("part.bin").unwrap();
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        let first = storage
+            .upload_part(
+                &b,
+                &key,
+                &upload.upload_id,
+                part_number(1).unwrap(),
+                body(b"first"),
+                None,
+            )
+            .await
+            .unwrap();
+        let content_key = ContentKey::Part {
+            upload_id: upload.upload_id.clone(),
+            number: first.part_number,
+        };
+
+        // The same part number under a key the upload does not record: the
+        // bytes publish, then the PARTS row write is refused (NoSuchUpload).
+        let other = object::key("other.bin").unwrap();
+        let err = storage
+            .upload_part(
+                &b,
+                &other,
+                &upload.upload_id,
+                part_number(1).unwrap(),
+                body(b"second"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Storage(NoSuchUpload(id)) if id == &upload.upload_id),
+            "the row write is refused: {err}"
+        );
+
+        // The old row survives, so its bytes must: the row and the bytes the
+        // completion would read still agree.
+        let rows = storage
+            .metadata()
+            .list_parts(&b, &upload.upload_id, part_number(1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the old PARTS row is still there");
+        assert_eq!(rows[0].etag, first.etag, "and it is still the old part");
+        let stream = storage
+            .content()
+            .open(&b, &content_key, None)
+            .await
+            .expect("the old row's bytes are still readable");
+        assert_eq!(read_body(stream).await.unwrap(), b"first");
+    }
+
+    /// The other half of the refusal compensation: when the upload's rows are
+    /// gone (a concurrent abort or complete drained it), the freshly published
+    /// bytes must leave too — restoring bytes no row names would leak them.
+    #[tokio::test]
+    async fn a_refused_part_row_write_drops_the_bytes_when_the_row_is_gone() {
+        let (storage, b) = with_bucket().await;
+        let key = object::key("drained.bin").unwrap();
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        let first = storage
+            .upload_part(
+                &b,
+                &key,
+                &upload.upload_id,
+                part_number(1).unwrap(),
+                body(b"kept"),
+                None,
+            )
+            .await
+            .unwrap();
+        let content_key = ContentKey::Part {
+            upload_id: upload.upload_id.clone(),
+            number: first.part_number,
+        };
+        // The rows leave while the bytes stay: the window a drain opens.
+        storage
+            .metadata()
+            .drain_upload(&b, &upload.upload_id)
+            .await
+            .unwrap();
+        assert!(
+            storage.content().open(&b, &content_key, None).await.is_ok(),
+            "the old bytes are still in the plane"
+        );
+
+        // A part write for the drained upload: the bytes publish, the row
+        // write is refused, and the compensation must take the bytes out.
+        let err = storage
+            .upload_part(
+                &b,
+                &key,
+                &upload.upload_id,
+                part_number(1).unwrap(),
+                body(b"new"),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Storage(NoSuchUpload(id)) if id == &upload.upload_id),
+            "the row write is refused: {err}"
+        );
+        assert!(
+            storage
+                .content()
+                .open(&b, &content_key, None)
+                .await
+                .is_err(),
+            "the compensation dropped the bytes no row names"
+        );
+    }
+
+    /// The drop half of a refused part write's compensation never takes another
+    /// writer's publish: the tag and the comparison are one contract call, so a
+    /// publish that landed after ours owns the key — its bytes stay, and its
+    /// accounting entry stays with them **even when it published the same
+    /// bytes** (two empty parts), which the byte compare alone cannot tell
+    /// apart.
+    #[tokio::test]
+    async fn a_refused_part_write_leaves_another_writers_bytes_alone() {
+        // A tracked total, so the release half is observable too: the
+        // replacement's bytes must stay billed.
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: None,
+            max_total_bytes: Some(1024),
+        })
+        .unwrap();
+        let b = bucket::name("part-race").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let key = ContentKey::Part {
+            upload_id: "u".to_owned(),
+            number: part_number(1).unwrap(),
+        };
+        // Ours first, then a later writer's over the same key — the same
+        // bytes, so only the recorded publish identity separates them.
+        let ours = storage.content().mint_publish_id();
+        publish_tagged_bytes(&storage, &b, &key, b"mine", ours).await;
+        let theirs = storage.content().mint_publish_id();
+        publish_tagged_bytes(&storage, &b, &key, b"mine", theirs).await;
+        assert_eq!(
+            storage.total_bytes(),
+            4,
+            "an equal-length replacement bills only the difference"
+        );
+
+        // The refused write's compensation names ITS publish and finds
+        // another's: nothing is deleted and nothing is released.
+        storage
+            .roll_back_publish(&b, &key, b"mine", ours, "PARTS")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_body(storage.content().open(&b, &key, None).await.unwrap())
+                .await
+                .unwrap(),
+            b"mine",
+            "the later writer's byte-identical content survives the compensation"
+        );
+        assert_eq!(storage.total_bytes(), 4, "and stays billed");
+
+        // Its own publish it does take back, accounting included.
+        storage
+            .roll_back_publish(&b, &key, b"mine", theirs, "PARTS")
+            .await
+            .unwrap();
+        assert!(
+            storage.content().open(&b, &key, None).await.is_err(),
+            "our own publish is taken back"
+        );
+        assert_eq!(storage.total_bytes(), 0, "and released");
+    }
+
+    /// A refused version-recording completion leaves the repository exactly as
+    /// it was: the object core is ONE transaction, so the upload, its part rows
+    /// and bytes, the outgoing version and the history all survive untouched.
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_refused_versioned_completion_leaves_history_rows_and_bytes_untouched() {
+        use crate::_core::{
+            storage::VersionOps,
+            version::{ListParams, ReadResult, State},
+        };
+
+        // The assembled object exceeds the single-object cap while each part
+        // fits it: the completion refuses before its transaction can move any
+        // version state.
+        let min = MIN_PART_BYTES as usize;
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: Some(MIN_PART_BYTES),
+            max_total_bytes: None,
+        })
+        .unwrap();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        storage
+            .set_bucket_versioning(&b, State::Enabled)
+            .await
+            .unwrap();
+        let key = object::key("refused-completion.bin").unwrap();
+        // The version the completion would supersede.
+        storage
+            .put_object(&b, &key, body(b"first".to_vec()))
+            .await
+            .unwrap();
+        let params = || ListParams {
+            max_keys: 1000,
+            ..Default::default()
+        };
+        let first_id = storage
+            .list_object_versions(&b, params())
+            .await
+            .unwrap()
+            .entries[0]
+            .id
+            .clone()
+            .expect("an enabled write mints an identity");
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        let first = storage
+            .upload_part(
+                &b,
+                &key,
+                &upload.upload_id,
+                1.into(),
+                body(vec![b'a'; min]),
+                None,
+            )
+            .await
+            .unwrap();
+        let second = storage
+            .upload_part(&b, &key, &upload.upload_id, 2.into(), body(b"b"), None)
+            .await
+            .unwrap();
+        let first_key = ContentKey::Part {
+            upload_id: upload.upload_id.clone(),
+            number: first.part_number,
+        };
+        let second_key = ContentKey::Part {
+            upload_id: upload.upload_id.clone(),
+            number: second.part_number,
+        };
+
+        let err = storage
+            .complete_multipart_upload(
+                &b,
+                &key,
+                &upload.upload_id,
+                &[completed(&first), completed(&second)],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Storage(EntityTooLarge { size, limit })
+                    if size == MIN_PART_BYTES + 1 && limit == MIN_PART_BYTES
+            ),
+            "the assembled object is refused: {err}"
+        );
+
+        // The upload is intact: its row, both part rows and both byte values.
+        assert!(
+            UploadMeta::get(&**storage.metadata(), &b, &key, &upload.upload_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the upload row survives the refusal"
+        );
+        let rows = storage
+            .metadata()
+            .list_parts(&b, &upload.upload_id, part_number(1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "the part rows survive the refusal");
+        assert_eq!(
+            read_body(storage.content().open(&b, &first_key, None).await.unwrap())
+                .await
+                .unwrap()
+                .len(),
+            min,
+            "the first part's bytes survive the refusal"
+        );
+        assert_eq!(
+            read_body(storage.content().open(&b, &second_key, None).await.unwrap())
+                .await
+                .unwrap(),
+            b"b",
+            "the second part's bytes survive the refusal"
+        );
+
+        // No fresh version and no history row: the outgoing version is still
+        // current, readable and alone.
+        let page = storage.list_object_versions(&b, params()).await.unwrap();
+        assert_eq!(page.entries.len(), 1, "no version entered history");
+        assert_eq!(page.entries[0].id.as_ref(), Some(&first_id));
+        let ReadResult::Object(old) = storage
+            .get_object_version(&b, &key, Some(&first_id), None)
+            .await
+            .unwrap()
+        else {
+            panic!("the outgoing version is still an object version");
+        };
+        assert_eq!(read_body(old.body).await.unwrap(), b"first");
+    }
+
+    /// The hook the plain path runs meters the history's fresh bytes in the
+    /// transaction that stores them: a cap refusal takes the version rows and the
+    /// blobs back together. The public surface cannot reach a growing hook delta
+    /// on that path — a bucket that records no versions never supersedes, so the
+    /// delta there is always zero, and only the state flip between the
+    /// completion's read and its transaction makes it grow — so the shape is
+    /// pinned white-box, at the layer that flip would hit.
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_refused_hook_takes_its_version_rows_and_history_blobs_back() {
+        use crate::_core::{
+            storage::VersionOps,
+            version::{ListParams, ReadResult, State},
+        };
+
+        // The cap is exactly what the bucket already holds: the hook's fresh
+        // history bytes (the outgoing version's copy) cannot fit.
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: None,
+            max_total_bytes: Some(5),
+        })
+        .unwrap();
+        let b = bucket::name("hook-cap").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        storage
+            .set_bucket_versioning(&b, State::Enabled)
+            .await
+            .unwrap();
+        let key = object::key("superseded.bin").unwrap();
+        storage
+            .put_object(&b, &key, body(b"first".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(storage.total_bytes(), 5, "the cap is the bytes stored");
+
+        let params = || ListParams {
+            max_keys: 1000,
+            ..Default::default()
+        };
+        let before = storage.list_object_versions(&b, params()).await.unwrap();
+        assert_eq!(before.entries.len(), 1, "one current version");
+        let first_id = before.entries[0]
+            .id
+            .clone()
+            .expect("an enabled write mints an identity");
+
+        let err = storage
+            .prepare_completion_publish(&b, &key, now_nanos())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Storage(EntityTooLarge { .. })),
+            "the hook's fresh history bytes cannot fit the cap: {err}"
+        );
+
+        // Nothing moved and nothing was billed: the version is still current and
+        // alone (no history row), its bytes are readable, and the total is the
+        // bytes the bucket really holds.
+        assert_eq!(storage.total_bytes(), 5, "the breach billed nothing");
+        let after = storage.list_object_versions(&b, params()).await.unwrap();
+        assert_eq!(after.entries.len(), 1, "no version entered the history");
+        assert_eq!(after.entries[0].id.as_ref(), Some(&first_id));
+        let ReadResult::Object(still) = storage
+            .get_object_version(&b, &key, Some(&first_id), None)
+            .await
+            .unwrap()
+        else {
+            panic!("the version is still an object version");
+        };
+        assert_eq!(read_body(still.body).await.unwrap(), b"first");
+    }
+
+    /// A completion releases its part bytes exactly once, on both write paths:
+    /// the plane's total ends at the bytes the repository really holds.
+    #[tokio::test]
+    async fn a_completed_upload_releases_its_part_bytes_exactly_once() {
+        let options = || MemoryOptions {
+            max_object_bytes: None,
+            max_total_bytes: Some(1024),
+        };
+        // An unversioned bucket with nothing at the key: the assembled object
+        // is all that is left.
+        let storage = MemoryStorage::with_options(options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let key = object::key("once.bin").unwrap();
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &key,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        let part = storage
+            .upload_part(
+                &b,
+                &key,
+                &upload.upload_id,
+                1.into(),
+                body(b"assembled"),
+                None,
+            )
+            .await
+            .unwrap();
+        let content_key = ContentKey::Part {
+            upload_id: upload.upload_id.clone(),
+            number: part.part_number,
+        };
+        assert_eq!(storage.total_bytes(), 9, "the part's bytes are counted");
+        let info = storage
+            .complete_multipart_upload(&b, &key, &upload.upload_id, &[completed(&part)], None)
+            .await
+            .unwrap();
+        assert_eq!(info.size, 9);
+        assert!(
+            storage
+                .content()
+                .open(&b, &content_key, None)
+                .await
+                .is_err(),
+            "the part bytes leave with the consume"
+        );
+        assert_eq!(
+            storage.total_bytes(),
+            9,
+            "the total is the object's bytes alone"
+        );
+
+        // A version-recording bucket with an outgoing version: the plane ends
+        // at the live object PLUS the history copy the supersede stored, and
+        // the released part is still subtracted exactly once.
+        #[cfg(feature = "versioning")]
+        {
+            use crate::_core::{storage::VersionOps, version::State};
+
+            let storage = MemoryStorage::with_options(options()).unwrap();
+            let b = bucket::name("data").unwrap();
+            storage
+                .create_bucket(&b, None, &Acl::default_private(None))
+                .await
+                .unwrap();
+            storage
+                .set_bucket_versioning(&b, State::Enabled)
+                .await
+                .unwrap();
+            let key = object::key("once-versioned.bin").unwrap();
+            storage
+                .put_object(&b, &key, body(b"first".to_vec()))
+                .await
+                .unwrap();
+            let upload = storage
+                .create_multipart_upload(
+                    &b,
+                    &key,
+                    None,
+                    object::Tags::empty(),
+                    None,
+                    &Acl::default_private(None),
+                )
+                .await
+                .unwrap();
+            let part = storage
+                .upload_part(
+                    &b,
+                    &key,
+                    &upload.upload_id,
+                    1.into(),
+                    body(b"assembled"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let content_key = ContentKey::Part {
+                upload_id: upload.upload_id.clone(),
+                number: part.part_number,
+            };
+            assert_eq!(
+                storage.total_bytes(),
+                14,
+                "the outgoing object and the part are both counted"
+            );
+            let info = storage
+                .complete_multipart_upload(&b, &key, &upload.upload_id, &[completed(&part)], None)
+                .await
+                .unwrap();
+            assert!(
+                info.version_id.is_some(),
+                "a versioned completion mints an identity"
+            );
+            assert!(
+                storage
+                    .content()
+                    .open(&b, &content_key, None)
+                    .await
+                    .is_err(),
+                "the part bytes leave with the consume"
+            );
+            assert_eq!(
+                storage.total_bytes(),
+                14,
+                "9 live object bytes + 5 history bytes, the part released once"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1355,5 +1868,94 @@ mod tests {
         assert_eq!(page.entries.len(), 2);
         assert_eq!(page.entries[0].id.as_ref(), Some(&current_id));
         assert_eq!(page.entries[1].id.as_ref(), Some(&first_id));
+    }
+    /// The UploadMeta contract's own legs, run from this crate's second
+    /// consumer (P2 Task 2's acceptance).
+    #[tokio::test]
+    async fn upload_meta_conformance() {
+        let storage = MemoryStorage::new().unwrap();
+        assert_upload_meta_conformance(&**storage.metadata()).await;
+    }
+
+    /// The ObjectContent contract's own legs — the D23 part-key surface, the
+    /// move/copy/scan/stat/bucket-lifecycle primitives and the 8 MiB staged
+    /// leg — run from the second consumer.
+    #[tokio::test]
+    async fn object_content_conformance() {
+        let storage = MemoryStorage::new().unwrap();
+        assert_content_conformance(&**storage.content()).await;
+    }
+
+    /// A part's PARTS row exists exactly while its bytes are readable: the
+    /// bytes-first order observed at the two points that matter — after the
+    /// part upload, and after the completion that consumes it.
+    #[tokio::test]
+    async fn a_part_row_exists_exactly_while_its_bytes_are_readable() {
+        let (storage, b) = with_bucket().await;
+        let k = object::key("order.bin").unwrap();
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        let part = storage
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                1.into(),
+                body(b"bytes".to_vec()),
+                None,
+            )
+            .await
+            .unwrap();
+        // The row is there...
+        let rows = storage
+            .metadata()
+            .list_parts(&b, &upload.upload_id, part_number(1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the part row landed");
+        // ...and its bytes are readable.
+        let content_key = ContentKey::Part {
+            upload_id: upload.upload_id.clone(),
+            number: part.part_number,
+        };
+        let stream = storage
+            .content()
+            .open(&b, &content_key, None)
+            .await
+            .unwrap();
+        assert_eq!(read_body(stream).await.unwrap(), b"bytes");
+
+        // The completion consumes the part: the row is gone first, and its
+        // bytes are gone with it (a row never outlives its bytes).
+        storage
+            .complete_multipart_upload(&b, &k, &upload.upload_id, &[completed(&part)], None)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .metadata()
+                .list_parts(&b, &upload.upload_id, part_number(1).unwrap())
+                .await
+                .unwrap()
+                .is_empty(),
+            "the consumed part row is drained"
+        );
+        assert!(
+            storage
+                .content()
+                .open(&b, &content_key, None)
+                .await
+                .is_err(),
+            "the consumed part's bytes are gone"
+        );
     }
 }

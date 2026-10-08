@@ -286,12 +286,20 @@ impl ObjectMeta for RedbMetadata {
         row: &Row,
         parts: &[PartRow],
     ) -> Result<(), <Self as Metadata>::Error> {
+        let refusal = storage::no_such_bucket(bucket);
         let bucket = bucket.to_string();
         let key = key.to_string();
         let row = row.clone();
         let parts: Vec<object_part::Stored> = parts.iter().map(part_row).collect();
         self.driver
             .write(move |txn| -> Result<(), Error> {
+                // The parts write is a guarded write too: the bucket row is
+                // probed in this transaction, first, so a concurrent
+                // `remove_if_empty` cannot be raced into leaving object and
+                // part rows behind (the shape `put_guarded` rules out).
+                if !BucketTable::open(txn)?.exists(&bucket)? {
+                    return Err(Error::Refused(refusal));
+                }
                 write_row(txn, &bucket, &key, &row)?;
                 let mut parts_table = PartTable::open(txn)?;
                 parts_table.remove_key(&bucket, &key)?;
@@ -329,11 +337,18 @@ impl ObjectMeta for RedbMetadata {
         key: &object::Key,
         identity: &Identity,
     ) -> Result<Preserved, <Self as Metadata>::Error> {
+        let refusal = storage::no_such_bucket(bucket);
         let bucket = bucket.to_string();
         let key = key.to_string();
         let identity = identity.clone();
         self.driver
             .write(move |txn| -> Result<Preserved, Error> {
+                // The preserving write is a guarded write too: the bucket row
+                // is probed in this transaction, first, exactly as
+                // `put_guarded` probes it.
+                if !BucketTable::open(txn)?.exists(&bucket)? {
+                    return Err(Error::Refused(refusal));
+                }
                 let mut table = MetaTable::open(txn)?;
                 let previous = table.get(&bucket, &key)?;
                 let preserved = preserved_of(previous.as_ref());
@@ -513,6 +528,7 @@ impl ObjectMeta for RedbMetadata {
         bucket: &bucket::Name,
         rows: &[(object::Key, Row)],
     ) -> Result<(), <Self as Metadata>::Error> {
+        let refusal = storage::no_such_bucket(bucket);
         let bucket = bucket.to_string();
         let rows: Vec<(String, Row)> = rows
             .iter()
@@ -520,6 +536,11 @@ impl ObjectMeta for RedbMetadata {
             .collect();
         self.driver
             .write(move |txn| -> Result<(), Error> {
+                // The batch is a guarded write too: the bucket row is probed in
+                // this transaction, first, exactly as `put_guarded` probes it.
+                if !BucketTable::open(txn)?.exists(&bucket)? {
+                    return Err(Error::Refused(refusal));
+                }
                 // One `object_meta` handle for the whole batch: the row writes
                 // open the table once here rather than once per entry, and the
                 // handle is dropped before the parts table opens below.
@@ -847,6 +868,81 @@ mod tests {
         );
     }
 
+    /// The parts write probes the bucket row in its own transaction, exactly as
+    /// `put_guarded` does: a concurrent `remove_if_empty` cannot be raced into
+    /// leaving object and part rows behind for a bucket that is gone (permanent
+    /// capacity loss — the shape `concurrent_put_and_delete_never_orphans`
+    /// rules out).
+    #[tokio::test]
+    async fn put_with_parts_refuses_a_bucket_with_no_row() {
+        let store = RedbMetadata::in_memory().unwrap();
+        let bucket = bucket_name("conf-parts-refusal");
+        let key = key("a.txt");
+
+        let refusal: storage::Error = store
+            .put_with_parts(&bucket, &key, &row(1), &[part(1), part(2)])
+            .await
+            .unwrap_err()
+            .into();
+        assert!(
+            matches!(refusal, storage::Error::NoSuchBucket(_)),
+            "{refusal:?}"
+        );
+        assert!(
+            store.get(&bucket, &key).await.unwrap().is_none(),
+            "a refused parts write leaves no object row"
+        );
+        assert!(
+            store.parts(&bucket, &key).await.unwrap().is_empty(),
+            "and no part rows"
+        );
+
+        bucket_with(&store, "conf-parts-refusal").await;
+        store
+            .put_with_parts(&bucket, &key, &row(1), &[part(1), part(2)])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&bucket, &key).await.unwrap().map(|row| row.size),
+            Some(1)
+        );
+        assert_eq!(store.parts(&bucket, &key).await.unwrap().len(), 2);
+    }
+
+    /// The batch write probes the bucket row as well: `put_batch` is the other
+    /// writer that lands object rows for a bucket that may already be gone (the
+    /// multipart completion's tail), so it must not outlive its bucket either.
+    #[tokio::test]
+    async fn put_batch_refuses_a_bucket_with_no_row() {
+        let store = RedbMetadata::in_memory().unwrap();
+        let bucket = bucket_name("conf-batch-refusal");
+        let key = key("a.txt");
+
+        let refusal: storage::Error = store
+            .put_batch(&bucket, &[(key.clone(), row(1))])
+            .await
+            .unwrap_err()
+            .into();
+        assert!(
+            matches!(refusal, storage::Error::NoSuchBucket(_)),
+            "{refusal:?}"
+        );
+        assert!(
+            store.get(&bucket, &key).await.unwrap().is_none(),
+            "a refused batch leaves no object row"
+        );
+
+        bucket_with(&store, "conf-batch-refusal").await;
+        store
+            .put_batch(&bucket, &[(key.clone(), row(1))])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&bucket, &key).await.unwrap().map(|row| row.size),
+            Some(1)
+        );
+    }
+
     #[tokio::test]
     async fn a_write_preserves_the_stored_version_columns_and_clears_the_parts() {
         let store = RedbMetadata::in_memory().unwrap();
@@ -906,6 +1002,41 @@ mod tests {
             store.parts(&bucket, &key).await.unwrap().len(),
             1,
             "a heal leaves the retained list"
+        );
+    }
+
+    /// The preserving write — the heal path — probes the bucket row in its own
+    /// transaction, exactly as `put_guarded` does: an identity heal must not
+    /// resurrect rows for a bucket that is gone.
+    #[tokio::test]
+    async fn put_preserving_refuses_a_bucket_with_no_row() {
+        let store = RedbMetadata::in_memory().unwrap();
+        let bucket = bucket_name("conf-heal-refusal");
+        let key = key("a.txt");
+
+        let refusal: storage::Error = store
+            .put_preserving(&bucket, &key, &identity(4))
+            .await
+            .unwrap_err()
+            .into();
+        assert!(
+            matches!(refusal, storage::Error::NoSuchBucket(_)),
+            "{refusal:?}"
+        );
+        assert!(
+            store.get(&bucket, &key).await.unwrap().is_none(),
+            "a refused heal leaves no row"
+        );
+
+        bucket_with(&store, "conf-heal-refusal").await;
+        let preserved = store
+            .put_preserving(&bucket, &key, &identity(4))
+            .await
+            .unwrap();
+        assert_eq!(preserved.tags, object::Tags::empty());
+        assert_eq!(
+            store.get(&bucket, &key).await.unwrap().map(|row| row.size),
+            Some(4)
         );
     }
 

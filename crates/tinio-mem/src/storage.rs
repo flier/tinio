@@ -1,79 +1,49 @@
-//! The in-memory database: table layout, shared helpers, and the
-//! [`MemoryStorage`] core.
+//! The in-memory database: construction, the shared handles, and the
+//! byte-accounting entry points.
 //!
 //! All state lives in a redb database over the [`redb::InMemoryBackend`].
 //! The seven common tables (buckets, object_meta, uploads, parts,
 //! upload_checksums, part_checksums, object_parts) come from tinio-store-redb —
 //! row shapes, typed handles, and the scan/drain helpers are shared with
-//! the fs backend — plus three mem-local content tables (objects,
-//! part_data, part_meta) with no fs counterpart, keyed like the shared
-//! tables. Every table is tuple-keyed: `(bucket, key)` for object rows,
-//! `(bucket, upload_id[, part_number])` for the multipart rows. Every
-//! check-and-write sequence (e.g. `put_object` checking the bucket before
-//! inserting) runs inside one redb **write transaction**: transactions are
-//! atomic and serialized (redb is a single-writer database), so
-//! `delete_bucket`'s empty-check + removal and a concurrent `put_object`'s
-//! bucket-check + insert cannot interleave — there is no TOCTOU window.
-//! Reads use read transactions with zero-copy `&str` / `&[u8]` access;
-//! object bodies are copied out before the transaction ends (streams are
-//! `'static` and cannot borrow the transaction guard).
+//! the fs backend. Beside them sit the byte tables [`RedbContent`] writes,
+//! `objects` and `part_data`, and mem's part-stat plane `part_meta`, which
+//! carries the size and mtime of a part (no contract row does). Every table
+//! is tuple-keyed: `(bucket, key)` for object rows,
+//! `(bucket, upload_id[, part_number])` for the multipart rows.
+//!
+//! The metadata access layer is the shared implementation's (design
+//! 2026-10-03 §4): mem holds [`RedbMetadata`] behind an `Arc` and delegates
+//! every row operation to the contracts, mapping the contract error onto
+//! [`Error::Database`]. What stays mem-side is the byte plane's accounting —
+//! [`CountingContent`] decorates the shared `RedbContent` and owns every
+//! count of stored object and part bytes (round 29) — plus the two paths the
+//! contracts cannot express: the versioned write/delete, which needs the
+//! outgoing bytes and the history row in one transaction, and the part-stat
+//! rows, which read and write straight through the [`store::Handle`].
 //!
 //! The `BucketOps` / `ObjectOps` / `MultipartOps` implementations live in
-//! [`crate::bucket`], [`crate::object`], and [`crate::multipart`] and share
-//! the items below.
+//! [`crate::bucket`], [`crate::object`], and [`crate::multipart`].
 
-use std::{
-    cell::Cell,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 
-use redb::ReadableTable;
+use futures::lock::MutexGuard as AsyncMutexGuard;
 
 #[cfg(test)]
 use crate::_core::bucket::name;
 #[cfg(test)]
-use crate::_store_redb::scan::for_each_pair;
+use crate::_store_redb::{bucket, scan::for_each_pair};
 use crate::{
-    _core::{Storage, bucket::Name, object},
-    _store_redb::{
-        bucket, ensure_all, objects, part_data, part_meta, store, table::TableDef, upload,
+    _core::{
+        Storage,
+        bucket::Name,
+        content::{ContentKey, ObjectContent, PublishId},
+        meta::BucketMeta,
     },
+    _store_redb::{Driver, RedbContent, RedbMetadata, ensure_all, objects, part_meta, store},
     Error,
-    error::{entity_too_large, no_such_bucket, no_such_upload},
+    counting::CountingContent,
+    error::no_such_bucket,
 };
-
-/// Check that `bucket` exists (`NoSuchBucket` otherwise). Multipart
-/// operations answer bucket existence first — the fs backend's
-/// `ensure_bucket` precedes everything else, and NoParts/NoSuchUpload
-/// must not mask a missing bucket.
-pub(crate) fn check_bucket<T>(buckets: &bucket::Table<'_, T>, name: &Name) -> Result<(), Error>
-where
-    T: ReadableTable<<bucket::Def as TableDef>::Key, <bucket::Def as TableDef>::Value>,
-{
-    if !buckets.exists(name.as_ref().as_str())? {
-        return Err(no_such_bucket(name));
-    }
-    Ok(())
-}
-
-/// Check that `upload_id` names an upload for exactly this bucket/key
-/// (a mismatched identity is `NoSuchUpload`): a point get on the shared
-/// `(bucket, upload_id)` key plus the stored-key comparison — the fs
-/// backend's `key_matches` pattern.
-pub(crate) fn check_upload<T>(
-    uploads: &upload::Table<'_, T>,
-    upload_id: &str,
-    bucket: &Name,
-    key: &object::Key,
-) -> Result<(), Error>
-where
-    T: ReadableTable<<upload::Def as TableDef>::Key, <upload::Def as TableDef>::Value>,
-{
-    if !uploads.key_matches(bucket.as_ref().as_str(), key.as_ref().as_str(), upload_id)? {
-        return Err(no_such_upload(upload_id));
-    }
-    Ok(())
-}
 
 /// A minimal in-memory backend over redb's in-memory backend.
 ///
@@ -85,7 +55,7 @@ where
 /// Resource limits are optional and configurable via [`MemoryOptions`]
 /// ([`MemoryStorage::with_options`]): `max_object_bytes` caps one object or
 /// part, `max_total_bytes` caps the sum of all object and part bytes. The
-/// default (`MemoryStorage::new`) is **unlimited**, matching the project's
+/// default ([`MemoryStorage::new`]) is **unlimited**, matching the project's
 /// documented no-limit posture (CHK028); a server wiring the in-memory
 /// backend should set explicit limits from its configuration. The total
 /// accounting is a best-effort soft limit — concurrent writers may briefly
@@ -112,12 +82,18 @@ where
 /// .unwrap();
 /// ```
 pub struct MemoryStorage {
-    pub(crate) db: store::Handle,
-    options: MemoryOptions,
-    /// Current total stored bytes across `objects`, `part_data` and the
-    /// version history's `blobs` table (updated only when a limit is
-    /// configured).
-    total_bytes: AtomicU64,
+    /// The database: mem's own tables (the version history's blobs, and the
+    /// unit tests' raw tampering) read and write through this handle. The
+    /// shared metadata implementation runs on the same database.
+    pub(crate) db: Arc<store::Handle>,
+    /// The shared metadata implementation: every bucket, object, upload and
+    /// version row mem serves goes through these contracts.
+    pub(crate) metadata: Arc<RedbMetadata>,
+    /// The byte plane behind the accounting decorator: object and part bytes
+    /// are published through it, and every count passes through it. The
+    /// configured limits and the shared total-byte counter live inside it
+    /// (round 29: one accounting home).
+    pub(crate) content: Arc<CountingContent<RedbContent>>,
 }
 
 /// Optional resource limits for [`MemoryStorage`].
@@ -161,7 +137,16 @@ impl MemoryStorage {
     /// Fails only if the redb database cannot be created (programmer error —
     /// the in-memory backend cannot fail in practice).
     pub fn with_options(options: MemoryOptions) -> Result<Self, Error> {
-        let handle = store::Handle::new(store::open_in_memory()?);
+        // One database serves the metadata rows and the byte plane: the
+        // content handle wraps the metadata handle's own driver, and the
+        // mem-local tables are created through that same database below.
+        let metadata = Arc::new(RedbMetadata::in_memory()?);
+        let driver = metadata.driver();
+        let content = CountingContent::new(RedbContent::from_driver(Arc::clone(&driver)), options);
+        // The same database, not a second one: mem's own tables (the version
+        // blobs, the part-stat rows, the unit tests' raw tampering) must see
+        // the metadata rows the contracts write.
+        let handle = metadata.store_handle();
         handle.write(|txn| -> Result<(), Error> {
             // Create all tables up front: read transactions refuse to open
             // a table that does not exist yet. The seven shared tables and
@@ -169,7 +154,6 @@ impl MemoryStorage {
             // transaction (the fs backend's open pattern).
             ensure_all(txn)?;
             objects::Table::ensure(txn)?;
-            part_data::Table::ensure(txn)?;
             part_meta::Table::ensure(txn)?;
             #[cfg(feature = "versioning")]
             crate::version::blobs::Table::ensure(txn)?;
@@ -177,102 +161,143 @@ impl MemoryStorage {
         })?;
         Ok(Self {
             db: handle,
-            options,
-            total_bytes: AtomicU64::new(0),
+            metadata,
+            content: Arc::new(content),
         })
     }
 
-    /// Enforce `max_object_bytes` on a single object/part of `size` bytes.
-    pub(crate) fn check_object_size(&self, size: u64) -> Result<(), Error> {
-        if let Some(limit) = self.options.max_object_bytes
-            && size > limit
-        {
-            return Err(entity_too_large(size, limit));
-        }
-        Ok(())
+    /// The shared metadata implementation — the handle every row operation
+    /// of this backend delegates to (test-visible).
+    pub fn metadata(&self) -> &Arc<RedbMetadata> {
+        &self.metadata
+    }
+
+    /// The byte plane behind the accounting decorator.
+    pub fn content(&self) -> &Arc<CountingContent<RedbContent>> {
+        &self.content
+    }
+
+    /// The redb driver the metadata and content handles share — the handle
+    /// a test inspects transaction counts through.
+    pub fn driver(&self) -> Arc<Driver> {
+        self.metadata.driver()
+    }
+
+    /// Take mem's accounting lock: the critical section a counted mutation
+    /// reads and writes in. The versioned single-transaction paths hold this
+    /// guard across their own transaction and meter their raw writes with
+    /// the `*_unlocked` entry points. The lock is **not** reentrant: a
+    /// caller holding it must never call a `*_locked` method.
+    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
+    pub(crate) async fn lock_accounting(&self) -> AsyncMutexGuard<'_, ()> {
+        self.content.lock_accounting().await
     }
 
     /// Apply a signed byte delta to the tracked total and enforce
-    /// `max_total_bytes`. Call inside the write transaction before the
-    /// commit; a failing limit leaves the total unchanged. No-op when no
-    /// total limit is configured.
-    pub(crate) fn adjust_total(&self, delta: i64) -> Result<(), Error> {
-        let Some(limit) = self.options.max_total_bytes else {
-            return Ok(());
-        };
-        // The projected size is carried out of the closure (T04): the
-        // error must report the size the write WOULD have produced, not
-        // the current total (`fetch_update`'s `Err` carries only the
-        // latter, and it is racy under concurrent deltas).
-        let projected = Cell::new(0u64);
-        self.total_bytes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
-                let new_total = total as i128 + delta as i128;
-                if new_total < 0 {
-                    // Defensive: internal accounting must never go negative.
-                    return Some(0);
-                }
-                let new_total = new_total as u64;
-                if new_total > limit {
-                    projected.set(new_total);
-                    return None;
-                }
-                Some(new_total)
-            })
-            .map_err(|_| entity_too_large(projected.get(), limit))?;
-        Ok(())
+    /// `max_total_bytes`
+    /// ([`CountingContent::adjust_total_unlocked`]). Call with the
+    /// accounting lock held, inside the write transaction before the commit;
+    /// a failing limit leaves the total unchanged. No-op when no total limit
+    /// is configured.
+    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
+    pub(crate) fn adjust_total_unlocked(&self, delta: i64) -> Result<(), Error> {
+        self.content.adjust_total_unlocked(delta)
+    }
+
+    /// [`Self::adjust_total_unlocked`] with a `credit` the caller is about
+    /// to release: the `max_total_bytes` check forgives those bytes while
+    /// the reservation stays the exact delta, so the total never drifts
+    /// ([[`CountingContent::adjust_total_with_credit_unlocked`]]).
+    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
+    pub(crate) fn adjust_total_with_credit_unlocked(
+        &self,
+        delta: i64,
+        credit: u64,
+    ) -> Result<(), Error> {
+        self.content
+            .adjust_total_with_credit_unlocked(delta, credit)
     }
 
     /// Apply a signed byte delta to the tracked total **without** the
     /// `max_total_bytes` check. The paths that only move or drop bytes the
-    /// backend already holds — a version delete (whose materialize can
-    /// re-publish content onto the key path), a bucket teardown — must never
-    /// fail for capacity: the limit governs what a client write may **add**,
-    /// and a backend that refused a delete for space would be unusable. The
-    /// delta is clamped at zero like [`Self::adjust_total`]'s; a delta that
-    /// grows the total can leave it above the limit, which the next write's
-    /// check then sees (the limit is best-effort, exactly as the type doc
-    /// says).
-    ///
-    /// The version paths are its only callers: without them the writes are
-    /// the only paths that move the total, and every one of those is a
-    /// client write the limit governs.
-    #[cfg(feature = "versioning")]
-    pub(crate) fn release_total(&self, delta: i64) {
-        self.total_bytes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
-                Some(((total as i128 + delta as i128).max(0)) as u64)
-            })
-            .ok();
+    /// backend already holds — a compensation after a failed publish, a
+    /// version delete (whose materialize can re-publish content onto the key
+    /// path), a bucket teardown — must never fail for capacity: the limit
+    /// governs what a client write may **add**, and a backend that refused a
+    /// delete for space would be unusable. The delta is clamped at zero, so a
+    /// compensation that would otherwise fail still lands; a delta that grows
+    /// the total can leave it above the limit, which the next write's check
+    /// then sees (the limit is best-effort, exactly as the type doc says).
+    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
+    pub(crate) fn release_total_unlocked(&self, delta: i64) {
+        self.content.release_total_unlocked(delta);
     }
 
-    /// Roll back a [`Self::adjust_total`] delta after a failed commit
-    /// (tested against the direct-accounting surface; the commit-failure
-    /// path is unreachable on the in-memory backend — no disk writes).
-    #[cfg(test)]
-    pub(crate) fn rollback_total(&self, delta: i64) {
-        self.total_bytes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
-                Some(((total as i128 - delta as i128).max(0)) as u64)
-            })
-            .ok();
+    /// [`Self::adjust_total_unlocked`] behind the accounting lock.
+    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
+    pub(crate) async fn adjust_total_locked(&self, delta: i64) -> Result<(), Error> {
+        self.content.adjust_total_locked(delta).await
     }
 
-    /// The currently tracked total bytes (objects + parts). Meaningful only
+    /// The single-object cap check (`max_object_bytes`) without the
+    /// accounting lock — for a caller that already holds it. Never touches
+    /// the total.
+    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
+    pub(crate) fn check_object_bytes_unlocked(&self, len: u64) -> Result<(), Error> {
+        self.content.check_object_bytes_unlocked(len)
+    }
+
+    /// The currently tracked total bytes (objects and parts). Meaningful only
     /// when a total limit is configured; 0 otherwise. Test hook.
     #[cfg(test)]
     pub(crate) fn total_bytes(&self) -> u64 {
-        self.total_bytes.load(Ordering::Relaxed)
+        self.content.total_bytes()
     }
 
-    /// Fast-fail bucket existence check (own read transaction). Backend
-    /// failures propagate — a real database fault is never misclassified
-    /// as `NoSuchBucket`.
-    pub(crate) fn has_bucket(&self, name: &Name) -> Result<bool, Error> {
-        self.db.read(|txn| {
-            let buckets = bucket::Table::open_readonly(txn)?;
-            Ok(buckets.get(name.as_ref().as_str())?.is_some())
-        })
+    /// The drop half of a refused publish's compensation: take the bytes this
+    /// call published back out — but only while the key still holds them
+    /// *and* still holds this call's publish: the tag the publish recorded
+    /// carries the identity the bytes cannot (two writers, one empty body).
+    /// The comparison and the removal are the contract's one primitive
+    /// ([`ObjectContent::remove_if_tagged`]), so a writer that published this
+    /// key in the meantime keeps its bytes: a false answer means the key's
+    /// content is that writer's, no row names ours any more, and the ledger
+    /// entry the publish left is the later write's own length — so nothing is
+    /// deleted and nothing is released. `row` names the refused row in the
+    /// report.
+    pub(crate) async fn roll_back_publish(
+        &self,
+        bucket: &Name,
+        key: &ContentKey,
+        published: &[u8],
+        publish_id: PublishId,
+        row: &str,
+    ) -> Result<(), Error> {
+        if !self
+            .content()
+            .remove_if_tagged(bucket, key, published, publish_id)
+            .await?
+        {
+            tracing::info!(
+                "a refused {row} row's published bytes were replaced by another writer; left \
+                 in place (their bytes, their accounting entry)"
+            );
+        }
+        Ok(())
+    }
+
+    /// The bucket guard every mem operation opens with: the bucket contract
+    /// answers whether the row exists, and its absence becomes
+    /// `NoSuchBucket`. This is the ordering half (`NoSuchBucket` answers before
+    /// a key's own validation), never the authority — the guarded row writes
+    /// re-check in their own transaction, and backend failures propagate, so a
+    /// real database fault is never misclassified as `NoSuchBucket`.
+    pub(crate) async fn ensure_bucket(&self, name: &Name) -> Result<(), Error> {
+        if self.metadata().created_at(name).await?.is_some() {
+            Ok(())
+        } else {
+            Err(no_such_bucket(name))
+        }
     }
 }
 
@@ -282,7 +307,7 @@ impl Storage for MemoryStorage {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{panic, sync::Arc};
 
     use redb::ReadableDatabase;
 
@@ -480,32 +505,98 @@ mod tests {
         assert_send_sync::<MemoryStorage>();
     }
 
-    #[test]
-    fn total_accounting_clamps_and_rolls_back() {
-        // `adjust_total` must never let the tracked total go negative
-        // (defensive), and `rollback_total` clamps at zero too — the
-        // failed-commit recovery path.
+    /// A release that lands exactly on zero is the rollback path; a delta
+    /// that would go *below* zero is a broken invariant, which
+    /// [`a_total_underflow_is_loud_and_clamped`] covers.
+    #[tokio::test]
+    async fn total_accounting_releases_to_zero_and_rolls_back() {
         let storage = MemoryStorage::with_options(MemoryOptions {
             max_object_bytes: None,
             max_total_bytes: Some(8),
         })
         .unwrap();
-        storage.adjust_total(4).unwrap();
+        storage.adjust_total_locked(4).await.unwrap();
         assert_eq!(storage.total_bytes(), 4);
-        // A delta below zero clamps the total to 0 instead of going
-        // negative.
-        storage.adjust_total(-5).unwrap();
-        assert_eq!(storage.total_bytes(), 0);
-        // Rollback subtracts without going negative.
-        storage.adjust_total(3).unwrap();
-        storage.rollback_total(2);
-        assert_eq!(storage.total_bytes(), 1);
-        storage.rollback_total(10);
+        // A rollback subtracts what it reserved, landing exactly on zero.
+        storage.release_total_unlocked(-2);
+        assert_eq!(storage.total_bytes(), 2);
+        storage.release_total_unlocked(-2);
         assert_eq!(storage.total_bytes(), 0);
     }
 
-    #[test]
-    fn limit_breach_reports_the_projected_size() {
+    /// The clamp is defensive, not silent: a delta that would take the total
+    /// below zero means another path moved the counter outside the
+    /// accounting lock, so it is asserted in debug builds, reported in all
+    /// of them, and still clamps.
+    #[tokio::test]
+    async fn a_total_underflow_is_loud_and_clamped() {
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: None,
+            max_total_bytes: Some(8),
+        })
+        .unwrap();
+        storage.adjust_total_unlocked(4).unwrap();
+        assert_eq!(storage.total_bytes(), 4);
+        let underflow = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            storage.adjust_total_unlocked(-5).ok();
+        }));
+        assert_eq!(storage.total_bytes(), 0, "the clamp still lands");
+        if cfg!(debug_assertions) {
+            assert!(
+                underflow.is_err(),
+                "a debug build asserts the underflow instead of hiding it"
+            );
+        }
+    }
+
+    /// A credit widens the cap check but never the reservation, so the total
+    /// stays exact across the write and the release that follows — the
+    /// unversioned complete's pre-release, through the mem-level entry
+    /// points.
+    #[tokio::test]
+    async fn the_credit_check_leaves_the_total_exact() {
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: Some(6),
+            max_total_bytes: Some(10),
+        })
+        .unwrap();
+        {
+            // The single-transaction posture: hold the lock, meter with the
+            // unlocked pair.
+            let _section = storage.lock_accounting().await;
+            storage.adjust_total_unlocked(6).unwrap();
+            assert_eq!(storage.total_bytes(), 6);
+            // Six more bytes cross the cap without a credit...
+            let err = storage.adjust_total_unlocked(6).unwrap_err();
+            assert!(matches!(
+                err,
+                Error::Storage(storage::Error::EntityTooLarge {
+                    size: 12,
+                    limit: 10
+                })
+            ));
+            assert_eq!(storage.total_bytes(), 6, "a refusal moves nothing");
+            // ... and land with the six bytes the caller is about to release.
+            storage.adjust_total_with_credit_unlocked(6, 6).unwrap();
+            assert_eq!(
+                storage.total_bytes(),
+                12,
+                "the credit widens the check, never the reservation"
+            );
+            storage.release_total_unlocked(-6);
+            assert_eq!(storage.total_bytes(), 6);
+            // The object cap is checked without the total moving.
+            storage.check_object_bytes_unlocked(6).unwrap();
+            assert!(matches!(
+                storage.check_object_bytes_unlocked(7).unwrap_err(),
+                Error::Storage(storage::Error::EntityTooLarge { size: 7, limit: 6 })
+            ));
+            assert_eq!(storage.total_bytes(), 6);
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_breach_reports_the_projected_size() {
         // T04: the `EntityTooLarge` payload is the size the write WOULD
         // have produced (current 4 + delta 10), not the current total —
         // the old code reported 4 and was racy under concurrency.
@@ -514,8 +605,8 @@ mod tests {
             max_total_bytes: Some(8),
         })
         .unwrap();
-        storage.adjust_total(4).unwrap();
-        let err = storage.adjust_total(10).unwrap_err();
+        storage.adjust_total_locked(4).await.unwrap();
+        let err = storage.adjust_total_locked(10).await.unwrap_err();
         let Error::Storage(storage::Error::EntityTooLarge { size, limit }) = err else {
             panic!("expected EntityTooLarge, got {err:?}");
         };

@@ -1,35 +1,49 @@
 //! The `ObjectOps` implementation for [`MemoryStorage`].
 //!
 //! Object put/get/head/delete/listing, the tag ops, rename, and the
-//! retained-part listing over the `objects` + `object_meta` +
-//! `object_parts` tables (spec 2026-08-31). Reads use read transactions
-//! with zero-copy `&str` / `&[u8]` access; bodies are copied out before
-//! the transaction ends (streams are `'static` and cannot borrow the
-//! transaction guard).
+//! retained-part listing. The metadata access layer is the shared
+//! implementation's: every object row read and write goes through the
+//! ObjectMeta contract, and the object bytes go through the accounting
+//! decorator, content first and the row that describes it after (design
+//! 2026-10-03 §1 property 6).
+//!
+//! A bucket that **records versions** is the one exception: its write paths
+//! keep the version-domain single transaction, because the supersede must read
+//! the outgoing bytes before they are replaced, the slot columns the contract's
+//! row cannot carry (D37) must land with the row, and the object and history
+//! bytes share one all-or-nothing admission decision (see `write_object`).
 
-use std::{ops::Deref, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 #[cfg(feature = "versioning")]
-use crate::version::{insert_marker, prepare_publish, rename_refusal};
+use crate::_store_redb::{object_meta, object_part, objects};
+use crate::counting::report;
+#[cfg(feature = "versioning")]
+use crate::version::check_bucket_write;
+#[cfg(feature = "versioning")]
+use crate::version::{insert_marker, prepare_publish, record_current_as_version};
 use crate::{
     _core::{
         BodyStream, ByteRange, ETag, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
         TagWriteResult, acl,
         acl::{Acl, AclGrants},
         bucket::Name,
-        checksum, collect_body, from_nanos, group_and_paginate,
+        checksum, collect_body,
+        content::{ContentKey, ObjectContent, StagedObject},
+        from_nanos, group_and_paginate,
+        meta::{ObjectMeta, VersionMeta, object::Row},
         multipart::ObjectPart,
-        now_nanos, object, version,
-    },
-    _store_redb::{
-        bucket, bucket_versioning, object_meta, object_part, objects, scan::for_each_pair,
+        now_nanos, object,
+        storage::VersionOps,
+        version,
     },
     Error,
-    error::{access_denied, invalid_key, no_such_bucket, no_such_key},
-    storage::{MemoryStorage, check_bucket},
-    version::{object_result, records_versions},
+    error::{access_denied, invalid_key, no_such_key},
+    storage::MemoryStorage,
+    version::object_result,
 };
 
 /// A staged object body: the buffered payload (the commit inserts it)
@@ -45,59 +59,71 @@ pub struct StagedBody {
 }
 
 impl MemoryStorage {
+    /// Whether the bucket records versions (enabled or suspended) — the write
+    /// path's discriminator and the carrier bit every served Info reports. The
+    /// bucket's versioning state is the version contract's bucket half (D26),
+    /// so the contract's own read answers it: a bucket with no state row is
+    /// `State::Unversioned`.
+    async fn bucket_records_versions(&self, bucket: &Name) -> Result<bool, Error> {
+        Ok(VersionMeta::bucket_state(self.metadata().as_ref(), bucket)
+            .await
+            .map_err(Error::from)?
+            .records_versions())
+    }
+
+    /// The key's current version identity — the version domain's fact (D37).
+    /// The contract's object row carries no version column, so the identity
+    /// comes from the current slot.
+    async fn current_version_id(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+    ) -> Result<Option<version::Id>, Error> {
+        let slot = VersionMeta::current_slot(self.metadata().as_ref(), bucket, key)
+            .await
+            .map_err(Error::from)?;
+        Ok(slot.and_then(|current| current.version))
+    }
+
     /// The tag-write transaction of the object trio — the shared body of
     /// `put_object_tags` and `delete_object_tags` (the bucket and key
-    /// gates stay in the ops): the table accessor replaces the row's
-    /// tags element, keeping the row's other elements (etag, size,
-    /// mtime, recorded checksum) verbatim, and the same transaction
-    /// reads the rewritten row's current-version identity and the
-    /// bucket's records-versions bit — the answer's pair ([`TagWriteResult`]),
-    /// one transaction, no second read. `None` when the row is missing
-    /// (nothing changed — nothing to name).
+    /// gates stay in the ops): the contract replaces the row's tags element,
+    /// and the key's current slot and the bucket's records-versions bit answer
+    /// the pair ([TagWriteResult]) in the same round. `None` when the row is
+    /// missing (nothing changed — nothing to name).
     async fn rewrite_tags_element(
         &self,
         bucket: &Name,
         key: &object::Key,
         tags: &object::Tags,
     ) -> Result<Option<TagWriteResult>, Error> {
-        self.db
-            .write(|txn| -> Result<Option<TagWriteResult>, Error> {
-                let b = bucket.as_ref().as_str();
-                let k = key.as_ref().as_str();
-                let row = {
-                    let mut table = object_meta::Table::open(txn)?;
-                    if table.put_tags(b, k, tags)?.is_none() {
-                        return Ok(None);
-                    }
-                    table.get(b, k)?
-                };
-                let Some(row) = row else {
-                    return Ok(None);
-                };
-                let records_versions = bucket_versioning::Table::open(txn)?
-                    .get(b)?
-                    .unwrap_or_default()
-                    .records_versions();
-                Ok(Some(TagWriteResult {
-                    version_id: row.version_id,
-                    bucket_records_versions: records_versions,
-                }))
-            })
+        // The row write is the contract's (a missing row answers false). The
+        // version identity is the version domain's (D37) and the state bit is
+        // the version contract's bucket half (D26).
+        if !self
+            .metadata()
+            .set_tags(bucket, key, tags)
+            .await
+            .map_err(Error::from)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(TagWriteResult {
+            version_id: self.current_version_id(bucket, key).await?,
+            bucket_records_versions: self.bucket_records_versions(bucket).await?,
+        }))
     }
 
     /// The shared commit tail of the object write paths
-    /// ([`ObjectOps::commit_object`] and the copy primitive): atomically
-    /// publish `data` onto `key` in one write transaction and record the
-    /// interface-validated `tags` and the recorded `checksum` (the
-    /// FULL_OBJECT tee digest of a plain commit, or an explicit carried
-    /// value — kind included) in the same `OBJECT_META` row — no
-    /// post-commit tag window — while removing any stale `OBJECT_PARTS`
-    /// rows of the key (a fresh object is single-part: overwriting a
-    /// previously multipart-completed object must not leave its parts
-    /// behind). Folder markers never become objects (s3-surface.md): the
-    /// body is dropped, the record stores the empty-content ETag, and the
-    /// tags/checksum are accept-and-dropped (the fs backend's marker
-    /// commit behaves the same way). Returns the committed metadata.
+    /// ([ObjectOps::commit_object] and the copy primitive). Folder markers
+    /// never become objects (s3-surface.md): the body is dropped, the record
+    /// stores the empty-content ETag, and the tags/checksum are
+    /// accept-and-dropped — the fs backend's marker commit behaves the same.
+    ///
+    /// A bucket that records versions keeps the version-domain single
+    /// transaction ([Self::write_object_recording_versions]); every other
+    /// bucket takes the contract path ([Self::write_object_plain]) — bytes
+    /// first through the accounting decorator, then the guarded row.
     #[allow(clippy::too_many_arguments)]
     async fn write_object(
         &self,
@@ -115,112 +141,259 @@ impl MemoryStorage {
         if key.is_reserved() {
             return Err(access_denied(key));
         }
-        // Folder markers are never objects (s3-surface.md): the staged
-        // body is dropped and the record stores the empty-content ETag —
-        // still counted as bucket content (delete-bucket's non-empty
-        // check), matching the fs backend's directory. A marker's bytes
-        // are never stored: a direct stage/commit with a non-empty body
-        // must not strand invisible bytes counted as content (the fs
-        // backend's commit creates a directory and drops the temp).
-        let marker = key.is_folder_marker();
-        if marker {
-            // A marker records no body, tags, or checksum (accepted and
-            // dropped) — the fs backend's marker commit behaves the same.
+        // Folder markers are never objects (s3-surface.md): the staged body is
+        // dropped, and a direct stage/commit with a non-empty body must not
+        // strand invisible bytes counted as bucket content.
+        if key.is_folder_marker() {
             data = Vec::new();
             tags = object::Tags::empty();
             checksum = None;
         }
+        // The per-object cap is the accounting decorator's alone (round 29):
+        // one gate for both write paths, after the marker normalization above
+        // and before anything is staged or published.
+        self.content().check_object_bytes(data.len() as u64)?;
+        #[cfg(feature = "versioning")]
+        if self.bucket_records_versions(bucket).await? {
+            return self
+                .write_object_recording_versions(bucket, key, data, tags, checksum, owner, acl)
+                .await;
+        }
+        self.write_object_plain(bucket, key, data, tags, checksum, owner, acl)
+            .await
+    }
+
+    /// The contract write path of a bucket that records no versions: the bytes
+    /// are published through the accounting decorator first — it refuses
+    /// max_object_bytes while the chunk is accepted and moves the shared total
+    /// by the difference the write makes — then the row through
+    /// [ObjectMeta::put_guarded] (D40's guaranteed bucket-row policy, so a
+    /// concurrent bucket delete cannot be raced). A refused row write removes
+    /// the published bytes again, so an object that was never recorded is
+    /// billed for nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_object_plain(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        data: Vec<u8>,
+        tags: object::Tags,
+        checksum: Option<checksum::Recorded>,
+        owner: Option<&acl::OwnerId>,
+        acl: &Acl,
+    ) -> Result<object::Info, Error> {
         let size = data.len() as u64;
-        // Enforce the per-object size limit before opening the write
-        // transaction (fast fail; folder markers are empty and pass).
-        self.check_object_size(size)?;
+        let etag = if key.is_folder_marker() {
+            ETag::EMPTY
+        } else {
+            ETag::from_content(&data)
+        };
+        let now = now_nanos();
+        let content = ContentKey::Object(key.clone());
+        // The published bytes stay reachable as a handle: a refused row write's
+        // refund must compare them against the key's content before it removes
+        // anything (a newer writer's bytes are not this call's to take).
+        let published = Bytes::from(data);
+        // The publish's identity, recorded with the bytes: a later writer can
+        // publish the same bytes (an empty body matches an empty body), and
+        // the refusal's refund must still tell its own publish from theirs.
+        let publish_id = self.content().mint_publish_id();
+        let mut staged = self.content().stage(bucket, &content).await?;
+        if !published.is_empty() {
+            staged.write(published.clone()).await?;
+        }
+        self.content()
+            .publish_tagged(bucket, staged, &content, publish_id)
+            .await?;
+        let row = Row {
+            etag: etag.clone(),
+            size,
+            mtime: from_nanos(now),
+            identity: 0,
+            tags: tags.clone(),
+            checksum: checksum.clone(),
+            owner: owner.cloned(),
+            acl: acl.clone(),
+        };
+        if let Err(err) = self
+            .metadata()
+            .put_guarded(bucket, key, &row)
+            .await
+            .map_err(Error::from)
+        {
+            // The refused row write must not strand the bytes it staged — and
+            // must not take a newer writer's with them: the refund compares
+            // before it deletes (the contract's `remove_if_matches`, §4). A
+            // refund that itself fails is reported — it books its own release
+            // either way — and is never promoted over the refusal it
+            // compensates: the caller's error is the row write's.
+            if let Err(failure) = self
+                .roll_back_publish(bucket, &content, &published, publish_id, "OBJECT")
+                .await
+            {
+                report(format_args!(
+                    "object compensation after a refused row write failed: {failure}"
+                ));
+            }
+            return Err(err);
+        }
+        // The row landed, so no compensation can follow this publish: its
+        // identity leaves the map instead of waiting for the key's next
+        // publish to replace it.
+        self.content()
+            .retire_publish_tag(bucket, &content, publish_id)
+            .await;
+        // The bucket can begin recording versions between this write's dispatch
+        // read and its row landing — only a concurrent `PutBucketVersioning`
+        // can do that — and the row just written is then an unversioned one in a
+        // bucket that records versions: give it the identity a versioned write
+        // would have given it, in one transaction
+        // (`version::record_current_as_version`).
+        #[cfg(feature = "versioning")]
+        let (version_id, bucket_records_versions) = if self.bucket_records_versions(bucket).await? {
+            // A repair that fails, or finds the row already identified, is
+            // reported at most — never escalated: the write itself landed, and
+            // the client's `put_object` must not fail for the repair. `None`
+            // claims no identity: a row an earlier repair or a racing
+            // versioned writer identified is not this write's to report.
+            match record_current_as_version(self, bucket, key).await {
+                Ok(Some(repaired)) => {
+                    tracing::info!(
+                        "{} was written while its bucket began recording versions; the row took \
+                         the identity {repaired:?} after the fact (the content it replaced in \
+                         that window is not recoverable)",
+                        key.as_ref()
+                    );
+                    (Some(repaired), true)
+                }
+                Ok(None) => (None, true),
+                Err(failure) => {
+                    tracing::warn!(
+                        "the version-window repair of {} failed: {failure}",
+                        key.as_ref()
+                    );
+                    (None, true)
+                }
+            }
+        } else {
+            (None, false)
+        };
+        #[cfg(not(feature = "versioning"))]
+        let (version_id, bucket_records_versions) = (None, false);
+        Ok(object::Info {
+            key: key.clone(),
+            size,
+            last_modified: from_nanos(now),
+            etag,
+            tags,
+            checksum,
+            owner: owner.cloned(),
+            acl: acl.clone(),
+            version_id,
+            bucket_records_versions,
+        })
+    }
+
+    /// The write path of a bucket that records versions: one raw transaction.
+    /// The contract's order (publish the bytes, then the row) cannot express
+    /// it — the supersede must read the outgoing bytes before they are
+    /// replaced, the slot columns the contract's row cannot carry (D37) land
+    /// with the row, and the object and history bytes are one admission
+    /// decision (version.rs's the_version_history_counts_against_the_total_limit).
+    #[cfg(feature = "versioning")]
+    #[allow(clippy::too_many_arguments)]
+    async fn write_object_recording_versions(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        data: Vec<u8>,
+        tags: object::Tags,
+        checksum: Option<checksum::Recorded>,
+        owner: Option<&acl::OwnerId>,
+        acl: &Acl,
+    ) -> Result<object::Info, Error> {
+        let marker = key.is_folder_marker();
+        let size = data.len() as u64;
         let etag = if marker {
             ETag::EMPTY
         } else {
             ETag::from_content(&data)
         };
-        let (now, version_id, records_versions) = self
-            .db
-            .write(|txn| -> Result<(u64, Option<version::Id>, bool), Error> {
-            {
-                check_bucket(&bucket::Table::open(txn)?, bucket)?;
-            }
-            let b = bucket.as_ref().as_str();
-            let k = key.as_ref().as_str();
-            // The shared handles borrow the write transaction exclusively,
-            // so each table is a separate pass (the fs pattern).
-            let old_len = {
-                let objects = objects::Table::open(txn)?;
-                objects
-                    .get(b, k)?
-                    .map(|guard| guard.value().len() as u64)
-                    .unwrap_or(0)
-            };
-            let delta = data.len() as i64 - old_len as i64;
-            let now = now_nanos();
-            // The current version's identity is the version state machine's
-            // call (spec 2026-10-03), and it runs BEFORE the publish below:
-            // what the machine moves into history is the outgoing content, so
-            // the object row must still hold it. An unversioned bucket
-            // records no identity, an enabled one records the freshly minted
-            // one, a suspended one records the null version. Its answer also
-            // carries the bytes the supersede newly stored in the history's
-            // blob table (a dedup hit stores nothing: those bytes are already
-            // metered).
-            #[cfg(feature = "versioning")]
-            let (version_id, version_seq, history_bytes, records_versions) =
-                prepare_publish(txn, bucket, key, now)?;
-            #[cfg(not(feature = "versioning"))]
-            let (history_bytes, records_versions) = (0i64, false);
-            {
-                let mut objects = objects::Table::open(txn)?;
-                objects.put(b, k, &data)?;
-            }
-            // The 6-tuple row (etag, size, mtime, file identity 0, tags
-            // wire, checksum wire) via the shared `meta::Stored` — the
-            // write-path encode home. A folder marker records no tags /
-            // checksum (accepted and dropped), like the fs backend's
-            // marker commit. (The `mut` is the versioning branch's.)
-            #[cfg_attr(not(feature = "versioning"), allow(unused_mut))]
-            let mut stored = object_meta::Stored {
-                version_id: None,
-                version_seq: 0,
-                is_delete_marker: false,
-                etag: etag.clone(),
-                size,
-                mtime: now,
-                file_identity: 0,
-                tags: tags.clone(),
-                checksum: checksum.clone(),
-                owner: owner.cloned(),
-                acl: acl.clone(),
-            };
-            #[cfg(feature = "versioning")]
-            {
-                stored.version_id = version_id;
-                stored.version_seq = version_seq;
-            }
-            {
-                let mut table = object_meta::Table::open(txn)?;
-                table.put(b, k, &stored)?;
-            }
-            {
-                let mut parts = object_part::Table::open(txn)?;
-                parts.remove_key(b, k)?;
-            }
-            // The write's bytes, in ONE adjustment after every fallible row
-            // operation and inside the transaction: the object row's own
-            // delta (the replaced content leaves, the new content enters) plus
-            // whatever the publish newly stored in the history's blob table.
-            // A limit breach aborts the whole transaction here, leaving both
-            // the rows and the tracked total untouched.
-            self.adjust_total(delta + history_bytes)?;
-            Ok((now, stored.version_id.clone(), records_versions))
-        })
-        // The in-memory backend's commit cannot fail (no disk path — an
-        // abort-only transaction is the only failure mode), so no
-        // rollback_total compensation is needed here.
-        ?;
+        // The accounting lock is taken BEFORE the transaction and held across
+        // it: the adjustment below runs inside the write, and the decorator's
+        // lock is not reentrant — the closure may only use the `*_unlocked`
+        // entry points.
+        let guard = self.lock_accounting().await;
+        let (now, version_id, records_versions) =
+            self.db
+                .write(|txn| -> Result<(u64, Option<version::Id>, bool), Error> {
+                    check_bucket_write(txn, bucket)?;
+                    let b = bucket.as_ref().as_str();
+                    let k = key.as_ref().as_str();
+                    let old_len = {
+                        let objects = objects::Table::open(txn)?;
+                        objects
+                            .get(b, k)?
+                            .map(|guard| guard.value().len() as u64)
+                            .unwrap_or(0)
+                    };
+                    let delta = data.len() as i64 - old_len as i64;
+                    let now = now_nanos();
+                    // The current version's identity is the version state
+                    // machine's call, and it runs BEFORE the publish below: what
+                    // the machine moves into history is the outgoing content, so
+                    // the object row must still hold it. Its answer also carries
+                    // the bytes the supersede newly stored in the history's blob
+                    // table (a dedup hit stores nothing: those bytes are already
+                    // metered).
+                    let (version_id, version_seq, history_bytes, records_versions) =
+                        prepare_publish(txn, bucket, key, now)?;
+                    {
+                        let mut objects = objects::Table::open(txn)?;
+                        objects.put(b, k, &data)?;
+                    }
+                    let stored = object_meta::Stored {
+                        version_id,
+                        version_seq,
+                        is_delete_marker: false,
+                        etag: etag.clone(),
+                        size,
+                        mtime: now,
+                        file_identity: 0,
+                        tags: tags.clone(),
+                        checksum: checksum.clone(),
+                        owner: owner.cloned(),
+                        acl: acl.clone(),
+                    };
+                    {
+                        let mut table = object_meta::Table::open(txn)?;
+                        table.put(b, k, &stored)?;
+                    }
+                    {
+                        let mut parts = object_part::Table::open(txn)?;
+                        parts.remove_key(b, k)?;
+                    }
+                    // The write's bytes, in ONE adjustment after every fallible
+                    // row operation and inside the transaction: the object row's
+                    // own delta plus whatever the publish newly stored in the
+                    // history's blob table. A limit breach aborts the whole
+                    // transaction here, leaving the rows and the tracked total
+                    // untouched. The accounting lock is already held (the caller
+                    // took it before opening the transaction), so this is the
+                    // unlocked variant.
+                    self.adjust_total_unlocked(delta + history_bytes)?;
+                    Ok((now, stored.version_id.clone(), records_versions))
+                })?;
+        // The versioned write published bytes through its own transaction:
+        // give them an identity too, so a stale compensation of the plain
+        // path can never mistake this content for its own (the guard is held,
+        // so the unlocked entry point is the one to use).
+        self.content().record_publish_tag(
+            bucket,
+            &ContentKey::Object(key.clone()),
+            self.content().mint_publish_id(),
+        );
+        drop(guard);
         Ok(object::Info {
             key: key.clone(),
             size,
@@ -233,6 +406,84 @@ impl MemoryStorage {
             version_id,
             bucket_records_versions: records_versions,
         })
+    }
+
+    /// The delete of a bucket that records versions: one raw transaction, for
+    /// the write path's reasons — the version state machine moves the outgoing
+    /// version into history (or replaces the current marker) in the transaction
+    /// that removes the rows, and the history's bytes and the object's bytes
+    /// are one admission decision.
+    #[cfg(feature = "versioning")]
+    async fn delete_object_recording_versions(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+    ) -> Result<version::Marker, Error> {
+        let (old_len, marker, history_bytes) =
+            self.db
+                .write(|txn| -> Result<(u64, version::Marker, i64), Error> {
+                    check_bucket_write(txn, bucket)?;
+                    let b = bucket.as_ref().as_str();
+                    let k = key.as_ref().as_str();
+                    let old_len = {
+                        let objects = objects::Table::open(txn)?;
+                        objects
+                            .get(b, k)?
+                            .map(|guard| guard.value().len() as u64)
+                            .unwrap_or(0)
+                    };
+                    // Before the rows below are removed: a versioned bucket
+                    // moves the outgoing version into history and makes a
+                    // delete marker current in this same transaction. A folder
+                    // marker never reaches it — folder markers stay outside the
+                    // version model, so their delete creates no marker.
+                    let (marker, history_bytes) = if key.is_folder_marker() {
+                        (version::Marker::none(), 0)
+                    } else {
+                        insert_marker(txn, bucket, key, now_nanos())?
+                    };
+                    {
+                        let mut objects = objects::Table::open(txn)?;
+                        objects.remove(b, k)?;
+                    }
+                    {
+                        let mut object_meta = object_meta::Table::open(txn)?;
+                        object_meta.remove(b, k)?;
+                    }
+                    {
+                        let mut parts = object_part::Table::open(txn)?;
+                        parts.remove_key(b, k)?;
+                    }
+                    Ok((old_len, marker, history_bytes))
+                })?;
+        // The bytes that left the backend: the object row the delete removed,
+        // minus the bytes its supersede newly stored in the history's blob
+        // table (a versioned delete moves the content there instead of dropping
+        // it — the same bytes stay metered; a dedup hit stores nothing fresh).
+        // The net is never positive, so it can never exceed a limit and needs
+        // no check. The adjustment lands after the transaction, so it takes the
+        // accounting lock itself rather than riding a guard.
+        if let Err(error) = self
+            .adjust_total_locked(history_bytes - old_len as i64)
+            .await
+        {
+            // The delta only ever removes bytes, so this is the "cannot happen"
+            // arm of the accounting API — logged rather than dropped, because a
+            // silently lost adjustment is exactly the drift the tracker exists
+            // to prevent (§4).
+            tracing::warn!(
+                "the versioned delete of {} could not settle the tracked total: {error}",
+                key.as_ref()
+            );
+        }
+        // The key's bytes left (or a marker now stands where they were):
+        // forget its publish identity, so no stale compensation claims them.
+        {
+            let _section = self.lock_accounting().await;
+            self.content()
+                .forget_publish_tag(bucket, &ContentKey::Object(key.clone()));
+        }
+        Ok(marker)
     }
 }
 
@@ -254,10 +505,8 @@ impl ObjectOps for MemoryStorage {
             return Err(access_denied(key));
         }
         // Fast-fail on a missing bucket before buffering the body (the
-        // commit transaction re-checks, closing the race).
-        if !self.has_bucket(bucket)? {
-            return Err(no_such_bucket(bucket));
-        }
+        // commit's guarded row write re-checks, closing the race).
+        self.ensure_bucket(bucket).await?;
         // Folder markers are never objects (s3-surface.md): no body is
         // buffered — the commit answers the marker's empty-content ETag
         // (the fs backend creates a directory instead). A marker's stage
@@ -333,81 +582,71 @@ impl ObjectOps for MemoryStorage {
         key: &object::Key,
         range: Option<ByteRange>,
     ) -> Result<GetObjectResult, Error> {
-        self.db.read(|txn| {
-            {
-                check_bucket(&bucket::Table::open_readonly(txn)?, bucket)?;
-            }
-            if key.is_reserved() || key.is_folder_marker() {
-                return Err(no_such_key(key));
-            }
-            // The bucket's versioning state rides the same transaction as
-            // the row it describes — the carrier for the plain read's
-            // version-header rule (the state the server used to read again
-            // per request).
-            let records_versions = records_versions(txn, bucket)?;
-            let objects = objects::Table::open_readonly(txn)?;
-            let object_meta = object_meta::Table::open_readonly(txn)?;
-            // The meta row is the existence gate; the shared validation decodes
-            // the 6-tuple (etag, size, mtime, file identity 0, tags wire,
-            // checksum wire) and self-heals a garbage tags/checksum element to
-            // empty/`None` (a garbage etag row reads as missing — the caller
-            // recomputes, the mem self-heal of a domain-invalid row).
-            let stored = object_meta
-                .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
-                .ok_or_else(|| no_such_key(key))?;
-            let size = stored.size;
-            let served_range = match range {
-                None => None,
-                Some(r) => Some(r.resolve(size)?),
-            };
-            // The served slice is copied straight out of the zero-copy redb
-            // guard (the shared construction does the slicing) — a range
-            // request never copies the full object.
-            let data_guard = objects
-                .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
-                .ok_or_else(|| no_such_key(key))?;
-            Ok(object_result(
-                key,
-                size,
-                from_nanos(stored.mtime),
-                stored.etag,
-                stored.tags,
-                stored.checksum,
-                stored.owner.clone(),
-                stored.acl.clone(),
-                stored.version_id.clone(),
-                records_versions,
-                data_guard.value(),
-                served_range,
-            ))
-        })
+        self.ensure_bucket(bucket).await?;
+        if key.is_reserved() || key.is_folder_marker() {
+            return Err(no_such_key(key));
+        }
+        // The row is the existence gate (a domain-invalid etag row reads as
+        // missing — the shared self-heal). The records-versions bit is the
+        // version contract's bucket half (D26) and the version identity is the
+        // key's current slot (D37) — the object row carries no version column.
+        let row = self
+            .metadata()
+            .get(bucket, key)
+            .await
+            .map_err(Error::from)?
+            .ok_or_else(|| no_such_key(key))?;
+        let records_versions = self.bucket_records_versions(bucket).await?;
+        let version_id = self.current_version_id(bucket, key).await?;
+        let size = row.size;
+        let served_range = match range {
+            None => None,
+            Some(r) => Some(r.resolve(size)?),
+        };
+        // The content plane windows the range itself, so a partial read never
+        // copies the whole object.
+        let content = ContentKey::Object(key.clone());
+        let data = collect_body(self.content().open(bucket, &content, range).await?).await?;
+        let mut result = object_result(
+            key,
+            size,
+            row.mtime,
+            row.etag,
+            row.tags,
+            row.checksum,
+            row.owner,
+            row.acl,
+            version_id,
+            records_versions,
+            &data,
+            None,
+        )?;
+        result.served_range = served_range;
+        Ok(result)
     }
 
     async fn head_object(&self, bucket: &Name, key: &object::Key) -> Result<object::Info, Error> {
-        self.db.read(|txn| {
-            {
-                check_bucket(&bucket::Table::open_readonly(txn)?, bucket)?;
-            }
-            if key.is_folder_marker() || key.is_reserved() {
-                return Err(no_such_key(key));
-            }
-            let records_versions = records_versions(txn, bucket)?;
-            let object_meta = object_meta::Table::open_readonly(txn)?;
-            let stored = object_meta
-                .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
-                .ok_or_else(|| no_such_key(key))?;
-            Ok(object::Info {
-                key: key.clone(),
-                size: stored.size,
-                last_modified: from_nanos(stored.mtime),
-                etag: stored.etag,
-                tags: stored.tags,
-                checksum: stored.checksum,
-                owner: stored.owner.clone(),
-                acl: stored.acl.clone(),
-                version_id: stored.version_id.clone(),
-                bucket_records_versions: records_versions,
-            })
+        self.ensure_bucket(bucket).await?;
+        if key.is_folder_marker() || key.is_reserved() {
+            return Err(no_such_key(key));
+        }
+        let row = self
+            .metadata()
+            .get(bucket, key)
+            .await
+            .map_err(Error::from)?
+            .ok_or_else(|| no_such_key(key))?;
+        Ok(object::Info {
+            key: key.clone(),
+            size: row.size,
+            last_modified: row.mtime,
+            etag: row.etag,
+            tags: row.tags,
+            checksum: row.checksum,
+            owner: row.owner,
+            acl: row.acl,
+            version_id: self.current_version_id(bucket, key).await?,
+            bucket_records_versions: self.bucket_records_versions(bucket).await?,
         })
     }
 
@@ -416,84 +655,45 @@ impl ObjectOps for MemoryStorage {
         bucket: &Name,
         key: &object::Key,
     ) -> Result<version::Marker, Error> {
-        let (old_len, marker, history_bytes) =
-            self.db
-                .write(|txn| -> Result<(u64, version::Marker, i64), Error> {
-                    {
-                        check_bucket(&bucket::Table::open(txn)?, bucket)?;
-                    }
-                    // The reserved segment is never a delete target (FR-020 —
-                    // the fs backend's `resolve_key` refusal).
-                    if key.is_reserved() {
-                        return Err(access_denied(key));
-                    }
-                    let b = bucket.as_ref().as_str();
-                    let k = key.as_ref().as_str();
-                    let old_len = {
-                        let objects = objects::Table::open(txn)?;
-                        objects
-                            .get(b, k)?
-                            .map(|guard| guard.value().len() as u64)
-                            .unwrap_or(0)
-                    };
-                    // The version state machine's call (spec 2026-10-03), before the
-                    // rows below are removed: an unversioned bucket deletes as today
-                    // (no marker), a versioned one moves the outgoing version into
-                    // history and makes a delete marker current — in this same
-                    // transaction. A folder marker never reaches it: folder markers
-                    // stay outside the version model (the design's ruling), so their
-                    // delete removes the rows and creates no marker — the fs
-                    // backend's directory delete.
-                    #[cfg(feature = "versioning")]
-                    let (marker, history_bytes) = if key.is_folder_marker() {
-                        (version::Marker::none(), 0)
-                    } else {
-                        insert_marker(txn, bucket, key, now_nanos())?
-                    };
-                    #[cfg(not(feature = "versioning"))]
-                    let (marker, history_bytes) = (version::Marker::none(), 0i64);
-                    {
-                        let mut objects = objects::Table::open(txn)?;
-                        objects.remove(b, k)?;
-                    }
-                    {
-                        let mut object_meta = object_meta::Table::open(txn)?;
-                        object_meta.remove(b, k)?;
-                    }
-                    // The retained part list dies with the object (one
-                    // transaction — a delete must not orphan the rows).
-                    {
-                        let mut parts = object_part::Table::open(txn)?;
-                        parts.remove_key(b, k)?;
-                    }
-                    Ok((old_len, marker, history_bytes))
-                })?;
-        // The bytes that left the backend: the object row the delete removed,
-        // minus the bytes its supersede newly stored in the history's blob
-        // table (a versioned delete moves the content there instead of
-        // dropping it — the same bytes stay metered; a dedup hit stores
-        // nothing fresh). The net is never positive, so it can never exceed a
-        // limit and needs no check.
-        let _ = self.adjust_total(history_bytes - old_len as i64);
-        Ok(marker)
+        self.ensure_bucket(bucket).await?;
+        // The reserved segment is never a delete target (FR-020 — the fs
+        // backend's `resolve_key` refusal).
+        if key.is_reserved() {
+            return Err(access_denied(key));
+        }
+        // A bucket that records versions keeps the version-domain transaction
+        // (see `delete_object_recording_versions`).
+        #[cfg(feature = "versioning")]
+        if self.bucket_records_versions(bucket).await? {
+            return self.delete_object_recording_versions(bucket, key).await;
+        }
+        // Unversioned: the bytes leave through the decorator's own removal
+        // (which releases exactly what was counted), the row and its retained
+        // part list after — the delete's mirror of the write order.
+        self.content()
+            .remove(bucket, &ContentKey::Object(key.clone()))
+            .await?;
+        self.metadata()
+            .remove(bucket, key)
+            .await
+            .map_err(Error::from)?;
+        Ok(version::Marker::none())
     }
 
-    /// Rename moves the object's rows in one transaction — except on a bucket
-    /// that records versions, where it is refused (`AccessDenied`): no spec
-    /// defines rename's versioning semantics, and the move would destroy the
-    /// destination's current version and the source's history. An unversioned
-    /// bucket renames exactly as before.
+    /// Rename moves the object's rows — except on a bucket that records
+    /// versions, where the contract's guard refuses it (`AccessDenied`): no
+    /// spec defines rename's versioning semantics, and the move would destroy
+    /// the destination's current version and the source's history. An
+    /// unversioned bucket renames exactly as before. The decorator accounts
+    /// the move by difference, so an overwritten destination's stored bytes
+    /// are subtracted — observable when `max_total_bytes` is set and the
+    /// destination existed, and the contract rename's correct accounting.
     async fn rename_object(
         &self,
         bucket: &Name,
         src: &object::Key,
         dst: &object::Key,
     ) -> Result<object::Info, Error> {
-        // A rename moves the object's rows — bytes, metadata (mtime,
-        // tags, recorded checksum), retained parts — in ONE all-or-nothing
-        // transaction (the mem backend has no file to move first; the fs
-        // backend's file-first/crash-window shape does not apply). A
-        // rename is not a fresh object: nothing is recomputed.
         if src == dst {
             // Degenerate — the interface answers 412 before calling; a
             // backend-level guard keeps the move idempotent.
@@ -513,87 +713,40 @@ impl ObjectOps for MemoryStorage {
         if src.is_reserved() || src.is_folder_marker() {
             return Err(no_such_key(src));
         }
-        self.db.write(|txn| -> Result<object::Info, Error> {
-            {
-                check_bucket(&bucket::Table::open(txn)?, bucket)?;
-            }
-            // A rename has no versioning semantics, so a bucket that records
-            // versions is refused here rather than corrupted by the row move
-            // below (the destination's current version would be overwritten
-            // without superseding it, and the source key's history would
-            // vanish without a marker). The rule itself is the contract's
-            // (`rename_allowed`); the answer is checked inside this
-            // transaction so no state change can slip between the read and
-            // the move. An unversioned bucket — and a build without the
-            // feature — moves the rows exactly as before.
-            #[cfg(feature = "versioning")]
-            rename_refusal(txn, bucket, dst)?;
-            let b = bucket.as_ref().as_str();
-            let src_key = src.as_ref().as_str();
-            let dst_key = dst.as_ref().as_str();
-            // The source's rows are copied to owned values first (the redb
-            // guards borrow the transaction), then re-keyed under `dst`. The
-            // shared handles borrow the write transaction exclusively, so
-            // each table is a separate pass.
-            let data = {
-                let objects = objects::Table::open(txn)?;
-                match objects.get(b, src_key)? {
-                    Some(guard) => guard.value().to_vec(),
-                    None => return Err(no_such_key(src)),
-                }
-            };
-            // The meta row moves via the shared `meta::Stored` — a rename is
-            // not a fresh object: nothing is recomputed, the six elements
-            // (file identity included) ride verbatim (re-encoded canonically
-            // from the validated row; rows are API-written).
-            let stored = {
-                let object_meta = object_meta::Table::open(txn)?;
-                object_meta
-                    .get(b, src_key)?
-                    .ok_or_else(|| no_such_key(src))?
-            };
-            {
-                let mut objects = objects::Table::open(txn)?;
-                objects.put(b, dst_key, &data)?;
-                objects.remove(b, src_key)?;
-            }
-            {
-                let mut object_meta = object_meta::Table::open(txn)?;
-                object_meta.put(b, dst_key, &stored)?;
-                object_meta.remove(b, src_key)?;
-            }
-            // The retained part rows migrate with the record: list the src's
-            // rows, clear the dst's stale rows (an overwritten destination's
-            // part list dies), re-key under dst, drop the src's.
-            let rows = {
-                let parts = object_part::Table::open(txn)?;
-                parts.list(b, src_key)?
-            };
-            {
-                let mut parts = object_part::Table::open(txn)?;
-                // Both range deletes precede the inserts — a redb 4.2.0
-                // debug build asserts when an insert precedes another key's
-                // range delete in one transaction.
-                parts.remove_key(b, dst_key)?;
-                parts.remove_key(b, src_key)?;
-                for row in rows {
-                    parts.put(b, dst_key, &row)?;
-                }
-            }
-            Ok(object::Info {
-                key: dst.clone(),
-                size: stored.size,
-                last_modified: from_nanos(stored.mtime),
-                etag: stored.etag,
-                tags: stored.tags,
-                checksum: stored.checksum,
-                owner: stored.owner.clone(),
-                acl: stored.acl.clone(),
-                version_id: stored.version_id.clone(),
-                // The rename guard above passed, so the bucket is
-                // unversioned — it records no versions by construction.
-                bucket_records_versions: false,
-            })
+        self.ensure_bucket(bucket).await?;
+        // The contract's rename guard: the whole policy, so a recording
+        // bucket is refused before anything moves (the interface's rule).
+        self.ensure_rename_allowed(bucket, dst).await?;
+        // The source row is read first: the move answers the metadata the old
+        // single transaction built from the moved row, and the contract's
+        // move_ does not answer it. A rename is not a fresh object — nothing
+        // is recomputed.
+        let row = self
+            .metadata()
+            .get(bucket, src)
+            .await
+            .map_err(Error::from)?
+            .ok_or_else(|| no_such_key(src))?;
+        // The bytes move first (the move is a content-plane rename), the row
+        // and its retained part list after, in the contract's one move
+        // transaction.
+        self.content().rename(bucket, src, dst).await?;
+        self.metadata()
+            .move_(bucket, src, dst)
+            .await
+            .map_err(Error::from)?;
+        Ok(object::Info {
+            key: dst.clone(),
+            size: row.size,
+            last_modified: row.mtime,
+            etag: row.etag,
+            tags: row.tags,
+            checksum: row.checksum,
+            owner: row.owner,
+            acl: row.acl,
+            // The guard above passed, so the bucket records no versions.
+            version_id: None,
+            bucket_records_versions: false,
         })
     }
 
@@ -602,26 +755,20 @@ impl ObjectOps for MemoryStorage {
         bucket: &Name,
         key: &object::Key,
     ) -> Result<object::Tags, Error> {
-        // Object existence is the `OBJECT_META` row — head_object's gate
-        // (rows and bytes are written in one transaction, so a row-less
-        // key is a missing object, and folder-marker / reserved keys are
-        // never objects — `NoSuchKey`, mirroring head). The tags come
-        // from the row's tags element, empty when the wire is
-        // domain-invalid (self-healing).
-        self.db.read(|txn| {
-            {
-                check_bucket(&bucket::Table::open_readonly(txn)?, bucket)?;
-            }
-            if key.is_reserved() || key.is_folder_marker() {
-                return Err(no_such_key(key));
-            }
-            let object_meta = object_meta::Table::open_readonly(txn)?;
-            let Some(stored) = object_meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())?
-            else {
-                return Err(no_such_key(key));
-            };
-            Ok(stored.tags)
-        })
+        // Object existence is the object row — head_object's gate (rows and
+        // bytes are written together, so a row-less key is a missing object,
+        // and folder-marker / reserved keys are never objects — NoSuchKey,
+        // mirroring head).
+        self.ensure_bucket(bucket).await?;
+        if key.is_reserved() || key.is_folder_marker() {
+            return Err(no_such_key(key));
+        }
+        self.metadata()
+            .get(bucket, key)
+            .await
+            .map_err(Error::from)?
+            .map(|row| row.tags)
+            .ok_or_else(|| no_such_key(key))
     }
 
     async fn put_object_tags(
@@ -630,14 +777,12 @@ impl ObjectOps for MemoryStorage {
         key: &object::Key,
         tags: &object::Tags,
     ) -> Result<TagWriteResult, Error> {
-        // Existence is the `OBJECT_META` row (`NoSuchKey` when missing —
-        // mirroring `head_object`; rows are written with their object, so
-        // the fs backend's row-heal for hand-dropped files has no mem
-        // equivalent). The bucket and key gates answer first, like every
-        // write path (a reserved key on a missing bucket is NoSuchBucket).
-        if !self.has_bucket(bucket)? {
-            return Err(no_such_bucket(bucket));
-        }
+        // Existence is the object row (NoSuchKey when missing — mirroring
+        // head_object; rows are written with their object, so the fs backend's
+        // row-heal for hand-dropped files has no mem equivalent). The bucket
+        // and key gates answer first, like every write path (a reserved key on
+        // a missing bucket is NoSuchBucket).
+        self.ensure_bucket(bucket).await?;
         if key.is_reserved() || key.is_folder_marker() {
             return Err(no_such_key(key));
         }
@@ -652,11 +797,9 @@ impl ObjectOps for MemoryStorage {
         key: &object::Key,
     ) -> Result<TagWriteResult, Error> {
         // Idempotent like `delete_object`: only the bucket must exist
-        // (`NoSuchBucket` when missing); a missing object — key, marker,
-        // or row — is a no-op that names no identity.
-        if !self.has_bucket(bucket)? {
-            return Err(no_such_bucket(bucket));
-        }
+        // (NoSuchBucket when missing); a missing object — key, marker, or row —
+        // is a no-op that names no identity.
+        self.ensure_bucket(bucket).await?;
         Ok(self
             .rewrite_tags_element(bucket, key, &object::Tags::empty())
             .await?
@@ -667,20 +810,18 @@ impl ObjectOps for MemoryStorage {
     }
 
     async fn get_object_acl(&self, bucket: &Name, key: &object::Key) -> Result<Acl, Error> {
-        // Existence is the `OBJECT_META` row (`NoSuchKey` when missing);
-        // the ACL recombines the stored owner element with the stored
-        // grant set (the row form keeps them apart — the shared
-        // decode-home rule).
-        self.db.read(|txn| {
-            let object_meta = object_meta::Table::open_readonly(txn)?;
-            object_meta
-                .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
-                .map(|stored| Acl {
-                    owner: stored.owner.clone(),
-                    grants: stored.acl.grants.clone(),
-                })
-                .ok_or_else(|| no_such_key(key))
-        })
+        // Existence is the object row (NoSuchKey when missing); the ACL
+        // recombines the stored owner element with the stored grant set (the
+        // row form keeps them apart — the shared decode-home rule).
+        self.metadata()
+            .get(bucket, key)
+            .await
+            .map_err(Error::from)?
+            .map(|row| Acl {
+                owner: row.owner,
+                grants: row.acl.grants,
+            })
+            .ok_or_else(|| no_such_key(key))
     }
 
     async fn put_object_acl(
@@ -689,28 +830,22 @@ impl ObjectOps for MemoryStorage {
         key: &object::Key,
         grants: &AclGrants,
     ) -> Result<(), Error> {
-        // Replace-all: the grant set replaces the row's ACL element; the
-        // owner element is preserved — a put never changes it (contract
-        // ruling). `NoSuchKey` when the object is missing.
-        let fresh = Acl {
-            owner: None,
-            grants: grants.clone(),
+        // Replace-all: the contract replaces the row's ACL element; the owner
+        // element is preserved — a put never changes it (contract ruling).
+        // NoSuchKey when the object is missing.
+        let Some(row) = self
+            .metadata()
+            .get(bucket, key)
+            .await
+            .map_err(Error::from)?
+        else {
+            return Err(no_such_key(key));
         };
-        self.db
-            .write(|txn| -> Result<bool, Error> {
-                let mut object_meta = object_meta::Table::open(txn)?;
-                let Some(row) = object_meta.get(bucket.as_ref().as_str(), key.as_ref().as_str())?
-                else {
-                    return Ok(false);
-                };
-                object_meta.put(
-                    bucket.as_ref().as_str(),
-                    key.as_ref().as_str(),
-                    &object_meta::Stored { acl: fresh, ..row },
-                )?;
-                Ok(true)
-            })
-            .map(|found| if found { Ok(()) } else { Err(no_such_key(key)) })?
+        self.metadata()
+            .set_acl(bucket, key, row.owner.as_ref(), grants)
+            .await
+            .map_err(Error::from)?;
+        Ok(())
     }
 
     async fn list_object_parts(
@@ -718,107 +853,97 @@ impl ObjectOps for MemoryStorage {
         bucket: &Name,
         key: &object::Key,
     ) -> Result<Vec<ObjectPart>, Error> {
-        // Existence is the `OBJECT_META` row (T2-B ruling: a missing
-        // object answers `NoSuchKey`, mirroring `get_object_tags`); the
-        // retained rows of a multipart-completed object are served in
-        // part-number order — empty for an object that was never
-        // multipart-completed (a plain put or copy has no parts).
-        self.db.read(|txn| {
-            {
-                check_bucket(&bucket::Table::open_readonly(txn)?, bucket)?;
-            }
-            if key.is_reserved() || key.is_folder_marker() {
-                return Err(no_such_key(key));
-            }
-            let object_meta = object_meta::Table::open_readonly(txn)?;
-            if object_meta
-                .get(bucket.as_ref().as_str(), key.as_ref().as_str())?
-                .is_none()
-            {
-                return Err(no_such_key(key));
-            }
-            let parts = object_part::Table::open_readonly(txn)?;
-            let out = parts
-                .list(bucket.as_ref().as_str(), key.as_ref().as_str())?
-                .into_iter()
-                .map(|row| ObjectPart {
-                    part_number: row.part_number.into(),
-                    size: row.size,
-                    checksum: row.checksum,
-                })
-                .collect();
-            Ok(out)
-        })
+        // Existence is the object row (T2-B ruling: a missing object answers
+        // NoSuchKey, mirroring `get_object_tags`); the retained rows of a
+        // multipart-completed object are served in part-number order — empty
+        // for an object that was never multipart-completed (a plain put or
+        // copy has no parts).
+        self.ensure_bucket(bucket).await?;
+        if key.is_reserved() || key.is_folder_marker() {
+            return Err(no_such_key(key));
+        }
+        if self
+            .metadata()
+            .get(bucket, key)
+            .await
+            .map_err(Error::from)?
+            .is_none()
+        {
+            return Err(no_such_key(key));
+        }
+        let parts = self
+            .metadata()
+            .parts(bucket, key)
+            .await
+            .map_err(Error::from)?;
+        Ok(parts
+            .into_iter()
+            .map(|row| ObjectPart {
+                part_number: row.number.into(),
+                size: row.size,
+                checksum: row.checksum,
+            })
+            .collect())
     }
 
     async fn list_objects(&self, params: ListObjectsParams) -> Result<ObjectListing, Error> {
-        self.db.read(|txn| {
-            {
-                check_bucket(&bucket::Table::open_readonly(txn)?, &params.bucket)?;
+        self.ensure_bucket(&params.bucket).await?;
+        // The page's objects all carry the bucket's state — one read for the
+        // page, the carrier's value on every row.
+        let records_versions = self.bucket_records_versions(&params.bucket).await?;
+        // The healing walk is the old per-row validation: a domain-invalid row
+        // is treated as missing, where the strict `walk` would fail the whole
+        // listing instead.
+        let walked = self
+            .metadata()
+            .walk_healing(&params.bucket)
+            .await
+            .map_err(Error::from)?;
+        let mut rows: Vec<object::Info> = Vec::new();
+        for (key, row) in walked {
+            let Some(row) = row else {
+                continue; // a garbage-etag row is treated as missing
+            };
+            if key.is_folder_marker() || key.is_reserved() {
+                continue;
             }
-            // The page's objects all carry the bucket's state — one read
-            // for the page, the carrier's value on every row.
-            let records_versions = records_versions(txn, &params.bucket)?;
-            let object_meta = object_meta::Table::open_readonly(txn)?;
-            let bucket_str = params.bucket.as_ref().as_str();
-            // The shared per-bucket walk starts at the prefix lower bound
-            // (rows below it cannot affect the rollups or the marker — the
-            // prefix-filter equivalence), with the keep boundary on the
-            // first element. Rows are validated after the marker/prefix
-            // skips (a domain-invalid key is skipped, a garbage etag reports
-            // `None` — a mem listing treats it as missing); the row key is
-            // the raw key (no bucket-prefix slicing). The sync scan runs
-            // inline on the async executor by design (mem is the reference
-            // backend, rows are owned copies, and the redb read txn is MVCC
-            // — no lock is held). The page's rows are materialized eagerly
-            // and handed to the pagination engine (the engine protocol).
-            let mut rows: Vec<object::Info> = Vec::new();
-            for_each_pair(
-                object_meta.deref(),
-                (bucket_str, params.prefix.as_str()),
-                |b, _| b == bucket_str,
-                |_, raw_key, value| -> Result<(), Error> {
-                    let Ok(key) = object::key(raw_key) else {
-                        return Ok(()); // invalid key domain → skip the row
-                    };
-                    if key.is_folder_marker() || key.is_reserved() {
-                        return Ok(());
-                    }
-                    if !key.as_ref().starts_with(&params.prefix) {
-                        return Ok(());
-                    }
-                    let Some(stored) = object_meta::validate(value) else {
-                        return Ok(()); // a garbage-etag row is treated as missing
-                    };
-                    rows.push(object::Info {
-                        key,
-                        size: stored.size,
-                        last_modified: from_nanos(stored.mtime),
-                        etag: stored.etag,
-                        tags: stored.tags,
-                        checksum: stored.checksum,
-                        owner: stored.owner.clone(),
-                        acl: stored.acl.clone(),
-                        version_id: stored.version_id.clone(),
-                        bucket_records_versions: records_versions,
-                    });
-                    Ok(())
-                },
-            )?;
-            let (keys, common_prefixes, truncated, next_start_after) = group_and_paginate(
-                rows,
-                &params.prefix,
-                params.delimiter.as_deref(),
-                params.start_after.as_deref(),
-                params.max_keys,
-                |o| o.key.as_ref(),
-            );
-            Ok(ObjectListing {
-                objects: keys,
-                common_prefixes,
-                truncated,
-                next_start_after,
-            })
+            if !key.as_ref().starts_with(&params.prefix) {
+                continue;
+            }
+            // The contract's row carries no version column (D37), so a bucket
+            // that records versions pays one point read per listed key; a
+            // bucket that does not has nothing to look up.
+            let version_id = if records_versions {
+                self.current_version_id(&params.bucket, &key).await?
+            } else {
+                None
+            };
+            rows.push(object::Info {
+                key,
+                size: row.size,
+                last_modified: row.mtime,
+                etag: row.etag,
+                tags: row.tags,
+                checksum: row.checksum,
+                owner: row.owner,
+                acl: row.acl,
+                version_id,
+                bucket_records_versions: records_versions,
+            });
+        }
+        let (keys, common_prefixes, truncated, next_start_after) = group_and_paginate(
+            rows,
+            &params.prefix,
+            params.delimiter.as_deref(),
+            params.start_after.as_deref(),
+            params.max_keys,
+            |o| o.key.as_ref(),
+        );
+        Ok(ObjectListing {
+            objects: keys,
+            common_prefixes,
+            truncated,
+            next_start_after,
         })
     }
 }
@@ -837,7 +962,7 @@ mod tests {
         },
         _util::testing::{body, complete_single_part, read_body},
         MemoryOptions,
-        testutil::checksum_tee,
+        testutil::{checksum_tee, publish_tagged_bytes},
     };
 
     async fn with_bucket() -> (MemoryStorage, Name) {
@@ -848,6 +973,49 @@ mod tests {
             .await
             .unwrap();
         (storage, name)
+    }
+
+    /// The refused row write's refund is conditional on the publish's identity
+    /// (ruling 2026-10-08): it takes back only this call's own publish, so a
+    /// newer writer at the same key keeps its content — even when that writer
+    /// published **byte-identical** content, which the byte compare alone
+    /// cannot tell from ours.
+    #[tokio::test]
+    async fn the_staged_bytes_refund_leaves_a_newer_writers_content_alone() {
+        let (storage, b) = with_bucket().await;
+        let key = object::key("raced.bin").unwrap();
+        let content = ContentKey::Object(key.clone());
+
+        // Ours first, then a later writer's over the same key — the same
+        // bytes, so only the recorded publish identity separates them.
+        let ours = storage.content().mint_publish_id();
+        publish_tagged_bytes(&storage, &b, &content, b"same body", ours).await;
+        let theirs = storage.content().mint_publish_id();
+        publish_tagged_bytes(&storage, &b, &content, b"same body", theirs).await;
+
+        // The stale compensation names its own publish and finds a newer
+        // one: nothing is deleted.
+        storage
+            .roll_back_publish(&b, &content, b"same body", ours, "OBJECT")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_body(storage.content().open(&b, &content, None).await.unwrap())
+                .await
+                .unwrap(),
+            b"same body".to_vec(),
+            "the newer writer's byte-identical content stays"
+        );
+
+        // The live publish's refund does take its bytes back.
+        storage
+            .roll_back_publish(&b, &content, b"same body", theirs, "OBJECT")
+            .await
+            .unwrap();
+        assert!(
+            storage.content().open(&b, &content, None).await.is_err(),
+            "the live publish is taken back"
+        );
     }
 
     /// Complete a fresh one-part multipart upload onto `key` — a single
@@ -1474,5 +1642,131 @@ mod tests {
             .unwrap();
         let err = storage.rename_object(&b, &src, &dst).await.unwrap_err();
         assert!(matches!(err, Error::Storage(AccessDenied(_))), "{err}");
+    }
+    /// The shared metadata conformance suite, run from mem's tests (the second
+    /// consumer's leg): the store the ops above serve must satisfy every
+    /// bucket, object and upload rule the contract pins.
+    #[tokio::test]
+    async fn metadata_conformance() {
+        use crate::_util::testing::metadata::assert_metadata_conformance;
+
+        let storage = MemoryStorage::new().unwrap();
+        assert_metadata_conformance(storage.metadata().as_ref()).await;
+    }
+
+    /// Review focus 1: a put whose guarded row write is refused (its bucket is
+    /// gone) must leave none of the staged bytes counted — the decorator's
+    /// publish happened, and the compensation removal takes it back out.
+    #[tokio::test]
+    async fn a_refused_guarded_row_write_leaves_the_total_unchanged() {
+        let storage = MemoryStorage::with_options(MemoryOptions {
+            max_object_bytes: None,
+            max_total_bytes: Some(64),
+        })
+        .unwrap();
+        let name = bucket::name("gone").unwrap();
+        let key = object::key("a.txt").unwrap();
+        storage
+            .create_bucket(&name, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        // Stage while the bucket still exists, then take the bucket away: the
+        // commit's row write is the refusal under test.
+        let staged = storage
+            .stage_body(&name, &key, body(b"staged".to_vec()), None, None)
+            .await
+            .unwrap();
+        storage.delete_bucket(&name).await.unwrap();
+        let err = storage
+            .commit_object(
+                &name,
+                &key,
+                staged,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err}");
+        assert_eq!(storage.total_bytes(), 0, "a refused write meters nothing");
+    }
+
+    /// The window the repair exists for (ruling 2026-10-08), driven through the
+    /// plain write itself: a write whose dispatch read the bucket as unversioned
+    /// while the bucket now records versions must not land an identity-less row.
+    #[cfg(feature = "versioning")]
+    mod versioned {
+        use super::*;
+        use crate::{
+            _core::{
+                storage::VersionOps,
+                version::{Id, State},
+            },
+            _store_redb::{object_meta, version as stored},
+        };
+
+        #[tokio::test]
+        async fn a_plain_write_into_a_bucket_that_records_versions_is_repaired() {
+            let storage = MemoryStorage::with_options(MemoryOptions {
+                max_object_bytes: None,
+                max_total_bytes: Some(4096),
+            })
+            .unwrap();
+            let b = bucket::name("data").unwrap();
+            storage
+                .create_bucket(&b, None, &Acl::default_private(None))
+                .await
+                .unwrap();
+            let key = object::key("window.txt").unwrap();
+            storage
+                .set_bucket_versioning(&b, State::Enabled)
+                .await
+                .unwrap();
+            // The dispatch read the state before the flip: the plain path runs
+            // against a bucket that now records versions.
+            let info = storage
+                .write_object_plain(
+                    &b,
+                    &key,
+                    b"window!!".to_vec(),
+                    object::Tags::empty(),
+                    None,
+                    None,
+                    &Acl::default_private(None),
+                )
+                .await
+                .unwrap();
+            let id = info
+                .version_id
+                .clone()
+                .expect("the recheck minted the identity a versioned write would have");
+            assert!(
+                info.bucket_records_versions,
+                "the answer reports the bucket's state"
+            );
+            assert_eq!(storage.total_bytes(), 8, "the bytes are metered once");
+            let bucket_name = b.as_ref().as_str().to_owned();
+            let key_name = key.as_ref().as_str().to_owned();
+            let (slot, rows) = storage
+                .db
+                .read(|txn| -> Result<(Option<Id>, u64), Error> {
+                    let slot = object_meta::Table::open_readonly(txn)?
+                        .get(&bucket_name, &key_name)?
+                        .and_then(|row| row.version_id.clone());
+                    let mut rows = 0u64;
+                    stored::Table::open_readonly(txn)?.for_key(&bucket_name, &key_name, |_| {
+                        rows += 1;
+                        Ok(())
+                    })?;
+                    Ok((slot, rows))
+                })
+                .unwrap();
+            assert_eq!(slot, Some(id), "the row's slot carries the identity");
+            assert_eq!(
+                rows, 0,
+                "the current version is the object row: none was written"
+            );
+        }
     }
 }

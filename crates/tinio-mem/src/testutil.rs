@@ -2,9 +2,15 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::{
-    _core::{acl, checksum},
+    _core::{
+        acl, bucket, checksum,
+        content::{ContentKey, ObjectContent, PublishId, StagedObject},
+    },
     _util::testing::{checksum_tee as util_checksum_tee, conform_other_owner, conform_owner},
+    MemoryStorage,
 };
 
 /// A canonical owner id — the standard test owner (same shape as the fs
@@ -31,4 +37,22 @@ pub(crate) fn checksum_tee(
     base64_value: &str,
 ) -> Arc<checksum::PartChecksum> {
     util_checksum_tee(algorithm, base64_value)
+}
+
+/// One tagged publish of `bytes` at `key` through the storage's content
+/// plane — the fixture the compensation tests publish with.
+pub(crate) async fn publish_tagged_bytes(
+    storage: &MemoryStorage,
+    bucket: &bucket::Name,
+    key: &ContentKey,
+    bytes: &'static [u8],
+    id: PublishId,
+) {
+    let mut staged = storage.content().stage(bucket, key).await.unwrap();
+    staged.write(Bytes::from_static(bytes)).await.unwrap();
+    storage
+        .content()
+        .publish_tagged(bucket, staged, key, id)
+        .await
+        .unwrap();
 }

@@ -25,6 +25,7 @@ pub extern crate tinio_version as _version;
 
 mod bucket;
 mod cleanup;
+mod counting;
 mod error;
 mod multipart;
 mod object;
@@ -35,6 +36,7 @@ mod version;
 
 pub use self::{
     cleanup::MemoryCleanup,
+    counting::{CountingContent, CountingStaged},
     error::{DatabaseError, Error},
     storage::{MemoryOptions, MemoryStorage},
 };

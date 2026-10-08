@@ -10,6 +10,8 @@ Always-loaded pointers. Each named doc = source of truth for its branch — do n
 - **Tests** — async harness, cucumber/e2e, scripts vs Rust tests, concurrency, verification scratch. `docs/tests.md`.
 - **Specs/plans** — one definer; ownership check; progress ticks. `docs/superpowers/README.md`.
 - **Manual edits** — user hand edits = law; conflict → stop, ask. `docs/compress.md`.
+- **Chat language** — dialogue with the user is Chinese; every repo artifact (docs, code, comments, commits) stays English. `docs/compress.md`.
+- **Plan progress** — tick the owning plan's `- [ ]` to `- [x]` in the same round a task/step finishes; a deliberate skip stays unticked with a one-line why. `docs/superpowers/README.md`.
 
 ## Agent skills
 
