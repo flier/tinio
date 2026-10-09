@@ -8,7 +8,10 @@ use std::{collections::HashMap, time::SystemTime};
 use cucumber::{gherkin::Step, given, then, when};
 
 use super::common::{deterministic_bytes, md5_hex};
-use crate::_core::{etag::ETag, multipart::PartInfo};
+use crate::_core::{
+    etag::ETag,
+    multipart::{PartInfo, part_number},
+};
 
 /// The scenario's multipart-upload state (world.mp): one rebuild per
 /// started upload ([`start_upload_with`]), so no upload-scoped field can
@@ -444,7 +447,7 @@ fn composed(parts: &[(u32, String)]) -> String {
     let infos: Vec<PartInfo> = parts
         .iter()
         .map(|(n, wire)| PartInfo {
-            part_number: (*n).into(),
+            part_number: part_number(*n).expect("a composed part number is in 1..=10000"),
             size: 0,
             etag: ETag::new(wire.trim_matches('"')).expect("recorded part etag"),
             last_modified: SystemTime::UNIX_EPOCH,

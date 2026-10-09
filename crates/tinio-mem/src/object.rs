@@ -876,14 +876,14 @@ impl ObjectOps for MemoryStorage {
             .parts(bucket, key)
             .await
             .map_err(Error::from)?;
-        Ok(parts
+        // The contract's own projection: a stored part number outside
+        // `1..=10000` refuses the read with `InvalidPartNumber` rather than
+        // panicking on a row this crate did not write.
+        parts
             .into_iter()
-            .map(|row| ObjectPart {
-                part_number: row.number.into(),
-                size: row.size,
-                checksum: row.checksum,
-            })
-            .collect())
+            .map(ObjectPart::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Error::from)
     }
 
     async fn list_objects(&self, params: ListObjectsParams) -> Result<ObjectListing, Error> {

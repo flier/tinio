@@ -272,6 +272,10 @@ pub fn parse_number(s: &str) -> Result<Decimal, Error> {
 /// raw `RawNumber` token back out, compact JSON for `Json`. CSV fields and
 /// JSON number values use this; the JSON serializer quotes `String`,
 /// renders `Null`/`Bool`/`Int` itself, and maps `Json` natively.
+#[expect(
+    clippy::expect_used,
+    reason = "infallible: serializing an owned `serde_json::Value` cannot fail — every variant is written by serde_json's own serializer (numbers ride the arbitrary-precision token verbatim), so no `Serialize` impl of ours is involved"
+)]
 pub fn display(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
@@ -284,7 +288,14 @@ pub fn display(v: &Value) -> String {
     }
 }
 
+// Test code stays panic-free-rule-exempt (style.md §Panics: production only,
+// D1), and clippy has no `allow-unreachable-in-tests` key — the two
+// `let … else { unreachable!() }` destructures below are test assertions.
 #[cfg(test)]
+#[expect(
+    clippy::unreachable,
+    reason = "test context: the two `let … else { unreachable!() }` destructures below are test assertions (docs/style.md §Panics)"
+)]
 mod tests {
     use std::rc::Rc;
 

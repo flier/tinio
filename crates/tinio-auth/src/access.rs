@@ -73,9 +73,9 @@ impl<S: Storage> S3Access for AclAccess<S> {
         // Precondition (Task 7 review note): s3s invokes `S3Access` only
         // AFTER signature verification against the auth provider —
         // `ConfigAuth` rejects unknown access keys — so `credentials()`
-        // is a verified signed user and `Identity::principal`'s
-        // expect-panic on an unknown key is unreachable here.
-        let principal = self.identity.principal(cx.credentials());
+        // is a verified signed user. A key that is somehow not configured
+        // still reads the same refusal it verifies with, never a panic.
+        let principal = self.identity.principal(cx.credentials())?;
         let headers = cx.headers();
         self.evaluate(&Request {
             principal,
@@ -698,8 +698,8 @@ mod tests {
     use crate::{
         _core::{
             acl::{
-                ANONYMOUS_CANONICAL_ID, Acl, GROUP_ALL_USERS, GROUP_AUTHENTICATED_USERS, Grant,
-                Grantee, GroupUri, OwnerId, Permission, default_owner_id,
+                Acl, GROUP_ALL_USERS, GROUP_AUTHENTICATED_USERS, Grant, Grantee, GroupUri, OwnerId,
+                Permission, default_owner_id,
             },
             bucket, object,
             storage::{BucketOps, MultipartOps, ObjectOps},
@@ -719,7 +719,7 @@ mod tests {
     }
 
     fn anon() -> OwnerId {
-        OwnerId::new(ANONYMOUS_CANONICAL_ID).unwrap()
+        OwnerId::anonymous()
     }
 
     fn alice() -> OwnerId {

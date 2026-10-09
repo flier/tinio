@@ -346,15 +346,31 @@ fn degrade(file: Option<&Path>, cause: &str, error: &dyn Display) -> Option<Salt
 /// Where a private file is written before it is published: **beside the published
 /// name, and named after the value being published**, so no two publishing runs can
 /// name one file.
-fn temporary_beside(file: &Path, bytes: &[u8]) -> PathBuf {
+///
+/// **`io::Result`, because the name is the caller's and the stem is derived from it.**
+/// A path whose last component carries no stem — `..`, or a directory a caller handed
+/// in — is an `InvalidInput` the caller propagates, rather than a panic on an argument
+/// this module did not choose (`docs/style.md` §Panics: the four excepted categories are
+/// prefixed `literal:`, `infallible:`, `guarded:` and `argued:`, and this site is none of
+/// them). The `?` costs nothing on the path that matters: `publish_private` already
+/// returns `io::Result<()>`.
+fn temporary_beside(file: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     let stem = file
         .file_stem()
-        .expect("a file name this module built")
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}` has no file stem, so no temporary can be named after it",
+                    file.display()
+                ),
+            )
+        })?
         .to_string_lossy();
-    file.with_file_name(format!(
+    Ok(file.with_file_name(format!(
         "{stem}.{}.tmp",
         hex::encode(&Sha256::digest(bytes)[..8])
-    ))
+    )))
 }
 
 /// Write `bytes` into a private file at `temporary` and publish that same object at
@@ -378,7 +394,7 @@ pub(crate) fn publish_private(
     step: &str,
     link: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    let temporary = temporary_beside(file, bytes);
+    let temporary = temporary_beside(file, bytes)?;
     let published = link(&temporary, file);
     if let Err(error) = fs::remove_file(&temporary)
         && error.kind() != io::ErrorKind::NotFound
@@ -2281,13 +2297,10 @@ mod tests {
             2,
             "both of derive's `hr != 0` arms classify through the one helper"
         );
-        // And the helper is where the classification itself lives, so the arms' delegation
-        // cannot keep passing while the rule it delegates to stops classifying.
-        let classified = function_body(include_str!("sid.rs"), "fn classified(step: &'static str");
-        assert!(
-            classified.contains("capability::classify(hr)"),
-            "the helper is the one place derive's HRESULTs are classified"
-        );
+        // What the delegate answers is **no longer a property of this source**: the behavioral
+        // test below drives `classified` itself, so the classify-or-launch rule is measured
+        // rather than read off the helper's text. What this region still has to show is the
+        // delegation above — the two arms reach the rule, and nothing else does.
         // **The log half is pinned by the delegation.** The `warn!` moved into its one
         // producer, `capability::refuse` — whose own test records the event — so what this
         // region still has to show is that the create arm, and not the takeover arm above,
@@ -2301,6 +2314,39 @@ mod tests {
             derive.contains("capability::refuse(hr, name)"),
             "and it refuses the profile this call named"
         );
+    }
+
+    /// **The helper's own behaviour, driven rather than read.** `classified` is the one place
+    /// [`PackageSid::derive`]'s HRESULTs are classified; no test can make `userenv` answer
+    /// `E_ACCESSDENIED` on a host that works, but the classification takes a bare HRESULT — so
+    /// both of its arms are reachable as *values*, and this seam reaches them. The slice above
+    /// keeps the delegation pinned; this leg pins what the delegate answers: the capability
+    /// answer is the host refusal, and anything else stays a launch failure naming the step that
+    /// ran, with the code verbatim.
+    #[test]
+    fn classified_maps_the_denied_hr_to_the_host_refusal_and_anything_else_names_the_step() {
+        let denied = classified(
+            "CreateAppContainerProfile",
+            "name",
+            capability::E_ACCESSDENIED,
+        );
+        assert!(
+            matches!(denied, Error::HostCannotConfine { hr, .. } if hr == capability::E_ACCESSDENIED),
+            "{denied}"
+        );
+        match classified("CreateAppContainerProfile", "name", 0x8007_0003u32 as i32) {
+            Error::Launch {
+                operation,
+                path,
+                source,
+            } => {
+                let rendered = source.to_string();
+                assert_eq!(operation, "CreateAppContainerProfile", "{rendered}");
+                assert_eq!(path, PathBuf::from("name"), "{rendered}");
+                assert!(rendered.contains("hr=0x80070003"), "{rendered}");
+            }
+            other => panic!("a non-denied HRESULT is a launch failure, got {other}"),
+        }
     }
 
     #[test]

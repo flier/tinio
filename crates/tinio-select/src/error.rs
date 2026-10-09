@@ -68,6 +68,13 @@ pub enum Error {
     NestedCsv,
     #[error("S3 select: parquet object exceeds the memory bound")]
     ParquetTooLarge,
+    /// An internal invariant the pipeline believed unreachable was violated —
+    /// the fallible replacement for a would-be panic (design 2026-10-09 D5,
+    /// named there). The payload names the broken invariant for `Debug` and
+    /// the server log; `Display` stays generic, so the wire body never
+    /// carries an internal symbol.
+    #[error("S3 select: internal error")]
+    Invariant(&'static str),
 }
 
 /// Failure-mode classification for consumers outside the crate, which cannot
@@ -138,6 +145,15 @@ mod tests {
             Error::ParquetTooLarge.to_string(),
             "S3 select: parquet object exceeds the memory bound"
         );
+    }
+
+    #[test]
+    fn invariant_display_stays_generic() {
+        // D5: the broken invariant's name is for logs (`Debug`), never for the
+        // response body the server renders from `Display`.
+        let e = Error::Invariant("a frame is open");
+        assert_eq!(e.to_string(), "S3 select: internal error");
+        assert!(format!("{e:?}").contains("a frame is open"), "{e:?}");
     }
 
     #[test]

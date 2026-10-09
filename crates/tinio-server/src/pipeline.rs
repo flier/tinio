@@ -38,7 +38,7 @@ use std::{
     mem,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -229,6 +229,23 @@ where
     }
 }
 
+impl<O> PipelineInner<O> {
+    /// The queue slot's guard (`None` = shut down, Q3) — the one spelling of
+    /// the lock's D3 recovery: a poisoned lock still holds the sender or
+    /// nothing, never a torn value. [`Pipeline::shutdown_inner`] takes the
+    /// sender, [`Runner::enqueue`] clones it.
+    fn queue_guard(&self) -> MutexGuard<'_, Option<mpsc::Sender<Job<O>>>> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The worker-handle vector's guard — same D3 recovery: each critical
+    /// section is the one `mem::take`, which leaves the guarded vector empty
+    /// either way.
+    fn workers_guard(&self) -> MutexGuard<'_, Vec<JoinHandle<()>>> {
+        self.workers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 impl<O> Pipeline<O> {
     /// The shutdown sequence (Q3), kind-agnostic — the [`Runner`] method
     /// wraps it, and the `Drop` impl calls it without the `O: Outcome`
@@ -244,7 +261,7 @@ impl<O> Pipeline<O> {
         // reset is owed here — `stats()` reads the depth from the
         // channel itself (item 4), and the channel reads 0 once the
         // workers drop the receiver (all permits released).
-        self.inner.queue.lock().unwrap().take();
+        self.inner.queue_guard().take();
     }
 
     /// Await the workers' exit — every in-flight task has completed by
@@ -256,7 +273,7 @@ impl<O> Pipeline<O> {
     /// later calls return immediately.
     pub async fn drain(&self) {
         let handles = {
-            let mut workers = self.inner.workers.lock().unwrap();
+            let mut workers = self.inner.workers_guard();
             mem::take(&mut *workers)
         };
         for handle in handles {
@@ -296,8 +313,11 @@ where
             return Err(ShutDown);
         }
         let (reply, done) = Completion::pair();
-        // Clone the sender under the lock, then send without holding it.
-        let sender = self.inner.queue.lock().unwrap().clone().ok_or(ShutDown)?;
+        // Clone the sender under the lock, then send without holding it: the
+        // clone is taken whole (`queue_guard` carries the D3 recovery), and a
+        // poisoned lock's slot is still the enqueue answer the shutdown arm
+        // reads.
+        let sender = self.inner.queue_guard().clone().ok_or(ShutDown)?;
         // No depth counting here — `stats()` reads the depth from the
         // channel itself (`max_capacity() - capacity()`, item 4,
         // data-path review 2026-08-29): a task still blocked in `send`

@@ -756,11 +756,12 @@ impl<S: Storage> S3Backend<S> {
         // present only when the object carries tags and the tagging
         // toggle is on (AWS omits it for a tag-less object).
         if self.caps.tagging && !head.tags.is_empty() {
-            // The count is a decimal digit string — the parse cannot
-            // fail (the header value rules accept it).
+            // The count is a decimal digit string rendered by
+            // `HeaderValue`'s own integer conversion — no parse, and no
+            // failure path to unwrap.
             resp.headers.insert(
                 "x-amz-tagging-count",
-                HeaderValue::from_str(&head.tags.len().to_string()).unwrap(),
+                HeaderValue::from(head.tags.len() as u64),
             );
         }
         resp
@@ -1077,10 +1078,7 @@ impl<S: Storage> S3Backend<S> {
         // once; the grants are irrelevant to this rule.
         #[cfg(feature = "acl")]
         let gate: Option<(acl::OwnerId, acl::OwnerId, acl::OwnerId)> =
-            if self.caps.acl && self.identity.is_some() {
-                let principal = self
-                    .owner_for(req.credentials.as_ref())
-                    .expect("identity attached above");
+            if let Some(principal) = self.principal_for(req.credentials.as_ref())? {
                 let bucket_owner = self.row_owner(
                     self.storage
                         .get_bucket_acl(&bucket)
@@ -1095,6 +1093,8 @@ impl<S: Storage> S3Backend<S> {
                 let lazy_default = self.row_owner(None);
                 Some((principal, bucket_owner, lazy_default))
             } else {
+                // No identity attached (or the toggle off): the per-key gate
+                // is the no-identity mode's, below.
                 None
             };
         #[cfg(feature = "acl")]

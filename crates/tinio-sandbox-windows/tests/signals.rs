@@ -22,6 +22,17 @@
 //! other watched for a delivery it must not receive.
 
 #![cfg(target_os = "windows")]
+// **The stated allow D7 gives a test target whose helper functions clippy's in-tests keys do
+// not reach** (`docs/style.md` §Panics; design 2026-10-09 D7): the sites below are methods of
+// this file's `Owned` guard — the process a test spawned — and clippy's in-tests keys cover a
+// `#[test]` function or a `#[cfg(test)]` module, not an inherent method a test calls. Each
+// `expect` states the invariant the guard holds, and a broken one should fail the test loudly.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a default-harness test target — the `Owned` guard's methods are outside clippy's in-tests keys (docs/style.md §Panics, design 2026-10-09 D7)"
+)]
 
 // **The harness is the library's now** (`tinio_sandbox_windows::testing`), and
 // this binary keeps its own top-level `child_role` and `launcher_role` shims —

@@ -528,7 +528,14 @@ impl SelectIter {
             return self.eof(0);
         }
         let (item, at) = {
-            let reader = self.reader.as_mut().expect("reader present");
+            // The slot empties only when the reader could not be built, and
+            // that failure rides the outbox — `pump` returns on
+            // `outbox.has_error()` before it calls `step`.
+            let Some(reader) = self.reader.as_mut() else {
+                return Err(Error::Invariant(
+                    "the built pipeline carries its record reader",
+                ));
+            };
             (reader.next()?, reader.last_record_start())
         };
         match item {

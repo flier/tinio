@@ -49,7 +49,12 @@ pub struct Config {
 
 impl Config {
     /// The canonical ID as the [`OwnerId`] type (validated at config
-    /// parse; valid by construction).
+    /// parse; valid by construction — the `#[expect]` below carries the
+    /// written argument).
+    #[expect(
+        clippy::expect_used,
+        reason = "argued: `canonical_id` is validated at config parse — `validate_canonical_id` is this field's garde rule (`schema/mod.rs`) and runs inside `Config::parse`/`Config::load`, and the field's default route codes `default_owner_id()`; the `pub` field's remaining hole is a hand-built struct, and no in-repo production caller builds one (checked 2026-10-09)"
+    )]
     pub fn resolved_canonical_id(&self) -> OwnerId {
         OwnerId::new(self.canonical_id.clone()).expect("canonical_id is validated at config parse")
     }

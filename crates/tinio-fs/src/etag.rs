@@ -32,7 +32,7 @@ use std::{
     io, mem,
     path::{Path, PathBuf},
     result,
-    sync::Mutex,
+    sync::{Mutex, PoisonError},
     time::SystemTime,
 };
 
@@ -156,12 +156,14 @@ static HASH_BUFFER_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 impl HashBuffer {
     /// Check a buffer out of the pool (allocating a fresh one when the
-    /// pool is empty).
+    /// pool is empty). A poisoned lock is recovered rather than
+    /// unwrapped: the guard is held only across the `pop`, so its poison
+    /// flag cannot describe a half-written queue (style.md §Panics, D3).
     pub(crate) fn acquire() -> Self {
         Self(
             HASH_BUFFER_POOL
                 .lock()
-                .unwrap()
+                .unwrap_or_else(PoisonError::into_inner)
                 .pop()
                 .unwrap_or_else(|| vec![0u8; CHUNK_SIZE]),
         )
@@ -175,11 +177,20 @@ impl HashBuffer {
 }
 
 impl Drop for HashBuffer {
+    /// Return the buffer to the shared pool.
+    ///
+    /// A `Drop` body cannot answer a `Result` (style.md §Panics, D6), so
+    /// the poison is neither unwrapped nor propagated: the pool is
+    /// recovered — the guard is only ever held across a `push`/`pop`, so
+    /// the flag cannot describe a half-written queue — and the recovery
+    /// is logged rather than swallowed. Never a panic: a panic here
+    /// would abort a drop that may already be unwinding.
     fn drop(&mut self) {
-        HASH_BUFFER_POOL
-            .lock()
-            .unwrap()
-            .push(mem::take(&mut self.0));
+        let mut pool = HASH_BUFFER_POOL.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("the hash buffer pool lock was poisoned; the pool is recovered");
+            poisoned.into_inner()
+        });
+        pool.push(mem::take(&mut self.0));
     }
 }
 

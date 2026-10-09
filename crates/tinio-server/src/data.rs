@@ -677,6 +677,10 @@ fn emit_access(fields: &AccessFields) {
 fn nginx_time() -> String {
     // The format description is static — parse it once, not per request.
     static FORMAT: OnceLock<Vec<BorrowedFormatItem<'static>>> = OnceLock::new();
+    #[expect(
+        clippy::expect_used,
+        reason = "literal: the input is this call site's compile-time literal, so a refusal is a source-level mistake, not a runtime condition — and `nginx_time_is_formatted_like_nginx` formats a timestamp through this very `OnceLock`, so a malformed description fails that test (design 2026-10-09 D2a)"
+    )]
     let format = FORMAT.get_or_init(|| {
         format_description::parse_borrowed::<2>(
             "[day]/[month repr:short]/[year]:[hour]:[minute]:[second] +0000",

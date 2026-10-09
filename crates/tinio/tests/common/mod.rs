@@ -12,6 +12,16 @@
 //! Nothing in here asserts — these are the helpers; the leg owns the expectations.
 
 #![allow(clippy::absolute_paths, dead_code)]
+// **A test-support module inside a test target, and a stated exemption because clippy's test
+// keys do not reach it** (docs/style.md §Panics): `doctor.rs` declares `mod common;`, but
+// `allow-*-in-tests` covers `#[test]` functions and `#[cfg(test)]` modules, while the fixture's
+// sites are plain helper `fn`s (design 2026-10-09 D7).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a test target's harness helpers (docs/style.md §Panics)"
+)]
 
 // The fixture spells `std::fs`/`std::process` at the call site rather than importing each one;
 // this is a test crate and the absolute paths are the point (they name the module, not a local
@@ -57,13 +67,18 @@ pub fn spawn(dir: &Path) -> Command {
 /// Runs the binary under test as `doctor <root> <flags...>` and answers its whole output: the
 /// one place the process leg's spawn shape lives, so it cannot forget that the state location
 /// is pinned ([`spawn`]) or spell the flag list out again.
+///
+/// **The child goes through the guard, and the capture recipe is the guard's own.**
+/// `Command::output()` was this line's shape — the raw spawn and wait, and the site
+/// `crates/tinio-util/tests/spawn_guard.rs` admits as a shape it must report — so
+/// `job::output` is what this helper calls now: the spawn is the guard's, and the three stdio
+/// modes a capture needs (`stdin` null, the other two piped) are the helper's rather than lines
+/// written out here. What it replaces left the modes to the caller because `job::spawn` takes
+/// the `Command` the builder left and sets no stdio of its own.
 pub fn run_doctor(dir: &Path, root: &Path, flags: &[&str]) -> std::process::Output {
-    spawn(dir)
-        .arg("doctor")
-        .arg(root)
-        .args(flags)
-        .output()
-        .expect("doctor")
+    let mut command = spawn(dir);
+    command.arg("doctor").arg(root).args(flags);
+    tinio_util::testing::job::output(&mut command).expect("doctor")
 }
 
 /// A root holding the complete configuration and nothing else: no store, no `state` file, no

@@ -678,12 +678,16 @@ pub(crate) fn linearize_full_object(
         }
         // The wire digest is the big-endian register value (s3s).
         let next = bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
-        crc = crc_combine(algo, crc, next, *size, &mut combine_cache);
+        crc = crc_combine(algo, crc, next, *size, &mut combine_cache)?;
     }
     let digest = match algo {
         Algorithm::Crc32 | Algorithm::Crc32C => (crc as u32).to_be_bytes().to_vec(),
         Algorithm::Crc64Nvme => crc.to_be_bytes().to_vec(),
-        _ => unreachable!("linearize is CRC-only"),
+        // The width match above refused every algorithm S3 gives no
+        // linearization (FULL_OBJECT is CRC-only, and the request-level
+        // refusal is `validate_supported` in `multipart`): a wrong-spec call
+        // is this `None`, never a panic.
+        _ => return None,
     };
     Some(checksum::Value(STANDARD.encode(digest)))
 }
@@ -695,10 +699,11 @@ pub(crate) fn linearize_full_object(
 #[cfg(feature = "multipart")]
 type CombineCache = Option<((checksum::Algorithm, u64), Vec<[u64; 64]>)>;
 
-/// The matrix chain of `crc_combine` for one `(algo, len)`.
+/// The matrix chain of `crc_combine` for one `(algo, len)` — `None` for an
+/// algorithm with no CRC register (see [`crc_params`]).
 #[cfg(feature = "multipart")]
-fn combine_matrices(algo: checksum::Algorithm, len: u64) -> Vec<[u64; 64]> {
-    let (poly, _) = crc_params(algo);
+fn combine_matrices(algo: checksum::Algorithm, len: u64) -> Option<Vec<[u64; 64]>> {
+    let (poly, _) = crc_params(algo)?;
     // The "advance by one bit" operator of the reflected register
     // domain: row 0 is the reflected polynomial, row n is bit n-1
     // (zlib's `odd` matrix). Squaring doubles the advance.
@@ -725,7 +730,7 @@ fn combine_matrices(algo: checksum::Algorithm, len: u64) -> Vec<[u64; 64]> {
         m = next;
         mats.push(m);
     }
-    mats
+    Some(mats)
 }
 
 /// One step of the carryless-multiplication combine: given the CRC of
@@ -736,6 +741,9 @@ fn combine_matrices(algo: checksum::Algorithm, len: u64) -> Vec<[u64; 64]> {
 /// xor `crc_b` (the all-ones init/xorout convention makes the xor the
 /// complete combination). The matrix chain comes from `cache` (the
 /// caller's single-slot memoization of [`combine_matrices`]).
+///
+/// `None` for an algorithm with no CRC register — the same refusal
+/// [`crc_params`] answers, propagated rather than asserted.
 #[cfg(feature = "multipart")]
 fn crc_combine(
     algo: checksum::Algorithm,
@@ -743,12 +751,15 @@ fn crc_combine(
     crc_b: u64,
     len_b: u64,
     cache: &mut CombineCache,
-) -> u64 {
-    if cache.as_ref().is_none_or(|(key, _)| *key != (algo, len_b)) {
-        *cache = Some(((algo, len_b), combine_matrices(algo, len_b)));
-    }
-    let mats = &cache.as_ref().expect("just set").1;
-    let (_, mask) = crc_params(algo);
+) -> Option<u64> {
+    let (_, mask) = crc_params(algo)?;
+    // The slot is filled and read as one step — `Option::insert` returns the
+    // entry it stored, so the memoized chain needs no follow-up unwrap of a
+    // value the same expression just wrote.
+    let (_, mats) = match cache {
+        Some(entry) if entry.0 == (algo, len_b) => entry,
+        slot => slot.insert(((algo, len_b), combine_matrices(algo, len_b)?)),
+    };
     let mut crc = crc_a;
     let mut len = len_b;
     for m in mats.iter() {
@@ -757,7 +768,7 @@ fn crc_combine(
         }
         len >>= 1;
     }
-    (crc ^ crc_b) & mask
+    Some((crc ^ crc_b) & mask)
 }
 
 /// Multiply a register value by a gf2 matrix (bits of `vec` select the
@@ -784,14 +795,18 @@ fn gf2_matrix_square(square: &mut [u64; 64], mat: &[u64; 64]) {
     }
 }
 
-/// The reflected polynomial and register-width mask of a CRC algorithm.
+/// The reflected polynomial and register-width mask of a CRC algorithm —
+/// `None` for every algorithm S3 gives no linearization (FULL_OBJECT is
+/// CRC-only; [`crate::backend::multipart`]'s `validate_supported` is the
+/// request-level refusal, and this `None` keeps the whole combine chain
+/// total behind it).
 #[cfg(feature = "multipart")]
-fn crc_params(algo: checksum::Algorithm) -> (u64, u64) {
+fn crc_params(algo: checksum::Algorithm) -> Option<(u64, u64)> {
     match algo {
-        Algorithm::Crc32 => (0xEDB88320, u64::MAX >> 32),
-        Algorithm::Crc32C => (0x82F63B78, u64::MAX >> 32),
-        Algorithm::Crc64Nvme => (0x9A6C9329AC4BC9B5, u64::MAX),
-        _ => unreachable!("linearize is CRC-only"),
+        Algorithm::Crc32 => Some((0xEDB88320, u64::MAX >> 32)),
+        Algorithm::Crc32C => Some((0x82F63B78, u64::MAX >> 32)),
+        Algorithm::Crc64Nvme => Some((0x9A6C9329AC4BC9B5, u64::MAX)),
+        _ => None,
     }
 }
 
@@ -920,6 +935,16 @@ mod tests {
 
         // The value-source of the parse under test (the single-value
         // scan already rejected a second).
+        //
+        // A stated exception (docs/style.md §Panics, design 2026-10-09 D7):
+        // clippy's `allow-*-in-tests` keys do not reach a nested helper fn
+        // inside a `#[test]` fn, and `unreachable` has no in-tests key at
+        // all — the arm is the single-value scan's own exclusion, which the
+        // cases below drive.
+        #[expect(
+            clippy::unreachable,
+            reason = "test context: a nested helper in a test fn, asserted by the two-value-field case below (docs/style.md §Panics)"
+        )]
         fn found<'a>(
             crc32: Option<&'a str>,
             sha256: Option<&'a str>,

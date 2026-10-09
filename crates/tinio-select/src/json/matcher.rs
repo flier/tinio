@@ -300,11 +300,11 @@ impl Matcher {
         if self.frames.is_empty() {
             return self.open_root(source);
         }
-        if self.frame().closing {
+        if self.frame()?.closing {
             self.close_frame(source)?;
             return Ok(());
         }
-        match self.frame().scope {
+        match self.frame()?.scope {
             Scope::Named | Scope::Wild { object: true } => self.step_container(source),
             Scope::Wild { object: false } | Scope::Indexed { .. } => self.step_array(source),
         }
@@ -346,15 +346,15 @@ impl Matcher {
     /// sits at a member-name position (struson panics on a peek there).
     fn step_container(&mut self, source: &mut dyn ValueSource) -> Result<(), Error> {
         if !source.has_next()? {
-            self.mark_closing();
+            self.mark_closing()?;
             return Ok(());
         }
-        let kind = match self.frame().scope {
+        let kind = match self.frame()?.scope {
             Scope::Named => {
                 let key = source.name()?;
-                let at = self.frame().at;
+                let at = self.frame()?.at;
                 let PathSeg::Name(name) = &self.steps[at] else {
-                    unreachable!("a Named scope is only opened by a Name step");
+                    return Err(Error::Invariant("a Named scope is opened by a Name step"));
                 };
                 if !key_matches(&key, name, NameStyle::Bare) {
                     // A member the step does not want: validate, materialize
@@ -364,10 +364,10 @@ impl Matcher {
                 // Semantics 7: a second case-folded match is ambiguous, and it
                 // is reported here rather than at close so rows produced before
                 // it survive (deviation 2).
-                if self.frame().named_matched {
+                if self.frame()?.named_matched {
                     return Err(Error::Ambiguous(name.clone()));
                 }
-                self.frame_mut().named_matched = true;
+                self.frame_mut()?.named_matched = true;
                 source.peek()?
             }
             Scope::Wild { object: true } => {
@@ -375,24 +375,26 @@ impl Matcher {
                 // reproducing the deleted pipeline's preserve_order IndexMap.
                 // The slot map owns the key, so the borrow is given up here.
                 let key = source.name()?.into_owned();
-                let frame = self.frame_mut();
+                let frame = self.frame_mut()?;
                 frame.slot = frame.slots.slot_for(key);
                 source.peek()?
             }
-            _ => unreachable!("step_container only serves object scopes"),
+            Scope::Wild { object: false } | Scope::Indexed { .. } => {
+                return Err(Error::Invariant("step_container only serves object scopes"));
+            }
         };
-        self.frame_mut().children_seen = true;
-        self.apply_at(self.child_index(), kind, source)
+        self.frame_mut()?.children_seen = true;
+        self.apply_at(self.child_index()?, kind, source)
     }
 
     /// One step of an array scope: a `Wild` reads every element, an `Index(i)`
     /// counts children and reads only element `target` (semantics 5).
     fn step_array(&mut self, source: &mut dyn ValueSource) -> Result<(), Error> {
         if !source.has_next()? {
-            self.mark_closing();
+            self.mark_closing()?;
             return Ok(());
         }
-        let indexed = match &mut self.frame_mut().scope {
+        let indexed = match &mut self.frame_mut()?.scope {
             Scope::Indexed { target, ord } => {
                 let current = *ord;
                 *ord += 1;
@@ -411,9 +413,9 @@ impl Matcher {
         // element's rows to its parent group as that element completes, which is
         // document order, so a 1 MB array of tiny elements retains no more than
         // the root it was charged for.
-        self.frame_mut().children_seen = true;
+        self.frame_mut()?.children_seen = true;
         let kind = source.peek()?;
-        self.apply_at(self.child_index(), kind, source)
+        self.apply_at(self.child_index()?, kind, source)
     }
 
     /// Apply the step at `at` to the value just peeked, routing its rows into
@@ -427,7 +429,7 @@ impl Matcher {
         if at == self.steps.len() {
             // No step is left: this value is the record of the deepest level.
             let value = read_value(kind, source)?;
-            self.record_row(Some(value));
+            self.record_row(Some(value))?;
             return Ok(());
         }
         let scope = {
@@ -470,33 +472,39 @@ impl Matcher {
 
     /// The frame on top of the stack: the one open container the next step
     /// applies to. Every step runs with a frame open, which the path shape
-    /// guarantees — a step that emptied the stack is already `done`.
-    fn frame(&self) -> &Frame {
-        self.frames.last().expect("a frame is open")
+    /// guarantees — a step that emptied the stack is already `done` — and the
+    /// empty case is an error rather than a panic.
+    fn frame(&self) -> Result<&Frame, Error> {
+        self.frames
+            .last()
+            .ok_or(Error::Invariant("a frame is open"))
     }
 
     /// The same frame, mutably.
-    fn frame_mut(&mut self) -> &mut Frame {
-        self.frames.last_mut().expect("a frame is open")
+    fn frame_mut(&mut self) -> Result<&mut Frame, Error> {
+        self.frames
+            .last_mut()
+            .ok_or(Error::Invariant("a frame is open"))
     }
 
     /// The step index the current frame's children obey.
-    fn child_index(&self) -> usize {
-        self.frame().at + 1
+    fn child_index(&self) -> Result<usize, Error> {
+        Ok(self.frame()?.at + 1)
     }
 
     /// Mark the current frame's container end.
-    fn mark_closing(&mut self) {
-        self.frame_mut().closing = true;
+    fn mark_closing(&mut self) -> Result<(), Error> {
+        self.frame_mut()?.closing = true;
+        Ok(())
     }
 
     /// Route one row produced at the deepest level.
     ///
     /// A final-`Name` scope holds its row until the object closes (semantics
     /// 6); every other scope emits it straight away.
-    fn record_row(&mut self, row: Option<Value>) {
-        let final_name = self.frame().is_final_name(self.steps.len());
-        let frame = self.frame_mut();
+    fn record_row(&mut self, row: Option<Value>) -> Result<(), Error> {
+        let final_name = self.frame()?.is_final_name(self.steps.len());
+        let frame = self.frame_mut()?;
         frame.children_seen = true;
         if final_name {
             // The ambiguity verdict needs the whole member scan (semantics 6).
@@ -504,6 +512,7 @@ impl Matcher {
         } else {
             self.emit(row);
         }
+        Ok(())
     }
 
     /// Hand one record to the nearest enclosing Wild-over-object member group,
@@ -599,7 +608,9 @@ impl Matcher {
     /// Closing the container in the reader comes first: the parent's next
     /// has_next() must see the container as finished.
     fn close_frame(&mut self, source: &mut dyn ValueSource) -> Result<(), Error> {
-        let frame = self.frames.pop().expect("close is reached with a frame");
+        let Some(frame) = self.frames.pop() else {
+            return Err(Error::Invariant("close is reached with a frame"));
+        };
         match frame.scope {
             Scope::Named | Scope::Wild { object: true } => source.end_object()?,
             Scope::Wild { object: false } | Scope::Indexed { .. } => source.end_array()?,

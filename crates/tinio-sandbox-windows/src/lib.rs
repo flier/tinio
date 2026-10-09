@@ -94,6 +94,12 @@ pub(crate) mod sweep;
 // It pulls `tinio-util`'s `testing` feature with it, which is the other half of the
 // same rule: the shared device is not compiled into the launcher the CLI starts.
 #[cfg(feature = "testing")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: behind `testing` (docs/style.md §Panics, design 2026-10-09 D7)"
+)]
 pub mod testing;
 
 /// This crate's own names, reached from the crate root.

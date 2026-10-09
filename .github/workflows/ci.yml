@@ -524,6 +524,15 @@ jobs:
         name: e2e traceability
         run: cargo test --profile ci -p tinio-e2e --test traceability
 
+      # The panic-policy gate (design 2026-10-09 D8): a `syn`-parsed scan of
+      # production source for the unannotated assert family, `#[allow]`
+      # escapes from the six panic lints, and `#[expect]` reasons outside
+      # D2's four prefixes. Plain-harness like traceability above — its own
+      # target, no cucumber argv, no platform dependence.
+      - &e2e-policy
+        name: e2e-policy
+        run: cargo test --profile ci -p tinio-e2e --test policy
+
       # PR test reports (BDD cucumber migration): the e2e/interop jobs write
       # JSON reports. Reports land in crates/tinio-e2e/ (cargo runs the test
       # binary with the package root as cwd), hence the ** glob.
@@ -719,6 +728,7 @@ jobs:
 
       - *e2e-mem
       - *e2e-trace
+      - *e2e-policy
       - *upload-report
 
   bench-smoke:

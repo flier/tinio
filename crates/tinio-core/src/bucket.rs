@@ -81,13 +81,11 @@ pub fn name(name: impl Into<String>) -> Result<Name, storage::Error> {
 impl From<&str> for Name {
     /// Trusted-input convenience (panics on invalid names — use [`name`] for
     /// untrusted input).
+    #[expect(
+        clippy::expect_used,
+        reason = "literal: the documented literal API — a `From<&str>` call site is a compile-time bucket-name fixture, wire input goes through `name`"
+    )]
     fn from(name: &str) -> Self {
-        self::name(name).expect("valid bucket name")
-    }
-}
-
-impl From<String> for Name {
-    fn from(name: String) -> Self {
         self::name(name).expect("valid bucket name")
     }
 }
@@ -145,16 +143,14 @@ mod tests {
         assert_eq!(String::from(n.clone()), "my-bucket");
         let from_literal: Name = "my-bucket".into();
         assert_eq!(from_literal, n);
-        let from_string: Name = "my-bucket".to_string().into();
-        assert_eq!(from_string, n);
         assert!(name("Big").is_err());
     }
 
     #[test]
     fn bucket_name_from_owned_string() {
-        // The owned-string conversion (used by wire payloads) accepts a
-        // valid name.
-        let n = Name::from("my-bucket".to_string());
+        // The owned-string path (wire payloads hand the ctor a `String`)
+        // accepts a valid name.
+        let n = name("my-bucket".to_string()).unwrap();
         assert_eq!(n.as_ref(), "my-bucket");
     }
 

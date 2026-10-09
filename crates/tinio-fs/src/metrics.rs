@@ -8,7 +8,7 @@
 //! family registered here is gathered by the management plane's `/metrics` on
 //! the same process (the shape `tinio-sandbox-linux`'s metrics module pins).
 //!
-//! `specs/001-s3-local-server/data-model.md`'s `## Metrics` owns the name
+//! `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns the name
 //! list. Additive only: every family here is a new name, and nothing changes
 //! an existing one.
 
@@ -20,6 +20,10 @@ use crate::sweep::Summary;
 
 /// Block files reclaimed by the block sweep, cumulative over the process's
 /// passes — the sweep's own `reclaimed_blocks`, summed.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: every error this registration can answer is about this family's own name — prometheus 0.14's `RegistryCore::register` refuses a name the process-global default registry already holds (`AlreadyReg`) or holds with a different label set or help string (`Msg`) — and each of this module's five names has one registration site in the repo (its own `LazyLock` here, whose closure runs once per process), against a family list owned by `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)`; a collision is a source-level mistake the registry refuses here, not a runtime condition, and `LazyLock::new` has no `Result` to return it through. The module's test reads all five names back out of the gathered exposition (`the_version_families_render_their_recorded_values`), so a registration that did not land fails a test (design 2026-10-09 D2d)"
+)]
 static RECLAIMED_BLOCKS: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "tinio_storage_blocks_reclaimed_total",
@@ -29,6 +33,10 @@ static RECLAIMED_BLOCKS: LazyLock<IntCounter> = LazyLock::new(|| {
 });
 
 /// Bytes reclaimed by the block sweep, cumulative over the process's passes.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `RECLAIMED_BLOCKS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
 static RECLAIMED_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "tinio_storage_bytes_reclaimed_total",
@@ -40,6 +48,10 @@ static RECLAIMED_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
 /// Noncurrent versions retained across the versioned buckets, as the last
 /// sweep pass counted them — the retention walk's view ([`Summary`]'s own
 /// `expired_versions` is what a pass dropped, this is what remains).
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `RECLAIMED_BLOCKS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
 static NONCURRENT_VERSIONS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "tinio_storage_noncurrent_versions_total",
@@ -53,6 +65,10 @@ static NONCURRENT_VERSIONS: LazyLock<IntGauge> = LazyLock::new(|| {
 /// ([`Summary`]'s own `reclaimed_bytes` is what a pass dropped, this is what
 /// remains; the store has no hard cap, so this family is the capacity
 /// signal).
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `RECLAIMED_BLOCKS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
 static BLOCK_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "tinio_storage_block_bytes",
@@ -64,6 +80,10 @@ static BLOCK_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
 /// Stored blocks that failed verification against their own name, cumulative
 /// across verify passes (the doctor's and the post-repair startup pass's) —
 /// each pass adds its findings, so the family answers "corrupt since start".
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `RECLAIMED_BLOCKS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
 static BLOCKS_CORRUPT: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "tinio_storage_blocks_corrupt_total",

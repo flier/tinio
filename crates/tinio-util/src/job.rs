@@ -109,6 +109,12 @@
 //! this guard works around; the two jobs' guarantees both hold, and this job's kill reaches the
 //! nested child as well.
 //!
+//! **The capture recipe has a spelling of its own beside [`spawn`], and it is [`output`].** A site
+//! that wants the child's whole output — an `icacls` read, a `pgrep`, this binary's own `--list` —
+//! used to write the three stdio modes and `wait_with_output` out by hand at every such site, or
+//! reach for `Command::output()` and lose the guard in the same line. [`output`] is that recipe
+//! once, on the same guard, and neither half of the pair is a caller's to remember.
+//!
 //! **The one spelling is a gate, not a convention.** "Every harness spawns through [`spawn`]" is a
 //! sentence anything can quietly falsify, so a check holds it up: `tests/spawn_guard.rs` scans the
 //! test sources — every `*.rs` under `crates/*/tests/`, which is every workspace member's
@@ -122,7 +128,7 @@
 
 use std::{
     io,
-    process::{Child, Command},
+    process::{Child, Command, Output, Stdio},
 };
 
 /// Spawn `command` guarded — the one spelling a harness's spawn sites use.
@@ -172,6 +178,35 @@ pub fn spawn(command: &mut Command) -> io::Result<Child> {
     {
         command.spawn()
     }
+}
+
+/// Spawn `command` guarded and collect its whole output — the one spelling a site that wants a
+/// child's captured output uses.
+///
+/// **The three stdio modes are set here rather than by the caller**, which is the rule
+/// `tinio_util::testing::PipedChild::spawn` states for the two pipes it sets: the capture is this
+/// function's contract, so a caller that forgot `Stdio::piped()` would get a child whose output
+/// nobody reads — an empty `stdout` that reads as "the tool said nothing" — and a caller that
+/// forgot `Stdio::null()` one that waits on a stdin no test will ever write. Null stdin, a pipe
+/// on each of the other two, and the whole of it waited for: the shape `Command::output()` has,
+/// which is why the sites this replaces were spelled that way.
+///
+/// **The spawn is [`spawn`]'s, so the guard still holds**: the child is a member of the job on
+/// Windows and armed with the parent-death signal on Linux, where `Command::output()` was the
+/// raw spawn and the wait with neither. **It is not a general replacement for
+/// `Command::output()`**: a site whose child must inherit a stream or write to a file sets its
+/// own stdio and calls [`spawn`] — this function sets all three modes itself, and would
+/// overwrite them.
+///
+/// # Errors
+///
+/// [`spawn`]'s errors — the spawn's own, and on Windows the assignment's — then the wait's.
+pub fn output(command: &mut Command) -> io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn(command)?.wait_with_output()
 }
 
 /// Arm the child `command` will create with Linux's parent-death signal, so the kernel sends it

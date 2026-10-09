@@ -4,6 +4,16 @@
 //! symlink reads through both its spellings, and a link out of the tree does not.
 
 #![cfg(target_os = "macos")]
+// **A macOS-only test target, and a stated exemption because clippy's test keys do not reach
+// it** (docs/style.md §Panics, design 2026-10-09 D7): `allow-*-in-tests` covers `#[test]`
+// functions and `#[cfg(test)]` modules, while this target's helpers and `harness/` — declared
+// below, inheriting this level — are plain `fn`s.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a test target's harness helpers (docs/style.md §Panics)"
+)]
 
 mod harness;
 

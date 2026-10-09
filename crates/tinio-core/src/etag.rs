@@ -66,7 +66,9 @@ impl FromStr for ETag {
         let bytes = s.as_bytes();
         if bytes.len() == 32 && bytes.iter().all(u8::is_ascii_hexdigit) {
             let mut digest = [0u8; 16];
-            hex::decode_to_slice(bytes, &mut digest).expect("32 hex digits decode to 16 bytes");
+            // The length/hex test above is the decode's whole precondition,
+            // so the only failure left is the format this branch excluded.
+            hex::decode_to_slice(bytes, &mut digest).map_err(|_| Error::InvalidFormat)?;
             return Ok(Self::Single(digest));
         }
         if bytes.len() > 33
@@ -75,8 +77,7 @@ impl FromStr for ETag {
             && bytes[33..].iter().all(u8::is_ascii_digit)
         {
             let mut digest = [0u8; 16];
-            hex::decode_to_slice(&bytes[..32], &mut digest)
-                .expect("32 hex digits decode to 16 bytes");
+            hex::decode_to_slice(&bytes[..32], &mut digest).map_err(|_| Error::InvalidFormat)?;
             let parts = s[33..]
                 .parse()
                 .map_err(|source| Error::PartCount { source })?;
@@ -156,6 +157,10 @@ impl From<ETag> for Bytes {
 impl From<&str> for ETag {
     /// Trusted-input convenience (panics on invalid ETags — use
     /// [`ETag::new`] for untrusted input).
+    #[expect(
+        clippy::expect_used,
+        reason = "literal: the documented literal API — a `From<&str>` call site is a compile-time ETag fixture, wire input goes through `ETag::new`"
+    )]
     fn from(etag: &str) -> Self {
         etag.parse().expect("valid etag")
     }

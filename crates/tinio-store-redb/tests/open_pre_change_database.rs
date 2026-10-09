@@ -10,6 +10,18 @@
 //! the committed file stays byte-identical; every read below goes through
 //! the public surface (`tinio_store_redb`), never the fixture's bytes.
 
+// This target is test context, but its file-level helper (`open_fixture`) is
+// not a `#[test]` function, and clippy's `allow-*-in-tests` keys reach
+// `#[test]` functions (and `#[cfg(test)]` modules) only — outside one,
+// test-support code reads as production to the lint (docs/style.md §Panics;
+// design 2026-10-09 D7: test contexts stay free).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: an integration-test target's file-level helper (docs/style.md §Panics)"
+)]
+
 use std::{
     fs,
     path::Path,

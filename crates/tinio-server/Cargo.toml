@@ -21,7 +21,6 @@ hyper-util = { workspace = true, features = [
     "http1",
     "http2",
 ] }
-lazy_static.workspace = true
 mime_guess.workspace = true
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true, features = [
@@ -180,6 +179,12 @@ otel = [
 
 [lints.clippy]
 absolute_paths = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_used = "warn"
 
 [lints.rust]
 unsafe_code = "forbid"

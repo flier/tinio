@@ -31,12 +31,11 @@
 use std::{
     collections::HashMap,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use lazy_static::lazy_static;
 use prometheus::{
     HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Result as PromResult,
     core::{Collector, Desc},
@@ -80,124 +79,221 @@ pub struct WriteLockStats {
     pub total_max_us: u64,
 }
 
-lazy_static! {
-    /// HTTP requests served by the management plane, by method and status.
-    pub static ref HTTP_REQUESTS: IntCounterVec = register_int_counter_vec!(
+/// HTTP requests served by the management plane, by method and status.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: every error this registration can answer is about this family's own name — prometheus 0.14's `RegistryCore::register` refuses a name the process-global default registry already holds (`AlreadyReg`) or holds with a different label set or help string (`Msg`) — and each of this module's eighteen names has one registration site in the repo (its own `LazyLock` here, whose closure runs once per process), against a family list owned by `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)`; a collision is a source-level mistake the registry refuses here, not a runtime condition, and `LazyLock::new` has no `Result` to return it through. The module's `registers_all_families` test reads the `tinio_*` names back out of the gathered exposition and pins the exact set, so a registration that did not land fails a test (design 2026-10-09 D2d)"
+)]
+pub static HTTP_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "tinio_http_requests_total",
         "HTTP requests served by the management plane, by method and status",
         &["method", "status"]
     )
-    .expect("register tinio_http_requests_total");
-    /// HTTP request durations, by method.
-    pub static ref HTTP_DURATION: HistogramVec = register_histogram_vec!(
+    .expect("register tinio_http_requests_total")
+});
+/// HTTP request durations, by method.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static HTTP_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
         "tinio_http_request_duration_seconds",
         "HTTP request durations, by method",
         &["method"]
     )
-    .expect("register tinio_http_request_duration_seconds");
-    /// HTTP requests currently being served.
-    pub static ref HTTP_IN_FLIGHT: IntGauge = register_int_gauge!(
+    .expect("register tinio_http_request_duration_seconds")
+});
+/// HTTP requests currently being served.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static HTTP_IN_FLIGHT: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
         "tinio_http_in_flight",
         "HTTP requests currently being served"
     )
-    .expect("register tinio_http_in_flight");
-    /// S3 data-plane operations, by operation and status.
-    pub static ref S3_OPERATIONS: IntCounterVec = register_int_counter_vec!(
+    .expect("register tinio_http_in_flight")
+});
+/// S3 data-plane operations, by operation and status.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static S3_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "tinio_s3_operations_total",
         "S3 data-plane operations, by operation and status",
         &["op", "status"]
     )
-    .expect("register tinio_s3_operations_total");
-    /// S3 operation durations, by operation.
-    pub static ref S3_DURATION: HistogramVec = register_histogram_vec!(
+    .expect("register tinio_s3_operations_total")
+});
+/// S3 operation durations, by operation.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static S3_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
         "tinio_s3_operation_duration_seconds",
         "S3 operation durations, by operation",
         &["op"]
     )
-    .expect("register tinio_s3_operation_duration_seconds");
-    /// Bucket count (full-scan, TTL-cached 30 s; management plane, T075).
-    pub static ref STORAGE_BUCKETS: IntGauge = register_int_gauge!(
+    .expect("register tinio_s3_operation_duration_seconds")
+});
+/// Bucket count (full-scan, TTL-cached 30 s; management plane, T075).
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static STORAGE_BUCKETS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
         "tinio_storage_buckets_total",
         "Number of buckets (full-scan, TTL-cached 30 s)"
     )
-    .expect("register tinio_storage_buckets_total");
-    /// Object count (full-scan, TTL-cached 30 s; management plane, T075).
-    pub static ref STORAGE_OBJECTS: IntGauge = register_int_gauge!(
+    .expect("register tinio_storage_buckets_total")
+});
+/// Object count (full-scan, TTL-cached 30 s; management plane, T075).
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static STORAGE_OBJECTS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
         "tinio_storage_objects_total",
         "Number of objects (full-scan, TTL-cached 30 s)"
     )
-    .expect("register tinio_storage_objects_total");
-    /// Total object bytes (full-scan, TTL-cached 30 s; management plane, T075).
-    pub static ref STORAGE_BYTES: IntGauge = register_int_gauge!(
+    .expect("register tinio_storage_objects_total")
+});
+/// Total object bytes (full-scan, TTL-cached 30 s; management plane, T075).
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static STORAGE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
         "tinio_storage_bytes_total",
         "Total object bytes (full-scan, TTL-cached 30 s)"
     )
-    .expect("register tinio_storage_bytes_total");
-    /// Bytes streamed into storage.
-    pub static ref STORAGE_UPLOAD_BYTES: IntCounter = register_int_counter!(
+    .expect("register tinio_storage_bytes_total")
+});
+/// Bytes streamed into storage.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static STORAGE_UPLOAD_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
         "tinio_storage_upload_bytes_total",
         "Bytes streamed into storage"
     )
-    .expect("register tinio_storage_upload_bytes_total");
-    /// Bytes streamed out of storage.
-    pub static ref STORAGE_DOWNLOAD_BYTES: IntCounter = register_int_counter!(
+    .expect("register tinio_storage_upload_bytes_total")
+});
+/// Bytes streamed out of storage.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static STORAGE_DOWNLOAD_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
         "tinio_storage_download_bytes_total",
         "Bytes streamed out of storage"
     )
-    .expect("register tinio_storage_download_bytes_total");
-    /// Objects written, by operation (put, copy, multipart-complete).
-    pub static ref STORAGE_OBJECTS_UPLOADED: IntCounterVec = register_int_counter_vec!(
+    .expect("register tinio_storage_download_bytes_total")
+});
+/// Objects written, by operation (put, copy, multipart-complete).
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static STORAGE_OBJECTS_UPLOADED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "tinio_storage_objects_uploaded_total",
         "Objects written to storage, by operation",
         &["op"]
     )
-    .expect("register tinio_storage_objects_uploaded_total");
-    /// Objects deleted from storage.
-    pub static ref STORAGE_OBJECTS_DELETED: IntCounter = register_int_counter!(
+    .expect("register tinio_storage_objects_uploaded_total")
+});
+/// Objects deleted from storage.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static STORAGE_OBJECTS_DELETED: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
         "tinio_storage_objects_deleted_total",
         "Objects deleted from storage"
     )
-    .expect("register tinio_storage_objects_deleted_total");
-    /// Multipart uploads currently in progress.
-    pub static ref STORAGE_MULTIPART_IN_PROGRESS: IntGauge = register_int_gauge!(
+    .expect("register tinio_storage_objects_deleted_total")
+});
+/// Multipart uploads currently in progress.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static STORAGE_MULTIPART_IN_PROGRESS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
         "tinio_storage_multipart_in_progress",
         "Multipart uploads currently in progress"
     )
-    .expect("register tinio_storage_multipart_in_progress");
-    /// Tasks currently queued in a pipeline, by pipeline (io/db).
-    pub static ref PIPELINE_QUEUE_DEPTH: IntGaugeVec = register_int_gauge_vec!(
+    .expect("register tinio_storage_multipart_in_progress")
+});
+/// Tasks currently queued in a pipeline, by pipeline (io/db).
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static PIPELINE_QUEUE_DEPTH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
         "tinio_pipeline_queue_depth",
         "Tasks currently queued in a pipeline, by pipeline",
         &["pipeline"]
     )
-    .expect("register tinio_pipeline_queue_depth");
-    /// Tasks currently executing in a pipeline, by pipeline (io/db).
-    pub static ref PIPELINE_IN_FLIGHT: IntGaugeVec = register_int_gauge_vec!(
+    .expect("register tinio_pipeline_queue_depth")
+});
+/// Tasks currently executing in a pipeline, by pipeline (io/db).
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static PIPELINE_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
         "tinio_pipeline_in_flight",
         "Tasks currently executing in a pipeline, by pipeline",
         &["pipeline"]
     )
-    .expect("register tinio_pipeline_in_flight");
-    /// Workers currently busy in a pipeline, by pipeline (io/db).
-    pub static ref PIPELINE_BUSY_WORKERS: IntGaugeVec = register_int_gauge_vec!(
+    .expect("register tinio_pipeline_in_flight")
+});
+/// Workers currently busy in a pipeline, by pipeline (io/db).
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static PIPELINE_BUSY_WORKERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
         "tinio_pipeline_busy_workers",
         "Workers currently busy in a pipeline, by pipeline",
         &["pipeline"]
     )
-    .expect("register tinio_pipeline_busy_workers");
-    /// The write-lock duration histograms (pipeline-spec.md §4): the
-    /// `wait` and `total` distributions of every write transaction,
-    /// converted from the tinio-fs snapshot at scrape time (registered
-    /// with the default registry — the registry holds its own copy of
-    /// the descriptors).
-    pub static ref WRITE_LOCK_HISTOGRAMS: WriteLockHistograms = {
-        let histograms = WriteLockHistograms::new()
-            .expect("build the write-lock histogram descriptors");
-        register(Box::new(histograms.clone()))
-            .expect("register the write-lock histogram families");
-        histograms
-    };
-}
+    .expect("register tinio_pipeline_busy_workers")
+});
+/// The write-lock duration histograms (pipeline-spec.md §4): the
+/// `wait` and `total` distributions of every write transaction,
+/// converted from the tinio-fs snapshot at scrape time (registered
+/// with the default registry — the registry holds its own copy of
+/// the descriptors).
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `HTTP_REQUESTS` above for both of this item's registrations — the two histogram families' names (already registered, or registered with a different label set or help; the descriptors are built from two fixed literals before that), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns, with `registers_all_families` pinning the gathered set; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
+pub static WRITE_LOCK_HISTOGRAMS: LazyLock<WriteLockHistograms> = LazyLock::new(|| {
+    let histograms =
+        WriteLockHistograms::new().expect("build the write-lock histogram descriptors");
+    register(Box::new(histograms.clone())).expect("register the write-lock histogram families");
+    histograms
+});
 
 /// The metric statics are process-global (the prometheus default
 /// registry): a test binary runs hundreds of tests in parallel threads,
@@ -407,7 +503,7 @@ pub struct WriteLockHistograms {
     wait_desc: Desc,
     total_desc: Desc,
     /// The latest snapshot, shared with the registered clone (the
-    /// lazy_static registers a clone — the snapshot must be one Arc, not
+    /// `LazyLock` registers a clone — the snapshot must be one Arc, not
     /// per-copy state). A cheap atomic read on the write path — no 30 s
     /// TTL cache; that pattern belongs to the storage full-scan gauges
     /// only.
@@ -440,9 +536,17 @@ impl WriteLockHistograms {
         })
     }
 
+    /// The snapshot's guard — the one spelling of the lock's D3 recovery,
+    /// never a panic: both critical sections are one whole-struct write or
+    /// read, invariant-preserving, so a poisoned lock still holds a complete
+    /// snapshot.
+    fn snapshot_guard(&self) -> MutexGuard<'_, WriteLockStats> {
+        self.snapshot.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Store the latest snapshot for the scrape-time conversion.
     fn refresh(&self, snapshot: WriteLockStats) {
-        *self.snapshot.lock().unwrap() = snapshot;
+        *self.snapshot_guard() = snapshot;
     }
 }
 
@@ -452,7 +556,9 @@ impl Collector for WriteLockHistograms {
     }
 
     fn collect(&self) -> Vec<MetricFamily> {
-        let snapshot = *self.snapshot.lock().unwrap();
+        // A poisoned lock still holds a complete snapshot (one struct,
+        // assigned whole) — see `snapshot_guard`.
+        let snapshot = *self.snapshot_guard();
         vec![
             write_lock_family(
                 &self.wait_desc,

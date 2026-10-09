@@ -48,6 +48,16 @@
 //! (`docs/style.md`'s import rule).
 
 #![allow(dead_code)]
+// **The shared harness of the macOS test targets, and a stated exemption because clippy's test
+// keys do not reach it** (docs/style.md §Panics, design 2026-10-09 D7): this file is plain
+// `pub fn`s with no `#[test]`/`#[cfg(test)]` marker, so `allow-*-in-tests` never applies — and
+// each target root that declares `mod harness;` states the same exemption for its own helpers.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a test target's harness helpers (docs/style.md §Panics)"
+)]
 
 use std::{
     env,
@@ -71,6 +81,7 @@ use tinio_sandbox_macos::{
     launch::{command_args, listener},
     profile::{Profile, profile, rule_count, with_canonical_paths},
 };
+use tinio_util::testing::job;
 
 /// Selects the child role in the re-executed test binary.
 pub const CHILD_ENV: &str = "TINIO_SANDBOX_MACOS_CHILD";
@@ -681,12 +692,13 @@ pub fn run_pruned(sandbox: &Sandbox, extra: &[(&str, String)], test_name: &str) 
         },
         None,
     );
-    let status = Command::new(SANDBOX_EXEC)
+    let mut command = Command::new(SANDBOX_EXEC);
+    command
         .args(&args)
         .env(CHILD_ENV, "1")
-        .env(PARAMS_ENV, &params)
-        .status()
-        .expect("spawn sandbox-exec");
+        .env(PARAMS_ENV, &params);
+    let mut child = job::spawn(&mut command).expect("spawn sandbox-exec");
+    let status = child.wait().expect("spawn sandbox-exec");
 
     let text = fs::read_to_string(&report).unwrap_or_else(|err| {
         panic!("the pruned child wrote no report ({err}); it exited with {status:?}\nprofile:\n{pruned}")

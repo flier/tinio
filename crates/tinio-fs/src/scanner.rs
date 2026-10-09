@@ -28,7 +28,7 @@ use std::{
     env,
     io::ErrorKind,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -314,11 +314,11 @@ impl Scanner {
             match result {
                 Ok(Ok(())) => {
                     summary.reclaimed += 1;
-                    self.stuck_tombstones.lock().unwrap().remove(&path);
+                    self.stuck_tombstones_guard().remove(&path);
                 }
                 Ok(Err(err)) => {
                     summary.removal_failures += 1;
-                    if self.stuck_tombstones.lock().unwrap().insert(path.clone()) {
+                    if self.stuck_tombstones_guard().insert(path.clone()) {
                         tracing::error!(
                             path = %path.display(),
                             error = %err,
@@ -333,6 +333,20 @@ impl Scanner {
                 ),
             }
         }
+    }
+
+    /// The known-stuck set's guard — the one spelling of the lock, so the
+    /// two arms of [`Self::reclaim_tombstones`] cannot disagree about it.
+    ///
+    /// A poisoned lock is recovered rather than unwrapped (style.md
+    /// §Panics, D3): each critical section is a single `insert`/`remove`
+    /// on the set, so the poison flag cannot describe a half-written set,
+    /// and a pass that panicked with the guard held must not take every
+    /// later pass down with it.
+    fn stuck_tombstones_guard(&self) -> MutexGuard<'_, HashSet<PathBuf>> {
+        self.stuck_tombstones
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Reconcile one bucket: for every object file, ensure a matching meta
@@ -397,11 +411,13 @@ impl Scanner {
         // pinned read transaction (data-path review 2026-08-29, finding
         // 1: a long cold scan no longer stalls page recycling in
         // meta.redb). O(bucket) memory — the same class as the `walked`
-        // set below, accepted by §3.7. A JoinError (a panicking load
-        // closure) re-panics the caller — the one documented policy
-        // (F25): a panic is a bug, not a recoverable IO error; converting
-        // it to `io::Error` would mask it as a self-healable recompute
-        // (consistent with `database::Driver` and `meta::md5_of_file`).
+        // set below, accepted by §3.7. A panic inside the load closure is
+        // not re-raised: the driver's join-error helper lifts it into the
+        // store's `Error`, so it reaches this `?` as an ordinary failure
+        // (this crate's `Database::read_blocking` is a pass-through to the
+        // driver's) — the bucket is skipped with a warn and retried next
+        // pass, never the pass or the process taken down (design
+        // 2026-10-09 D1 supersedes F25's re-panic policy).
         let snapshot: HashMap<object::Key, Option<object_meta::Stored>> = meta
             .load_bucket(name)
             .await?
@@ -720,6 +736,7 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::{
         fs::File,
+        panic,
         path::Path,
         sync::{Arc, atomic::Ordering},
         time::SystemTime,
@@ -922,6 +939,44 @@ mod tests {
         assert_eq!(second.removal_failures, 1);
         assert!(leftover.exists());
         drop(file);
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_stuck_tombstone_set_is_recovered_and_the_pass_continues() {
+        // Review Focus 4 (D3): the guard is recovered, never unwrapped. A
+        // pass that panicked with the set held is the only way the lock can
+        // be poisoned — both critical sections are a single `insert`/
+        // `remove` — and it must not take every later pass down with it.
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let leftover = tombstone::dir(root.path()).join("dead-bucket");
+        fs::create_dir_all(&leftover).await.unwrap();
+        fs::write(leftover.join("leftover.bin"), b"was-a-bucket")
+            .await
+            .unwrap();
+        let scanner = Scanner::new(storage, options());
+
+        // Poison the set exactly as a panicking holder would: the panic runs
+        // with the guard alive, so the mutex records the poison.
+        let set = Arc::clone(&scanner.stuck_tombstones);
+        let caught = panic::catch_unwind(move || {
+            let _guard = set.lock().unwrap();
+            panic!("a previous pass panicked with the stuck-tombstone set held");
+        });
+        assert!(caught.is_err(), "the poisoning panic is caught");
+        assert!(
+            scanner.stuck_tombstones.lock().is_err(),
+            "the set is poisoned — the recovery below is not a no-op"
+        );
+
+        // Recover and continue: the pass reaches the set's guard in the
+        // removal arm and completes (the old `unwrap` panicked here), and the
+        // guard the pass took is the same set the pass just removed from.
+        let summary = scanner.scan_once().await.unwrap();
+        assert_eq!(summary.reclaimed, 1);
+        assert_eq!(summary.removal_failures, 0);
+        assert!(!leftover.exists());
+        assert!(scanner.stuck_tombstones_guard().is_empty());
     }
 
     #[tokio::test]

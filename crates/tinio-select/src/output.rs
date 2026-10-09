@@ -124,6 +124,10 @@ fn serialize_json(params: &JsonOutputParams, row: &OutRow) -> Vec<u8> {
 }
 
 /// Quoted JSON text — the key form and the String value form.
+#[expect(
+    clippy::expect_used,
+    reason = "infallible: serde_json's serializer only fails where our input type cannot reach — a custom `Serialize` erroring, or a map with non-string keys; a `&str` is neither, and escaping writes into the `String`"
+)]
 fn json_text(s: &str) -> String {
     serde_json::to_string(s).expect("json string serialization is infallible")
 }
@@ -131,6 +135,10 @@ fn json_text(s: &str) -> String {
 /// One JSON value: `Null`/`Bool`/`Int`/`Decimal`/`RawNumber` unquoted
 /// (Decimal via its normalized text, RawNumber verbatim), `String` quoted,
 /// `Json` nested natively.
+#[expect(
+    clippy::expect_used,
+    reason = "infallible: serializing an owned `serde_json::Value` cannot fail — every variant is written by serde_json's own serializer (numbers ride the arbitrary-precision token verbatim), so no `Serialize` impl of ours is involved"
+)]
 fn json_value(out: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Null => out.extend_from_slice(b"null"),

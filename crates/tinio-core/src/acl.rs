@@ -67,6 +67,22 @@ impl OwnerId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Wrap a raw SHA-256 digest: hex-encoding 32 bytes emits exactly the
+    /// 64 lowercase hex digits [`OwnerId::new`] checks, so a derived ID is
+    /// constructed rather than asserted into shape.
+    fn from_digest(digest: impl AsRef<[u8]>) -> Self {
+        Self(hex::encode(digest))
+    }
+
+    /// The anonymous principal's canonical ID — the unsigned requester's
+    /// owner. Total, with no assertion to annotate: the constant is the
+    /// `|| s == ANONYMOUS_CANONICAL_ID` arm of [`OwnerId::new`]'s own shape
+    /// check, so the wrap is the same construction `OwnerId::from_digest`
+    /// performs.
+    pub fn anonymous() -> Self {
+        Self(ANONYMOUS_CANONICAL_ID.to_string())
+    }
 }
 
 /// The default owner display name (`"tinio"` — the `[owner]` config
@@ -87,7 +103,7 @@ pub const DEFAULT_ROOT_ACCESS_KEY: &str = "minioadmin";
 /// 64-hex constant every default owner element resolves to.
 pub fn default_owner_id() -> OwnerId {
     let digest = Sha256::digest(DEFAULT_OWNER_DISPLAY_NAME.as_bytes());
-    OwnerId::new(hex::encode(digest)).expect("sha256 hex is 64 lowercase hex digits")
+    OwnerId::from_digest(digest)
 }
 
 /// `hex(SHA-256(access_key))` — the canonical ID for a `[[users]]` entry
@@ -96,7 +112,7 @@ pub fn default_owner_id() -> OwnerId {
 /// assembly (tinio-auth re-exports it) share the derivation.
 pub fn derive_canonical_id(access_key: &str) -> OwnerId {
     let digest = Sha256::digest(access_key.as_bytes());
-    OwnerId::new(hex::encode(digest)).expect("sha256 hex is 64 lowercase hex digits")
+    OwnerId::from_digest(digest)
 }
 
 /// The single-key delete/overwrite parity rule (spec review B2): `P ==
@@ -454,6 +470,8 @@ mod tests {
         // AWS's anonymous uploader ID is 32-hex — the one non-64 exception.
         assert_eq!(ANONYMOUS_CANONICAL_ID.len(), 32);
         assert!(OwnerId::new(ANONYMOUS_CANONICAL_ID).is_ok());
+        // The total constructor wraps exactly the admitted constant.
+        assert_eq!(OwnerId::anonymous().as_str(), ANONYMOUS_CANONICAL_ID);
         assert_eq!(
             OwnerId::new(ANONYMOUS_CANONICAL_ID).unwrap().as_str(),
             ANONYMOUS_CANONICAL_ID

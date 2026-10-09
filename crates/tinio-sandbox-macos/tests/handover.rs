@@ -35,6 +35,16 @@
 //! measures the child, releases it, and reaps the launcher copy; every other exit path kills both.
 
 #![cfg(target_os = "macos")]
+// **A macOS-only test target, and a stated exemption because clippy's test keys do not reach
+// it** (docs/style.md §Panics, design 2026-10-09 D7): `allow-*-in-tests` covers `#[test]`
+// functions and `#[cfg(test)]` modules, while this target's role helpers (`child_role`,
+// `parent_role`) and `harness/` — declared below, inheriting this level — are plain `fn`s.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a test target's harness helpers (docs/style.md §Panics)"
+)]
 
 mod harness;
 
@@ -48,7 +58,7 @@ use std::{
 };
 
 use tinio_sandbox_core::{AccessMode, Sandbox};
-use tinio_util::testing::{kill_and_reap, poll_exit, wait_for_path};
+use tinio_util::testing::{job, kill_and_reap, poll_exit, wait_for_path};
 
 /// This test's name, which is also the filter the confined child runs under.
 ///
@@ -306,7 +316,13 @@ impl Drop for Children {
         targets.dedup();
         for pid in targets {
             let pid_arg = pid.to_string();
-            let _ = Command::new(KILL).args(["-9", pid_arg.as_str()]).status();
+            let mut command = Command::new(KILL);
+            command.args(["-9", pid_arg.as_str()]);
+            // Through the guard, and `if let` rather than `?`: this arm never panics, so a spawn
+            // the guard refused leaves the pid for the kernel to reap like any other failure here.
+            if let Ok(mut killer) = job::spawn(&mut command) {
+                let _ = killer.wait();
+            }
         }
         kill_and_reap(&mut self.launcher);
     }
@@ -354,7 +370,7 @@ fn pgrep(parent: u32, marker: Option<&str>) -> io::Result<Vec<u32>> {
     if let Some(marker) = marker {
         command.args(["-f", marker]);
     }
-    let out = command.output()?;
+    let out = job::output(&mut command)?;
     Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| line.trim().parse::<u32>().ok())
@@ -364,15 +380,15 @@ fn pgrep(parent: u32, marker: Option<&str>) -> io::Result<Vec<u32>> {
 /// The descriptor table `lsof -p pid` reports, as text.
 fn descriptor_table(pid: u32) -> String {
     let pid_arg = pid.to_string();
-    let out = Command::new(LSOF)
-        .args(["-p", pid_arg.as_str()])
-        .output()
-        .unwrap_or_else(|err| {
-            panic!(
-                "`{LSOF} -p {pid}` could not run ({err}); the spawned process's descriptor table \
-                 is the whole observation, and this leg fails rather than skipping"
-            )
-        });
+    let mut command = Command::new(LSOF);
+    command.args(["-p", pid_arg.as_str()]);
+    let out = job::output(&mut command);
+    let out = out.unwrap_or_else(|err| {
+        panic!(
+            "`{LSOF} -p {pid}` could not run ({err}); the spawned process's descriptor table \
+             is the whole observation, and this leg fails rather than skipping"
+        )
+    });
     assert!(
         out.status.success(),
         "`{LSOF} -p {pid}` exited {}: {}",

@@ -41,6 +41,12 @@ pub mod multipart;
 pub mod path;
 mod scanner;
 pub mod sweep;
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: compiled outside `cfg(test)` — offline construction helpers for tests, benches and the doctor, not production code (docs/style.md §Panics, design 2026-10-09 D7)"
+)]
 pub mod testing;
 #[cfg(test)]
 mod testutil;

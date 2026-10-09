@@ -153,9 +153,18 @@ impl StagedFile {
         self.file.sync_all().await?;
         let etag = match self.hasher {
             Some(hasher) => ETag::Single(hasher.finalize().into()),
-            // The tee's MD5: the raw digest lands in the etag cell before
-            // the stream's final `None`, so the value is there.
-            None => ETag::Single(tee_etag.expect("the etag tee fills the cell at stream end")),
+            None => {
+                // The tee's MD5: the raw digest lands in the etag cell before
+                // the stream's final `None`, so the value is there. A caller
+                // that promised the digest without draining the tee through
+                // this stage is answered with the crate's own error rather
+                // than a panic (design 2026-10-09 D1) — the write fails and
+                // the staged temp is removed by the caller.
+                let digest = tee_etag.ok_or(Error::Invariant(
+                    "the etag tee's promise is filled when the body it wraps drains",
+                ))?;
+                ETag::Single(digest)
+            }
         };
         Ok((self.temp, etag, self.written))
     }
@@ -319,7 +328,9 @@ impl AtomicWriter {
     /// read pass over the temp — the kernel did the copy, so the hash
     /// has no write side to piggyback on) and a content sync (D1 — the
     /// same durability the streaming stage gives). Returns
-    /// `(temp, etag)`; the temp is removed best-effort on failure.
+    /// `(temp, etag)`; the temp is removed best-effort on the closure's
+    /// failure — the join path's own temp is left to the cleanup sweep's
+    /// full `tmp/` clear.
     #[cfg(unix)]
     pub(crate) async fn stage_copy(
         &self,
@@ -355,10 +366,21 @@ impl AtomicWriter {
             Ok::<_, Error>(ETag::Single(digest))
         })
         .await
-        // A panicking copy closure re-panics the caller, consistent with
-        // `meta::ensure_etag`'s blocking-pool hash (a panic is a bug,
-        // not a recoverable IO error).
-        .unwrap_or_else(|join| panic!("the file-copy task panicked: {join}"));
+        // A panicking (or cancelled) copy closure is answered as this call's
+        // failure instead of re-panicking the caller (design 2026-10-09 D1):
+        // nothing is published — the join error returns before the removal
+        // below, so this path's temp is left to the cleanup sweep's full
+        // `tmp/` clear — and the join's own detail goes to the log, while the
+        // error carries only the broken invariant (D5). A task that did not
+        // report a result is a bug, so it is neither swallowed nor classified
+        // as I/O.
+        .map_err(|join| {
+            tracing::error!(
+                error = %join,
+                "the file-copy task did not report a result; the copy is failed, not published"
+            );
+            Error::Invariant("the file-copy task reports its result")
+        })?;
         match result {
             Ok(etag) => Ok((temp, etag)),
             Err(err) => {

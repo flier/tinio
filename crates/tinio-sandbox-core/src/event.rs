@@ -10,12 +10,8 @@ use sse_core::{SseDecoder, SseEvent};
 const DATA: &str = "data: ";
 const EVENT: &str = "event: ";
 
-/// The pinned field limit, in the plain integer the compile-time assertion below can police.
+/// The pinned field limit, in the plain integer [`MAX_FIELD`] refuses a zero for at build time.
 const MAX_FIELD_LIMIT: usize = 64 * 1024;
-
-// A compile-time assertion and not a runtime one: a zero here stops the build, which is
-// what leaves the conversion below with no `None` arm any run could take.
-const _: () = assert!(MAX_FIELD_LIMIT != 0);
 
 /// The largest a single SSE field may be before the decoder discards the frame.
 ///
@@ -31,16 +27,24 @@ const _: () = assert!(MAX_FIELD_LIMIT != 0);
 /// while the relay pinned 64 KiB — the same crate, two limits, and the one this
 /// comment argues against at the site a consumer reaches.
 ///
-/// **The conversion to `NonZeroUsize` is written so that no input can panic it.** The
-/// limit is the plain integer above, and the assertion beside it refuses a zero *at
-/// compile time* — so the match's `None` arm is a build failure rather than a branch
-/// any run reaches. Constitution II forbids `unwrap()` in library code and the
-/// alternatives are worse here: `NonZeroUsize::new_unchecked` is an `unsafe fn` this
-/// crate may not call (`unsafe_code = "forbid"`), and a fallible spelling would have to
-/// answer *something* for the zero that cannot occur — a second limit, silently
-/// different from this one.
+/// **The conversion to `NonZeroUsize` is written so that no input can panic it, and this
+/// `const` is its own compile-time check.** A `const` item's initializer is const-evaluated,
+/// so the arm a zero in the plain integer above would reach is an `E0080` that stops the build
+/// (probed 2026-10-09) rather than a branch any run reaches. That is why the
+/// `const _: () = assert!(…);` that used to sit beside this item is gone: the repo policy test
+/// rejects the assert family in production source with no exception it can see (design
+/// 2026-10-09 D8), while this `const` needs none — the refusal *is* the const evaluation, and
+/// the arm's `#[expect]` states the mechanism. Constitution II forbids `unwrap()` in library
+/// code and the alternatives are worse here: `NonZeroUsize::new_unchecked` is an `unsafe fn`
+/// this crate may not call (`unsafe_code = "forbid"`), and a fallible spelling would have to
+/// answer *something* for the zero that cannot occur — a second limit, silently different from
+/// this one.
 pub(crate) const MAX_FIELD: NonZeroUsize = match NonZeroUsize::new(MAX_FIELD_LIMIT) {
     Some(field) => field,
+    #[expect(
+        clippy::unreachable,
+        reason = "argued: `MAX_FIELD_LIMIT` edited to zero fails const evaluation of this item (E0080, at this arm) rather than reaching it at a run — the check and the conversion are one item, so the constant cannot leave the check behind, and every build of this crate runs it (design 2026-10-09 D2d)"
+    )]
     None => unreachable!(),
 };
 

@@ -502,7 +502,13 @@ impl MultipartOps for MemoryStorage {
                 checksum: record.checksum.clone(),
             });
         }
-        let etag = ETag::composed_from_parts(&infos).expect("parts checked non-empty above");
+        // The parts list is checked non-empty at this operation's entry (the
+        // NoParts refusal above), and every part pushes exactly one info, so a
+        // composed ETag always exists here; the refusal arm keeps the impossible
+        // case an error rather than a panic (style.md §Panics).
+        let Some(etag) = ETag::composed_from_parts(&infos) else {
+            return Err(no_parts());
+        };
         let now = now_nanos();
         let size = data.len() as u64;
         let object_key = ContentKey::Object(key.clone());

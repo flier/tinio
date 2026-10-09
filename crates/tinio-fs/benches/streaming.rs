@@ -4,6 +4,17 @@
 //! rename, ETag MD5 computed inline) and streaming read (full-object
 //! drain). Baselines are recorded in Phase 6 (T088) and regression-gated.
 
+// This bench declares `harness = false`, so clippy's `allow-*-in-tests` keys do
+// not reach it (design 2026-10-09 D7), and a bench is not production code
+// (style.md §Panics covers production sources, D1): its unwraps are fixture
+// assertions, kept as written.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a `harness = false` bench's fixture assertions (docs/style.md §Panics)"
+)]
+
 use std::hint::black_box;
 
 use bytes::Bytes;

@@ -94,13 +94,11 @@ pub fn key(key: impl Into<String>) -> Result<Key, storage::Error> {
 impl From<&str> for Key {
     /// Trusted-input convenience (panics on invalid keys — use [`key`] for
     /// untrusted input).
+    #[expect(
+        clippy::expect_used,
+        reason = "literal: the documented literal API — a `From<&str>` call site is a compile-time object-key fixture, wire input goes through `key`"
+    )]
     fn from(key: &str) -> Self {
-        self::key(key).expect("valid object key")
-    }
-}
-
-impl From<String> for Key {
-    fn from(key: String) -> Self {
         self::key(key).expect("valid object key")
     }
 }
@@ -444,7 +442,8 @@ mod tests {
     fn object_key_from_trusted_literals() {
         let key: Key = "dir/file.txt".into();
         assert_eq!(key.as_ref(), "dir/file.txt");
-        let key2 = Key::from("dir/file.txt".to_string());
+        // An owned string takes the validated ctor (wire payloads).
+        let key2 = super::key("dir/file.txt".to_string()).unwrap();
         assert_eq!(key, key2);
     }
 

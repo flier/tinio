@@ -60,7 +60,12 @@ pub struct Config {
 impl Config {
     /// The effective canonical ID: the configured one, or the spec §6
     /// default `hex(SHA-256(access_key))` (validated at config parse;
-    /// valid by construction).
+    /// valid by construction — the `#[expect]` below carries the written
+    /// argument).
+    #[expect(
+        clippy::expect_used,
+        reason = "argued: a configured `canonical_id` is validated at config parse — `validate_canonical_id_opt` is this field's garde rule (`schema/mod.rs`) and runs inside `Config::parse`/`Config::load`, and the `None` arm derives instead; the `pub` field's remaining hole is a hand-built struct, and no in-repo production caller builds one (checked 2026-10-09)"
+    )]
     pub fn resolved_canonical_id(&self) -> OwnerId {
         match &self.canonical_id {
             Some(id) => {

@@ -9,6 +9,7 @@ A feature large enough to need a design document usually needs more than one pla
 - Task done + review pass → tick that task's `- [ ]` boxes.
 - Skip deliberately → leave unticked + one-line why.
 - Ticked = step happened.
+- Subagent-run execution: the dispatcher ticks the task's boxes and writes its Evidence line once the task's review passes; a task's subagents never edit the plan — parallel tasks share that file and would collide on it.
 
 ## One definer per fact
 

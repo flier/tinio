@@ -372,13 +372,12 @@ where
         // composite order. A plain row's order is owned — only the
         // caller can build it, so it is materialized up front; a rollup
         // row's prefix stays borrowed through the checks.
-        let composite = match cp {
-            Some(_) => None,
-            None => Some(order_of(&item)),
-        };
-        let view: &str = match composite {
-            Some(ref order) => order,
-            None => cp.expect("a rollup row borrows its prefix"),
+        let composite = cp.is_none().then(|| order_of(&item));
+        // Exactly one of the two is present — `order_of` runs when, and
+        // only when, `cp` is absent — so the guard carries the invariant
+        // instead of asserting it; the absent-in-both arm is unreachable.
+        let Some(view) = composite.as_deref().or(cp) else {
+            return;
         };
         // Exclusive-after marker — BEFORE the rollup dedup (see the
         // divergence note on the function: a marker-skipped prefix is
@@ -400,9 +399,12 @@ where
         if heap_evict_larger(&mut self.heap, &mut self.heap_prefixes, view, cap) {
             return;
         }
-        let order = match composite {
-            Some(order) => order,
-            None => cp.expect("a rollup row borrows its prefix").to_string(),
+        // The view's borrow ends with the materialization: the composite is
+        // owned already, the rollup's prefix is copied now, at admission.
+        // Both absent cannot happen (see the view above); dropping the entry
+        // is the same rejection the checks above make.
+        let Some(order) = composite.or_else(|| cp.map(str::to_string)) else {
+            return;
         };
         heap_push(
             &mut self.heap,
@@ -566,10 +568,17 @@ fn heap_evict_larger<T>(
     if heap.len() < cap {
         return false; // room — no eviction needed
     }
-    if view >= heap.peek().expect("non-empty heap").order.as_str() {
+    // `heap.len() >= cap >= 1` here, so an entry exists; the absent arm is
+    // unreachable and fail-closed on either side.
+    let Some(largest) = heap.peek() else {
+        return false;
+    };
+    if view >= largest.order.as_str() {
         return true; // rejected — the caller drops the entry
     }
-    let displaced = heap.pop().expect("non-empty heap");
+    let Some(displaced) = heap.pop() else {
+        return false;
+    };
     if displaced.item.is_none() {
         heap_prefixes.remove(&displaced.order);
     }

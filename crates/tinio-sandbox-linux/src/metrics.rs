@@ -64,6 +64,10 @@ impl ReadOnlyArm {
 /// A gauge rather than a counter: the fact is *which* arm this run used, not how many times an
 /// exposure used it, and two exposures that took different arms set two labels rather than
 /// summing into one unreadable number.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: every error this registration can answer is about this family's own name — prometheus 0.14's `RegistryCore::register` refuses a name the process-global default registry already holds (`AlreadyReg`) or holds with a different label set or help string (`Msg`) — and the name has exactly one registration site in the repo (this `LazyLock`, whose closure runs once per process), with the family list owned by `specs/001-s3-local-server/data-model.md`'s `## Metrics`; a collision is a source-level mistake the registry refuses here, not a runtime condition, and `LazyLock::new` has no `Result` to return it through. No dedicated name-uniqueness test exists (checked 2026-10-09): the registry's refusal, which this `expect` renders, is the mechanism (design 2026-10-09 D2d)"
+)]
 static READ_ONLY_ARM: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "tinio_sandbox_read_only_arm",
@@ -78,6 +82,10 @@ static READ_ONLY_ARM: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 ///
 /// **Both answers are recorded, so the family is not merely present but readable in either
 /// state**: a `0` is the assertion that the network cut landed, which an absence could not make.
+#[expect(
+    clippy::expect_used,
+    reason = "argued: the same argument as `READ_ONLY_ARM` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against a family list owned by `specs/001-s3-local-server/data-model.md`'s `## Metrics`; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
+)]
 static SECCOMP_SKIPPED: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "tinio_sandbox_seccomp_skipped",

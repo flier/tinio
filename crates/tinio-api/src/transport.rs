@@ -39,7 +39,7 @@ use std::{
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 #[cfg(feature = "tls")]
@@ -537,25 +537,31 @@ impl Pool {
         Arc::try_unwrap(slot).ok()?.into_inner().ok()?.take()
     }
 
-    /// The inner stream, for the poll that is running now. The mutex's poison case is a bug
-    /// rather than a state this loop can be in: no crate code panics while holding the guard.
+    /// The inner stream, for the poll that is running now. A poisoned lock is recovered rather
+    /// than unwrapped: the guard is held only across a short invariant-preserving mutation, so
+    /// its poison flag cannot describe a half-written slot (style.md §Panics, D3).
     fn held(&self) -> MutexGuard<'_, Option<NamedPipeServer>> {
-        self.slot
-            .lock()
-            .expect("the instance slot is not poisoned while a connection is served")
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// `body` against the instance in the slot, with the guard taken and given back around it —
     /// **the one spelling of the forwarded-poll shape**, so the four `AsyncWrite` methods and the
     /// read retry below cannot disagree about it.
+    ///
+    /// An empty slot is answered as this connection's own I/O error rather than a panic: the
+    /// instance is taken out only by [`Pool::release`], on the frame holding the other `Arc`, so
+    /// an empty slot means this connection outlived the instance it was served on — a connection
+    /// to end, not a process to take down.
     fn with_instance<T>(
         &mut self,
-        body: impl for<'a> FnOnce(Pin<&'a mut NamedPipeServer>) -> T,
-    ) -> T {
-        let mut held = self.held();
-        body(Pin::new(held.as_mut().expect(
-            "the instance is in the slot for the connection's life",
-        )))
+        body: impl for<'a> FnOnce(Pin<&'a mut NamedPipeServer>) -> Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        match self.held().as_mut() {
+            Some(instance) => body(Pin::new(instance)),
+            None => Poll::Ready(Err(io::Error::other(
+                "the connection's pipe instance is no longer in its slot",
+            ))),
+        }
     }
 }
 
@@ -1981,10 +1987,7 @@ impl Plane {
     /// ```
     pub async fn serve(&self, stop: watch::Receiver<bool>) -> Result<(), Error> {
         let transport = self
-            .transport
-            .lock()
-            .map_err(|_| Error::Internal("the plane's transport lock was poisoned".to_string()))?
-            .take()
+            .release_transport()
             .ok_or_else(|| Error::Internal("the plane is already serving".to_string()))?;
 
         // The metrics reader starts here, the one place that has both the `Arc<Gauges>` and the
@@ -2119,16 +2122,35 @@ impl Plane {
             _ => Ok(()),
         }
     }
+
+    /// The plane's transport, taken out of its slot under this file's one lock rule (D3): a
+    /// poisoned lock is recovered with `PoisonError::into_inner`, never unwrapped and never
+    /// propagated.
+    ///
+    /// **One method for the two sites that take it, because they must agree.** `serve` takes the
+    /// transport it is about to run; `Drop` takes whatever a startup left behind. A poison flag
+    /// says a lock holder panicked somewhere else, which is no statement at all about the slot —
+    /// and it used to be read as one at both sites: `serve` turned it into an `Error::Internal`
+    /// naming the lock, failing a legitimate start for a reason that says nothing about the plane,
+    /// and `Drop` read `if let Ok(…)` and skipped the take, leaving the transport — and the
+    /// listener it owns — to the field's own drop instead of releasing it before `remove_owned`.
+    /// Recovering answers both: `serve` sees the slot it actually has, and `Drop` still empties it.
+    fn release_transport(&self) -> Option<Transport> {
+        self.transport
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
 }
 
 impl Drop for Plane {
     /// Best-effort backstop only — the paths that matter call [`Plane::shutdown`], and this runs
     /// the same ownership-checked deletion (`Plane::remove_owned`) one last time. Errors are
-    /// deliberately swallowed: nothing may panic on the way out of a failed startup.
+    /// deliberately swallowed: nothing may panic on the way out of a failed startup, and the
+    /// transport release is `Plane::release_transport`'s, so a poisoned slot is emptied here
+    /// too rather than skipped.
     fn drop(&mut self) {
-        if let Ok(mut transport) = self.transport.lock() {
-            transport.take();
-        }
+        let _ = self.release_transport();
         let _ = self.remove_owned();
     }
 }
@@ -2159,6 +2181,15 @@ async fn serve_transport(
     }
 }
 
+// This test module's `unreachable!`s close the tests' own control flow: `LocalForm` selections
+// the tests made themselves, and a `for` loop whose exits are its `assert!` and its `return`.
+// `clippy.toml`'s in-tests keys reach the unwrap/expect/panic family only — `unreachable` has no
+// `allow-*-in-tests` key (design 2026-10-09 D7) — so the module carries the stated allow the rule
+// calls for (docs/style.md §Panics).
+#[allow(
+    clippy::unreachable,
+    reason = "test context: these `unreachable!`s close the tests' own control flow — `LocalForm` selections the tests made themselves and a `for` loop whose exits are its `assert!` and its `return` (docs/style.md §Panics)"
+)]
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -2188,6 +2219,7 @@ mod tests {
     // and TLS legs of this module name it.
     use std::{
         net::{SocketAddr, TcpListener},
+        panic,
         path::{Path, PathBuf},
         process,
     };
@@ -2390,6 +2422,60 @@ mod tests {
             State::read(dir.path()).expect("read").is_none(),
             "dropping the plane removes the state file it published"
         );
+    }
+
+    /// The D3 rule at both sites that take the plane's transport, pinned because each of them
+    /// used to read the poison flag as a fact about the plane: `serve` propagated it as an
+    /// `Error::Internal` naming the lock, and `Drop` skipped the take outright.
+    ///
+    /// **`serve`'s half, and the slot is emptied first so the answer says which code ran.** A
+    /// recovered guard finds `None` and refuses with "already serving"; the propagation this
+    /// replaced answered about the lock instead, which would have failed a legitimate start for a
+    /// reason that names neither the plane nor its state.
+    #[tokio::test]
+    async fn a_poisoned_transport_lock_still_refuses_the_second_serve() {
+        let dir = TempDir::new().expect("temp dir");
+        let plane = plane(dir.path());
+        assert!(
+            plane.release_transport().is_some(),
+            "the bind leaves the transport in the slot"
+        );
+        poison(&plane.transport);
+        let (_stop, rx) = watch::channel(false);
+        let err = plane
+            .serve(rx)
+            .await
+            .expect_err("a plane with no transport left cannot serve");
+        assert!(
+            matches!(&err, Error::Internal(message) if message == "the plane is already serving"),
+            "the recovered lock reaches the take: {err:?}"
+        );
+    }
+
+    /// **`Drop`'s half, and it is the take itself.** `if let Ok(…)` skipped it on a poisoned
+    /// lock, so a plane dropped mid-startup kept its transport — and the listener under it —
+    /// alive past the backstop that exists to release it. `release_transport` is the body `Drop`
+    /// runs, so this is that path.
+    #[test]
+    fn a_poisoned_transport_lock_still_yields_the_transport() {
+        let dir = TempDir::new().expect("temp dir");
+        let plane = plane(dir.path());
+        poison(&plane.transport);
+        assert!(
+            plane.release_transport().is_some(),
+            "the poisoned lock still hands the transport over"
+        );
+    }
+
+    /// Poisons `lock` the way a panicking holder does — the guard is dropped while a thread
+    /// unwinds through it. The panic is caught and asserted, so the poisoning is a fact this
+    /// helper establishes rather than a failure of the test that asked for it.
+    fn poison(lock: &Mutex<Option<Transport>>) {
+        let unwound = panic::catch_unwind(|| {
+            let _guard = lock.lock().expect("a fresh lock");
+            panic!("poison the lock");
+        });
+        assert!(unwound.is_err(), "the poisoning panic was caught");
     }
 
     /// **The two answers `state_for` has, and why the difference is load-bearing.** A plane that

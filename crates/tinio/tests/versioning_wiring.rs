@@ -23,6 +23,16 @@
 //! carrier above them was broken, and there would be no seam left to check.
 
 #![cfg(feature = "versioning")]
+// **A test-support root (docs/style.md §Panics), and a stated one because clippy's test keys do
+// not reach it** (design 2026-10-09 D7): `allow-*-in-tests` covers `#[test]` functions and
+// `#[cfg(test)]` modules, while the round-trip helper both legs call is a plain `fn` in an
+// integration target.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a test target's harness helpers (docs/style.md §Panics)"
+)]
 
 use tinio::{Storage, bucket, object};
 use tinio_core::{

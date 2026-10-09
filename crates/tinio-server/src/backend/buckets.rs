@@ -70,25 +70,25 @@ impl<S: Storage> S3Backend<S> {
         #[cfg(feature = "acl")]
         use crate::_core::acl::Acl;
         #[cfg(feature = "acl")]
-        let write_acl: Option<(acl::OwnerId, Acl)> = if self.caps.acl && self.identity.is_some() {
-            let owner = self
-                .owner_for(req.credentials.as_ref())
-                .expect("identity attached above");
-            let acl = bucket_write_acl(
-                &owner,
-                req.input.acl.as_ref().map(|c| c.as_str()),
-                &grant_headers(
-                    req.input.grant_full_control.as_deref(),
-                    req.input.grant_read.as_deref(),
-                    req.input.grant_read_acp.as_deref(),
-                    req.input.grant_write.as_deref(),
-                    req.input.grant_write_acp.as_deref(),
-                ),
-            )?;
-            Some((owner, acl))
-        } else {
-            None
-        };
+        let write_acl: Option<(acl::OwnerId, Acl)> =
+            if let Some(owner) = self.principal_for(req.credentials.as_ref())? {
+                let acl = bucket_write_acl(
+                    &owner,
+                    req.input.acl.as_ref().map(|c| c.as_str()),
+                    &grant_headers(
+                        req.input.grant_full_control.as_deref(),
+                        req.input.grant_read.as_deref(),
+                        req.input.grant_read_acp.as_deref(),
+                        req.input.grant_write.as_deref(),
+                        req.input.grant_write_acp.as_deref(),
+                    ),
+                )?;
+                Some((owner, acl))
+            } else {
+                // No identity attached (or the toggle off): the Task 5
+                // defaults below record the empty owner wire.
+                None
+            };
         #[cfg(not(feature = "acl"))]
         use crate::_core::acl::Acl;
         #[cfg(not(feature = "acl"))]
@@ -198,19 +198,16 @@ impl<S: Storage> S3Backend<S> {
         // the unfiltered legacy listing (`None, None`).
         #[cfg(feature = "acl")]
         let (owner, lazy_default): (Option<acl::OwnerId>, Option<acl::OwnerId>) =
-            match (self.caps.acl, self.identity.as_ref()) {
-                // Fail-closed (fix-round Minor #2): the enforced filter
-                // must never degrade to the unfiltered listing via an
-                // unresolved principal — the identity is present here, so
-                // the resolution cannot fail (the same invariant as the
-                // write paths' `owner_for(...).expect`).
-                (true, Some(identity)) => {
-                    let principal = self
-                        .owner_for(req.credentials.as_ref())
-                        .expect("identity attached above");
-                    (Some(principal), Some(identity.default_owner.clone()))
-                }
-                _ => (None, None),
+            if let Some(principal) = self.principal_for(req.credentials.as_ref())? {
+                // Fail-closed (fix-round Minor #2): the enforced filter must
+                // never degrade to the unfiltered listing via an unresolved
+                // principal — `principal_for` answers the resolution or the
+                // request fails, and its `None` is the no-identity / toggle-off
+                // mode's own. The lazy default is `row_owner`'s — the same
+                // resolution the walk compares against.
+                (Some(principal), Some(self.row_owner(None)))
+            } else {
+                (None, None)
             };
         #[cfg(not(feature = "acl"))]
         let (owner, lazy_default): (Option<acl::OwnerId>, Option<acl::OwnerId>) = (None, None);

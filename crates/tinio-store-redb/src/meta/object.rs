@@ -40,7 +40,7 @@ use redb::{ReadableTable, WriteTransaction};
 use crate::{
     _core::{
         acl, bucket,
-        etag::ETag,
+        etag::{self, ETag},
         meta::{
             Metadata, ObjectMeta,
             object::{Identity, PartRow, Preserved, Row},
@@ -141,10 +141,19 @@ fn part_row(part: &PartRow) -> object_part::Stored {
     }
 }
 
-/// The parse failure behind a row [`object_meta::validate`] rejected: the etag is the one
-/// element that decides the whole row, so the failure carries it.
+/// The failure behind a row [`object_meta::validate`] rejected: the etag is the
+/// one element that decides the whole row, so the failure is that element's own
+/// parse failure — the only `?` in `validate`'s body.
+///
+/// A rejected row's etag never parses, so the `Ok` arm answers the canonical
+/// malformed-etag failure ([`etag::Error::InvalidFormat`], the same
+/// [`storage::Error`] variant the failing arm carries) rather than panicking on
+/// a row that cannot be served either way (style.md §Panics).
 fn invalid_etag(etag: &str) -> storage::Error {
-    ETag::new(etag).expect_err("a row rejected by object_meta::validate has an invalid etag")
+    match ETag::new(etag) {
+        Ok(_) => etag::Error::InvalidFormat.into(),
+        Err(rejected) => rejected,
+    }
 }
 
 /// The strict traversal's corrupt-row outcome: the row named, the validation

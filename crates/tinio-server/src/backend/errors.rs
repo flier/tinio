@@ -76,7 +76,17 @@ pub(crate) fn map_backend_error<E: Into<StorageError>>(err: E) -> S3Error {
             );
             s3_error!(AccessDenied)
         }
-        StorageError::Io(err) => s3_error!(InternalError, "storage I/O error: {err}"),
+        // D5: the detail is the log's, never the body's. A backend `Io` can
+        // wrap tinio-fs's `Invariant` (that crate's `From<Error> for
+        // storage::Error`), whose `Debug` names the broken invariant while its
+        // `Display` stays generic — so reflecting `Display` here would drop
+        // the one diagnostic there is; an OS error's text, in turn, can embed
+        // on-disk paths (the rule the select mapping applies). Log the whole
+        // error and answer the generic 500.
+        StorageError::Io(err) => {
+            tracing::error!(error = ?err, "storage I/O error");
+            s3_error!(InternalError)
+        }
     }
 }
 
@@ -191,6 +201,21 @@ mod tests {
         for (storage_err, expected) in cases {
             assert_eq!(s3_code(storage_err), expected);
         }
+    }
+
+    #[test]
+    fn an_io_detail_stays_out_of_the_body() {
+        // D5 (carried from the A1 review): the detail is the log's. A storage
+        // `Io` is where tinio-fs's `Invariant` lands, so reflecting its text
+        // would put an internal symbol (or an on-disk path) in the response;
+        // the client sees the code and nothing else.
+        let err = map_backend_error(StorageError::Io(IoError::other("secret/path")));
+        assert_eq!(err.code().as_str(), "InternalError");
+        assert!(
+            !err.message().unwrap_or_default().contains("secret/path"),
+            "the internal detail is not reflected: {:?}",
+            err.message()
+        );
     }
 
     #[test]

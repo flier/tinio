@@ -85,14 +85,18 @@ pub(crate) fn settings() -> ReaderSettings {
 }
 
 /// `current_position(false).data_pos`: the offset of the last consumed byte,
-/// which struson always reports for a stream reader. The handlers' own free
-/// function: the matcher never samples a position, so it is not a
-/// `ValueSource` member.
-pub(crate) fn position<R: JsonReader>(reader: &R) -> u64 {
+/// which the stream reader always reports — struson's `JsonStreamReader`
+/// fills `data_pos` on every position it builds (`stream_reader.rs`), and the
+/// `Option` is the trait's generic shape, not a state this reader reaches.
+/// The handlers' own free function: the matcher never samples a position, so
+/// it is not a `ValueSource` member.
+pub(crate) fn position<R: Read>(reader: &JsonStreamReader<R>) -> Result<u64, Error> {
     reader
         .current_position(false)
         .data_pos
-        .expect("JsonStreamReader always reports data_pos")
+        .ok_or(Error::Invariant(
+            "the struson stream reader reports a data position",
+        ))
 }
 
 /// The stream reader both handlers drive, named here so that the same rule that

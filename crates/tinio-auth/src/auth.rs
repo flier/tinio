@@ -5,10 +5,9 @@ use std::sync::Arc;
 use s3s::{
     S3Result,
     auth::{S3Auth, SecretKey},
-    s3_error,
 };
 
-use crate::identity::Identity;
+use crate::identity::{Identity, invalid_access_key_id};
 
 /// The s3s `S3Auth` provider: resolves the secret per configured user;
 /// an unknown access key answers `InvalidAccessKeyId` (the root-only
@@ -29,10 +28,7 @@ impl S3Auth for ConfigAuth {
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
         match self.identity.users.get(access_key) {
             Some(user) => Ok(user.secret.clone()),
-            None => Err(s3_error!(
-                InvalidAccessKeyId,
-                "The AWS Access Key Id you provided does not exist in our records."
-            )),
+            None => Err(invalid_access_key_id()),
         }
     }
 }

@@ -767,7 +767,18 @@ pub fn supervise(child: &mut Child, teardown: impl FnOnce()) -> Result<ExitStatu
     status
 }
 
+// **The stated allow D7 gives a test context clippy's in-tests keys cannot reach**
+// (`docs/style.md` §Panics: the panic family is free in tests — this module is one — but
+// `allow-unreachable-in-tests` does not exist, and clippy's three in-tests keys cover only
+// `unwrap`/`expect`/`panic`). The six `unreachable!()` closures the fixtures below hand
+// `Child::new` are each a `wait` arm a test deliberately never runs, and they are what the
+// crate's new rows would otherwise fail the gate on. Scoped to the module rather than the
+// file, so the production code above keeps the lint.
 #[cfg(test)]
+#[allow(
+    clippy::unreachable,
+    reason = "test context: `unreachable!` in the fixtures' never-run `wait` closures (docs/style.md §Panics, design 2026-10-09 D7)"
+)]
 mod tests {
     use std::{
         cell::RefCell,

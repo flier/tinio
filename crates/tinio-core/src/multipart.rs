@@ -72,6 +72,14 @@ pub fn part_number(n: u32) -> Result<PartNumber, storage::Error> {
 impl From<u32> for PartNumber {
     /// Trusted-input convenience (panics on an invalid number — use
     /// [`part_number`] for untrusted input).
+    // A stored row's `u32` is the row's data, not this API's: the backends
+    // and this crate's projections read it through [`part_number`] (or the
+    // `TryFrom<PartRow>` projection for `multipart::ObjectPart`), which
+    // refuses it with `InvalidPartNumber` instead of panicking.
+    #[expect(
+        clippy::expect_used,
+        reason = "literal: the trusted-number API — every call site is a compile-time part-number literal; a stored row's number goes through `part_number()`"
+    )]
     fn from(n: u32) -> Self {
         part_number(n).expect("valid part number")
     }

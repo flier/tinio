@@ -29,6 +29,17 @@
 //! serves unsigned requests, exactly as the cucumber harness drives its
 //! servers.
 
+// **A stated exemption because clippy's test keys do not reach it**
+// (docs/style.md §Panics, design 2026-10-09 D7): `allow-*-in-tests` covers
+// `#[test]` functions and `#[cfg(test)]` modules, while this target's fixtures
+// ([`Scratch`], [`Plane`]) are plain structs with helper `fn`s outside one.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a test target's harness helpers (docs/style.md §Panics)"
+)]
+
 mod common;
 
 use std::{

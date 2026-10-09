@@ -138,8 +138,13 @@ use std::{io::Error as IoError, sync::Arc, time::SystemTime};
 #[cfg(feature = "multipart")]
 const CHECKSUM_SPEC_CACHE_CAP: usize = 8192;
 
+#[cfg(feature = "select")]
+use std::sync::OnceLock;
 #[cfg(feature = "multipart")]
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, PoisonError},
+};
 
 pub(crate) use conditions::{
     ConditionalHeaders, DeleteConditions, check_write_shape, checked_if_match_size, decide_fetch,
@@ -324,13 +329,17 @@ pub struct S3Backend<S: Storage> {
     /// response stream (dropped on end or cancel).
     #[cfg(feature = "select")]
     pub(crate) select_semaphore: Arc<Semaphore>,
-    /// Pre-sized rayon pool for the sync select engine (same width as
+    /// The rayon pool for the sync select engine (same width as
     /// [`Self::select_semaphore`], stack
     /// [`Capabilities::select_stack_bytes`] — X3 parquet/arrow recursion).
     /// Reuses threads across jobs instead of `thread::Builder::spawn` per
-    /// request.
+    /// request. **Built on first use**, through [`Self::select_pool`]:
+    /// pool construction is fallible (it spawns OS threads), and the
+    /// select op is the site that has a `Result` to answer a refused build
+    /// through, so no constructor panics for every connection (design
+    /// 2026-10-09 D5).
     #[cfg(feature = "select")]
-    pub(crate) select_pool: Arc<ThreadPool>,
+    pub(crate) select_pool: Arc<OnceLock<Arc<ThreadPool>>>,
     /// The identity map (feature `acl`): `Some` = the auth-configured
     /// principals and default owner, `None` = the legacy/no-identity
     /// mode (the ACL ops answer with the core default-owner pair and
@@ -366,14 +375,7 @@ impl<S: Storage> S3Backend<S> {
             #[cfg(feature = "select")]
             select_semaphore: Arc::new(Semaphore::new(caps.select_concurrency as usize)),
             #[cfg(feature = "select")]
-            select_pool: Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(caps.select_concurrency as usize)
-                    .stack_size(caps.select_stack_bytes as usize)
-                    .thread_name(|i| format!("tinio-select-{i}"))
-                    .build()
-                    .expect("select rayon pool"),
-            ),
+            select_pool: Arc::new(OnceLock::new()),
             #[cfg(feature = "acl")]
             identity: None,
         }
@@ -396,6 +398,37 @@ impl<S: Storage> S3Backend<S> {
     /// The capability toggles.
     pub fn capabilities(&self) -> Capabilities {
         self.caps
+    }
+
+    /// The select job pool (X3), built on first use: a rayon pool whose
+    /// threads carry [`Capabilities::select_stack_bytes`] — parquet footer
+    /// schema recursion and `arrow_json` nesting would otherwise abort the
+    /// process on a stack overflow (`catch_unwind` cannot hold one). The
+    /// build spawns OS threads, so it is fallible; the refusal is logged
+    /// and answered as the request's generic 500 (design 2026-10-09 D5:
+    /// the detail stays in the log, the body carries no internal string).
+    #[cfg(feature = "select")]
+    pub(crate) fn select_pool(&self) -> S3Result<Arc<ThreadPool>> {
+        if let Some(pool) = self.select_pool.get() {
+            return Ok(Arc::clone(pool));
+        }
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(self.caps.select_concurrency as usize)
+                .stack_size(self.caps.select_stack_bytes as usize)
+                .thread_name(|i| format!("tinio-select-{i}"))
+                .build()
+                .map_err(|err| {
+                    tracing::error!(
+                        error = %err,
+                        "select job pool could not be built — select requests answer 500"
+                    );
+                    s3_error!(InternalError, "select job pool unavailable")
+                })?,
+        );
+        // A concurrent first use may have won the race: the winner's pool is
+        // the one stored, and this call still answers with a pool either way.
+        Ok(Arc::clone(self.select_pool.get_or_init(|| pool)))
     }
 
     /// The bucket of a request input, validated (FR-012).
@@ -455,7 +488,7 @@ impl<S: Storage> S3Backend<S> {
         if let Some(spec) = self
             .checksum_specs
             .lock()
-            .expect("checksum-spec cache poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(upload_id)
             .cloned()
         {
@@ -486,7 +519,7 @@ impl<S: Storage> S3Backend<S> {
         let mut map = self
             .checksum_specs
             .lock()
-            .expect("checksum-spec cache poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         map.insert(upload_id, spec);
         if map.len() > CHECKSUM_SPEC_CACHE_CAP
             && let Some(id) = map.keys().next().cloned()
@@ -502,7 +535,7 @@ impl<S: Storage> S3Backend<S> {
     pub(crate) fn evict_checksum_spec(&self, upload_id: &str) {
         self.checksum_specs
             .lock()
-            .expect("checksum-spec cache poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .remove(upload_id);
     }
 
@@ -536,11 +569,40 @@ impl<S: Storage> S3Backend<S> {
     /// no-identity mode — the row records the empty owner wire (review
     /// B4, never the default owner). The write paths resolve through it;
     /// the ACL ops use the row-owner resolution instead.
+    ///
+    /// The resolution is fallible — credentials naming an access key the
+    /// map does not carry are refused with the `InvalidAccessKeyId` their
+    /// signature was verified under, never a panic — so a caller must
+    /// propagate that refusal instead of reading `None` (which is the
+    /// no-identity mode alone) as "the identity is attached".
     #[cfg(feature = "acl")]
-    pub(crate) fn owner_for(&self, credentials: Option<&Credentials>) -> Option<acl::OwnerId> {
-        self.identity
-            .as_ref()
-            .map(|identity| identity.principal(credentials))
+    pub(crate) fn owner_for(
+        &self,
+        credentials: Option<&Credentials>,
+    ) -> S3Result<Option<acl::OwnerId>> {
+        match self.identity.as_ref() {
+            Some(identity) => identity.principal(credentials).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The request's principal under the enforced ACL mode — the ONE spelling
+    /// of the "enforced mode resolves the requester" gate (create, listing
+    /// filter, per-key delete gate). The toggle on: [`Self::owner_for`]'s
+    /// resolution, fail-closed — an unresolved principal is the request
+    /// failure that function answers, never a silent `None` read as
+    /// "no identity". The toggle off (or no identity attached): `None`, and
+    /// the caller keeps its legacy path.
+    #[cfg(feature = "acl")]
+    pub(crate) fn principal_for(
+        &self,
+        credentials: Option<&Credentials>,
+    ) -> S3Result<Option<acl::OwnerId>> {
+        if self.caps.acl {
+            self.owner_for(credentials)
+        } else {
+            Ok(None)
+        }
     }
 
     /// The lazy-resolved owner of a row (review B4): the recorded owner
@@ -574,12 +636,14 @@ impl<S: Storage> S3Backend<S> {
         canned: Option<&str>,
         headers: GrantHeaders<'_>,
     ) -> S3Result<Option<(acl::OwnerId, Acl)>> {
-        if !self.caps.acl || self.identity.is_none() {
+        if !self.caps.acl {
             return Ok(None);
         }
-        let owner = self
-            .owner_for(credentials)
-            .expect("identity attached above");
+        let Some(owner) = self.owner_for(credentials)? else {
+            // No identity attached: the toggle-off above's shape — there is
+            // no requester to record and no owner to expand against.
+            return Ok(None);
+        };
         let bucket_owner = if matches!(
             canned,
             Some("bucket-owner-read" | "bucket-owner-full-control")

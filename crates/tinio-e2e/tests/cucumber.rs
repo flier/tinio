@@ -31,6 +31,19 @@
 //! failures — a feature/step that drifts out of sync with its step
 //! definitions must fail the run, never pass silently as "skipped".
 
+// **A `harness = false` root (docs/style.md §Panics), and a stated exemption because clippy's
+// test keys do not reach the whole target it roots** (design 2026-10-09 D7): the target is not
+// built as a test, so nothing in it — this file's runner or `steps/`, which inherits this level
+// — is a test context as far as `allow-*-in-tests` is concerned. `tinio-e2e` is outside the
+// cleanup (design non-goals); this one allow is what keeps its rows from firing on a suite the
+// plan does not convert.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a `harness = false` target's helpers (docs/style.md §Panics)"
+)]
+
 use std::{env, fs::File, io, process, thread};
 #[doc(hidden)]
 pub extern crate tinio_core as _core;

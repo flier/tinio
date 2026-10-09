@@ -32,7 +32,7 @@ use crate::{
         BodyStream, ETag, acl,
         acl::{Acl, AclGrants},
         bucket, checksum,
-        multipart::ObjectPart,
+        multipart::{ObjectPart, part_number},
         object::{self, Info, Tags},
         storage,
         storage::{
@@ -1538,15 +1538,19 @@ impl ObjectOps for FsStorage {
                     .map_err(Into::into)
             })
             .map_err(Error::from)?;
-        let parts = rows
-            .into_iter()
-            .map(|row| ObjectPart {
-                part_number: row.part_number.into(),
-                size: row.size,
-                checksum: row.checksum,
+        // A stored part number is the row's, not a literal: it takes the
+        // validated constructor, so a row this crate did not write (0 or
+        // > 10000) is refused with `InvalidPartNumber` instead of panicking
+        // a `list_object_parts` read.
+        rows.into_iter()
+            .map(|row| {
+                Ok(ObjectPart {
+                    part_number: part_number(row.part_number)?,
+                    size: row.size,
+                    checksum: row.checksum,
+                })
             })
-            .collect();
-        Ok(parts)
+            .collect::<Result<Vec<_>, Error>>()
     }
 
     async fn list_objects(&self, params: ListObjectsParams) -> Result<ObjectListing, Error> {

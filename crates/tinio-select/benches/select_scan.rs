@@ -60,6 +60,17 @@
 //! stream with its error item (the `S3QueryError` shape) instead of evaluating
 //! every wildcard pair of every record.
 
+// This bench declares `harness = false`, so clippy's `allow-*-in-tests` keys do
+// not reach it (design 2026-10-09 D7), and a bench is not production code
+// (style.md §Panics covers production sources, D1): its unwraps and panics are
+// fixture assertions, kept as written.
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "test support: a `harness = false` bench's fixture assertions (docs/style.md §Panics)"
+)]
+
 use std::{
     hint::black_box,
     io::{self, BufRead, BufReader, Cursor, Read},

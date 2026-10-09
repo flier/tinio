@@ -7,7 +7,14 @@
 //! out-of-band steps (`I write … in the served root`) build the inner
 //! state directly on disk, not through the S3 API.
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+#[cfg(windows)]
+use std::process::Command;
+
 use cucumber::{given, then};
+#[cfg(windows)]
+use tinio_util::testing::job;
 use tokio::fs;
 
 use super::common::plant_in_root;
@@ -56,20 +63,17 @@ async fn link_in_root(world: &mut super::World, rel: String) {
     let target = parent.join(format!("{}-outside", rel.replace('/', "_")));
     fs::create_dir_all(&target).await.unwrap();
     #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-    #[cfg(unix)]
     symlink(&target, &link).unwrap();
     #[cfg(windows)]
     {
-        use std::process::Command;
         // `mklink` parses the destination with cmd's tokenizer: normalize
         // to the native separator first (a forward slash reads as a switch).
         let dst = link.to_string_lossy().replace('/', "\\");
         let src = target.to_string_lossy().replace('/', "\\");
-        let status = Command::new("cmd")
-            .args(["/C", "mklink", "/J", &dst, &src])
-            .status()
-            .expect("run mklink");
+        let mut command = Command::new("cmd");
+        command.args(["/C", "mklink", "/J", &dst, &src]);
+        let mut child = job::spawn(&mut command).expect("run mklink");
+        let status = child.wait().expect("run mklink");
         assert!(
             status.success(),
             "mklink /J failed for {link:?} -> {target:?}"

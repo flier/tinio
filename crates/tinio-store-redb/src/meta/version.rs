@@ -29,7 +29,7 @@ use crate::{
         bucket,
         meta::{
             VersionMeta,
-            version::{Current, Stored},
+            version::{Current, Kind as ContractKind, Stored},
         },
         object, storage,
         version::{self as contract, Id, State},
@@ -42,11 +42,24 @@ use crate::{
     version_index::Table as IndexTable,
 };
 
+/// The table kind of a contract row's kind: the two enumerations carry the same
+/// two wires (the contract's `Kind::as_wire` produces exactly what the table's
+/// `Kind` parses), so the mapping is total — a contract-side kind the table
+/// cannot store is a compile error here, never a runtime parse failure
+/// (style.md §Panics: eliminate over annotate).
+fn table_kind(kind: ContractKind) -> RowKind {
+    match kind {
+        ContractKind::Object => RowKind::Object,
+        ContractKind::Marker => RowKind::Marker,
+    }
+}
+
 /// Encode one contract row into the table layer's row: the elements
-/// [`Stored::to_raw`] emits are the table's value tuple in order, and the
-/// row's sequence is the key's third element.
+/// [`Stored::to_raw`] emits are the table's value tuple in order — the kind
+/// element among them is the typed field's [`table_kind`] mapping, the same
+/// wire — and the row's sequence is the key's third element.
 fn table_row(stored: &Stored) -> VersionRow {
-    let (id, blob, size, etag, created, became_noncurrent, kind, tags, checksum, owner, acl) =
+    let (id, blob, size, etag, created, became_noncurrent, _kind, tags, checksum, owner, acl) =
         stored.to_raw();
     VersionRow {
         id,
@@ -55,9 +68,7 @@ fn table_row(stored: &Stored) -> VersionRow {
         etag,
         created,
         became_noncurrent,
-        kind: kind
-            .parse()
-            .expect("the contract kind wire names a table kind"),
+        kind: table_kind(stored.kind),
         tags,
         checksum,
         owner,

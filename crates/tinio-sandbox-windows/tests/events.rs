@@ -6,6 +6,18 @@
 //! write into libtest's own capture, where nothing can be read back.
 
 #![cfg(target_os = "windows")]
+// **The stated allow D7 gives a test target whose helper functions clippy's in-tests keys do
+// not reach** (`docs/style.md` §Panics; design 2026-10-09 D7): `allow-panic-in-tests` and
+// `allow-expect-in-tests` cover a `#[test]` function and a `#[cfg(test)]` module, and the four
+// sites below are neither — `wait_for_address` and `read_launcher_output` are free helpers the
+// tests call, and a helper that cannot get the address it waits for fails the test by panicking,
+// which is what a test is allowed to do.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a default-harness test target — its helper functions are outside clippy's in-tests keys (docs/style.md §Panics, design 2026-10-09 D7)"
+)]
 
 // **The harness is the library's now** (`tinio_sandbox_windows::testing`), and
 // this binary keeps its own top-level `child_role` and `launcher_role` shims —

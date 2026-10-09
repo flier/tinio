@@ -25,6 +25,20 @@
 //! std imports sit beside them because the only thing that uses them is the
 //! same gated body, and an ungated one would be an unused import there.
 
+// **The stated allow D7 gives a target that is test context by construction** (`docs/style.md`
+// §Panics: production code returns, while tests, benches and test-support targets are outside
+// the rule). This binary is the confined half of the jail test — the module doc above says what
+// it exists for, and `tests/jail.rs` is its only spawner — so the panic family is free in it,
+// and a target root takes the attribute at the top of the file. What it covers is the three
+// `expect`s in the gated `main` below: the syscall table, the root and the probe address a
+// *test* passes in through the environment.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a test-purpose binary — the confined half of the jail test, run by `tests/jail.rs` and the WSL2 harness only (docs/style.md §Panics, design 2026-10-09 D7)"
+)]
+
 #[cfg(target_os = "linux")]
 fn main() {
     use std::{

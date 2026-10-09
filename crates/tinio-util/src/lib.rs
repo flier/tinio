@@ -74,6 +74,12 @@ pub mod switch;
 // — on Linux, one `prctl` — and its own tests have to run in the default graph (`cargo test -p
 // tinio-util`, which is what each platform's leg runs) rather than only for a caller who asked for
 // a feature. `testing` re-exports the module, so a harness still spells it `tinio_util::testing::job`.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: behind `testing` (docs/style.md §Panics)"
+)]
 #[cfg(any(test, feature = "testing"))]
 pub mod job;
 
@@ -87,5 +93,11 @@ pub mod job;
 #[cfg(windows)]
 pub mod job_object;
 
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: behind `testing` (docs/style.md §Panics)"
+)]
 #[cfg(feature = "testing")]
 pub mod testing;

@@ -16,6 +16,7 @@
 
 use std::{
     array::from_fn,
+    io,
     path::Path,
     sync::{
         Arc,
@@ -25,7 +26,7 @@ use std::{
 };
 
 use redb::{Database, ReadTransaction, WriteTransaction};
-use tokio::task::spawn_blocking;
+use tokio::task::{JoinError, spawn_blocking};
 
 use crate::{
     _core::storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS},
@@ -38,6 +39,15 @@ use crate::{
 /// The histogram bucket of a duration in microseconds.
 pub(crate) fn write_lock_bucket(duration_us: u64) -> usize {
     WRITE_LOCK_BUCKET_BOUNDS_US.partition_point(|bound| *bound <= duration_us)
+}
+
+/// The failure a blocking-pool join reports: the closure panicked, or the task
+/// was cancelled before it ran, so no transaction answered. The value is the
+/// store's own error, never a panic re-raised on the caller's side (style.md
+/// §Panics — business code returns); the join's message names the task and the
+/// panic payload, so the detail rides the error's chain to the log.
+fn blocking_task_failed(what: &str, join: JoinError) -> Error {
+    Error::Io(io::Error::other(format!("the {what} task failed: {join}")))
 }
 
 /// A read-only snapshot of the write-lock histograms (pipeline-spec.md
@@ -241,8 +251,10 @@ impl Driver {
     /// sites clone their captured data into it (one small alloc per
     /// scan, noise next to the scan itself). Point reads stay on the
     /// inline [`Self::read`] (no lock, no fsync, O(1) cost). A panic
-    /// inside the closure re-panics the caller via the join error (like
-    /// [`Self::write`]).
+    /// inside the closure is answered as an error — the join failure
+    /// lifts into the store's `Error` (the private `blocking_task_failed`)
+    /// rather than re-raising on the caller's side (style.md §Panics) —
+    /// like [`Self::write`].
     pub async fn read_blocking<T, E>(
         self: &Arc<Self>,
         f: impl FnOnce(&ReadTransaction) -> Result<T, E> + Send + 'static,
@@ -254,7 +266,7 @@ impl Driver {
         let this = Arc::clone(self);
         spawn_blocking(move || this.read(f))
             .await
-            .unwrap_or_else(|join| panic!("the read-transaction task panicked: {join}"))
+            .map_err(|join| E::from(blocking_task_failed("read-transaction", join)))?
     }
 
     /// Run `f` against a write transaction — committed on success, aborted
@@ -276,9 +288,9 @@ impl Driver {
     /// insert**. The other order frees a page of the table and then
     /// reuses or re-reads it, tripping the debug assertion
     /// `!read_page_ref_counts...contains_key(&page)`
-    /// (`tree_store/page_store/page_manager.rs`); the panic surfaces one
-    /// frame up as "the write-transaction task panicked" (the
-    /// `spawn_blocking` join in this method and in
+    /// (`tree_store/page_store/page_manager.rs`); the failing write
+    /// surfaces one frame up as the write transaction's error (the
+    /// `spawn_blocking` join in `timed_write` and in
     /// [`Self::read_blocking`]). A range iterator that is still alive
     /// while point removes run on the same table is the same hazard:
     /// collect the keys in an inner scope so the iterator is dropped
@@ -364,8 +376,8 @@ impl Driver {
     /// the returned future (task abort) does not cancel the transaction —
     /// the closure still runs to its commit/abort on the pool, so the
     /// database never sees a torn transaction. A panic inside the closure
-    /// re-panics the caller via the join error (the old inline call
-    /// propagated panics too).
+    /// is answered as an error (the join failure lifts into the store's
+    /// `Error`); the old inline call propagated the panic instead.
     async fn timed_write<T, E>(
         self: &Arc<Self>,
         f: impl FnOnce(WriteTransaction) -> Result<T, E> + Send + 'static,
@@ -386,7 +398,7 @@ impl Driver {
         let this = Arc::clone(self);
         spawn_blocking(move || this.timed_write_blocking(start, f))
             .await
-            .unwrap_or_else(|join| panic!("the write-transaction task panicked: {join}"))
+            .map_err(|join| E::from(blocking_task_failed("write-transaction", join)))?
     }
 
     /// The synchronous timing body — runs on the blocking pool
@@ -846,21 +858,47 @@ mod tests {
         });
     }
 
-    /// A panic inside the write closure re-panics the caller: the blocking
-    /// task's panic surfaces as a `JoinError`, which the wrapper re-raises
-    /// on the awaiting side (the old inline call propagated panics the same
-    /// way — behavior unchanged by the blocking-pool move). The open
-    /// transaction is dropped, i.e. aborted, so the database stays
-    /// consistent; only the awaiting task panics.
+    /// A panic inside the write closure is reported to the caller as an error:
+    /// the blocking task's panic surfaces as a `JoinError`, which the wrapper
+    /// lifts into the store's `Error` — never a panic re-raised on the awaiting
+    /// side (style.md §Panics; the old inline call propagated it instead). The
+    /// open transaction is dropped, i.e. aborted, so the database stays
+    /// consistent: the failing call reports the failure and the next one still
+    /// runs.
     #[tokio::test]
-    #[should_panic(expected = "the write-transaction task panicked")]
-    async fn a_panicking_write_closure_panics_the_caller() {
+    async fn a_panicking_write_closure_is_reported_as_an_error() {
         let (dir, db) = open_db();
         let driver = Driver::new(db);
-        driver
+        let err = driver
             .write(move |_txn| -> Result<(), Error> { panic!("boom") })
             .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(_)),
+            "the join failure lifts into the store's error: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("the write-transaction task failed"),
+            "the failure names the transaction that died: {err}"
+        );
+        // The aborted transaction persisted nothing and the driver still
+        // serves transactions: the panic cost one call, not the database.
+        let name = name("after-panic").unwrap();
+        let write_name = name.clone();
+        driver
+            .write(move |txn| -> Result<(), Error> {
+                bucket::Table::open(txn)?.put(&write_name, UNIX_EPOCH)?;
+                Ok(())
+            })
+            .await
             .unwrap();
+        let got = driver
+            .read(|txn| -> Result<Option<SystemTime>, Error> {
+                bucket::Table::open_readonly(txn)?.get(&name)
+            })
+            .unwrap();
+        assert_eq!(got, Some(UNIX_EPOCH));
         drop(dir);
     }
 

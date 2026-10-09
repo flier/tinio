@@ -35,6 +35,17 @@
 //! out kills and reaps the child, so a failing assertion never leaves a server holding the root's
 //! state database.
 
+// **A test-support root (docs/style.md §Panics), and a stated one because clippy's test keys do
+// not reach it** (design 2026-10-09 D7): `allow-*-in-tests` covers `#[test]` functions and
+// `#[cfg(test)]` modules, while this target's helpers (the readiness wait, the child teardown,
+// the root fixture) are plain `fn`s in an integration target.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a test target's harness helpers (docs/style.md §Panics)"
+)]
+
 use std::{
     fs,
     path::{Path, PathBuf},

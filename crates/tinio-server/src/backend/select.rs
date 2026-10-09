@@ -18,6 +18,8 @@
 //! Runtime errors mapping (§3): `Ambiguous` → `AmbiguousFieldName`,
 //! `MissingHeader` → `Custom("MissingHeaderName")`, everything else →
 //! `Custom("S3QueryError")` — all in-stream items inside the 200 response.
+//! An engine `Invariant` answers that same generic item, with its payload
+//! (the broken invariant) logged server-side instead of reflected (D5).
 //! Request-level `Custom` errors ([`S3QueryParsingError`]) MUST carry
 //! `set_status_code(BAD_REQUEST)` — s3s serializes a `Custom` with no status
 //! override as HTTP 500.
@@ -26,7 +28,7 @@ use std::{
     io, panic,
     panic::AssertUnwindSafe,
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, PoisonError},
     task::{Context, Poll},
     thread,
     time::{Duration, Instant},
@@ -147,7 +149,10 @@ impl Stream for EventStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let item = {
-            let mut rx = this.rx.lock().expect("select event stream poisoned");
+            // D3: recovered lock — `poll_recv` needs `&mut self`, and the
+            // mutex exists only to satisfy the stream's `Send + Sync` bound,
+            // so a poisoned guard still holds the receiver.
+            let mut rx = this.rx.lock().unwrap_or_else(PoisonError::into_inner);
             rx.poll_recv(cx)
         };
         match item {
@@ -209,6 +214,15 @@ fn map_event(event: SelectEvent) -> dto::SelectObjectContentEvent {
 /// the 200 event stream — no status override (a `Custom` status only matters
 /// for request-level errors, which must be set explicitly, below).
 fn map_stream_error(e: Error) -> S3Error {
+    // D5 (carried from the A1 review): `Invariant`'s payload names the
+    // broken invariant, and its `Display` — what the catch-all below would
+    // put on the wire — is deliberately generic, so without this the detail
+    // would be dropped entirely. Log it, then answer exactly what every
+    // other engine failure answers: the wire body never carries an internal
+    // symbol, the server log does.
+    if let Error::Invariant(detail) = &e {
+        tracing::error!(invariant = *detail, "select engine invariant violated");
+    }
     match e {
         Error::Ambiguous(m) => S3Error::with_message(S3ErrorCode::AmbiguousFieldName, m),
         Error::MissingHeader(m) => {
@@ -317,8 +331,11 @@ impl<S: Storage> S3Backend<S> {
         // `arrow_json` can nest thousands of levels, and a stack overflow is
         // NOT a panic: `catch_unwind` cannot hold it and the process would
         // abort. Width matches the admission semaphore so jobs wait outside
-        // the pool (R9) rather than stacking unbounded in rayon.
-        self.select_pool.spawn(move || {
+        // the pool (R9) rather than stacking unbounded in rayon. The pool is
+        // built on first use, so a refused build is this request's 500
+        // rather than a panic on the connection path (D5).
+        let pool = self.select_pool()?;
+        pool.spawn(move || {
             let input = Box::new(ChannelReader {
                 rx: in_rx,
                 pending: None,
@@ -433,6 +450,16 @@ fn build_config(
     let output = if let Some(csv) = output_serialization.csv {
         OutputMode::Csv(csv_output_params(csv)?)
     } else {
+        // `require_one_output` above admits exactly one half, so the
+        // CSV-less arm is the JSON one; the `let-else` keeps the extraction
+        // total instead of assuming it (playbook step 4) — the arm answers
+        // the check's own 400.
+        let Some(json) = output_serialization.json.as_ref() else {
+            return Err(s3_error!(
+                InvalidRequestParameter,
+                "exactly one of CSV or JSON output serialization must be specified"
+            ));
+        };
         // JSON output names its columns from aliases / plain field names
         // (grilling Q6): any other expression without an alias would need a
         // guessed key — rejected request-level, CSV output is positional and
@@ -443,9 +470,7 @@ fn build_config(
                 "a JSON output projection that is not a column reference must have an alias"
             ));
         }
-        OutputMode::Json(json_output_params(
-            output_serialization.json.as_ref().expect("checked above"),
-        )?)
+        OutputMode::Json(json_output_params(json)?)
     };
 
     Ok((
@@ -1403,6 +1428,22 @@ mod tests {
         ));
         assert_eq!(err.code().as_str(), "S3QueryError", "{err:?}");
         assert_eq!(err.message().unwrap(), "S3 select: io error", "{err:?}");
+    }
+
+    #[test]
+    fn an_engine_invariant_answers_the_generic_item() {
+        // D5: the payload is the log's (see `map_stream_error`); the client
+        // sees the same generic in-stream error every other engine failure
+        // answers, and never the invariant's name.
+        let err = map_stream_error(Error::Invariant(
+            "the built pipeline carries its record reader",
+        ));
+        assert_eq!(err.code().as_str(), "S3QueryError", "{err:?}");
+        assert_eq!(
+            err.message().unwrap(),
+            "S3 select: internal error",
+            "{err:?}"
+        );
     }
 
     #[test]

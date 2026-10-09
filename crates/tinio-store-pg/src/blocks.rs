@@ -202,18 +202,19 @@ impl BlockStore for PgBlocks {
         }
         // One statement, and only when this address has no row yet. Appending
         // the missing seqs of a partial block would splice two publishes.
-        // rows_affected counts only what this publish inserted. The borrowed
-        // chunk array cannot pass query_file!, the same reason insert_chunks
-        // stays a runtime query.
-        let inserted = sqlx::query(include_str!("../sql/blocks/publish.sql"))
-            .bind(hash.as_str())
-            .bind(&seqs)
-            .bind(&pieces)
-            .bind(len as i64)
-            .bind(published)
-            .execute(self.store.as_driver())
-            .await?
-            .rows_affected();
+        // rows_affected counts only what this publish inserted. `&pieces as _`
+        // skips BYTEA[]'s `&[Vec<u8>]` check and binds the borrowed slices.
+        let inserted = sqlx::query_file!(
+            "sql/blocks/publish.sql",
+            hash.as_str(),
+            &seqs,
+            &pieces as _,
+            len as i64,
+            published
+        )
+        .execute(self.store.as_driver())
+        .await?
+        .rows_affected();
         // No row inserted means every chunk row of this address was already
         // there: the dedup hit, and the staged bytes are dropped with `staged`.
         Ok(if inserted == 0 {
@@ -322,9 +323,13 @@ impl BlockStore for PgBlocks {
                     return Some((Ok(entry), state));
                 }
                 match page(&state.pool, state.cursor.as_deref(), WALK_PAGE).await {
-                    Ok(entries) if entries.is_empty() => return None,
+                    // An empty page ends the walk (the `?` answers `None`), so
+                    // the cursor is the page's last address — the point the
+                    // next step resumes strictly after — with no separate empty
+                    // check (style.md §Panics: an invariant-holding shape
+                    // rather than a `last()` the page's emptiness could panic).
                     Ok(entries) => {
-                        let last = entries.last().expect("a non-empty page has a last entry");
+                        let last = entries.last()?;
                         state.cursor = Some(last.hash.to_hex());
                         state.page = entries.into_iter();
                     }
@@ -341,7 +346,8 @@ impl BlockStore for PgBlocks {
 }
 
 /// A walk in progress: the pool, the keyset cursor, the current page, and
-/// whether an empty page or an error already ended the traversal.
+/// whether an error already ended the traversal (an empty page ends it too, by
+/// yielding nothing).
 struct Walk {
     pool: PgPool,
     cursor: Option<String>,

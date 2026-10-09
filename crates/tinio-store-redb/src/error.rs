@@ -40,8 +40,9 @@ pub enum Error {
     /// Commit failed.
     #[error("commit error: {0}")]
     Commit(#[from] redb::CommitError),
-    /// Filesystem I/O around the state database — the state directory
-    /// the open creates ([`crate::open::open`]).
+    /// I/O around the state database: the state directory the open creates
+    /// ([`crate::open::open`]), and the join failure of a blocking-pool read
+    /// or write task (`driver`'s `blocking_task_failed` lift).
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     /// A compaction failed ([`crate::compact::compact_if_needed`]).

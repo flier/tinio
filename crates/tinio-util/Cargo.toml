@@ -11,9 +11,11 @@ derive_more = { workspace = true, features = ["full"] }
 futures.workspace = true
 handlebars = { workspace = true, optional = true }
 papaya.workspace = true
+proc-macro2 = { workspace = true, optional = true, features = ["span-locations"] }
 secrecy = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
+syn = { workspace = true, optional = true, features = ["full", "visit"] }
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
@@ -22,6 +24,7 @@ uuid = { workspace = true, features = ["v4"] }
 tinio-core.workspace = true
 
 [dev-dependencies]
+syn = { workspace = true, features = ["full", "visit"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = [
     "macros",
@@ -48,13 +51,25 @@ windows-sys = { workspace = true, features = [
 [features]
 render = ["dep:handlebars"]
 testing = [
+    "dep:proc-macro2",
     "dep:rustix",
     "dep:serde_json",
+    "dep:syn",
     "dep:tracing-subscriber",
 ]
 
+[[test]]
+name = "spawn_guard"
+required-features = ["testing"]
+
 [lints.clippy]
 absolute_paths = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_used = "warn"
 
 [lints.rust]
 unsafe_code = "deny"

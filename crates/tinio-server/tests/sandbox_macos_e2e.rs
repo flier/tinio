@@ -276,11 +276,11 @@ fn a_confined_run_publishes_its_state_and_reports_the_mechanism_it_chose() {
     // fields are the **serving** process's — the child answers `/status`, so its
     // `pid` is the child's and not the launcher's the file above names — which is
     // why this asserts the shape of the answer rather than a second pid.
-    let reported = Command::new(tinio_bin())
+    let mut command = Command::new(tinio_bin());
+    command
         .args(["status", root.to_str().expect("utf-8 root")])
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("run tinio status");
+        .env("NO_COLOR", "1");
+    let reported = job::output(&mut command).expect("run tinio status");
     let reported = String::from_utf8_lossy(&reported.stdout).into_owned();
     if !reported.starts_with("running") || reported.contains("it is stale") {
         fail(
@@ -305,10 +305,10 @@ fn a_confined_run_publishes_its_state_and_reports_the_mechanism_it_chose() {
             "the launcher never showed a child process",
         ),
     };
-    let signalled = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .expect("kill");
+    let mut command = Command::new("kill");
+    command.args(["-TERM", &child.id().to_string()]);
+    let mut killer = job::spawn(&mut command).expect("kill");
+    let signalled = killer.wait().expect("kill");
     if !signalled.success() {
         fail(
             &mut child,
@@ -586,9 +586,10 @@ fn fail(child: &mut Child, logged: thread::JoinHandle<String>, root: &Path, mess
 fn waits_for_exit(pid: u32) -> bool {
     let deadline = Instant::now() + wait_timeout();
     while Instant::now() < deadline {
-        let alive = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
+        let mut command = Command::new("kill");
+        command.args(["-0", &pid.to_string()]);
+        let alive = job::spawn(&mut command)
+            .and_then(|mut child| child.wait())
             .map(|status| status.success())
             .unwrap_or(false);
         if !alive {
@@ -610,10 +611,13 @@ fn wait_for_child_pid(parent: u32) -> Option<u32> {
     let parent = parent.to_string();
     let deadline = Instant::now() + wait_timeout();
     while Instant::now() < deadline {
+        let mut command = Command::new("pgrep");
+        command.args(["-P", &parent]);
+        let listed = job::output(&mut command);
         // One let-chain rather than three nested `if`s: `clippy::collapsible_if`
         // refuses the nest under `-D warnings`, and edition 2024 is where the
         // chain is available.
-        if let Ok(out) = Command::new("pgrep").args(["-P", &parent]).output()
+        if let Ok(out) = listed
             && let Some(pid) = String::from_utf8_lossy(&out.stdout)
                 .split_whitespace()
                 .next()

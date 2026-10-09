@@ -287,25 +287,25 @@ fn arrow_value(array: &dyn Array, i: usize, enum_hint: EnumHint) -> Result<Value
         return Ok(Value::Null);
     }
     Ok(match array.data_type() {
-        DataType::Int8 => Value::Int(primitive::<Int8Type>(array, i) as i64),
-        DataType::Int16 => Value::Int(primitive::<Int16Type>(array, i) as i64),
-        DataType::Int32 => Value::Int(primitive::<Int32Type>(array, i) as i64),
-        DataType::Int64 => Value::Int(primitive::<Int64Type>(array, i)),
-        DataType::UInt8 => Value::Int(primitive::<UInt8Type>(array, i) as i64),
-        DataType::UInt16 => Value::Int(primitive::<UInt16Type>(array, i) as i64),
-        DataType::UInt32 => Value::Int(primitive::<UInt32Type>(array, i) as i64),
+        DataType::Int8 => Value::Int(primitive::<Int8Type>(array, i)? as i64),
+        DataType::Int16 => Value::Int(primitive::<Int16Type>(array, i)? as i64),
+        DataType::Int32 => Value::Int(primitive::<Int32Type>(array, i)? as i64),
+        DataType::Int64 => Value::Int(primitive::<Int64Type>(array, i)?),
+        DataType::UInt8 => Value::Int(primitive::<UInt8Type>(array, i)? as i64),
+        DataType::UInt16 => Value::Int(primitive::<UInt16Type>(array, i)? as i64),
+        DataType::UInt32 => Value::Int(primitive::<UInt32Type>(array, i)? as i64),
         DataType::UInt64 => Value::Int(
-            i64::try_from(primitive::<UInt64Type>(array, i))
+            i64::try_from(primitive::<UInt64Type>(array, i)?)
                 .map_err(|_| Error::Value("parquet value exceeds 64-bit signed integer".into()))?,
         ),
         DataType::Float32 => {
-            Value::RawNumber(float_text(primitive::<Float32Type>(array, i) as f64)?)
+            Value::RawNumber(float_text(primitive::<Float32Type>(array, i)? as f64)?)
         }
-        DataType::Float64 => Value::RawNumber(float_text(primitive::<Float64Type>(array, i))?),
-        DataType::Boolean => Value::Bool(downcast::<BooleanArray>(array).value(i)),
-        DataType::Utf8 => Value::String(downcast::<StringArray>(array).value(i).to_string()),
+        DataType::Float64 => Value::RawNumber(float_text(primitive::<Float64Type>(array, i)?)?),
+        DataType::Boolean => Value::Bool(downcast::<BooleanArray>(array)?.value(i)),
+        DataType::Utf8 => Value::String(downcast::<StringArray>(array)?.value(i).to_string()),
         DataType::LargeUtf8 => {
-            Value::String(downcast::<LargeStringArray>(array).value(i).to_string())
+            Value::String(downcast::<LargeStringArray>(array)?.value(i).to_string())
         }
         // AWS reads an ENUM as a string. The guard is load-bearing: without the
         // annotation `Binary` means an unannotated BYTE_ARRAY, BSON, Geometry,
@@ -317,31 +317,31 @@ fn arrow_value(array: &dyn Array, i: usize, enum_hint: EnumHint) -> Result<Value
         DataType::Decimal128(precision, scale) => Value::Decimal(decimal_value(
             *precision,
             decimal_text(
-                &downcast::<Decimal128Array>(array).value(i).to_string(),
+                &downcast::<Decimal128Array>(array)?.value(i).to_string(),
                 *scale,
             ),
         )?),
         DataType::Decimal256(precision, scale) => Value::Decimal(decimal_value(
             *precision,
             decimal_text(
-                &downcast::<Decimal256Array>(array).value(i).to_string(),
+                &downcast::<Decimal256Array>(array)?.value(i).to_string(),
                 *scale,
             ),
         )?),
         DataType::Timestamp(unit, _) => {
             let at = match unit {
-                TimeUnit::Second => primitive::<TimestampSecondType>(array, i),
-                TimeUnit::Millisecond => primitive::<TimestampMillisecondType>(array, i),
-                TimeUnit::Microsecond => primitive::<TimestampMicrosecondType>(array, i),
-                TimeUnit::Nanosecond => primitive::<TimestampNanosecondType>(array, i),
+                TimeUnit::Second => primitive::<TimestampSecondType>(array, i)?,
+                TimeUnit::Millisecond => primitive::<TimestampMillisecondType>(array, i)?,
+                TimeUnit::Microsecond => primitive::<TimestampMicrosecondType>(array, i)?,
+                TimeUnit::Nanosecond => primitive::<TimestampNanosecondType>(array, i)?,
             };
             Value::String(timestamp_string(unit, at)?)
         }
         DataType::Date32 => Value::String(date_string_from_days(
-            primitive::<Date32Type>(array, i) as i64,
+            primitive::<Date32Type>(array, i)? as i64,
         )?),
         DataType::Date64 => {
-            Value::String(date_string_from_millis(primitive::<Date64Type>(array, i))?)
+            Value::String(date_string_from_millis(primitive::<Date64Type>(array, i)?)?)
         }
         DataType::List(_)
         | DataType::LargeList(_)
@@ -382,7 +382,7 @@ impl EnumHint {
 /// `from_utf8_lossy`, whose U+FFFD substitution would smuggle in exactly the
 /// silently-wrong value `float_text` refuses for NaN/inf.
 fn enum_string(array: &dyn Array, i: usize) -> Result<String, Error> {
-    from_utf8(downcast::<BinaryArray>(array).value(i))
+    from_utf8(downcast::<BinaryArray>(array)?.value(i))
         .map(str::to_owned)
         .map_err(|e| Error::Format(format!("parquet enum is not valid UTF-8: {e}")))
 }
@@ -404,19 +404,19 @@ fn arrow_json(array: &dyn Array, i: usize, depth: usize) -> Result<serde_json::V
     }
     Ok(match array.data_type() {
         DataType::List(_) => serde_json::Value::Array(list_items(
-            downcast::<ListArray>(array).value(i).as_ref(),
+            downcast::<ListArray>(array)?.value(i).as_ref(),
             depth + 1,
         )?),
         DataType::LargeList(_) => serde_json::Value::Array(list_items(
-            downcast::<LargeListArray>(array).value(i).as_ref(),
+            downcast::<LargeListArray>(array)?.value(i).as_ref(),
             depth + 1,
         )?),
         DataType::FixedSizeList(_, _) => serde_json::Value::Array(list_items(
-            downcast::<FixedSizeListArray>(array).value(i).as_ref(),
+            downcast::<FixedSizeListArray>(array)?.value(i).as_ref(),
             depth + 1,
         )?),
         DataType::Struct(_) => {
-            let s = downcast::<StructArray>(array);
+            let s = downcast::<StructArray>(array)?;
             let mut map = serde_json::Map::new();
             for (field, column) in s.fields().iter().zip(s.columns()) {
                 map.insert(
@@ -430,7 +430,7 @@ fn arrow_json(array: &dyn Array, i: usize, depth: usize) -> Result<serde_json::V
         // top-level root fields, and this recursion has no path back to one —
         // so an ENUM inside a list/struct keeps refusing rather than decoding
         // by accident.
-        _ => value_to_json(&arrow_value(array, i, EnumHint::Unannotated)?),
+        _ => value_to_json(&arrow_value(array, i, EnumHint::Unannotated)?)?,
     })
 }
 
@@ -443,20 +443,25 @@ fn list_items(values: &dyn Array, depth: usize) -> Result<Vec<serde_json::Value>
 
 /// crate `Value` → JSON: numeric text parses as a JSON number literal
 /// (arbitrary precision keeps it a `Number`, not a string).
-fn value_to_json(v: &Value) -> serde_json::Value {
-    match v {
+fn value_to_json(v: &Value) -> Result<serde_json::Value, Error> {
+    Ok(match v {
         Value::Null => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::Int(i) => serde_json::Value::Number((*i).into()),
-        Value::Decimal(d) => json_number(&d.normalize().to_string()),
-        Value::RawNumber(s) => json_number(s),
+        Value::Decimal(d) => json_number(&d.normalize().to_string())?,
+        Value::RawNumber(s) => json_number(s)?,
         Value::String(s) => serde_json::Value::String(s.clone()),
         Value::Json(j) => j.as_ref().clone(),
-    }
+    })
 }
 
-fn json_number(s: &str) -> serde_json::Value {
-    serde_json::from_str(s).expect("decimal canonical text is valid JSON")
+/// The JSON number literal a numeric text spells. The inputs this path builds
+/// are JSON numbers by construction (`float_text`'s finite-float text,
+/// `Decimal::normalize`'s digits), so the refusal below is the defensive
+/// answer to a token that is not one — the same surface `parse_number` gives,
+/// never a panic.
+fn json_number(s: &str) -> Result<serde_json::Value, Error> {
+    serde_json::from_str(s).map_err(|_| Error::Value(format!("invalid numeric value: {s}")))
 }
 
 /// Float canonical text as a raw carrier (review 2026-09-06b R6, decision):
@@ -521,9 +526,11 @@ fn timestamp_string(unit: &TimeUnit, at: i64) -> Result<String, Error> {
         TimeUnit::Nanosecond => OffsetDateTime::from_unix_timestamp_nanos(at as i128),
     }
     .map_err(|_| Error::Value("parquet timestamp out of range".into()))?;
-    Ok(dt
-        .format(&Rfc3339)
-        .expect("rfc3339 formatting is infallible"))
+    // RFC 3339 spells four-digit years, so a legal `OffsetDateTime` before the
+    // common era is a `Format` error here — the same refusal the DATE path
+    // below makes, never a panic.
+    dt.format(&Rfc3339)
+        .map_err(|e| Error::Format(format!("parquet timestamp format: {e}")))
 }
 
 /// Days since the Unix epoch → RFC 3339 midnight UTC. Chosen over a bare
@@ -558,17 +565,18 @@ fn date_string_from_millis(ms: i64) -> Result<String, Error> {
 }
 
 /// The typed value at `i` for the matched `data_type` arm.
-fn primitive<T: ArrowPrimitiveType>(array: &dyn Array, i: usize) -> T::Native {
-    downcast::<PrimitiveArray<T>>(array).value(i)
+fn primitive<T: ArrowPrimitiveType>(array: &dyn Array, i: usize) -> Result<T::Native, Error> {
+    Ok(downcast::<PrimitiveArray<T>>(array)?.value(i))
 }
 
 /// Typed downcast pinned by the matched `data_type` arm — an internal
-/// invariant, never a user-facing failure.
-fn downcast<A: Array + 'static>(array: &dyn Array) -> &A {
-    array
-        .as_any()
-        .downcast_ref::<A>()
-        .expect("typed downcast follows data_type")
+/// invariant, never a user-facing failure: arrow's own `data_type()` selects
+/// the arm, so a mismatch would mean a caller paired an array with the wrong
+/// one (a bug here, not in the input).
+fn downcast<A: Array + 'static>(array: &dyn Array) -> Result<&A, Error> {
+    array.as_any().downcast_ref::<A>().ok_or(Error::Invariant(
+        "a parquet downcast follows the matched data_type",
+    ))
 }
 
 fn from_parquet(e: ParquetError) -> Error {

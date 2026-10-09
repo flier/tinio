@@ -273,10 +273,12 @@ pub fn parse(sql: &str) -> Result<QueryPlan, Error> {
         ));
     }
     if aggregates {
-        for item in &projections {
-            let Projection::Item { expr, .. } = item else {
-                unreachable!("aggregates+Wild rejected above");
-            };
+        // Only `Item` survives this point: `aggregates && Wild` was rejected
+        // just above, so the items to validate are the non-Wild ones.
+        for expr in projections.iter().filter_map(|item| match item {
+            Projection::Item { expr, .. } => Some(expr),
+            Projection::Wild => None,
+        }) {
             validate_aggregate_item(expr)?;
         }
     }
@@ -713,20 +715,16 @@ pub fn projection_needs_alias(item: &Projection) -> bool {
 /// reader treats as "all columns". Names pass as written; the reader
 /// matches them against the schema case-insensitively (identifier rules).
 pub fn referenced_columns(plan: &QueryPlan) -> Vec<String> {
-    if plan
-        .projections
-        .iter()
-        .any(|p| matches!(p, Projection::Wild))
-    {
-        return Vec::new();
-    }
     let mut names = Vec::new();
     let mut collect = Columns(&mut names);
     for item in &plan.projections {
-        let Projection::Item { expr, .. } = item else {
-            unreachable!("Wild rejected above");
-        };
-        let _ = expr.visit(&mut collect);
+        match item {
+            // The `Wild` rule the doc states: everything, i.e. no pruning.
+            Projection::Wild => return Vec::new(),
+            Projection::Item { expr, .. } => {
+                let _ = expr.visit(&mut collect);
+            }
+        }
     }
     if let Some(expr) = &plan.where_expr {
         let _ = expr.visit(&mut collect);
@@ -751,13 +749,14 @@ impl Visitor for Columns<'_> {
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
         match expr {
             Expr::Identifier(id) => self.0.push(id.value.clone()),
-            Expr::CompoundIdentifier(parts) => self.0.push(
-                parts
-                    .last()
-                    .expect("compound identifier is non-empty")
-                    .value
-                    .clone(),
-            ),
+            // `a.b[.c]` — sqlparser folds a dot chain into a compound
+            // identifier, so it carries a last part; a list without one names
+            // no column, like the identifier-less shapes the `_` arm ignores.
+            Expr::CompoundIdentifier(parts) => {
+                if let Some(last) = parts.last() {
+                    self.0.push(last.value.clone());
+                }
+            }
             _ => {}
         }
         ControlFlow::Continue(())

@@ -2,6 +2,19 @@
 //! here and the jail runs in `src/bin/sandbox-child.rs`.
 
 #![cfg(target_os = "linux")]
+// **The stated allow D7 gives a default-harness test target whose helper functions clippy's
+// in-tests keys do not reach** (`docs/style.md` §Panics; design 2026-10-09 D7): the keys cover
+// a `#[test]` function and a `#[cfg(test)]` module, and the sites here are neither — the
+// file-scope helpers every leg goes through (`run_child`, `run_child_with_env`,
+// `probe_listener`, `jail_fixture`, `run_child_under_a_nested_user_namespace`) set up the
+// child, the root and the listener, and a setup step that cannot do its job fails its test by
+// panicking, which is what a test target is allowed to do.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a default-harness test target — its file-scope helpers are outside clippy's in-tests keys (docs/style.md §Panics, design 2026-10-09 D7)"
+)]
 
 use std::{
     env, fs,
@@ -15,7 +28,7 @@ use std::{
 // instead of keeping a copy each; what stays here is the part that is this
 // suite's own — the child, the listener and the assertions.
 use tinio_sandbox_linux::testing::{host_can_confine, requested_model};
-use tinio_util::testing::host_cannot;
+use tinio_util::testing::{host_cannot, job};
 
 /// The environment every leg hands its child, in one place.
 ///
@@ -95,7 +108,7 @@ fn run_child_with_env(
     }
     let mut command = Command::new(env!("CARGO_BIN_EXE_sandbox-child"));
     child_environment(&mut command, root, state, home, access, probe, extra);
-    let output = command.output().expect("spawn confined child");
+    let output = job::output(&mut command).expect("spawn confined child");
     let log = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
         !log.contains("bad-model"),
@@ -395,7 +408,7 @@ fn run_child_under_a_nested_user_namespace(root: &Path, home: &Path, probe: Sock
         )
         .env("TINIO_SANDBOX_MODEL", "userns");
     child_environment(&mut command, root, None, home, "read-only", probe, &[]);
-    let output = command.output().expect("spawn the wrapper");
+    let output = job::output(&mut command).expect("spawn the wrapper");
     let log = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

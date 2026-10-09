@@ -146,11 +146,9 @@ use crate::{
 /// it twice would be two ways to spell one tool in one phase — with the second
 /// selectable by whoever set `PATH`.
 pub fn icacls(path: &Path, args: &[&str]) -> String {
-    let output = Command::new(acl::icacls_binary())
-        .arg(path)
-        .args(args)
-        .output()
-        .expect("run icacls");
+    let mut command = Command::new(acl::icacls_binary());
+    command.arg(path).args(args);
+    let output = job::output(&mut command).expect("run icacls");
     assert!(
         output.status.success(),
         "icacls {} {}: {}",
@@ -181,12 +179,9 @@ pub fn icacls(path: &Path, args: &[&str]) -> String {
 /// which is the plans' own rule: a run that never made the link proves nothing
 /// about the case the link exists for.
 pub fn junction(link: &Path, target: &Path) {
-    let output = Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .output()
-        .expect("run mklink");
+    let mut command = Command::new("cmd");
+    command.args(["/C", "mklink", "/J"]).arg(link).arg(target);
+    let output = job::output(&mut command).expect("run mklink");
     assert!(
         output.status.success(),
         "mklink /J {} -> {}: {}{}",
@@ -343,11 +338,11 @@ pub fn tree(volume: &Path) -> (tempfile::TempDir, Tree) {
     // functional half of the same answer.
     fs::write(tree.root.join("granted.txt"), b"granted").expect("seed");
     fs::write(tree.denied.join("secret.txt"), b"secret").expect("seed");
-    let granted = Command::new(acl::icacls_binary())
+    let mut command = Command::new(acl::icacls_binary());
+    command
         .arg(&tree.denied)
-        .args(["/grant", r"*S-1-5-32-545:(OI)(CI)R", "/q"])
-        .output()
-        .expect("grant Users on the denied tree");
+        .args(["/grant", r"*S-1-5-32-545:(OI)(CI)R", "/q"]);
+    let granted = job::output(&mut command).expect("grant Users on the denied tree");
     assert!(
         granted.status.success(),
         "{}",
@@ -1584,10 +1579,9 @@ mod tests {
     /// same `env::current_exe()` a launch re-enters.
     #[test]
     fn every_role_the_harness_spawns_is_a_test_in_this_binary() {
-        let listed = Command::new(env::current_exe().expect("the test binary"))
-            .arg("--list")
-            .output()
-            .expect("run this binary with --list");
+        let mut command = Command::new(env::current_exe().expect("the test binary"));
+        command.arg("--list");
+        let listed = job::output(&mut command).expect("run this binary with --list");
         assert!(
             listed.status.success(),
             "this binary refused --list: {}",

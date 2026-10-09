@@ -21,6 +21,17 @@
 //! numbers and reasoning are recorded in task-2.5-report.md (Q6 — the
 //! spec default is wired by task 4, not here).
 
+// This bench declares `harness = false`, so clippy's `allow-*-in-tests` keys do
+// not reach it (design 2026-10-09 D7), and a bench is not production code
+// (style.md §Panics covers production sources, D1): its unwraps are fixture
+// assertions, kept as written.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a `harness = false` bench's fixture assertions (docs/style.md §Panics)"
+)]
+
 use std::{
     hint::black_box,
     time::{Duration, SystemTime},

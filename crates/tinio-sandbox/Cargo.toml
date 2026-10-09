@@ -27,6 +27,12 @@ rustix = { workspace = true, features = ["process"] }
 
 [lints.clippy]
 absolute_paths = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_used = "warn"
 
 [lints.rust]
 unsafe_code = "forbid"

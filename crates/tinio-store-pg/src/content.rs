@@ -263,18 +263,20 @@ impl PgStaged {
                 .iter()
                 .map(|(_number, chunk)| chunk.as_slice())
                 .collect();
-            // The borrowed chunk array cannot pass the macro's element mapping
-            // (it wants `&[Vec<u8>]`) and copying every chunk is not acceptable,
-            // so this statement stays the one runtime query in the crate.
-            sqlx::query(include_str!("../sql/content/insert_chunks.sql"))
-                .bind(&self.bucket)
-                .bind(self.kind)
-                .bind(self.ckey.as_str())
-                .bind(self.seq)
-                .bind(numbers)
-                .bind(chunks)
-                .execute(&self.pool)
-                .await?;
+            // BYTEA[]'s macro mapping is `&[Vec<u8>]`. The wildcard skips that
+            // one check and still binds the borrowed slices; copying each chunk
+            // to satisfy the mapping is not acceptable. `kind as _` is the enum.
+            sqlx::query_file!(
+                "sql/content/insert_chunks.sql",
+                &self.bucket,
+                self.kind as _,
+                self.ckey.as_str(),
+                self.seq,
+                &numbers,
+                &chunks as _
+            )
+            .execute(&self.pool)
+            .await?;
         }
         self.pending.clear();
         Ok(())

@@ -10,6 +10,15 @@
 //! bytes **and** the object row that describes them, because the engine reads
 //! that row for the outgoing version's metadata wires.
 
+// **A test context that states its own exemption**: `lib.rs` declares this file `#[cfg(test)]`,
+// so the panic family is free by rule (design 2026-10-09 D1) and by `clippy.toml`, but
+// `unimplemented` has no `allow-*-in-tests` key — the 57 contract calls no engine path reaches
+// are exactly the sites that key would have covered (D7, docs/style.md §Panics).
+#![allow(
+    clippy::unimplemented,
+    reason = "test context: `unimplemented` has no in-tests key (docs/style.md §Panics)"
+)]
+
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     io,

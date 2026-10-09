@@ -176,7 +176,8 @@ impl<R: Read> Reader<R> {
         // `csv` positions are logical-stream offsets (seek-compatible), so
         // the end - start span is exact regardless of internal buffer refills.
         let end = self.inner.position().byte();
-        if end - record_start(&self.buf) > MAX_RECORD {
+        let start = record_start(&self.buf)?;
+        if end - start > MAX_RECORD {
             return Err(Error::Format(CAP_MESSAGE.into()));
         }
         Ok(true)
@@ -196,12 +197,14 @@ pub(crate) fn map_error(e: _csv::Error, context: &str) -> Error {
 }
 
 /// First byte offset of `record` — `csv` sets a position on every record it
-/// returns (its own doc guarantee).
-fn record_start(record: &StringRecord) -> u64 {
+/// returns (its own doc guarantee), so the crate's own `None` backstop is
+/// never a state a read record reaches. The conversion carries the message
+/// both callers used to spell, so they just `?` it.
+fn record_start(record: &StringRecord) -> Result<u64, Error> {
     record
         .position()
-        .expect("csv sets a position on records it reads")
-        .byte()
+        .map(|p| p.byte())
+        .ok_or(Error::Invariant("a csv record carries its start position"))
 }
 
 /// `_1.._n` for a row of `len` fields — the positional alias set.
@@ -229,7 +232,7 @@ impl<R: Read> RecordReader for Reader<R> {
         if !self.read_record()? {
             return Ok(None);
         }
-        self.last_record_start = record_start(&self.buf);
+        self.last_record_start = record_start(&self.buf)?;
         let names = match self.mode {
             Some(Header::Use) => self.names_header.clone(),
             _ => {

@@ -4,6 +4,18 @@
 //! point is the cross-table contract (spec 2026-09-03): the rows of a
 //! completed upload are the same rows the backends commit and read.
 
+// This target is test context, but its file-level helper (`handle`) is not a
+// `#[test]` function, and clippy's `allow-*-in-tests` keys reach `#[test]`
+// functions (and `#[cfg(test)]` modules) only — outside one, test-support code
+// reads as production to the lint (docs/style.md §Panics; design 2026-10-09
+// D7: test contexts stay free).
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: an integration-test target's file-level helper (docs/style.md §Panics)"
+)]
+
 use std::time::SystemTime;
 
 use tinio_core::{

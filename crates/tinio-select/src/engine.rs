@@ -54,11 +54,12 @@ pub struct Engine {
     /// the parse layer already guarantees the bare-call shape, so this
     /// memo is also the engine's defense.
     agg_kinds: Option<Vec<AggKind>>,
-    /// Precomputed `Item` projection keys (alias, else plain field name,
-    /// else the expression text). The expression-text fallback re-renders
-    /// the whole AST, so building it per row was pure waste (review
-    /// 2026-09-06 simplify); `None` at `Wild` slots.
-    item_keys: Vec<Option<String>>,
+    /// Per-projection slot, resolved once in `new`: the output key lives
+    /// beside the item it names, so the two cannot disagree — `Wild` takes
+    /// its keys from the record at row time and carries none, and the
+    /// expression-text key fallback re-renders the whole AST, so computing
+    /// it per row was pure waste (review 2026-09-06 simplify).
+    slots: Vec<Slot>,
     /// This request's MISSING sentinel name, derived once in `new`
     /// (`SentinelNames::is_missing()` formats a fresh String — paying it
     /// per row on every Function eval was the waste; review 2026-09-09).
@@ -66,6 +67,24 @@ pub struct Engine {
     /// This request's evaluation budget, charged by the work each step does
     /// (P3) — shared into every evaluation path through `&RowCtx`.
     budget: Budget,
+}
+
+/// One projection slot, engine-side: the output key its column carries — the
+/// alias, else the plain field name, else the expression text — resolved once
+/// at construction. The expression itself is not held here: it stays in
+/// `plan.projections`, which `new` walks in lockstep with this list, so one
+/// AST has one home (the per-item clone this replaced was pure duplication).
+enum Slot {
+    Wild,
+    Item { key: String },
+}
+
+/// The aggregate path's projection shape, spelled once: every aggregate
+/// projection is an item — a `Wild` projection has no expression to classify
+/// and no key to answer with, and the parse layer already refuses one, so
+/// this is the engine's own backstop.
+fn no_wild_projection() -> Error {
+    Error::Invariant("aggregate plans carry no Wild projection")
 }
 
 /// One projection item's aggregate form.
@@ -115,14 +134,14 @@ impl Engine {
             count: 0,
             per_col: vec![AggCol::default(); plan.projections.len()],
         });
-        let item_keys = plan
+        let slots = plan
             .projections
             .iter()
             .map(|item| match item {
-                Projection::Item { expr, alias } => {
-                    Some(alias.clone().unwrap_or_else(|| plain_key(expr)))
-                }
-                Projection::Wild => None,
+                Projection::Item { expr, alias } => Slot::Item {
+                    key: alias.clone().unwrap_or_else(|| plain_key(expr)),
+                },
+                Projection::Wild => Slot::Wild,
             })
             .collect();
         Self {
@@ -130,7 +149,7 @@ impl Engine {
             emitted: 0,
             agg_state,
             agg_kinds: None,
-            item_keys,
+            slots,
             missing_name,
             budget: Budget::new(),
         }
@@ -140,8 +159,14 @@ impl Engine {
     /// in aggregate mode it always accumulates and returns `Ok(None)` (the
     /// single row is live in `finish`).
     pub fn next(&mut self, rec: Record) -> Result<Option<OutRow>, Error> {
-        if self.agg_state.is_some() {
-            return self.aggregate_next(rec);
+        // The accumulator is taken out for the call and put back after it:
+        // aggregate mode is then a value in hand rather than a re-asserted
+        // invariant, and `None` is the ordinary non-aggregate case, not an
+        // error.
+        if let Some(mut state) = self.agg_state.take() {
+            let out = self.aggregate_next(&mut state, rec);
+            self.agg_state = Some(state);
+            return out;
         }
         if self.emitted >= self.plan.limit.unwrap_or(usize::MAX) {
             return Ok(None);
@@ -169,19 +194,18 @@ impl Engine {
             return Ok(None);
         };
         self.classified()?;
-        let kinds = self.agg_kinds.as_deref().expect("classified above");
-        let mut keys = Vec::with_capacity(self.plan.projections.len());
-        let mut vals = Vec::with_capacity(self.plan.projections.len());
-        for (item, (kind, col)) in self
-            .plan
-            .projections
+        let kinds = self.agg_kinds()?;
+        let mut keys = Vec::with_capacity(self.slots.len());
+        let mut vals = Vec::with_capacity(self.slots.len());
+        for (slot, (kind, col)) in self
+            .slots
             .iter()
             .zip(kinds.iter().zip(state.per_col.iter()))
         {
-            let Projection::Item { expr, alias } = item else {
-                unreachable!("aggregate plans never carry Wild (rejected at parse)");
+            let Slot::Item { key } = slot else {
+                return Err(no_wild_projection());
             };
-            keys.push(alias.clone().unwrap_or_else(|| plain_key(expr)));
+            keys.push(key.clone());
             vals.push(Field::Present(finish_value(kind, &state, col)?));
         }
         Ok(Some(OutRow { keys, vals }))
@@ -189,8 +213,13 @@ impl Engine {
 
     /// Aggregate mode: WHERE-filter, then accumulate for the row. A filtered
     /// record contributes nothing; LIMIT applies to the single output row
-    /// (never a positive bound) and is not consulted here.
-    fn aggregate_next(&mut self, rec: Record) -> Result<Option<OutRow>, Error> {
+    /// (never a positive bound) and is not consulted here. `state` is the
+    /// accumulator `next` took out of its slot for this call.
+    fn aggregate_next(
+        &mut self,
+        state: &mut AggState,
+        rec: Record,
+    ) -> Result<Option<OutRow>, Error> {
         self.classified()?;
         let ctx = RowCtx::new(
             &rec,
@@ -199,8 +228,7 @@ impl Engine {
             &self.budget,
         );
         if self.passes(&ctx)? {
-            let kinds = self.agg_kinds.as_deref().expect("classified above");
-            let state = self.agg_state.as_mut().expect("aggregate mode");
+            let kinds = self.agg_kinds()?;
             accumulate(kinds, state, &ctx)?;
         }
         Ok(None)
@@ -222,13 +250,24 @@ impl Engine {
         !self.agg_state.is_some() && self.plan.limit.is_some_and(|n| self.emitted >= n)
     }
 
+    /// The classified aggregate kinds — [`Self::classified`] runs before every
+    /// read, so the memo is present; the precondition is spelled once, here.
+    fn agg_kinds(&self) -> Result<&[AggKind], Error> {
+        self.agg_kinds.as_deref().ok_or(Error::Invariant(
+            "aggregate kinds are classified before use",
+        ))
+    }
+
     /// Classify the projection list once (defense: the parse layer already
     /// guarantees every item is a bare aggregate call).
     fn classified(&mut self) -> Result<(), Error> {
         if self.agg_kinds.is_none() {
             let mut kinds = Vec::with_capacity(self.plan.projections.len());
             for item in &self.plan.projections {
-                kinds.push(aggregate_kind(item)?);
+                let Projection::Item { expr, .. } = item else {
+                    return Err(no_wild_projection());
+                };
+                kinds.push(aggregate_kind(expr)?);
             }
             self.agg_kinds = Some(kinds);
         }
@@ -244,9 +283,11 @@ impl Engine {
     fn project(&self, ctx: &RowCtx) -> Result<OutRow, Error> {
         let mut keys = Vec::new();
         let mut vals = Vec::new();
-        for (i, item) in self.plan.projections.iter().enumerate() {
-            match item {
-                Projection::Wild => match ctx.record {
+        // The slot and the plan item are walked together: the key is the
+        // slot's (resolved once), the expression the plan's (its one home).
+        for (slot, item) in self.slots.iter().zip(&self.plan.projections) {
+            match slot {
+                Slot::Wild => match ctx.record {
                     Record::Csv(cols) | Record::Parquet(cols) => {
                         keys.extend(cols.header.names().iter().cloned());
                         vals.extend(cols.fields.iter().cloned());
@@ -261,18 +302,19 @@ impl Engine {
                     }
                     Record::Json(_) => {}
                 },
-                Projection::Item { expr, .. } => {
+                Slot::Item { key } => {
+                    // `new` builds the two lists in lockstep, so an item slot
+                    // always names an item projection (the error is a backstop
+                    // for a future drift, not a reachable state).
+                    let Projection::Item { expr, .. } = item else {
+                        return Err(Error::Invariant("a projection slot mirrors its plan item"));
+                    };
                     let field = match ctx.record {
                         Record::Json(_) => eval_field(expr, ctx)?,
                         _ => Field::Present(eval(expr, ctx)?),
                     };
                     vals.push(field);
-                    keys.push(
-                        self.item_keys[i]
-                            .as_ref()
-                            .expect("Item projection key precomputed")
-                            .clone(),
-                    );
+                    keys.push(key.clone());
                 }
             }
         }
@@ -436,14 +478,11 @@ fn finish_value(kind: &AggKind, state: &AggState, col: &AggCol) -> Result<Value,
     })
 }
 
-/// Classify one projection item as the aggregate it must be — the shape the
-/// accumulation dispatches on; the parse layer rejects anything else, so
-/// the two error arms below are defense-in-depth.
-fn aggregate_kind(item: &Projection) -> Result<AggKind, Error> {
+/// Classify one aggregate item's expression as the aggregate it must be — the
+/// shape the accumulation dispatches on; the parse layer rejects anything
+/// else, so the error arms below are defense-in-depth.
+fn aggregate_kind(expr: &Expr) -> Result<AggKind, Error> {
     let not_aggregate = || Error::Parse("non-aggregate expression in aggregate select list".into());
-    let Projection::Item { expr, .. } = item else {
-        return Err(not_aggregate());
-    };
     let Expr::Function(f) = expr else {
         return Err(not_aggregate());
     };
@@ -494,11 +533,14 @@ fn precision_overflow() -> Error {
 fn plain_key(expr: &Expr) -> String {
     match expr {
         Expr::Identifier(id) => id.value.clone(),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .expect("compound identifier is non-empty")
-            .value
-            .clone(),
+        // `a.b[.c]` — sqlparser builds the list from a dot chain, so it always
+        // has a last part; a list without one names nothing identifiable and
+        // falls through to the expression text, the documented last resort
+        // (an empty compound identifier prints as the empty string).
+        Expr::CompoundIdentifier(parts) => match parts.last() {
+            Some(last) => last.value.clone(),
+            None => expr.to_string(),
+        },
         Expr::CompoundFieldAccess { root, access_chain } => access_key(root, access_chain),
         other => other.to_string(),
     }
@@ -570,9 +612,11 @@ fn json_column(ctx: &RowCtx, name: &str, style: NameStyle) -> Result<Field, Erro
 /// resolves on the record (`_1`/the FROM alias → the row; any other name →
 /// a field), the remaining parts walk object fields.
 fn json_path(ctx: &RowCtx, parts: &[Ident]) -> Result<Field, Error> {
-    let (first, rest) = parts
-        .split_first()
-        .expect("compound identifier is non-empty");
+    let Some((first, rest)) = parts.split_first() else {
+        return Err(Error::Invariant(
+            "a compound identifier carries a first part",
+        ));
+    };
     let mut field = json_root_field(ctx, &first.value, ident_style(first))?;
     for part in rest {
         field = json_dot_step(field, &part.value, ident_style(part), ctx)?;
@@ -823,7 +867,11 @@ fn eval_field(expr: &Expr, ctx: &RowCtx) -> Result<Field, Error> {
         Expr::CompoundIdentifier(parts) => match ctx.record {
             Record::Json(_) => json_path(ctx, parts),
             _ => {
-                let last = parts.last().expect("compound identifier is non-empty");
+                let Some(last) = parts.last() else {
+                    return Err(Error::Invariant(
+                        "a compound identifier carries a last part",
+                    ));
+                };
                 column_field(ctx, &last.value, ident_style(last))
             }
         },

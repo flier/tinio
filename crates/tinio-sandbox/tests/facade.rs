@@ -7,6 +7,17 @@
 //! a real backend, the target backend's enforcement, the macOS mechanism's defaults — lives beside
 //! the code it exercises, in `src/lib.rs` (`plans/2026-10-01-test-placement-cleanup.md`).
 
+// **The stated allow D7 gives a test target for the one panic-family lint clippy's in-tests
+// keys cannot cover** (`docs/style.md` §Panics; design 2026-10-09 D7): the keys are
+// `allow-unwrap-in-tests` / `allow-expect-in-tests` / `allow-panic-in-tests`, and there is no
+// `allow-unreachable-in-tests` — so the two `unreachable!()` closures this file hands
+// `Child::new` (a `wait` arm no test runs, in `the_launcher_surface_is_re_exported` and
+// `the_launch_failure_surface_is_re_exported`) would otherwise fail the gate on test code.
+#![allow(
+    clippy::unreachable,
+    reason = "test support: a test target — `unreachable!` has no in-tests key, and the two sites are never-run `Child::new` wait closures in test bodies (docs/style.md §Panics, design 2026-10-09 D7)"
+)]
+
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]

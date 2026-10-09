@@ -52,7 +52,12 @@ fn walk_path_pair(pair: Pair<'_, Rule>) -> Result<Vec<PathSeg>, String> {
                 out.extend(walk_path_pair(seg)?);
             }
             Rule::dot_name => {
-                let p = seg.into_inner().next().unwrap(); // name
+                // `dot_name` wraps exactly one inner pair (the name token); a
+                // shape without one is not a path, refused like the oversized
+                // index below.
+                let Some(p) = seg.into_inner().next() else {
+                    return Err(INVALID_FROM_PATH.to_string());
+                };
                 out.push(PathSeg::Name(p.as_str().to_string()));
             }
             Rule::dot_wild | Rule::wstar => out.push(PathSeg::Wild),

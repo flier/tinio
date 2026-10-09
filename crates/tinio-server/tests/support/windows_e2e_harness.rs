@@ -1,6 +1,17 @@
 //! Process, DACL and console helpers for the Windows confined-server legs.
 
 #![allow(dead_code)]
+// **A support module inside a test target, and a stated exemption because
+// clippy's test keys do not reach it** (docs/style.md §Panics, design 2026-10-09
+// D7): `allow-*-in-tests` covers `#[test]` functions and `#[cfg(test)]` modules,
+// while this harness's sites are plain helper `fn`s (the process spawn, the DACL
+// probe, the console drain) that no `#[test]` encloses.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a test target's harness helpers (docs/style.md §Panics)"
+)]
 
 use std::{
     env, fs,
@@ -445,10 +456,9 @@ impl Exit {
 /// field quoted and `,`-separated, the SID last. A refusal is the fixture's, so it
 /// fails with the tool's text.
 pub fn current_user_sid() -> String {
-    let output = Command::new("whoami")
-        .args(["/user", "/fo", "csv", "/nh"])
-        .output()
-        .expect("run whoami");
+    let mut command = Command::new("whoami");
+    command.args(["/user", "/fo", "csv", "/nh"]);
+    let output = job::output(&mut command).expect("run whoami");
     assert!(
         output.status.success(),
         "whoami: {}",

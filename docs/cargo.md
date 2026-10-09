@@ -2,7 +2,7 @@
 
 ## Rules
 
-- Manifests: no comments (`docs/` owns rationale). Pin once at workspace; members path-only, inherit version/edition (`major.minor` only); publish only the facade; optional/target deps at the crate.
+- Manifests: no comments (`docs/` owns rationale). Pin once at workspace; members path-only, inherit version/edition (`major or major.minor`, major.minor preferred); publish only the facade; optional/target deps at the crate — a consumer-facing optional dep whose features the crate's own code needs (e.g. `syn`'s `full, visit` for `tinio-util`'s `testing` walk) rides the crate's edge, not the workspace pin, and a dev-dep keeps its own feature pair because a dev-dep is not in a consumer's build.
 - Groups: workspace pins, deps, dev-deps, target — external then in-tree; alpha within group; no extra blank when a group is one.
 - Patched dep: vendor it, keep the upstream version, header names the change; root names patch + exclude (sandbox design).
 - `unsafe_code` `forbid` by default; `deny` + enumerated allow only where raw platform API forces it. Sandbox backends go `deny` as each lands (design decision 14); stub stays `forbid`. Clippy `absolute_paths` warn (`docs/style.md`).

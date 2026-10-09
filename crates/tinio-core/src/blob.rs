@@ -136,6 +136,10 @@ impl FromStr for BlockHash {
 impl From<&str> for BlockHash {
     /// Trusted-input convenience (panics on a malformed hash — use
     /// [`BlockHash::new`] for untrusted input).
+    #[expect(
+        clippy::expect_used,
+        reason = "literal: the documented literal API — a `From<&str>` call site is a compile-time block-hash fixture, stored hashes go through `BlockHash::new`"
+    )]
     fn from(hash: &str) -> Self {
         Self::new(hash).expect("valid block hash")
     }

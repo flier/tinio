@@ -77,16 +77,27 @@ impl<R: Read> Document<R> {
     }
 }
 
+/// The reader-slot invariant, spelled once for its three readers: the reader
+/// is present until `finish_document` takes it out at `Done`, so an empty slot
+/// is never a state a pull can reach.
+fn reader_absent() -> Error {
+    Error::Invariant("the document reader is present until Done")
+}
+
 /// Borrow the document reader as a ValueSource. The reader lives for the whole
-/// document, so its position and container stack survive each poll.
-fn source<R: Read>(reader: &mut Option<Reader<R>>) -> ReaderSource<'_, Reader<R>> {
-    ReaderSource::new(reader.as_mut().expect("the reader is present until Done"))
+/// document, so its position and container stack survive each poll; the slot
+/// empties only in `finish_document`, which latches `Done` in the same pull.
+fn source<R: Read>(reader: &mut Option<Reader<R>>) -> Result<ReaderSource<'_, Reader<R>>, Error> {
+    reader
+        .as_mut()
+        .map(ReaderSource::new)
+        .ok_or_else(reader_absent)
 }
 
 /// The document reader itself, still in its slot: `source` lends it to the
 /// matcher's adapter, while the free `position` samples the reader directly.
-fn as_reader<R: Read>(reader: &Option<Reader<R>>) -> &Reader<R> {
-    reader.as_ref().expect("the reader is present until Done")
+fn as_reader<R: Read>(reader: &Option<Reader<R>>) -> Result<&Reader<R>, Error> {
+    reader.as_ref().ok_or_else(reader_absent)
 }
 
 /// One root pull: decide the root shape, then read one batch of the current
@@ -113,8 +124,8 @@ fn pull_root<R: Read>(
                 return Ok(());
             }
             RootState::Array { in_element: false } => {
-                let has_next = source(reader).has_next()?;
-                let start = position(as_reader(reader));
+                let has_next = source(reader)?.has_next()?;
+                let start = position(as_reader(reader)?)?;
                 if !has_next {
                     // `has_next()` skipped the whitespace before `]`, so this
                     // position is past it: the document-level end. The budget
@@ -123,8 +134,8 @@ fn pull_root<R: Read>(
                     // (checked at its `End`) is the authority, and this end
                     // reaches past it through the whitespace and the bracket.
                     let end = {
-                        let end = position(as_reader(reader));
-                        source(reader).end_array()?;
+                        let end = position(as_reader(reader)?)?;
+                        source(reader)?.end_array()?;
                         end
                     };
                     if !*produced {
@@ -156,7 +167,7 @@ fn pull_root<R: Read>(
                 }
                 // The single-value root's span is the whole document, so this
                 // check stays as it was: the budget origin is the root start.
-                let end = position(as_reader(reader));
+                let end = position(as_reader(reader)?)?;
                 return finish_document(reader, budget, stream, state, end);
             }
             RootState::Done => {
@@ -176,9 +187,9 @@ fn decide_shape<R: Read>(
     stream: &mut ReaderTail,
     state: &mut RootState,
 ) -> Result<(), Error> {
-    let outcome = source(reader).peek();
+    let outcome = source(reader)?.peek();
     let (kind, start) = match outcome {
-        Ok(kind) => (kind, position(as_reader(reader))),
+        Ok(kind) => (kind, position(as_reader(reader)?)?),
         // Empty input is zero records; whitespace-only input is a format error.
         // Both report IncompleteDocument at the first peek (fact 10) and only
         // the consumed-byte position tells them apart.
@@ -192,7 +203,7 @@ fn decide_shape<R: Read>(
     stream.last_record_start = start;
     budget.begin(start);
     if kind == ValueKind::Array {
-        source(reader).begin_array()?;
+        source(reader)?.begin_array()?;
         *state = RootState::Array { in_element: false };
         return Ok(());
     }
@@ -226,10 +237,10 @@ fn read_element<R: Read>(
     state: &mut RootState,
 ) -> Result<bool, Error> {
     let progress = {
-        let mut source = source(reader);
+        let mut source = source(reader)?;
         matcher.next_root(&mut source)?
     };
-    let end = position(as_reader(reader));
+    let end = position(as_reader(reader)?)?;
     match progress {
         // Cap-check this root's span so far; the rest of the value is read by
         // the next pull.
@@ -270,7 +281,9 @@ fn finish_document<R: Read>(
     // The trailing probe consumes the reader, so it is taken out for good. The
     // message is bare text: `JsonError::Other` renders it as `json input: {0}`,
     // so the crate-level Display keeps the old verbatim wording (deviation ⑨).
-    let owned = reader.take().expect("the reader is present until Done");
+    let Some(owned) = reader.take() else {
+        return Err(reader_absent());
+    };
     consume_trailing(owned, "trailing characters after the JSON document")?;
     stream.done = true;
     Ok(())
@@ -290,7 +303,7 @@ fn empty_or<R: Read>(
     let Error::Json(JsonInputError(json)) = &err else {
         return Err(err);
     };
-    if json.is_incomplete_document() && position(as_reader(reader)) == 0 {
+    if json.is_incomplete_document() && position(as_reader(reader)?)? == 0 {
         stream.done = true;
         return Ok(());
     }
@@ -1139,10 +1152,10 @@ mod tests {
                 settings(),
             ));
             {
-                assert_eq!(position(as_reader(&slot)), 0, "{input}");
-                source(&mut slot).peek().unwrap();
+                assert_eq!(position(as_reader(&slot).unwrap()).unwrap(), 0, "{input}");
+                source(&mut slot).unwrap().peek().unwrap();
                 assert_eq!(
-                    position(as_reader(&slot)),
+                    position(as_reader(&slot).unwrap()).unwrap(),
                     start,
                     "{input}: peek moved data_pos"
                 );
@@ -1152,7 +1165,7 @@ mod tests {
             let mut state = RootState::Undecided;
             decide_shape(&mut slot, &mut budget, &mut stream, &mut state).unwrap();
             assert_eq!(stream.last_record_start, start, "{input}");
-            let pos = position(slot.as_ref().unwrap());
+            let pos = position(slot.as_ref().unwrap()).unwrap();
             assert!(
                 pos <= start + 1,
                 "{input}: the shape decision crossed the root"

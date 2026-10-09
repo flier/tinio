@@ -3,8 +3,10 @@
 use std::collections::HashMap;
 
 use s3s::{
+    S3Error, S3Result,
     auth::{Credentials, SecretKey},
     dto::Owner,
+    s3_error,
 };
 
 pub use crate::_core::acl::{ANONYMOUS_CANONICAL_ID, derive_canonical_id};
@@ -81,19 +83,23 @@ impl Identity {
     /// The requester's canonical ID: the authenticated user's, or
     /// [`ANONYMOUS_CANONICAL_ID`] when no credentials are present.
     ///
-    /// A signed request with an unknown access key is impossible post-auth
-    /// (`ConfigAuth` rejects it) — an invariant violation panics.
-    pub fn principal(&self, credentials: Option<&Credentials>) -> OwnerId {
-        match credentials {
-            Some(creds) => self
-                .users
-                .get(creds.access_key.as_str())
-                .expect("authenticated access key must resolve to a configured user")
-                .canonical_id
-                .clone(),
-            None => OwnerId::new(ANONYMOUS_CANONICAL_ID)
-                .expect("the anonymous canonical ID is a valid OwnerId"),
-        }
+    /// A signed request whose access key is not configured is refused with
+    /// the `InvalidAccessKeyId` [`ConfigAuth`](crate::auth::ConfigAuth)
+    /// answers for that key while it verifies the signature — the same
+    /// refusal wherever it is noticed, rather than a panic.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidAccessKeyId` when `credentials` name an access key the
+    /// identity map does not carry.
+    pub fn principal(&self, credentials: Option<&Credentials>) -> S3Result<OwnerId> {
+        let Some(creds) = credentials else {
+            return Ok(OwnerId::anonymous());
+        };
+        self.users
+            .get(creds.access_key.as_str())
+            .map(|user| user.canonical_id.clone())
+            .ok_or_else(invalid_access_key_id)
     }
 
     /// The s3s `Owner` element for a row owner: the display name from the
@@ -119,6 +125,17 @@ impl Identity {
     }
 }
 
+/// The refusal for an access key that is not configured: the
+/// `InvalidAccessKeyId` phrase [`ConfigAuth`](crate::auth::ConfigAuth) fails
+/// signature verification with, so a key that is unknown reads the same
+/// wherever it is noticed.
+pub(crate) fn invalid_access_key_id() -> S3Error {
+    s3_error!(
+        InvalidAccessKeyId,
+        "The AWS Access Key Id you provided does not exist in our records."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,10 +152,24 @@ mod tests {
             secret_key: SecretKey::from("secret"),
         };
         assert_eq!(
-            id.principal(Some(&cred)).as_str(),
+            id.principal(Some(&cred)).unwrap().as_str(),
             user1_canonical_id().as_str()
         );
-        assert_eq!(id.principal(None).as_str(), ANONYMOUS_CANONICAL_ID);
+        assert_eq!(id.principal(None).unwrap().as_str(), ANONYMOUS_CANONICAL_ID);
+    }
+
+    #[test]
+    fn principal_refuses_an_unconfigured_access_key() {
+        // The converted site's client-visible half: the code `ConfigAuth`
+        // answers the same key with while it verifies the signature — never
+        // a 500 (design 2026-10-09 D5).
+        let id = Identity::test(vec![User::test("AKID", "secret", "user1")]);
+        let cred = Credentials {
+            access_key: "WHO".into(),
+            secret_key: SecretKey::from("secret"),
+        };
+        let err = id.principal(Some(&cred)).err().unwrap();
+        assert_eq!(err.code().as_str(), "InvalidAccessKeyId");
     }
 
     #[test]

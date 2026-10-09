@@ -64,6 +64,12 @@ testing = ["tinio-util/testing", "dep:tempfile", "dep:tracing-subscriber"]
 
 [lints.clippy]
 absolute_paths = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_used = "warn"
 
 [lints.rust]
 unsafe_code = "deny"

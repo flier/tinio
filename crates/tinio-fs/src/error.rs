@@ -55,6 +55,13 @@ pub enum Error {
     /// The storage root exists but is not a directory.
     #[error("storage root is not a directory: {}", .0.display())]
     RootNotDirectory(PathBuf),
+    /// An internal invariant this crate believed unreachable was violated —
+    /// the fallible replacement for a would-be panic (design 2026-10-09 D5,
+    /// named there). The payload names the broken invariant for `Debug` and
+    /// the log; `Display` stays generic, so the wire body never carries an
+    /// internal symbol.
+    #[error("internal error")]
+    Invariant(&'static str),
 }
 
 /// A path-mapping violation (rejected before any filesystem access).
@@ -148,7 +155,9 @@ impl From<Error> for storage::Error {
             Error::Storage(e) => e,
             Error::Database(e) => storage::io(IoError::other(e)),
             Error::Pipeline(e) => storage::io(IoError::other(e)),
-            Error::InvalidValue(_) | Error::RootNotDirectory(_) => storage::io(IoError::other(err)),
+            Error::InvalidValue(_) | Error::RootNotDirectory(_) | Error::Invariant(_) => {
+                storage::io(IoError::other(err))
+            }
         }
     }
 }
@@ -269,6 +278,21 @@ mod tests {
         assert!(matches!(core, Io(_)));
         let core: storage::Error = root_not_directory("/x").into();
         assert!(matches!(core, Io(_)));
+    }
+
+    #[test]
+    fn an_invariant_failure_displays_generically_and_names_itself_in_debug() {
+        // D5: the broken invariant is named for `Debug` and the log; the
+        // wire body — the storage projection's own display — stays generic,
+        // so no internal symbol reaches a response.
+        let err = Error::Invariant("the etag tee's promise is filled when the body drains");
+        assert_eq!(err.to_string(), "internal error");
+        assert!(
+            format!("{err:?}").contains("the etag tee's promise is filled"),
+            "{err:?}"
+        );
+        let core: storage::Error = err.into();
+        assert_eq!(core.to_string(), "I/O error: internal error");
     }
 
     #[test]

@@ -51,7 +51,9 @@ use crate::{
         acl::Acl,
         bucket, checksum,
         meta::{UploadMeta, upload as row},
-        multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber, check_part_minimum},
+        multipart::{
+            CompletedPart, MultipartUpload, PartInfo, PartNumber, check_part_minimum, part_number,
+        },
         object::{self},
         storage::{self, DEFAULT_MAX_CONCURRENT_UPLOADS, Error::NoSuchUpload},
     },
@@ -559,7 +561,7 @@ impl Store {
                 Err(err) => return Err(err.into()),
             };
             parts.push(PartInfo {
-                part_number: row.number.into(),
+                part_number: part_number(row.number)?,
                 size: metadata.len(),
                 etag: row.etag,
                 last_modified: metadata.modified()?,
@@ -2846,7 +2848,7 @@ mod tests {
                 let key = object::key("big.bin").unwrap();
                 let upload = store
                     .create(&b, &key, None, object::Tags::empty(), None, &Acl::default_private(None)).await.unwrap();
-                let pn: PartNumber = n.into();
+                let pn = part_number(n).expect("the strategy's range is inside 1..=10000");
                 prop_assert!(u32::from(pn) == n);
                 let part = store.put_part(&b, &key, &upload.upload_id, pn, body(b"x"), None).await.unwrap();
                 prop_assert_eq!(u32::from(part.part_number), n);

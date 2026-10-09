@@ -20,6 +20,17 @@
 - Async traits: `async-trait` + `async fn`. Storage aggregates `*Ops`; `Error: Into<storage::Error>`; methods use `<Self as Storage>::Error`; pinned stream aliases.
 - ETag: `Single` / `Composed`; parse `ETag::new`; emit `Display`; content/composed constructors.
 
+## Panics
+
+- Business code returns; never panics. No `.unwrap()` / `.expect()` / `unwrap_err` / `expect_err` / `panic!` / `unreachable!` / `todo!` / `unimplemented!` / `assert!` outside tests, benches, doc examples, test-support modules (design 2026-10-09 D1).
+- Exception = `#[expect(<lint>, reason = "…")]`, prefix one of four: `literal:` compile-time input; `infallible:` cannot fail by construction; `guarded:` invariant visible in the same expression, no better shape; `argued:` unreachable, argument + catching mechanism in the reason (D2). Runtime-failable never. Eliminate over annotate.
+- Test code is outside the four: a test fn, a test-gated module and a test-support module/target carry a *stated* `#[allow]`/`#[expect]` whose reason prefix is one of two — `test support:` a test-support module or non-test target (bench, `harness = false` binary, integration target's helpers); `test context:` a test-gated module or test fn (D7).
+- Lock: `.lock()` recovers — `.unwrap_or_else(PoisonError::into_inner)`; never unwrap, never propagate (D3).
+- Error: reuse the fitting variant; else `Invariant(&'static str)`; detail to log/metrics only, response body generic 500 (D5).
+- Fallback only where `Result` is impossible (`Display`, `Drop`, foreign trait): defined fallback + `tracing` event, never panic (D6).
+- Out of rule: indexing/slicing, arithmetic overflow, `debug_assert!` (D4).
+- Gate: the six lints warn per crate (CI `-D warnings`); assert family, `#[allow]` use and reason prefixes by `crates/tinio-e2e/tests/policy.rs` (D7, D8).
+
 ## Doc examples
 
 - Public item: doc comment + runnable rustdoc example. Exempt classes: constitution III.

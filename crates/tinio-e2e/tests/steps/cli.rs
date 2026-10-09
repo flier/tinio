@@ -800,22 +800,19 @@ impl Cli {
     ///
     /// **The probe spawns through the job guard like every other site in this harness.** It used
     /// to reach the binary through `Command::output()`, which is the same spawn-and-wait without
-    /// the guard — the one spawn site here the textual spawn-guard rule
-    /// (`crates/tinio-util/tests/spawn_guard.rs`; `.spawn()`-only) could not see, because
-    /// `output()` is method sugar over it. `job::spawn` + [`Child::wait_with_output`] is that
-    /// sugar spelled out: standard streams piped by hand, stdin null as `output()` makes it, and
-    /// the child a member of the test process's job (a `--help` probe exits on its own, so what
-    /// the guard buys here is the property rather than the reaping).
+    /// the guard — and it is the shape the spawn guard (`crates/tinio-util/tests/spawn_guard.rs`)
+    /// now reads as a site of its own, where the `.spawn()`-only text scan it replaced could not
+    /// see it: `output()` spawns as surely as `spawn()` does, and a suite that reaches the binary
+    /// through it never holds the handle the job membership is about. `job::output` is the guard's
+    /// own spelling of that recipe, so the child is a member of the test process's job and the
+    /// three stdio modes are the helper's rather than three lines written here (a `--help` probe
+    /// exits on its own, so what the guard buys here is the property rather than the reaping).
     fn knows_flag(&self, flag: &str) -> bool {
         let mut cmd = self.command();
         cmd.arg("server")
             .arg(&self.root)
             .args(["--port", "0", flag, "--help"]);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = job::spawn(&mut cmd).expect("probe the flag");
-        let out = child.wait_with_output().expect("probe the flag");
+        let out = job::output(&mut cmd).expect("probe the flag");
         !String::from_utf8_lossy(&out.stderr).contains("error: unexpected argument")
     }
 
@@ -2814,9 +2811,9 @@ fn macos_witness(cli: &Cli) {
         .unwrap_or_else(|| panic!("the launcher's `spawn` event carries no `pid=` field: {line}"))
         .parse()
         .unwrap_or_else(|err| panic!("the launcher's `spawn` pid is not a number: {err}"));
-    let output = Command::new("/bin/ps")
-        .args(["-o", "ppid=", "-p", &pid.to_string()])
-        .output()
+    let mut command = Command::new("/bin/ps");
+    command.args(["-o", "ppid=", "-p", &pid.to_string()]);
+    let output = job::output(&mut command)
         .unwrap_or_else(|err| panic!("could not read the process table for {pid}: {err}"));
     let ppid: u32 = String::from_utf8_lossy(&output.stdout)
         .trim()
@@ -2949,9 +2946,9 @@ fn macos_unconfined(cli: &Cli) {
 /// line per process with no header and both columns bare.
 #[cfg(target_os = "macos")]
 fn children_of(pid: u32) -> Vec<u32> {
-    let output = Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid="])
-        .output()
+    let mut command = Command::new("/bin/ps");
+    command.args(["-axo", "pid=,ppid="]);
+    let output = job::output(&mut command)
         .unwrap_or_else(|err| panic!("could not read the process table: {err}"));
     let table = String::from_utf8_lossy(&output.stdout).into_owned();
     table
