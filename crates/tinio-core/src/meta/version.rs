@@ -38,6 +38,15 @@ use crate::{
 };
 
 /// Whether a version row is an object version or a delete marker.
+///
+/// `version_rows.kind` is PostgreSQL's own `version_kind` enum, so the
+/// `sqlx`-gated derive below owns the mapping: the type name is the DDL's and
+/// `lowercase` reproduces this type's `Display` labels.
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+#[cfg_attr(
+    feature = "sqlx",
+    sqlx(type_name = "version_kind", rename_all = "lowercase")
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 pub enum Kind {
     /// A stored object version: the row's blob is the version's content.
@@ -213,6 +222,48 @@ impl Stored {
             checksum: checksum::Recorded::from_wire_opt(checksum),
             owner: bucket_meta::decode_owner(owner),
             acl: bucket_meta::decode_acl(grants),
+            seq,
+        })
+    }
+
+    /// Decode one stored value tuple from the contract's own values.
+    ///
+    /// `None` is a domain-invalid blob or identifier element (what the row is
+    /// and where its content lives cannot be guessed, so it reads as absent);
+    /// the `kind` is the contract's own and the tags and ACL arrive whole
+    /// (the ACL carrying the owner, which the row splits out through
+    /// [`Acl::into_parts`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_values(
+        seq: u64,
+        id: &str,
+        blob: &str,
+        size: u64,
+        etag: &str,
+        created: SystemTime,
+        became_noncurrent: u64,
+        kind: Kind,
+        tags: object::Tags,
+        checksum: &str,
+        acl: Acl,
+    ) -> Option<Self> {
+        let blob = decode_blob(blob)?;
+        if id != "null" && version::Id::new(id).is_err() {
+            return None;
+        }
+        let (owner, grants) = acl.into_parts();
+        Some(Self {
+            id: version::Id::from_wire(id),
+            blob,
+            size,
+            etag: ETag::new(etag).unwrap_or(ETag::EMPTY),
+            created,
+            became_noncurrent,
+            kind,
+            tags,
+            checksum: checksum::Recorded::from_wire_opt(checksum),
+            owner,
+            acl: Acl::from_parts(None, grants),
             seq,
         })
     }

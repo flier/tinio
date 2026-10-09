@@ -75,6 +75,8 @@ pub fn mint() -> Id {
 /// assert_eq!(id.as_str(), "3/L4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY");
 /// assert_eq!(id.to_string(), id.as_str());
 /// ```
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+#[cfg_attr(feature = "sqlx", sqlx(transparent))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Deref, AsRef)]
 #[display("{0}")]
 #[as_ref(forward)]
@@ -305,6 +307,11 @@ impl TryFrom<&str> for Id {
 /// assert!(State::Enabled.records_versions());
 /// assert!(!State::Unversioned.records_versions());
 /// ```
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+#[cfg_attr(
+    feature = "sqlx",
+    sqlx(type_name = "bucket_state", rename_all = "PascalCase")
+)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Display, FromStr)]
 pub enum State {
     /// The default: every write replaces the previous object.
@@ -337,6 +344,12 @@ impl State {
         self != State::Unversioned
     }
 }
+
+// `bucket_versioning.state` is PostgreSQL's own `bucket_state` enum, so the
+// `sqlx`-gated derive above owns the mapping: the type name is the DDL's and
+// `PascalCase` reproduces this type's `Display` labels, exactly as
+// `object::Tags` and `checksum::Algorithm` map through the same feature.
+// Decode is strict because the database enum can hold no outside value.
 
 /// What a version-creating write or a delete produced.
 ///

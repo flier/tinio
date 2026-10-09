@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- How many migrations the migration table records.\nSELECT count(*) AS \"applied!\" FROM schema_version\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "applied!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "b064a656ba9517988d9132cda3246566339898b990825e927975d99b47ee7b16"
+}

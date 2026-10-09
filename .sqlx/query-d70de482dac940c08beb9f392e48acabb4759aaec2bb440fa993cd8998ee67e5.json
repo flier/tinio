@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT ON (hash COLLATE \"C\") hash, len, published\nFROM blocks\nWHERE hash > $1\nORDER BY hash COLLATE \"C\", seq\nLIMIT $2\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blocks",
+            "name": "hash"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "len",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blocks",
+            "name": "len"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "published",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "blocks",
+            "name": "published"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d70de482dac940c08beb9f392e48acabb4759aaec2bb440fa993cd8998ee67e5"
+}

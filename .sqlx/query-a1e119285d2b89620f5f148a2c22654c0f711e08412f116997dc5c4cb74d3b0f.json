@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM part_checksums WHERE bucket = $1 AND upload_id = $2 AND number = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a1e119285d2b89620f5f148a2c22654c0f711e08412f116997dc5c4cb74d3b0f"
+}

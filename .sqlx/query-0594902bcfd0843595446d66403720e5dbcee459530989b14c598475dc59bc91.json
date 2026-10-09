@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO current_slots (bucket, key, version_id, seq)\nVALUES ($1, $2, $3, $4)\nON CONFLICT (bucket, key) DO UPDATE SET\n    version_id = excluded.version_id, seq = excluded.seq\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0594902bcfd0843595446d66403720e5dbcee459530989b14c598475dc59bc91"
+}

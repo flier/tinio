@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO upload_checksums (bucket, upload_id, algorithm, kind)\nVALUES ($1, $2, $3, $4)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4e457cfbf21045a7997a0f40fb1012fff96c0e339363932fdc39946c61ceb467"
+}

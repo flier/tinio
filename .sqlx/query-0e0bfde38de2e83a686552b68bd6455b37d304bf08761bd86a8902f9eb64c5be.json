@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO object_meta\n(bucket, key, etag, size, mtime, identity, tags, checksum, acl)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\nON CONFLICT (bucket, key) DO UPDATE SET\n    etag = excluded.etag, size = excluded.size, mtime = excluded.mtime,\n    identity = excluded.identity, tags = excluded.tags,\n    checksum = excluded.checksum, acl = excluded.acl\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Timestamptz",
+        "Int8",
+        "Jsonb",
+        "Text",
+        {
+          "Custom": {
+            "name": "acl",
+            "kind": {
+              "Composite": [
+                [
+                  "owner",
+                  "Text"
+                ],
+                [
+                  "grants",
+                  {
+                    "Custom": {
+                      "name": "acl_grant[]",
+                      "kind": {
+                        "Array": {
+                          "Custom": {
+                            "name": "acl_grant",
+                            "kind": {
+                              "Composite": [
+                                [
+                                  "grantee",
+                                  {
+                                    "Custom": {
+                                      "name": "acl_grantee",
+                                      "kind": {
+                                        "Composite": [
+                                          [
+                                            "grantee_kind",
+                                            "Text"
+                                          ],
+                                          [
+                                            "grantee_value",
+                                            "Text"
+                                          ]
+                                        ]
+                                      }
+                                    }
+                                  }
+                                ],
+                                [
+                                  "permission",
+                                  "Text"
+                                ]
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0e0bfde38de2e83a686552b68bd6455b37d304bf08761bd86a8902f9eb64c5be"
+}

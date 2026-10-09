@@ -67,7 +67,7 @@ A work list, not a design. Each item names the document that owns the fix, the c
 35. Task 1 Interfaces: `&Arc<RedbMetadata>` (or `&Arc<dyn Metadata<Error = tinio_store_redb::Error>>`) — `Arc<RedbMetadata>` cannot coerce to a `Metadata<Error = tinio_mem::Error>` object.
 
 **`plans/2026-10-03-tinio-store-pg-p3.md`**
-36. Every DB-backed gate command becomes `--features pg,pg-tests` (three places; `--features pg` alone skips the conformance suite and the PG18–PG24 legs).
+36. Every DB-backed gate command becomes `--features pg,pg-tests` (three places; `--features pg` alone skips the conformance suite and the PG18–PG24 legs). **Superseded by P3 Task 11**: the crate carries no `pg` feature, so its DB gate is `--features pg-tests`, and `pg` is the consumer's optional dependency on the crate.
 37. Task 2 Step 4: consume the same coverage claim P1 pins (the spike covered all eleven) — delete the "three it did not" list.
 38. Task 3 Interfaces: `VersionMeta`'s row shape (P1 deletes `VersionRows`).
 39. Task 2 Step 4 + Task 4: the completion form (B5) and its leg.

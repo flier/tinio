@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT key AS \"key: object::Key\" FROM uploads WHERE bucket = $1 AND upload_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key: object::Key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "key"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "71c219ec23c3ed4f4a33169e1a1e95afd26d28c6a47d240602a5b6ca0f00403f"
+}

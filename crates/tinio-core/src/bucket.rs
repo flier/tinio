@@ -62,6 +62,8 @@ pub struct Bucket {
 /// let from_literal: bucket::Name = "my-bucket".into();
 /// assert_eq!(from_literal, name);
 /// ```
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+#[cfg_attr(feature = "sqlx", sqlx(transparent))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Display, Deref, AsRef, Into)]
 #[display("{}", _0)]
 #[deref(forward)]

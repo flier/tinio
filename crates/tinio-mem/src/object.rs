@@ -20,7 +20,6 @@ use bytes::Bytes;
 
 #[cfg(feature = "versioning")]
 use crate::_store_redb::{object_meta, object_part, objects};
-use crate::counting::report;
 #[cfg(feature = "versioning")]
 use crate::version::check_bucket_write;
 #[cfg(feature = "versioning")]
@@ -41,6 +40,7 @@ use crate::{
         version,
     },
     Error,
+    counting::report,
     error::{access_denied, invalid_key, no_such_key},
     storage::MemoryStorage,
     version::object_result,

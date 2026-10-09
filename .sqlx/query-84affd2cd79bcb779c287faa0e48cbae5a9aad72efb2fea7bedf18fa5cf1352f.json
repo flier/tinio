@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE buckets SET cors = '' WHERE name = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "84affd2cd79bcb779c287faa0e48cbae5a9aad72efb2fea7bedf18fa5cf1352f"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- Drop one chunk row of a stored block, behind the store's back: the block's\n-- declared length row survives, so a reader sees fewer bytes than it promises.\nDELETE FROM blocks\nWHERE hash = $1 AND seq = $2\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3bec739819e03428850709b81c5cf5498c10055eff18cafa2f5427caf113e1ce"
+}

@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM content\nWHERE bucket = $1 AND kind = $2 AND ckey = $3\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "content_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "part"
+              ]
+            }
+          }
+        },
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7f5c7e984a00d89dde2de68328ea76cec4c74ac19192bf12489a1b4e07a3cb95"
+}

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT NOT EXISTS (\n    SELECT 1 FROM content_heads WHERE bucket = $1 AND live_seq IS NOT NULL\n) AS \"empty!\"\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "empty!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "e20ceec8474e2fcdfa42f6aa6e331d005888781f7f7fa6ed46fb5c7c97bb5357"
+}

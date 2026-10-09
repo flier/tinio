@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
-exclude = ["vendor/soft-canonicalize", "spike"]
+members = ["crates/*", "xtask"]
+exclude = ["vendor/soft-canonicalize"]
 
 [workspace.package]
 version = "0.1.0"
@@ -75,6 +75,7 @@ signal-hook = "0.4"
 smart-default = "0.7"
 soft-canonicalize = "0.5"
 sqlparser = "0.63"
+sqlx = { version = "0.9", default-features = false }
 sse-core = { version = "0.2", default-features = false }
 strict-path = "0.2"
 struson = "0.7"
@@ -111,6 +112,7 @@ tinio-sandbox-macos = { path = "crates/tinio-sandbox-macos" }
 tinio-sandbox-windows = { path = "crates/tinio-sandbox-windows" }
 tinio-select = { path = "crates/tinio-select" }
 tinio-server = { path = "crates/tinio-server", default-features = false }
+tinio-store-pg = { path = "crates/tinio-store-pg", default-features = false }
 tinio-store-redb = { path = "crates/tinio-store-redb" }
 tinio-util = { path = "crates/tinio-util" }
 tinio-version = { path = "crates/tinio-version" }

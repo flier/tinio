@@ -4,3 +4,12 @@
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[alias]
+xtask = "run --package xtask --"
+
+# sqlx macros read the committed .sqlx cache. A command that must describe
+# statements against a live database sets SQLX_OFFLINE=false itself; this
+# entry does not force, so that value wins.
+[env]
+SQLX_OFFLINE = "true"

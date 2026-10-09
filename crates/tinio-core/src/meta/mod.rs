@@ -11,10 +11,12 @@
 //!
 //! Every row type here is **decoded** — a domain type or an owned string, never
 //! a redb key or value tuple, never a table handle. The wire codecs the stored
-//! rows share live once in [`bucket`] — the owner/ACL split
-//! ([`bucket::decode_acl`], [`bucket::encode_owner`], [`bucket::encode_grants`]),
-//! the strict grants decode and the CORS decode — and every row module calls
-//! them: one home for the encode/decode rules, shared by every backend.
+//! rows share live once in [`bucket`] — the ACL wires ([`bucket::decode_acl`],
+//! [`bucket::encode_owner`], [`bucket::encode_grants`]), the strict grants
+//! decode and the CORS decode — and every row module calls them: one home for
+//! the encode/decode rules, shared by every backend. The owner/grants split
+//! those wires carry is the ACL type's own ([`crate::acl::Acl::into_parts`],
+//! [`crate::acl::Acl::from_parts`]).
 //!
 //! The traits are used **generically** (`M: Metadata + VersionMeta`), never as
 //! `dyn` (D6): each category method returns `<Self as Metadata>::Error` and

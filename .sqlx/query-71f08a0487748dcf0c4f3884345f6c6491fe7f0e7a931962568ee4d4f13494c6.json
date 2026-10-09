@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM current_slots WHERE bucket = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "71f08a0487748dcf0c4f3884345f6c6491fe7f0e7a931962568ee4d4f13494c6"
+}

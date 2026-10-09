@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO object_meta\n(bucket, key, etag, size, mtime, identity, tags, checksum, acl)\nVALUES (\n    $1, $2, 'not-an-etag', 1, to_timestamp(0), 0, '{}', '',\n    row(NULL, ARRAY[]::acl_grant[])::acl\n)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7471c8e349e3b59a115714f7d5a08b296cc7a334248c89590a7f90ef002fcca9"
+}

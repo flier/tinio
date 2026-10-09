@@ -1,0 +1,91 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO version_rows\n(\n    bucket, key, seq, id, blob, size, etag, created, became_noncurrent,\n    kind, tags, checksum, acl\n)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)\nON CONFLICT (bucket, key, seq) DO UPDATE SET\n    id = excluded.id, blob = excluded.blob, size = excluded.size,\n    etag = excluded.etag, created = excluded.created,\n    became_noncurrent = excluded.became_noncurrent, kind = excluded.kind,\n    tags = excluded.tags, checksum = excluded.checksum,\n    acl = excluded.acl\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Timestamptz",
+        "Int8",
+        {
+          "Custom": {
+            "name": "version_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "marker"
+              ]
+            }
+          }
+        },
+        "Jsonb",
+        "Text",
+        {
+          "Custom": {
+            "name": "acl",
+            "kind": {
+              "Composite": [
+                [
+                  "owner",
+                  "Text"
+                ],
+                [
+                  "grants",
+                  {
+                    "Custom": {
+                      "name": "acl_grant[]",
+                      "kind": {
+                        "Array": {
+                          "Custom": {
+                            "name": "acl_grant",
+                            "kind": {
+                              "Composite": [
+                                [
+                                  "grantee",
+                                  {
+                                    "Custom": {
+                                      "name": "acl_grantee",
+                                      "kind": {
+                                        "Composite": [
+                                          [
+                                            "grantee_kind",
+                                            "Text"
+                                          ],
+                                          [
+                                            "grantee_value",
+                                            "Text"
+                                          ]
+                                        ]
+                                      }
+                                    }
+                                  }
+                                ],
+                                [
+                                  "permission",
+                                  "Text"
+                                ]
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "950373c4a035b9a52cfb2220195806fd228b6234b1ffd206d68d9f08478bbc3d"
+}

@@ -11,8 +11,7 @@
 //! delete: the bucket's version rows, their index, its state row and its
 //! blobs die with the bucket (spec 2026-10-03).
 
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::{sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use redb::ReadableTable;

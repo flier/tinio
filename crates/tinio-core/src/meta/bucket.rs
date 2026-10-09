@@ -67,6 +67,29 @@ impl Row {
         }
     }
 
+    /// Decode a row from the contract's own values.
+    ///
+    /// The stored form is one ACL composite carrying the owner, so the caller
+    /// passes the whole [`Acl`] and the row splits it ([`Acl::into_parts`]) the
+    /// way every backend serves it: `owner` is the composite's owner and `acl`
+    /// the grant set with no owner. The tags and CORS arrive as the contract
+    /// values.
+    pub fn from_values(
+        created: SystemTime,
+        tags: object::Tags,
+        acl: Acl,
+        cors: Option<cors::Config>,
+    ) -> Self {
+        let (owner, grants) = acl.into_parts();
+        Self {
+            created,
+            tags,
+            owner,
+            acl: Acl::from_parts(None, grants),
+            cors,
+        }
+    }
+
     /// Encode the row back into its value tuple's elements.
     pub fn to_raw(&self) -> Wires {
         Wires {
@@ -116,15 +139,13 @@ pub fn decode_tags(wire: &str) -> object::Tags {
     object::Tags::from_wire_limited(wire, object::BUCKET_TAGS_MAX)
 }
 
-/// Decode the row's owner/ACL elements into the [`Acl`] the row serves: the
-/// owner rides its own element ([`decode_owner`]), so the decoded ACL carries
-/// the grants only. The **one home** of that split — every row module calls it
-/// rather than re-deriving it.
+/// Decode the row's grants element into the [`Acl`] the row serves: the owner
+/// rides its own element ([`decode_owner`]), so the decoded ACL carries the
+/// grants only — the absent owner beside them is [`Acl::from_parts`], the one
+/// home of the row's split. Every row module calls this rather than
+/// re-deriving it.
 pub fn decode_acl(grants: &str) -> Acl {
-    Acl {
-        owner: None,
-        grants: decode_grants(grants).unwrap_or_default(),
-    }
+    Acl::from_parts(None, decode_grants(grants).unwrap_or_default())
 }
 
 /// Encode an [`Acl`]'s grants element. The owner is not part of this wire —

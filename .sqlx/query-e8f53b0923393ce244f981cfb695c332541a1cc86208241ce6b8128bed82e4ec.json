@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM version_rows WHERE bucket = $1 AND key = $2 AND seq = ANY($3)\n    RETURNING seq, id\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8Array"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "e8f53b0923393ce244f981cfb695c332541a1cc86208241ce6b8128bed82e4ec"
+}

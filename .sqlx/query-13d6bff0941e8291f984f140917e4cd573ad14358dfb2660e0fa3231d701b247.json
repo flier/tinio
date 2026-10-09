@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM version_index\nWHERE bucket = $1 AND key = $2 AND seq = $3 AND id <> $4\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "13d6bff0941e8291f984f140917e4cd573ad14358dfb2660e0fa3231d701b247"
+}

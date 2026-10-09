@@ -7,8 +7,9 @@
 //! alike — the fs backend adds its own blocking-pool hop and write-lock
 //! histograms around the same core; see `tinio-fs`'s `Handle`).
 
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
+use derive_more::Debug;
 use redb::{
     Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, WriteTransaction,
     backends::InMemoryBackend,
@@ -53,25 +54,21 @@ pub fn open_in_memory() -> Result<Database, Error> {
 /// here is a programming error — except on the read paths that rewrite a
 /// row they could not hit, where the refusal is the designed "not
 /// written back" (tinio-fs's `Error::is_read_only`).
+///
+/// `Debug` names each arm and not the handle it wraps, because
+/// `redb::ReadOnlyDatabase` has no `Debug`: a variant-level `#[debug(...)]`
+/// carries the bare name (`Writable`, `ReadOnly`, `Empty`).
+#[derive(Debug)]
 enum Db {
     /// The database, opened for writing.
+    #[debug("Writable")]
     Writable(Database),
     /// The database, opened read-only.
+    #[debug("ReadOnly")]
     ReadOnly(ReadOnlyDatabase),
     /// The empty in-memory view a read-only run degrades to.
+    #[debug("Empty")]
     Empty(Database),
-}
-
-impl fmt::Debug for Db {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `redb::ReadOnlyDatabase` has no `Debug`, so the arm names
-        // itself rather than the wrapped handle.
-        f.write_str(match self {
-            Self::Writable(_) => "Writable(Database)",
-            Self::ReadOnly(_) => "ReadOnly(ReadOnlyDatabase)",
-            Self::Empty(_) => "Empty(Database)",
-        })
-    }
 }
 
 /// The shared access handle to a state database.

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE buckets SET tags = '{}' WHERE name = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "40b97be9f23534c6794d858e63914464c8f45466e3319f9b039856bb4ba41f43"
+}

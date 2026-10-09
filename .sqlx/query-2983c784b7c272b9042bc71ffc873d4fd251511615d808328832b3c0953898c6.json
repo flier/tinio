@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- How many other sessions in this database have run a statement inside the\n-- window: an idle session keeps the query it last ran, so a count of one here\n-- is the ownership guard's dedicated connection re-probing on its cadence.\nSELECT count(*) AS \"recent!\" FROM pg_stat_activity\nWHERE\n    datname = current_database()\n    AND pid <> pg_backend_pid()\n    AND query_start > now() - interval '400 milliseconds'\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "recent!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2983c784b7c272b9042bc71ffc873d4fd251511615d808328832b3c0953898c6"
+}

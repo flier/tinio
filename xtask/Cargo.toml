@@ -1,0 +1,24 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+clap = { workspace = true, features = [
+    "derive",
+    "error-context",
+    "help",
+    "std",
+    "suggestions",
+    "usage",
+] }
+thiserror = { workspace = true }
+
+tinio-util.workspace = true
+
+[lints.clippy]
+absolute_paths = "warn"
+
+[lints.rust]
+unsafe_code = "forbid"

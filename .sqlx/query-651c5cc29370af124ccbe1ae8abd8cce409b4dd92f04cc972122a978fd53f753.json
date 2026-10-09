@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- A live head whose encoded key starts with the object prefix but cannot decode\n-- into an object key: a traversal has to report the row, never yield the key.\nINSERT INTO content_heads\n(bucket, kind, ckey, next_seq, live_seq, live_len)\nVALUES (\n    $1, 'object', 'o:', 1, 1, 0\n)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "651c5cc29370af124ccbe1ae8abd8cce409b4dd92f04cc972122a978fd53f753"
+}

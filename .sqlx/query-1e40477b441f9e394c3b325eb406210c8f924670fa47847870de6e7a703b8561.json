@@ -1,0 +1,55 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT chunk_no, chunk FROM content\nWHERE\n    bucket = $1 AND kind = $2 AND ckey = $3 AND seq = $4\n    AND chunk_no BETWEEN $5 AND $6\nORDER BY chunk_no\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "chunk_no",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "content",
+            "name": "chunk_no"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "chunk",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "content",
+            "name": "chunk"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "content_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "part"
+              ]
+            }
+          }
+        },
+        "Text",
+        "Int8",
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "1e40477b441f9e394c3b325eb406210c8f924670fa47847870de6e7a703b8561"
+}

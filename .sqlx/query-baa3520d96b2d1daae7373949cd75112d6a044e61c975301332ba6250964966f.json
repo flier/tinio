@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE object_meta SET tags = $3\nWHERE bucket = $1 AND key = $2 AND tags IS DISTINCT FROM $3\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "baa3520d96b2d1daae7373949cd75112d6a044e61c975301332ba6250964966f"
+}

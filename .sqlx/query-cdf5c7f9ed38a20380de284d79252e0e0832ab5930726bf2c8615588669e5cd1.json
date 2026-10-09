@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE content_heads SET ckey = $3\nWHERE bucket = $1 AND kind = 'object'::content_kind AND ckey = $2\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cdf5c7f9ed38a20380de284d79252e0e0832ab5930726bf2c8615588669e5cd1"
+}

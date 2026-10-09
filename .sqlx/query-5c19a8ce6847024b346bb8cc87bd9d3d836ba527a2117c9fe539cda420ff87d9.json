@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO version_index (bucket, key, id, seq) VALUES ($1, $2, $3, $4)\nON CONFLICT (bucket, key, id) DO UPDATE SET seq = excluded.seq\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5c19a8ce6847024b346bb8cc87bd9d3d836ba527a2117c9fe539cda420ff87d9"
+}

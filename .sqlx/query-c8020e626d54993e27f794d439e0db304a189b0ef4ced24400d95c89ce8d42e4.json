@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO bucket_versioning (bucket, state) VALUES ($1, $2)\nON CONFLICT (bucket) DO UPDATE SET state = excluded.state\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "bucket_state",
+            "kind": {
+              "Enum": [
+                "Unversioned",
+                "Enabled",
+                "Suspended"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c8020e626d54993e27f794d439e0db304a189b0ef4ced24400d95c89ce8d42e4"
+}

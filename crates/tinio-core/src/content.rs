@@ -26,6 +26,7 @@ use std::{error::Error as StdError, time::SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use derive_more::{From, Into};
 use futures::StreamExt;
 
 use crate::{
@@ -91,15 +92,17 @@ pub struct ContentEntry {
 /// apart. A plane that records the tag answers the stale compensation's
 /// `false` instead of deleting the later writer's bytes; a plane that keeps no
 /// identity falls back to the byte compare, documented per method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PublishId(u64);
-
-impl PublishId {
-    /// The identity with the given value.
-    pub fn new(value: u64) -> Self {
-        Self(value)
-    }
-}
+///
+/// # Examples
+///
+/// ```
+/// use tinio_core::content::PublishId;
+///
+/// let id = PublishId::from(7_u64);
+/// assert_eq!(u64::from(id), 7);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, From, Into)]
+pub struct PublishId(pub(crate) u64);
 
 /// The staged half of a write: the handle [`ObjectContent::stage`] answers, into
 /// which the caller streams the body before [`ObjectContent::publish`].

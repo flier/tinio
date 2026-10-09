@@ -17,6 +17,14 @@
 //! `from_grants_wire` self-heals — any domain-invalid wire becomes
 //! [`Acl::default_private`] with no owner, the established read-path
 //! discipline for stored rows.
+//!
+//! The contract's PostgreSQL mapping lives in the crate's one mapping module
+//! (`sql_types`), behind the crate's `sqlx` feature: a backend binds the
+//! contract types themselves and keeps no mirror. The composite's guarantees
+//! are the wire codec's: a write is canonical (unknown group URIs dropped, the
+//! grant set sorted by the same key and deduped), and a read self-heals a
+//! stored element outside the domain — the same discipline this module's own
+//! `from_grants_wire` applies.
 
 use sha2::{Digest, Sha256};
 
@@ -31,6 +39,8 @@ pub const ANONYMOUS_CANONICAL_ID: &str = "65a011a29cdf8ec533ec3d1ccaae921c";
 /// identifier S3 uses for owners and grantees (AWS's own canonical IDs
 /// have the same shape), or AWS's anonymous special-grantee ID
 /// ([`ANONYMOUS_CANONICAL_ID`] — the one exception to the shape).
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+#[cfg_attr(feature = "sqlx", sqlx(transparent))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OwnerId(String);
 
@@ -199,7 +209,9 @@ pub const ACL_GRANTS_MAX: usize = 100;
 
 /// An access-control list: the owning account and its grant set. The
 /// row form the backends persist; the owner is its own row element —
-/// `to_grants_wire`/`from_grants_wire` cover the grant set only.
+/// [`Acl::into_parts`] splits the two and [`Acl::from_parts`] re-joins
+/// them, while `to_grants_wire`/`from_grants_wire` cover the grant set
+/// only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Acl {
     /// The owning canonical ID (`None` = legacy/lazy — resolves to the
@@ -224,6 +236,62 @@ impl Acl {
         Self { owner, grants }
     }
 
+    /// Split the composite into the two row elements every backend stores: the
+    /// owner (which rides its own row element) and the grant set. The row keeps
+    /// the grants in an owner-less [`Acl`] ([`Acl::from_parts`] re-joins the
+    /// pair).
+    ///
+    /// The **one home** of that split — the row modules call it rather than
+    /// re-deriving it, and the row's own ACL decode reaches it through the
+    /// absent owner.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_core::acl::{Acl, OwnerId};
+    ///
+    /// let owner =
+    ///     OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899").unwrap();
+    /// let acl = Acl::default_private(Some(owner.clone()));
+    ///
+    /// // The row form: the owner rides its own element, the grants stay behind.
+    /// let (owner_element, grants) = acl.into_parts();
+    /// assert_eq!(owner_element, Some(owner));
+    /// assert_eq!(grants.len(), 1, "the owner's own FULL_CONTROL grant");
+    /// ```
+    pub fn into_parts(self) -> (Option<OwnerId>, AclGrants) {
+        (self.owner, self.grants)
+    }
+
+    /// The inverse of [`Acl::into_parts`]: the composite a row's split elements
+    /// make. A store's write path assembles it before binding the ACL
+    /// composite, so the re-join has one home too.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_core::acl::{Acl, Grant, Grantee, OwnerId, Permission};
+    ///
+    /// let owner =
+    ///     OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899").unwrap();
+    /// let acl = Acl::from_parts(
+    ///     Some(owner.clone()),
+    ///     vec![Grant {
+    ///         grantee: Grantee::Canonical(owner),
+    ///         permission: Permission::FullControl,
+    ///     }],
+    /// );
+    /// assert!(acl.owner.is_some());
+    /// assert_eq!(acl.grants.len(), 1);
+    ///
+    /// // Round trip: the two row elements re-join to what they split from.
+    /// let (owner_element, grants) = acl.clone().into_parts();
+    /// assert_eq!(Acl::from_parts(owner_element, grants), acl);
+    /// ```
+    pub fn from_parts(owner: Option<OwnerId>, grants: AclGrants) -> Self {
+        Self { owner, grants }
+    }
+
     /// The canonical grantee wire element; a group URI outside the
     /// three documented constants has no wire form.
     fn grantee_wire(g: &Grantee) -> Option<String> {
@@ -234,24 +302,57 @@ impl Acl {
         })
     }
 
-    /// The canonical grants wire: each `grantee_wire,PERMISSION` entry
-    /// sorted and deduped, joined by `&`. Grants whose grantee has no
-    /// wire form (unknown group URIs) are dropped.
-    pub fn to_grants_wire(&self) -> String {
-        let mut entries: Vec<String> = self
+    /// One grant's canonical key: `grantee_wire,PERMISSION`. `None` when the
+    /// grantee has no stored form (an unknown group URI) -- the one rule both
+    /// the grants wire and the PostgreSQL composite drop on.
+    pub(crate) fn grant_key(grant: &Grant) -> Option<String> {
+        Some(format!(
+            "{},{}",
+            Self::grantee_wire(&grant.grantee)?,
+            grant.permission.as_wire()
+        ))
+    }
+
+    /// The canonical grant order: each grant's [`Acl::grant_key`] beside the
+    /// index of the grant it came from, grants whose grantee has no stored form
+    /// dropped, sorted by key and deduped. The **one home** of the
+    /// canonicalization rule — [`Acl::canonical_grants`] and
+    /// [`Acl::to_grants_wire`] both derive from it, so a key is built once per
+    /// grant and no grant is cloned unless an owned copy is the answer.
+    fn canonical_order(&self) -> Vec<(String, usize)> {
+        let mut keyed: Vec<(String, usize)> = self
             .grants
             .iter()
-            .filter_map(|g| {
-                Some(format!(
-                    "{},{}",
-                    Self::grantee_wire(&g.grantee)?,
-                    g.permission.as_wire()
-                ))
-            })
+            .enumerate()
+            .filter_map(|(index, grant)| Some((Self::grant_key(grant)?, index)))
             .collect();
-        entries.sort();
-        entries.dedup();
-        entries.join("&")
+        // The sort is stable, so an equal-key run keeps its first occurrence:
+        // exactly the grant the clone-based sort-then-dedupe picked, and the
+        // order the stored form's byte identity is pinned to.
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed.dedup_by(|a, b| a.0 == b.0);
+        keyed
+    }
+
+    /// The canonical grant set, in the stored order every backend persists:
+    /// grants whose grantee has no stored form are dropped, and the rest are
+    /// ordered by [`Acl::grant_key`] and deduped. The grants wire and the
+    /// PostgreSQL composite's write share this one rule.
+    pub(crate) fn canonical_grants(&self) -> AclGrants {
+        self.canonical_order()
+            .into_iter()
+            .map(|(_, index)| self.grants[index].clone())
+            .collect()
+    }
+
+    /// The canonical grants wire: each `Acl::grant_key` entry, sorted and
+    /// deduped, joined by `&`.
+    pub fn to_grants_wire(&self) -> String {
+        self.canonical_order()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>()
+            .join("&")
     }
 
     /// Parse the grants wire; any domain-invalid input self-heals to
@@ -288,31 +389,15 @@ impl Acl {
         if grants.len() > ACL_GRANTS_MAX {
             return Err(AclError::GrantsOverflow);
         }
-        // Canonical: sort by the same `grantee_wire,PERMISSION` key the
-        // encoder emits, and dedupe exact duplicates. The canonical
-        // encoder is the only writer — the read path (every ACL row
-        // decode) verifies the order+dedupe in one linear pass and
-        // skips the sort for the canonical rows it wrote.
-        let mut keyed: Vec<(String, Grant)> = grants
-            .into_iter()
-            .filter_map(|g| {
-                Some((
-                    format!(
-                        "{},{}",
-                        Self::grantee_wire(&g.grantee)?,
-                        g.permission.as_wire()
-                    ),
-                    g,
-                ))
-            })
-            .collect();
-        if !keyed.windows(2).all(|w| w[0].0 < w[1].0) {
-            keyed.sort_by(|a, b| a.0.cmp(&b.0));
-            keyed.dedup_by(|a, b| a.0 == b.0);
-        }
+        // Canonical: the same sort and dedupe the encoder emits, so a parsed
+        // wire is byte-identical to the one a write stores.
+        let parsed = Self {
+            owner: None,
+            grants,
+        };
         Ok(Self {
             owner: None,
-            grants: keyed.into_iter().map(|(_, g)| g).collect(),
+            grants: parsed.canonical_grants(),
         })
     }
 }
@@ -581,5 +666,74 @@ mod tests {
             Acl::parse_grants_wire(&wire).unwrap().to_grants_wire(),
             format!("id={b},FULL_CONTROL&id={a},READ")
         );
+    }
+
+    #[test]
+    fn the_composite_write_is_the_grants_wires_canonical_value() {
+        // The PostgreSQL composite's write reuses the wire codec's key, so a
+        // stored grant set is byte-identical to the wire's canonical value:
+        // an unknown group URI dropped, order fixed, duplicates removed.
+        let acl = Acl {
+            owner: Some(uid()),
+            grants: vec![
+                Grant {
+                    grantee: Grantee::Group(GroupUri("http://evildomain/".into())),
+                    permission: Permission::Read,
+                },
+                Grant {
+                    grantee: Grantee::Canonical(uid()),
+                    permission: Permission::Read,
+                },
+                Grant {
+                    grantee: Grantee::Canonical(uid()),
+                    permission: Permission::Read,
+                },
+                Grant {
+                    grantee: Grantee::Group(GroupUri(GROUP_ALL_USERS.to_string())),
+                    permission: Permission::Write,
+                },
+            ],
+        };
+        let canonical = acl.canonical_grants();
+        assert_eq!(
+            canonical.len(),
+            2,
+            "the unknown group and the duplicate drop"
+        );
+        assert_eq!(
+            canonical
+                .iter()
+                .filter_map(Acl::grant_key)
+                .collect::<Vec<_>>(),
+            acl.to_grants_wire().split('&').collect::<Vec<_>>(),
+            "the composite's write is the wire's canonical value"
+        );
+        assert_eq!(canonical[0].grantee, Grantee::Canonical(uid()));
+        assert_eq!(
+            canonical[1].grantee,
+            Grantee::Group(GroupUri(GROUP_ALL_USERS.to_string()))
+        );
+    }
+
+    #[test]
+    fn the_composite_read_drops_an_element_outside_the_domain() {
+        // A stored grantee outside the domain has no canonical key, so the
+        // composite's read drops the whole grant -- the wire's own self-heal.
+        let unknown = Grant {
+            grantee: Grantee::Group(GroupUri("http://evildomain/".into())),
+            permission: Permission::Read,
+        };
+        // The sentinel a stored fragment outside the domain decodes to.
+        let sentinel = Grant {
+            grantee: Grantee::Group(GroupUri(String::new())),
+            permission: Permission::Read,
+        };
+        let canonical = Grant {
+            grantee: Grantee::Canonical(uid()),
+            permission: Permission::Read,
+        };
+        assert!(Acl::grant_key(&canonical).is_some());
+        assert!(Acl::grant_key(&unknown).is_none());
+        assert!(Acl::grant_key(&sentinel).is_none());
     }
 }

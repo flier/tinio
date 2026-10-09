@@ -1,0 +1,7 @@
+# sqruff cannot parse these four statements in its postgres dialect: three use
+# `= ANY (array)` and one uses `LOCALE_PROVIDER builtin BUILTIN_LOCALE`.
+# The dialect gap and the revisit condition are recorded in docs/style.md.
+crates/tinio-store-pg/sql/meta/object/load.sql
+crates/tinio-store-pg/sql/meta/upload/part_records_rows.sql
+crates/tinio-store-pg/sql/meta/version/expire_many.sql
+crates/tinio-store-pg/sql/tests/create_database_locale.sql

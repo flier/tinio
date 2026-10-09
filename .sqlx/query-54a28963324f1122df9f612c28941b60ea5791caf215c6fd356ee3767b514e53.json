@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT seq, chunk\nFROM blocks\nWHERE hash = $1 AND seq >= $2 AND seq <= $3\nORDER BY seq\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "blocks",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "chunk",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "blocks",
+            "name": "chunk"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "54a28963324f1122df9f612c28941b60ea5791caf215c6fd356ee3767b514e53"
+}

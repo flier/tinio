@@ -120,23 +120,16 @@ fn write_row(txn: &mut WriteTransaction, bucket: &str, key: &str, row: &Row) -> 
     write_row_into(&mut MetaTable::open(txn)?, bucket, key, row)
 }
 
-/// The recorded elements a content-derived rewrite carries over — empty,
-/// `None` and the private default when the row is absent.
+/// The recorded elements a content-derived rewrite carries over — the
+/// contract's own absent-row value ([`Preserved::none`]) when there is no
+/// previous row.
 fn preserved_of(previous: Option<&object_meta::Stored>) -> Preserved {
-    previous.map_or_else(
-        || Preserved {
-            tags: object::Tags::empty(),
-            checksum: None,
-            owner: None,
-            acl: acl::Acl::default_private(None),
-        },
-        |stored| Preserved {
-            tags: stored.tags.clone(),
-            checksum: stored.checksum.clone(),
-            owner: stored.owner.clone(),
-            acl: stored.acl.clone(),
-        },
-    )
+    previous.map_or_else(Preserved::none, |stored| Preserved {
+        tags: stored.tags.clone(),
+        checksum: stored.checksum.clone(),
+        owner: stored.owner.clone(),
+        acl: stored.acl.clone(),
+    })
 }
 
 /// The retained part row of one contract part.

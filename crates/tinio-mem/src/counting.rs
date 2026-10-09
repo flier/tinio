@@ -239,7 +239,7 @@ where
     /// counter starts the sequence at 1), so no later publish can carry a
     /// stale compensation's id.
     pub(crate) fn mint_publish_id(&self) -> PublishId {
-        PublishId::new(self.next_publish.fetch_add(1, Ordering::Relaxed) + 1)
+        PublishId::from(self.next_publish.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     /// Record `id` as the key's latest publish. Call with

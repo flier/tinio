@@ -108,6 +108,7 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures::stream::iter;
+use redb::WriteTransaction;
 
 // The feature-on `records_versions` body is this import's only user — with
 // the feature off the body answers the constant `false` and the shared
@@ -119,8 +120,6 @@ use crate::_store_redb::bucket_versioning;
 // does not carry an unused import.
 #[cfg(not(feature = "versioning"))]
 use crate::{_core::storage::VersionOps, storage::MemoryStorage};
-use redb::WriteTransaction;
-
 use crate::{
     _core::{
         BodyStream, ByteRange, ETag, GetObjectResult,
@@ -260,8 +259,6 @@ pub(crate) fn check_bucket_write(txn: &mut WriteTransaction, bucket: &Name) -> R
 /// The versioned implementation, compiled with the `versioning` feature.
 #[cfg(feature = "versioning")]
 mod enabled {
-    use super::{check_bucket_read, check_bucket_write};
-
     use std::{
         cmp::{Reverse, min},
         collections::{BTreeMap, HashSet},
@@ -272,6 +269,7 @@ mod enabled {
     use async_trait::async_trait;
     use redb::{ReadableTable, WriteTransaction};
 
+    use super::{check_bucket_read, check_bucket_write};
     use crate::{
         _core::{
             ByteRange, ETag,

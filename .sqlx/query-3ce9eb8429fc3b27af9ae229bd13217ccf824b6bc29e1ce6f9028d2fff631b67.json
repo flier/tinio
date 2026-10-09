@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT name, created FROM buckets WHERE name = ANY ($1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "buckets",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "created",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "buckets",
+            "name": "created"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "3ce9eb8429fc3b27af9ae229bd13217ccf824b6bc29e1ce6f9028d2fff631b67"
+}

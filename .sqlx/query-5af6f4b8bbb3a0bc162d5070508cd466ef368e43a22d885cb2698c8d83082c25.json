@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT host(client_addr) FROM pg_stat_activity WHERE pid = pg_backend_pid()",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "host",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "5af6f4b8bbb3a0bc162d5070508cd466ef368e43a22d885cb2698c8d83082c25"
+}

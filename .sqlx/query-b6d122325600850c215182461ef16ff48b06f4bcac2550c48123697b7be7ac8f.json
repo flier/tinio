@@ -1,0 +1,156 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    u.upload_id,\n    u.key,\n    u.initiated_at,\n    u.tags AS \"tags: object::Tags\",\n    u.acl AS \"acl: Acl\",\n    c.algorithm AS \"algorithm?: checksum::Algorithm\",\n    c.kind AS \"kind?\"\nFROM uploads u LEFT JOIN upload_checksums c\n    ON c.bucket = u.bucket AND c.upload_id = u.upload_id\nWHERE u.bucket = $1 AND u.upload_id = $2\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "upload_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "upload_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "initiated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "initiated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "tags: object::Tags",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "acl: Acl",
+        "type_info": {
+          "Custom": {
+            "name": "acl",
+            "kind": {
+              "Composite": [
+                [
+                  "owner",
+                  "Text"
+                ],
+                [
+                  "grants",
+                  {
+                    "Custom": {
+                      "name": "acl_grant[]",
+                      "kind": {
+                        "Array": {
+                          "Custom": {
+                            "name": "acl_grant",
+                            "kind": {
+                              "Composite": [
+                                [
+                                  "grantee",
+                                  {
+                                    "Custom": {
+                                      "name": "acl_grantee",
+                                      "kind": {
+                                        "Composite": [
+                                          [
+                                            "grantee_kind",
+                                            "Text"
+                                          ],
+                                          [
+                                            "grantee_value",
+                                            "Text"
+                                          ]
+                                        ]
+                                      }
+                                    }
+                                  }
+                                ],
+                                [
+                                  "permission",
+                                  "Text"
+                                ]
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "acl"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "algorithm?: checksum::Algorithm",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_checksums",
+            "name": "algorithm"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "kind?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_checksums",
+            "name": "kind"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "b6d122325600850c215182461ef16ff48b06f4bcac2550c48123697b7be7ac8f"
+}

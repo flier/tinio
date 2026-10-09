@@ -9,7 +9,7 @@
 //! [`super::version::Stored`] and the key's current slot (D37).
 //!
 //! The self-heal rule is the row's own: a domain-invalid ETag makes the whole
-//! row read as absent ([`Row::from_raw`] answers `None` — the reader
+//! row read as absent ([`Row::from_values`] answers `None` — the reader
 //! recomputes and rewrites on the next read), while every other element
 //! self-heals individually inside its accessor.
 //!
@@ -30,7 +30,7 @@ use crate::{
     ETag,
     acl::{self, Acl, OwnerId},
     bucket, checksum, multipart, object,
-    storage::{self, from_nanos, to_nanos},
+    storage::{self, to_nanos},
 };
 
 /// The content-derived description of one object — the four elements
@@ -51,7 +51,8 @@ pub struct Identity {
 }
 
 /// The elements a content-derived rewrite carries over from the row it
-/// replaces — the answer of [`super::ObjectMeta::put_preserving`].
+/// replaces — the answer of [`super::ObjectMeta::put_preserving`], and
+/// [`Preserved::none`] when there was no previous row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preserved {
     /// The replaced row's tag set (empty when it had none).
@@ -62,6 +63,33 @@ pub struct Preserved {
     pub owner: Option<OwnerId>,
     /// The replaced row's grant set.
     pub acl: Acl,
+}
+
+impl Preserved {
+    /// The zero state: nothing to carry over, because the row the rewrite
+    /// replaces is absent — no tags, no checksum, no owner, and the private
+    /// default in place of its grant set. The one home of the "no previous
+    /// row" value every backend's preserving write answers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_core::{acl::Acl, meta::object::Preserved, object::Tags};
+    ///
+    /// let preserved = Preserved::none();
+    /// assert_eq!(preserved.tags, Tags::empty());
+    /// assert_eq!(preserved.checksum, None);
+    /// assert_eq!(preserved.owner, None);
+    /// assert_eq!(preserved.acl, Acl::default_private(None));
+    /// ```
+    pub fn none() -> Self {
+        Self {
+            tags: object::Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
+        }
+    }
 }
 
 /// A decoded object row.
@@ -86,32 +114,33 @@ pub struct Row {
 }
 
 impl Row {
-    /// Decode one stored value tuple.
+    /// Decode one stored value tuple from the contract's own values.
     ///
     /// `None` is a domain-invalid ETag — the whole row reads as absent, the
-    /// point read's self-heal. A domain-invalid tags, checksum, owner or ACL
-    /// element self-heals to empty / `None` / the private default and the row
-    /// is still served.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_raw(
+    /// point read's self-heal. A domain-invalid checksum element self-heals to
+    /// `None` and the row is still served; the tags and the ACL arrive as the
+    /// contract values, already healed by the backend's own jsonb and
+    /// composite decoders, and the row splits the ACL ([`Acl::into_parts`])
+    /// exactly as its wire decode does.
+    pub fn from_values(
         etag: &str,
         size: u64,
-        mtime: u64,
+        mtime: SystemTime,
         identity: u64,
-        tags: &str,
+        tags: object::Tags,
         checksum: &str,
-        owner: &str,
-        grants: &str,
+        acl: Acl,
     ) -> Option<Self> {
+        let (owner, grants) = acl.into_parts();
         Some(Self {
             etag: ETag::new(etag).ok()?,
             size,
-            mtime: from_nanos(mtime),
+            mtime,
             identity,
-            tags: object::Tags::from_wire_limited(tags, object::OBJECT_TAGS_MAX),
+            tags,
             checksum: checksum::Recorded::from_wire_opt(checksum),
-            owner: bucket_row::decode_owner(owner),
-            acl: bucket_row::decode_acl(grants),
+            owner,
+            acl: Acl::from_parts(None, grants),
         })
     }
 
@@ -488,45 +517,54 @@ pub trait ObjectMeta: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     const ETAG: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
-    fn raw() -> (
-        &'static str,
-        u64,
-        u64,
-        u64,
-        &'static str,
-        &'static str,
-        &'static str,
-        &'static str,
-    ) {
-        (ETAG, 4, 7, 9, "env=prod", "", "", "")
+    /// The mtime the stored tuple pins (7 unix nanoseconds).
+    fn at() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_nanos(7)
+    }
+
+    /// The non-empty tag set the stored tuple pins.
+    fn tag_set() -> object::Tags {
+        object::Tags::from_wire_limited("env=prod", object::OBJECT_TAGS_MAX)
+    }
+
+    /// One object row with the pinned size and identity, decoded from the
+    /// contract's own values.
+    fn object_row(etag: &str, checksum: &str, tags: object::Tags, acl: Acl) -> Option<Row> {
+        Row::from_values(etag, 4, at(), 9, tags, checksum, acl)
+    }
+
+    /// The whole ACL of a row: the split owner and grant set rejoined
+    /// ([`Acl::from_parts`]) the way a backend keeps them in one stored value.
+    fn whole_acl(row: &Row) -> Acl {
+        Acl::from_parts(row.owner.clone(), row.acl.grants.clone())
     }
 
     #[test]
     fn an_object_row_round_trips_through_its_wires() {
-        let (etag, size, mtime, identity, tags, checksum, owner, grants) = raw();
-        let row = Row::from_raw(etag, size, mtime, identity, tags, checksum, owner, grants)
+        let row = object_row(ETAG, "", tag_set(), Acl::default_private(None))
             .expect("a valid etag row is served");
         assert_eq!(row.etag.as_str(), ETAG);
         assert_eq!(row.size, 4);
-        assert_eq!(row.mtime, from_nanos(7));
+        assert_eq!(row.mtime, at());
         assert_eq!(row.identity, 9);
         assert_eq!(row.tags.iter().collect::<Vec<_>>(), [("env", "prod")]);
         assert_eq!(row.checksum, None);
         let wires = row.to_raw();
         assert_eq!(
-            Row::from_raw(
+            Row::from_values(
                 &wires.etag,
                 wires.size,
-                wires.mtime,
+                storage::from_nanos(wires.mtime),
                 wires.identity,
-                &wires.tags,
+                row.tags.clone(),
                 &wires.checksum,
-                &wires.owner,
-                &wires.grants,
+                whole_acl(&row),
             )
             .unwrap(),
             row
@@ -541,36 +579,29 @@ mod tests {
     fn a_corrupt_etag_makes_the_whole_row_read_as_absent() {
         // The point read's self-heal: a row that cannot say its content's
         // identity is not served at all — the reader recomputes and rewrites.
-        let (.., tags, checksum, owner, grants) = raw();
         assert_eq!(
-            Row::from_raw("not-an-etag", 4, 7, 9, tags, checksum, owner, grants),
+            object_row("not-an-etag", "", tag_set(), Acl::default_private(None)),
             None
         );
     }
 
     /// The row `walk_healing` serves as `Some` and heals: a valid identity
     /// with a corrupt metadata element, which never fails the traversal. This
-    /// is the decode half of the healing leg.
+    /// is the decode half of the healing leg; the tag and ACL self-heal lives
+    /// in each backend's own decoder.
     #[test]
-    fn every_other_corrupt_element_self_heals_and_the_row_is_still_served() {
-        let row = Row::from_raw(
+    fn a_corrupt_checksum_element_self_heals_and_the_row_is_still_served() {
+        let owner = OwnerId::new("a".repeat(64)).expect("a canonical id");
+        let row = object_row(
             ETAG,
-            4,
-            7,
-            9,
-            "team=%zz&",
             "CRC32:@@:NOPE",
-            "bad-owner",
-            "id=short,READ",
+            tag_set(),
+            Acl::default_private(Some(owner.clone())),
         )
         .expect("the etag is valid and the row is served");
-        assert!(row.tags.is_empty(), "a corrupt tag wire is no tag set");
         assert_eq!(row.checksum, None, "a corrupt checksum wire is no checksum");
-        assert_eq!(row.owner, None, "a corrupt owner wire is no owner");
-        assert!(
-            row.acl.grants.is_empty(),
-            "a corrupt grants wire is no grant set"
-        );
+        assert_eq!(row.owner, Some(owner));
+        assert_eq!(row.acl.grants.len(), 1, "the owned grant rides the ACL");
         assert_eq!(row.size, 4, "the content-derived elements ride untouched");
     }
 
@@ -626,7 +657,7 @@ mod tests {
 
     #[test]
     fn put_preserving_carries_the_recorded_elements_over() {
-        let row = Row::from_raw(ETAG, 4, 7, 9, "env=prod", "", "", "").unwrap();
+        let row = object_row(ETAG, "", tag_set(), Acl::default_private(None)).unwrap();
         let refreshed = row.with_identity(&Identity {
             etag: ETag::new("900150983cd24fb0d6963f7d28e17f72").unwrap(),
             size: 11,

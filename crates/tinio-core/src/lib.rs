@@ -34,6 +34,13 @@ pub mod pipeline;
 pub mod storage;
 pub mod version;
 
+// The contract types' hand-written PostgreSQL mapping, behind the crate's
+// `sqlx` feature (see the module docs). Named `sql_types`, never `sqlx`: a
+// crate-root `mod sqlx` would make `sqlx::...` paths inside this crate
+// resolve to the module instead of the `sqlx` crate.
+#[cfg(feature = "sqlx")]
+mod sql_types;
+
 pub use self::{
     blob::BlockHash,
     bucket::Bucket,

@@ -1,0 +1,70 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE buckets SET acl = $2 WHERE name = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "acl",
+            "kind": {
+              "Composite": [
+                [
+                  "owner",
+                  "Text"
+                ],
+                [
+                  "grants",
+                  {
+                    "Custom": {
+                      "name": "acl_grant[]",
+                      "kind": {
+                        "Array": {
+                          "Custom": {
+                            "name": "acl_grant",
+                            "kind": {
+                              "Composite": [
+                                [
+                                  "grantee",
+                                  {
+                                    "Custom": {
+                                      "name": "acl_grantee",
+                                      "kind": {
+                                        "Composite": [
+                                          [
+                                            "grantee_kind",
+                                            "Text"
+                                          ],
+                                          [
+                                            "grantee_value",
+                                            "Text"
+                                          ]
+                                        ]
+                                      }
+                                    }
+                                  }
+                                ],
+                                [
+                                  "permission",
+                                  "Text"
+                                ]
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "98257322abd2db0a1c60d1a13e3754bf12a9dd8872cb40c7f71579185d153461"
+}

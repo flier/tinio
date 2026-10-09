@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"held!\" FROM pg_locks\nWHERE\n    locktype = 'advisory'\n    AND classid = $1\n    AND objid = $2\n    AND objsubid = 1\n    AND pid = pg_backend_pid()\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "held!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Oid",
+        "Oid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "4e888529f300397a1ada9dda8af283eb5ca6555c134a4edb5e9774a72e89e649"
+}

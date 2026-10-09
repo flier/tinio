@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO buckets (name, created, tags, acl, cors)\nVALUES ($1, $2, '{}', row(NULL, ARRAY[]::acl_grant[])::acl, '')\nON CONFLICT (name) DO NOTHING\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "16cc316c1ef3d0de4416d1d942b91c09c8c988a0805f7cf1f1f2ee4c5d7430da"
+}

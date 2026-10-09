@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE object_meta SET key = $3 WHERE bucket = $1 AND key = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8d064be98d43b8415b297609acd854f1e3e7c4ecb21c8911c81184ebd16f51fa"
+}

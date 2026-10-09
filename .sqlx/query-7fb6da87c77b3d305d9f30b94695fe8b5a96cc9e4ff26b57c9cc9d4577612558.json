@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO part_checksums (bucket, upload_id, number, algorithm, value)\nVALUES ($1, $2, $3, $4, $5)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7fb6da87c77b3d305d9f30b94695fe8b5a96cc9e4ff26b57c9cc9d4577612558"
+}

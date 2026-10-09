@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH displaced AS (\n    DELETE FROM version_rows\n    WHERE bucket = $1 AND key = $2 AND id = 'null' AND seq <> $3\n    RETURNING seq\n)\n\nDELETE FROM version_index\nWHERE\n    bucket = $1 AND key = $2 AND id = 'null'\n    AND seq IN (SELECT seq FROM displaced)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "da4cdc079a8d8266ad39db735c3627d66ec99200b81f9efc63197077030bfcb8"
+}

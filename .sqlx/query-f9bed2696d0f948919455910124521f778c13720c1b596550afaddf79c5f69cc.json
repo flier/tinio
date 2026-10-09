@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE object_meta SET tags = '{}' WHERE bucket = $1 AND key = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f9bed2696d0f948919455910124521f778c13720c1b596550afaddf79c5f69cc"
+}

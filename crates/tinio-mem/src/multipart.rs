@@ -19,10 +19,8 @@ use uuid::Uuid;
 
 #[cfg(feature = "versioning")]
 use crate::_core::{meta::VersionMeta, version::Id};
-use crate::counting::report;
 #[cfg(feature = "versioning")]
 use crate::version;
-use crate::version::check_bucket_write;
 use crate::{
     _core::{
         BodyStream, CompletedPart, ETag, ListPartsParams, ListUploadsParams, MultipartOps,
@@ -38,8 +36,10 @@ use crate::{
     },
     _store_redb::part_meta,
     Error,
+    counting::report,
     error::{access_denied, invalid_key, invalid_part, no_parts, no_such_upload},
     storage::MemoryStorage,
+    version::check_bucket_write,
 };
 
 impl MemoryStorage {

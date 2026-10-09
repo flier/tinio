@@ -96,6 +96,28 @@ impl Row {
         })
     }
 
+    /// Decode a row from the contract's own values: the tags and the ACL
+    /// arrive whole (the ACL carrying the owner), and the row splits the ACL
+    /// ([`Acl::into_parts`]) exactly as its wire decode does.
+    pub fn from_values(
+        upload_id: &str,
+        key: &str,
+        initiated_at: SystemTime,
+        tags: object::Tags,
+        acl: Acl,
+    ) -> Option<Self> {
+        let (owner, grants) = acl.into_parts();
+        Some(Self {
+            upload_id: upload_id.to_owned(),
+            key: object::key(key).ok()?,
+            initiated_at,
+            checksum: None,
+            tags,
+            owner,
+            acl: Acl::from_parts(None, grants),
+        })
+    }
+
     /// Encode the row back into its value tuple's elements.
     pub fn to_raw(&self) -> Wires {
         Wires {

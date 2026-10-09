@@ -2,7 +2,7 @@
 //! volume that will serve it resolves the two?
 //!
 //! [`path_contains`] is the *definer* of the question, and it is the only
-//! one. It has three readers, and they are the places a wrong answer is
+//! one. It has four readers, and they are the places a wrong answer is
 //! expensive:
 //!
 //! - the filesystem backend's read-only state-dir guard (`FR-023`,
@@ -14,7 +14,10 @@
 //!   set rather than a storage error;
 //! - `tinio-config`'s discovery guard, one process earlier — the same
 //!   read-only refusal at the config path, whose leaf a run has not
-//!   created yet.
+//!   created yet;
+//! - the `xtask`'s `sqlx check`/`update` guard — a cache directory inside
+//!   the scratch directory (or the reverse) would have the run regenerate
+//!   and then compare against the same tree.
 //!
 //! **The copies this module replaced are why it exists.** While each
 //! reader carried its own comparison, the Windows case folding below lived

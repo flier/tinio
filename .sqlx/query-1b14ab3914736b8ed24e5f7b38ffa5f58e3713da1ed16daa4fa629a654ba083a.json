@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT state AS \"state: State\" FROM bucket_versioning WHERE bucket = $1\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state: State",
+        "type_info": {
+          "Custom": {
+            "name": "bucket_state",
+            "kind": {
+              "Enum": [
+                "Unversioned",
+                "Enabled",
+                "Suspended"
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "bucket_versioning",
+            "name": "state"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1b14ab3914736b8ed24e5f7b38ffa5f58e3713da1ed16daa4fa629a654ba083a"
+}

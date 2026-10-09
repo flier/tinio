@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM object_meta WHERE bucket = $1 AND key = $2\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "185c1f411af575e1c85feaa15bad9d69718cb002a55e5cb1aee7ee6dde4b939e"
+}

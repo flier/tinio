@@ -61,6 +61,8 @@ pub const RESERVED_SEGMENT: &str = ".tinio";
 /// let from_literal: object::Key = "dir/file.txt".into();
 /// assert_eq!(from_literal, k);
 /// ```
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+#[cfg_attr(feature = "sqlx", sqlx(transparent))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Display, Deref, AsRef, Into)]
 #[display("{}", _0)]
 #[deref(forward)]
@@ -181,7 +183,7 @@ pub const BUCKET_TAGS_MAX: usize = 50;
 /// from the Unicode charset, no duplicate keys. Sorted iteration
 /// gives deterministic output and a canonical wire form.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Tags(BTreeMap<String, String>);
+pub struct Tags(pub(crate) BTreeMap<String, String>);
 
 impl Tags {
     /// The empty tag set.

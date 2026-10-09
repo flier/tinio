@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM upload_checksums WHERE bucket = $1 AND upload_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "478a684eff49f101174f7f865e5cdbd1865933bd14eca6f6999dc372a6fd9c4b"
+}

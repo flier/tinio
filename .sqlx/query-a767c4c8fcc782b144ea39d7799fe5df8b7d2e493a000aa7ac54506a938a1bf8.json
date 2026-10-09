@@ -1,0 +1,165 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    u.bucket, u.upload_id, u.key, u.initiated_at,\n    u.tags AS \"tags: object::Tags\", u.acl AS \"acl: Acl\",\n    c.algorithm AS \"algorithm?: checksum::Algorithm\", c.kind AS \"kind?\"\nFROM uploads u LEFT JOIN upload_checksums c\n    ON c.bucket = u.bucket AND c.upload_id = u.upload_id\nORDER BY u.bucket COLLATE \"C\", u.key COLLATE \"C\", u.upload_id COLLATE \"C\"\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bucket",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "bucket"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "upload_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "upload_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "initiated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "initiated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "tags: object::Tags",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "acl: Acl",
+        "type_info": {
+          "Custom": {
+            "name": "acl",
+            "kind": {
+              "Composite": [
+                [
+                  "owner",
+                  "Text"
+                ],
+                [
+                  "grants",
+                  {
+                    "Custom": {
+                      "name": "acl_grant[]",
+                      "kind": {
+                        "Array": {
+                          "Custom": {
+                            "name": "acl_grant",
+                            "kind": {
+                              "Composite": [
+                                [
+                                  "grantee",
+                                  {
+                                    "Custom": {
+                                      "name": "acl_grantee",
+                                      "kind": {
+                                        "Composite": [
+                                          [
+                                            "grantee_kind",
+                                            "Text"
+                                          ],
+                                          [
+                                            "grantee_value",
+                                            "Text"
+                                          ]
+                                        ]
+                                      }
+                                    }
+                                  }
+                                ],
+                                [
+                                  "permission",
+                                  "Text"
+                                ]
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "acl"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "algorithm?: checksum::Algorithm",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_checksums",
+            "name": "algorithm"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "kind?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_checksums",
+            "name": "kind"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a767c4c8fcc782b144ea39d7799fe5df8b7d2e493a000aa7ac54506a938a1bf8"
+}

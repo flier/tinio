@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT name, created FROM buckets ORDER BY name COLLATE \"C\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "buckets",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "created",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "buckets",
+            "name": "created"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "0964454f71b482859c1d00f7d09b4cc1b896f168650f9758a011854a8270f239"
+}

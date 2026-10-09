@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE content_heads\nSET live_seq = $4, live_len = $5, publish_id = $6\nWHERE bucket = $1 AND kind = $2 AND ckey = $3 AND next_seq = $4\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "content_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "part"
+              ]
+            }
+          }
+        },
+        "Text",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8e20ac6ea2b771bb3db9278bf33c6836554f097e0cebfed3bfd464f1b35057ea"
+}

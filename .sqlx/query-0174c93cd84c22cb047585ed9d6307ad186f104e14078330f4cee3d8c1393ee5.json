@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO parts (bucket, upload_id, number, etag) VALUES ($1, $2, $3, $4)\nON CONFLICT (bucket, upload_id, number) DO UPDATE SET etag = excluded.etag\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0174c93cd84c22cb047585ed9d6307ad186f104e14078330f4cee3d8c1393ee5"
+}

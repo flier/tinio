@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE object_meta SET etag = $3, size = $4, mtime = $5, identity = $6\nWHERE bucket = $1 AND key = $2\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "493961a41c1f96ff1949a8f078e8281b29cb6cfb3d7d22571ca1d7f837aa804f"
+}

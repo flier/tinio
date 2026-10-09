@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO schema_version (id, applied_at, note) VALUES (\n    $1, 0, 'planted by the test'\n)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "55d38b23060c6315e384996b7cc141a2f0dcb25f8d31084a04cacca7fd517aa8"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM object_parts WHERE bucket = $1 AND key = ANY($2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "39c1a27665463fcd84697cca0d2ca55381f686e6230d4b91427505fd04ef494a"
+}

@@ -1,0 +1,119 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT created, tags AS \"tags: object::Tags\", acl AS \"acl: Acl\", cors FROM buckets WHERE name = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "created",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "buckets",
+            "name": "created"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "tags: object::Tags",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "buckets",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "acl: Acl",
+        "type_info": {
+          "Custom": {
+            "name": "acl",
+            "kind": {
+              "Composite": [
+                [
+                  "owner",
+                  "Text"
+                ],
+                [
+                  "grants",
+                  {
+                    "Custom": {
+                      "name": "acl_grant[]",
+                      "kind": {
+                        "Array": {
+                          "Custom": {
+                            "name": "acl_grant",
+                            "kind": {
+                              "Composite": [
+                                [
+                                  "grantee",
+                                  {
+                                    "Custom": {
+                                      "name": "acl_grantee",
+                                      "kind": {
+                                        "Composite": [
+                                          [
+                                            "grantee_kind",
+                                            "Text"
+                                          ],
+                                          [
+                                            "grantee_value",
+                                            "Text"
+                                          ]
+                                        ]
+                                      }
+                                    }
+                                  }
+                                ],
+                                [
+                                  "permission",
+                                  "Text"
+                                ]
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "buckets",
+            "name": "acl"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "cors",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "buckets",
+            "name": "cors"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4cf7dc3c25247a7d558a39528212ffcf13cc83f3aab8e30ee3736b8562cb16fc"
+}

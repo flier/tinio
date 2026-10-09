@@ -998,7 +998,7 @@ where
     // stale-id blind spot is the trait's documented default, and the
     // recording plane's own suite leg lives with its decorator).
     let tagged = ContentKey::Object(key("tagged.bin"));
-    let tag = PublishId::new(1);
+    let tag = PublishId::from(1_u64);
     let mut staged = store.stage(&bucket, &tagged).await.unwrap();
     staged.write(Bytes::from_static(b"tagged")).await.unwrap();
     store

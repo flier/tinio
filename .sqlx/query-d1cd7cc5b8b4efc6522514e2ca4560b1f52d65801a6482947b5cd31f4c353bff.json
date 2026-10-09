@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH locked AS MATERIALIZED (\n    SELECT name FROM buckets WHERE name = $1 FOR UPDATE\n),\n\nremoved AS (\n    DELETE FROM buckets AS b\n    WHERE\n        b.name = $1\n        AND EXISTS (SELECT 1 FROM locked)\n        AND NOT EXISTS (SELECT 1 FROM object_meta AS o WHERE o.bucket = b.name)\n        AND NOT EXISTS (SELECT 1 FROM uploads AS u WHERE u.bucket = b.name)\n    RETURNING b.name\n)\n\nSELECT\n    exists(SELECT 1 FROM locked) AS \"present!\",\n    exists(SELECT 1 FROM removed) AS \"removed!\"\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "present!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "removed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "d1cd7cc5b8b4efc6522514e2ca4560b1f52d65801a6482947b5cd31f4c353bff"
+}

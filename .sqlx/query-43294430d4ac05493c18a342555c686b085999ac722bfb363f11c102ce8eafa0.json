@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT number, size, algorithm, value FROM object_parts\nWHERE bucket = $1 AND key = $2 ORDER BY number\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "number",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "object_parts",
+            "name": "number"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "object_parts",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "algorithm",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "object_parts",
+            "name": "algorithm"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "value",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "object_parts",
+            "name": "value"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "43294430d4ac05493c18a342555c686b085999ac722bfb363f11c102ce8eafa0"
+}

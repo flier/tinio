@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO object_parts (bucket, key, number, size, algorithm, value)\nSELECT $1, $2, u.n, u.s, u.a, u.v\nFROM unnest($3::bigint[], $4::bigint[], $5::text[], $6::text[])\n    AS u (n, s, a, v)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8Array",
+        "Int8Array",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d0595755261c985b98dad1b2a541847d33e6cbe2a5439dd030ce764d615e7bd2"
+}

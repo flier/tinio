@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT created FROM buckets WHERE name = $1\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "created",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "buckets",
+            "name": "created"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b7ff0af766f8aaee625adb88014785e2f817b4a935505b6e9047a4d934ef1941"
+}
