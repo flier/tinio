@@ -130,6 +130,16 @@ impl From<Error> for storage::Error {
     fn from(err: Error) -> Self {
         match err {
             Error::Refused(err) => err,
+            // The read-only refusal keeps its own identity: it is the designed
+            // outcome of a **read** path that recomputes a row it cannot write
+            // back (FR-023 amended), and a caller must be able to tell it from
+            // a real I/O fault — [`storage::Error::is_read_only`] is that
+            // question. `io::Error::new` keeps the inner error's `Display` and
+            // `Debug`, so the rendering is what `io::Error::other` produced.
+            Error::ReadOnly => storage::Error::Io(io::Error::new(
+                io::ErrorKind::ReadOnlyFilesystem,
+                Error::ReadOnly,
+            )),
             other => storage::Error::Io(io::Error::other(other)),
         }
     }
@@ -172,7 +182,10 @@ mod tests {
     }
 
     /// A contract refusal projects verbatim onto the contract error (D22);
-    /// every redb failure lifts to the I/O-class arm.
+    /// every redb failure lifts to the I/O-class arm, and the read-only
+    /// refusal keeps the kind a read path asks about
+    /// ([`storage::Error::is_read_only`], FR-023 amended) while rendering what
+    /// it always rendered.
     #[test]
     fn contract_refusals_project_and_redb_failures_lift() {
         let name = bucket::name("data").unwrap();
@@ -181,9 +194,34 @@ mod tests {
             storage::Error::from(refused),
             storage::Error::NoSuchBucket(_)
         ));
+
+        let read_only = storage::Error::from(Error::ReadOnly);
+        assert!(
+            read_only.is_read_only(),
+            "the refusal keeps its identity across the projection: {read_only:?}"
+        );
+        assert!(
+            matches!(&read_only, storage::Error::Io(err) if err.kind() == io::ErrorKind::ReadOnlyFilesystem),
+            "{read_only:?}"
+        );
+        assert_eq!(
+            read_only.to_string(),
+            "I/O error: the state database is read-only",
+            "the rendering is unchanged"
+        );
+
+        let other = storage::Error::from(Error::UnsupportedVersion {
+            path: "meta.redb".into(),
+            found: 9,
+            expected: 1,
+        });
+        assert!(
+            !other.is_read_only(),
+            "a real failure is never read as the refusal: {other:?}"
+        );
         assert!(matches!(
-            storage::Error::from(Error::ReadOnly),
-            storage::Error::Io(_)
+            &other,
+            storage::Error::Io(err) if err.kind() == io::ErrorKind::Other
         ));
     }
 }

@@ -5,6 +5,8 @@
 //! pre-existing directory. Names are re-validated on create (defensive
 //! backstop, FR-012); the reserved `.tinio/` directory is never a bucket.
 
+#[cfg(unix)]
+use std::path::Path;
 use std::{io::ErrorKind, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
@@ -17,8 +19,9 @@ use crate::{
         acl::{Acl, AclGrants},
         bucket::{self, Bucket},
         cors, object,
-        storage::{BucketOps, UnorderedPager, already_exists, no_such_bucket, not_empty},
+        storage::{BucketOps, already_exists, no_such_bucket, not_empty},
     },
+    _ops::bucket::paginate_buckets,
     path::{STATE_DIR_NAME, bucket_path_lexical},
     tombstone,
 };
@@ -58,28 +61,16 @@ impl FsStorage {
     /// the directory and apply the unix ownership/mode hardening (FAIL-CLOSED:
     /// a hardening failure removes the just-created directory).
     ///
-    /// This shape takes the bucket mutation lock itself because the content
-    /// contract's `create_bucket` has no `BUCKETS` record — the directory is
-    /// its whole create. `BucketOps::create_bucket` spans the directory
-    /// **and** its record, so it takes that same lock and calls
-    /// `Self::create_bucket_dir_locked`; a second acquisition there would
-    /// deadlock (the lock map hands out one `tokio` mutex per bucket name).
+    /// This shape takes the bucket mutation lock itself: the directory is the
+    /// content plane's whole create, and the ops engine's `create_bucket`
+    /// reaches it through here too (`ObjectContent::create_bucket`), its row
+    /// write following the lock's release.
     pub(crate) async fn create_bucket_dir(
         &self,
         name: &bucket::Name,
         owner: Option<&acl::OwnerId>,
     ) -> Result<(), Error> {
         let _guard = self.lock_bucket_mutations(name).await;
-        self.create_bucket_dir_locked(name, owner).await
-    }
-
-    /// `create_bucket_dir`'s body under the **caller's** bucket mutation
-    /// guard (the caller's doc says which one holds it and why).
-    async fn create_bucket_dir_locked(
-        &self,
-        name: &bucket::Name,
-        owner: Option<&acl::OwnerId>,
-    ) -> Result<(), Error> {
         // The owner is the unix dir-hardening input only.
         #[cfg(not(unix))]
         let _ = owner;
@@ -102,15 +93,22 @@ impl FsStorage {
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
-        // The directory creation runs under the caller's guard. For
-        // `BucketOps::create_bucket` that guard spans this directory **and**
-        // its `BUCKETS` record — one critical section against
-        // `delete_bucket` (a delete must never remove a bucket a create just
-        // reported as created) and against `put_bucket_acl`'s
-        // owner-preserving read-modify-write (the C1 lost update: the
-        // create's record upsert would otherwise land between its read and
-        // its write). The tags/CORS setters take no bucket mutation lock, so
-        // this section does not cover them.
+        // The directory creation runs inside the guard taken above — the whole
+        // of this namespace step, for both callers (the content contract's
+        // `create_bucket` and the ops engine's `create_bucket`). The guard is
+        // one critical section against `delete_bucket` (a delete must never
+        // remove a bucket a create just reported as created).
+        //
+        // It does **not** span the create's record write, and that window is
+        // open, not closed: on the lazy policy the engine's create writes its
+        // row with an unconditional full-row upsert after returning from this
+        // lock, so a concurrent `put_bucket_tags`/`put_bucket_acl` taken under
+        // the same guard can still be overwritten by that upsert (the C1
+        // lost-update window the wider section used to close). The narrowing is
+        // RF2's: the engine's content side takes this non-re-entrant mutex
+        // itself, so the guard cannot span the engine call, and the create's row
+        // write is outside it. Recorded as a known exception to P4's
+        // zero-observable-change acceptance.
         match fs::create_dir(&dir).await {
             Ok(()) => {}
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {
@@ -128,22 +126,9 @@ impl FsStorage {
         // the create reporting success, or every object of the mapped
         // owner under it is stranded.
         #[cfg(unix)]
-        {
-            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
-
-            use crate::{fsutil, fsutil::DIR_MODE_PRIVATE};
-            if let Err(err) =
-                fs::set_permissions(&dir, Permissions::from_mode(DIR_MODE_PRIVATE)).await
-            {
-                let _ = fs::remove_dir(&dir).await;
-                return Err(err.into());
-            }
-            if let Some(uid) = self.owner_uid(owner)
-                && let Err(err) = fsutil::chown_file(&dir, uid).await
-            {
-                let _ = fs::remove_dir(&dir).await;
-                return Err(err.into());
-            }
+        if let Err(err) = harden_bucket_dir(&dir, self.owner_uid(owner)).await {
+            let _ = fs::remove_dir(&dir).await;
+            return Err(err);
         }
         Ok(())
     }
@@ -158,31 +143,40 @@ impl FsStorage {
         // section against every write into this bucket: a concurrent
         // PUT's rename cannot land in a directory about to disappear
         // with 200 returned. Other buckets are not serialized here.
-        let dest = {
-            let _guard = self.lock_bucket_mutations(name).await;
-            self.ensure_bucket(name).await?;
-            if !bucket_is_empty(self, name).await? {
-                return Err(not_empty(name).into());
-            }
-            // Unpublish: rename the lexical root entry onto
-            // `<root>/.tinio/deleting/<id>` (same volume as the name — a
-            // relocated state dir must not receive this rename). The live
-            // name is gone before the tree walk; a crash leaves private
-            // residue the startup repair reclaims. Followed-symlink buckets:
-            // the directory *entry* under root moves (the link), not the
-            // canonical target.
-            let live = bucket_path_lexical(self.root(), name)?;
-            let dest = tombstone::prepare(self.root()).await?;
-            fs::rename(&live, &dest).await?;
-            // The name is gone — the delete has succeeded — so a state
-            // failure must NOT fail the response (the client would see an
-            // error for a delete that happened); leaked rows are
-            // reclaimed by the startup repair.
-            if let Err(err) = self.remove_bucket_state(name).await {
-                tracing::warn!(error = %err, "bucket state not removed after delete");
-            }
-            dest
-        };
+        let _guard = self.lock_bucket_mutations(name).await;
+        self.ensure_bucket(name).await?;
+        if !bucket_is_empty(self, name).await? {
+            return Err(not_empty(name).into());
+        }
+        self.unpublish_bucket_locked(name).await
+    }
+
+    /// The teardown body: the tombstone move, the derived state's removal
+    /// (best-effort) and the removal pipeline's reclaim.
+    ///
+    /// The caller holds the bucket's mutation guard — this is the critical
+    /// section [`Self::unpublish_bucket`] and the ops engine's
+    /// `Hooks::before_bucket_delete` both run inside — and has established
+    /// that the bucket holds no content. Taking that lock again here would
+    /// deadlock the per-bucket mutex, which the map hands out non-re-entrantly.
+    pub(crate) async fn unpublish_bucket_locked(&self, name: &bucket::Name) -> Result<(), Error> {
+        // Unpublish: rename the lexical root entry onto
+        // `<root>/.tinio/deleting/<id>` (same volume as the name — a
+        // relocated state dir must not receive this rename). The live
+        // name is gone before the tree walk; a crash leaves private
+        // residue the startup repair reclaims. Followed-symlink buckets:
+        // the directory *entry* under root moves (the link), not the
+        // canonical target.
+        let live = bucket_path_lexical(self.root(), name)?;
+        let dest = tombstone::prepare(self.root()).await?;
+        fs::rename(&live, &dest).await?;
+        // The name is gone — the delete has succeeded — so a state
+        // failure must NOT fail the response (the client would see an
+        // error for a delete that happened); leaked rows are
+        // reclaimed by the startup repair.
+        if let Err(err) = self.remove_bucket_state(name).await {
+            tracing::warn!(error = %err, "bucket state not removed after delete");
+        }
         // The directory is unpublished: the per-bucket mutex still
         // serializes a parked PUT against recreate (the waiter holds the
         // slot until it fails `ensure_bucket`). Tree delete is slow IO —
@@ -193,6 +187,83 @@ impl FsStorage {
         tombstone::reclaim(Arc::clone(&self.remove_pipeline), dest);
         Ok(())
     }
+
+    /// The unix ownership/mode hardening of a bucket directory the ops
+    /// engine's create just made (spec 2026-09-05 §5a), as its own step
+    /// because the content contract carries no owner — the same trade
+    /// `publish` documents for object files. Inert off unix.
+    ///
+    /// FAIL-CLOSED: a failure removes the record the engine wrote and the
+    /// directory, and errors the create — a wrongly-owned `0700` bucket dir
+    /// must not be left behind with the create reporting success.
+    ///
+    /// The bucket's mutation guard is taken **around this step alone**. It
+    /// cannot span the engine call above it (see [`BucketOps::create_bucket`],
+    /// which takes the engine's content-side lock internally and is
+    /// non-re-entrant), so the rollback is the part that must be serialized:
+    /// without the guard it could remove a concurrent create's fresh directory.
+    /// **Residual race, stated**: a create that ran between the engine call and
+    /// this guard is not serialized against the rollback — it would lose its
+    /// directory and its record to a hardening failure of a *different*
+    /// generation's create, which is the price of the engine's create ordering
+    /// and is filed against the plan's "the lock is acquired by the trait impl
+    /// around the engine call".
+    #[cfg(unix)]
+    async fn harden_created_bucket(
+        &self,
+        name: &bucket::Name,
+        owner: Option<&acl::OwnerId>,
+    ) -> Result<(), Error> {
+        use crate::{_core::meta::BucketMeta, _store_redb::RedbMetadata};
+
+        let _guard = self.lock_bucket_mutations(name).await;
+        let dir = bucket_path_lexical(self.root(), name)?;
+        if let Err(err) = harden_bucket_dir(&dir, self.owner_uid(owner)).await {
+            let _ = fs::remove_dir(&dir).await;
+            // The record the engine just wrote goes with it: the create answers
+            // an error, so the bucket must not stay recorded either.
+            if let Err(cleanup) =
+                <RedbMetadata as BucketMeta>::remove(&self.meta_store().engine(), name).await
+            {
+                tracing::warn!(
+                    error = %cleanup,
+                    "the refused create's bucket record was not removed"
+                );
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// [`Self::harden_created_bucket`] off unix: nothing to harden, and so
+    /// nothing to serialize — the guarded step exists for the rollback the
+    /// unix arm may run, and this arm has neither.
+    #[cfg(not(unix))]
+    async fn harden_created_bucket(
+        &self,
+        _name: &bucket::Name,
+        _owner: Option<&acl::OwnerId>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// The unix ownership/mode hardening of a fresh bucket directory
+/// (spec 2026-09-05 §5a): `0700`, chowned to the owner's mapped uid when the
+/// configuration maps one (an unmapped owner stays server-user-owned, still
+/// `0700`). One home for the two create paths — the content plane's
+/// `create_bucket` and the ops engine's create under the backend's own step.
+#[cfg(unix)]
+async fn harden_bucket_dir(dir: &Path, uid: Option<u32>) -> Result<(), Error> {
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+    use crate::{fsutil, fsutil::DIR_MODE_PRIVATE};
+
+    fs::set_permissions(dir, Permissions::from_mode(DIR_MODE_PRIVATE)).await?;
+    if let Some(uid) = uid {
+        fsutil::chown_file(dir, uid).await?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -203,37 +274,50 @@ impl BucketOps for FsStorage {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
     ) -> Result<(), Error> {
-        // The directory first (the namespace), then its record: the two are
-        // one logical create, and a record failure leaves the directory the
-        // next create reports as taken (the pre-existing rule). The guard
-        // must span BOTH: it is what `put_bucket_acl`'s owner-preserving
-        // read-modify-write serializes against (the C1 lost update — this
-        // record upsert can otherwise slip between its read and its write).
-        let _guard = self.lock_bucket_mutations(name).await;
-        self.create_bucket_dir_locked(name, owner).await?;
-        self.bucket_store
-            .record_full(name, SystemTime::now(), owner, acl)
-            .await?;
-        Ok(())
+        // The namespace and its record are the ops engine's (one logical
+        // create: the directory then its row, and a record failure leaves the
+        // directory the next create reports as taken). The **unix ownership
+        // hardening** is fs's own step, because the content contract carries no
+        // owner — the same trade `publish` documents for object files — and it
+        // is fail-closed (`harden_created_bucket`).
+        //
+        // No bucket-mutation guard spans this call: the engine's content side
+        // takes that lock for the directory itself (`create_bucket_dir`), and
+        // the per-bucket mutex is not re-entrant. The accept-and-document
+        // ruling (RF2/RF4): the guard's narrow home is
+        // `harden_created_bucket`, and the record write this call makes on the
+        // lazy policy — an unconditional full-row upsert — is outside it, so a
+        // concurrent element write under the guard can be overwritten by it.
+        // That residual window is recorded as a known exception to P4's
+        // zero-observable-change acceptance, not apologized for: the mutex's
+        // non-re-entrancy leaves no ordering that closes it without giving up
+        // the engine's create.
+        self.ops()
+            .create_bucket(name, owner, acl)
+            .await
+            .map_err(Error::from)?;
+        self.harden_created_bucket(name, owner).await
     }
 
     async fn delete_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
-        // The whole teardown is the content plane's (shared with the content
-        // contract's `remove_bucket`); the `BUCKETS` row goes with the rest of
-        // the state, inside `unpublish_bucket`.
-        self.unpublish_bucket(name).await
+        // The engine's probes and its commit point, inside the bucket's
+        // mutation guard: the guard must span the emptiness check and the
+        // unpublish rename (a concurrent PUT's rename cannot land in a
+        // directory about to disappear with 200 returned), and the teardown the
+        // hook runs takes no lock of its own. `ensure_bucket` is the namespace
+        // probe the content plane has no call for — a missing directory is
+        // `NoSuchBucket`, never one of the probes' answers.
+        let _guard = self.lock_bucket_mutations(name).await;
+        self.ensure_bucket(name).await?;
+        self.ops().delete_bucket(name).await.map_err(Error::from)
     }
 
     async fn head_bucket(&self, name: &bucket::Name) -> Result<Bucket, Error> {
+        // The namespace probe is fs's (the directory IS the bucket); the row
+        // work is the engine's, and the lazy row policy records the first sight
+        // when a pre-existing directory has no row yet.
         self.ensure_bucket(name).await?;
-        let creation_time = self
-            .bucket_store
-            .get_or_record(name, SystemTime::now())
-            .await?;
-        Ok(Bucket {
-            name: name.clone(),
-            creation_time,
-        })
+        self.ops().head_bucket(name).await.map_err(Error::from)
     }
 
     async fn list_buckets(
@@ -242,59 +326,48 @@ impl BucketOps for FsStorage {
         owner: Option<&acl::OwnerId>,
         lazy_default: Option<&acl::OwnerId>,
     ) -> Result<BucketsListing, Error> {
-        // The bounded pagination engine (`UnorderedPager`, the
-        // uploads-page engine) consumes the root sweep incrementally:
-        // the streaming walk offers only prefix-matching, name-valid
-        // candidates, and the engine keeps only the page — a max-heap of
-        // `max + 1` entries — so neither the full collection nor the
-        // O(N log N) sort of the old `bucket_names` sweep survives
-        // (memory is O(page), never O(matches)). `max = 0` still
-        // short-circuits the root sweep — no dirent scan, no stats, no
-        // metadata reads (the cost-profile parity with the mem backend,
-        // which never drains the table for an empty page); the engine
-        // produces the empty page itself, so the contract has one home.
+        // fs's own body, not the engine's: the engine's `list_buckets` reads
+        // the BUCKET ROWS, and fs's buckets exist as root directories — a
+        // pre-existing directory has no row until it is sighted, so the
+        // candidate set has to be the content-side sweep. The candidate
+        // **source** is what stays fs's; the owner filter, the exclusive
+        // marker and the page cut are the engine's own rules, taken from their
+        // one home ([`paginate_buckets`]) over this sweep's candidates.
         //
-        // The `owner` filter applies DURING the walk, before pagination
+        // `max = 0` still short-circuits the root sweep — no dirent scan, no
+        // stats, no metadata reads (the cost-profile parity with the mem
+        // backend, which never drains the table for an empty page); the shared
+        // rule produces the empty page itself, so the contract has one home.
+        //
+        // The `owner` filter applies during the walk, before pagination
         // (contract review P2#4 — the continuation-token math applies to
         // the filtered set): the candidate names collect first (the
         // filtered walk cannot stream into the pager — each name's row
         // must be read before the offer), then one read transaction
         // resolves every candidate's recorded owner element, and only
-        // the principal's buckets reach the pager. The comparison uses
+        // the principal's buckets reach the page. The comparison uses
         // the EFFECTIVE owner — the recorded element, or `lazy_default`
         // for a row whose wire is empty (the uniform lazy-default
         // semantics, review B4 — such rows belong to the default
         // principal); `lazy_default = None` is the strict compare.
-        // `None` owner = no filter, the legacy listing, with the
-        // streaming walk unchanged.
-        let max = params.max_buckets;
-        let mut pager = UnorderedPager::new(
-            &params.prefix,
-            None,
-            params.start_after.as_deref(),
-            max,
+        // `None` owner = no filter, the legacy listing, with no owners
+        // read at all.
+        let mut names = Vec::new();
+        if params.max_buckets > 0 {
+            self.for_each_bucket_name(&params.prefix, |name| names.push(name))
+                .await?;
+        }
+        let recorded = match owner {
+            Some(_) => self.bucket_store.owners(&names).await?,
+            None => vec![None; names.len()],
+        };
+        let (page, truncated, next) = paginate_buckets(
+            names.into_iter().zip(recorded).collect(),
+            &params,
+            owner,
+            lazy_default,
             |name: &bucket::Name| name.as_ref().as_str(),
         );
-        if max > 0 {
-            match owner {
-                Some(owner) => {
-                    let mut names = Vec::new();
-                    self.for_each_bucket_name(&params.prefix, |name| names.push(name))
-                        .await?;
-                    let recorded = self.bucket_store.owners(&names).await?;
-                    for (name, recorded_owner) in names.into_iter().zip(recorded) {
-                        if recorded_owner.as_ref().or(lazy_default) == Some(owner) {
-                            pager.offer_keyed(name);
-                        }
-                    }
-                }
-                None => {
-                    self.for_each_bucket_name(&params.prefix, |name| pager.offer_keyed(name))
-                        .await?;
-                }
-            }
-        }
-        let (page, _prefixes, truncated, next) = pager.finish();
         // Creation times resolve only for the page's buckets — the
         // metadata-per-page analogue of the object listing's page-driven
         // ETag gate (P3) — in ONE read transaction (`load_many`, the
@@ -332,47 +405,64 @@ impl BucketOps for FsStorage {
     }
 
     async fn get_bucket_tags(&self, name: &bucket::Name) -> Result<object::Tags, Error> {
-        // Existence is the bucket directory (`NoSuchBucket` when missing
-        // — mirroring head_bucket); the tags come from the `BUCKETS`
-        // row, empty when the bucket has no row yet (a pre-existing
-        // bucket has never been tagged through the API).
+        // Existence is the bucket directory (`NoSuchBucket` when missing —
+        // mirroring head_bucket); the tags are the engine's lazy-row read: the
+        // `BUCKETS` row's element, empty when the bucket has no row yet (a
+        // pre-existing bucket has never been tagged through the API).
         self.ensure_bucket(name).await?;
-        self.bucket_store.tags(name).await
+        self.ops().get_bucket_tags(name).await.map_err(Error::from)
     }
 
     async fn put_bucket_tags(&self, name: &bucket::Name, tags: &object::Tags) -> Result<(), Error> {
         // The bucket's mutation lock, the `put_bucket_acl` shape: the tags
-        // write is element-targeted, but a concurrent `create_bucket`'s
-        // create-time record is a full-row upsert — unserialized it can land
-        // after this write and leave the bucket untagged (the same C1 lost
-        // update, on the tag element).
+        // write is element-targeted, and the engine's lazy-row body records a
+        // row-less bucket's row WITH the tags in one transaction. The lock
+        // serializes it against the other guard-takers — but **not** against the
+        // create's record write, which on the lazy policy is a full-row upsert
+        // running outside this guard (RF2/RF4's stated residual): a create
+        // landing after this write still overwrites the tag element, the C1
+        // lost update. Recorded as a known exception; the guard is kept because
+        // it is what the delete teardown and the element writes coordinate on.
         let _guard = self.lock_bucket_mutations(name).await;
         self.ensure_bucket(name).await?;
-        self.bucket_store.set_tags(name, tags).await
+        self.ops()
+            .put_bucket_tags(name, tags)
+            .await
+            .map_err(Error::from)
     }
 
     async fn delete_bucket_tags(&self, name: &bucket::Name) -> Result<(), Error> {
         // S3 semantics: idempotent — a missing bucket is Ok (the
         // contract's delete-object/bucket leniency). The row's creation
         // time is preserved; a row-less bucket has nothing to clear. The
-        // bucket's mutation lock, the `put_bucket_acl` shape: the clear must
-        // not race a create's create-time record (the same C1 window).
+        // bucket's mutation lock serializes the clear against the other
+        // guard-takers (the teardown and the sibling element writes) — it does
+        // **not** reach a concurrent create's record write, which on the lazy
+        // policy is a full-row upsert running outside the guard (RF2/RF4's
+        // stated residual): a create landing after this clear restores its
+        // create-time row, tag element included.
         let _guard = self.lock_bucket_mutations(name).await;
-        self.bucket_store.clear_tags(name).await
+        self.ops()
+            .delete_bucket_tags(name)
+            .await
+            .map_err(Error::from)
     }
 
     async fn get_bucket_cors(&self, name: &bucket::Name) -> Result<Option<cors::Config>, Error> {
         // Existence is the bucket directory (`NoSuchBucket` when missing —
-        // mirroring `get_bucket_tags`); the configuration comes from the
-        // `BUCKETS` row, None when the bucket has no configuration (`''`
+        // mirroring `get_bucket_tags`); the configuration is the engine's
+        // lazy-row read, None when the bucket has no configuration (the `''`
         // wire — a bucket that was cleared or never configured).
         self.ensure_bucket(name).await?;
-        self.bucket_store.cors(name).await
+        self.ops().get_bucket_cors(name).await.map_err(Error::from)
     }
 
     async fn put_bucket_cors(&self, name: &bucket::Name, cors: &cors::Config) -> Result<(), Error> {
         self.ensure_bucket(name).await?;
-        self.bucket_store.set_cors(name, cors).await
+        self.ops()
+            .put_bucket_cors(name, cors)
+            .await
+            .map_err(Error::from)
     }
 
     async fn delete_bucket_cors(&self, name: &bucket::Name) -> Result<(), Error> {
@@ -381,40 +471,55 @@ impl BucketOps for FsStorage {
         // CORS spec mandates `NoSuchBucket` for a missing bucket); a
         // bucket that simply has no configuration clears to the same
         // state (idempotent). The row's creation time is preserved. The
-        // bucket's mutation lock, the `put_bucket_acl` shape: the clear must
-        // not race a create's create-time record (the same C1 window).
+        // bucket's mutation lock serializes the clear against the other
+        // guard-takers — not against a concurrent create's record write, which
+        // on the lazy policy is a full-row upsert running outside the guard
+        // (RF2/RF4's stated residual): a create landing after this clear
+        // restores its create-time row, the CORS configuration cleared with it.
         let _guard = self.lock_bucket_mutations(name).await;
         self.ensure_bucket(name).await?;
-        self.bucket_store.clear_cors(name).await
+        self.ops()
+            .delete_bucket_cors(name)
+            .await
+            .map_err(Error::from)
     }
 
     async fn get_bucket_acl(&self, name: &bucket::Name) -> Result<Acl, Error> {
-        // Existence is the bucket directory (`NoSuchBucket` when missing
-        // — mirroring head_bucket); the ACL comes from the `BUCKETS`
-        // row, which answers `NoSuchBucket` itself when unrecorded (a
-        // legacy bucket has no ACL row until first sight).
+        // Existence is the bucket directory (`NoSuchBucket` when missing —
+        // mirroring head_bucket); the ACL is the engine's lazy-row read: the
+        // recorded owner element recombined with the stored grant set, and a
+        // row-less bucket (a legacy directory with no `BUCKETS` row until first
+        // sight) serves the default private ACL rather than refusing.
         self.ensure_bucket(name).await?;
-        self.bucket_store.acl(name).await
+        self.ops().get_bucket_acl(name).await.map_err(Error::from)
     }
 
     async fn put_bucket_acl(&self, name: &bucket::Name, grants: &AclGrants) -> Result<(), Error> {
         // The bucket's mutation lock, the `put_bucket_tags` shape: the ACL
-        // write is element-targeted, but a concurrent `create_bucket`'s
-        // create-time record is a full-row upsert — unserialized it can land
-        // after this write and replace the grants and the recorded owner
-        // with the create-time row. The store's setter itself no longer
-        // holds a cross-transaction read-modify-write to guard:
+        // write is element-targeted, but a concurrent `create_bucket` writes
+        // the create-time record — the lazy store's arm is an **upsert** — so
+        // unserialized it can land after this write and replace the grants and
+        // the recorded owner with the create-time row. The store's setter
+        // itself no longer holds a cross-transaction read-modify-write to
+        // guard:
         // `set_grants_or_create` reads the row, replaces the grants and
         // carries the recorded owner over **inside one write transaction**
         // (the contract's setter replaces both ACL elements), so no writer
-        // can slip between its read and its write. The owner is what the
-        // lock protects — it drives GetBucketAcl and the ListBuckets owner
-        // filter (the C1 lost-update review pinned this section; the
-        // setter's in-transaction carry-over since closed its read-write
-        // half).
+        // can slip between its read and its write. What the guard still
+        // serializes is this write against the other guard-takers (the delete
+        // teardown, the tag/CORS element writes); it does **not** reach the
+        // create's record write, which on the lazy policy is a full-row upsert
+        // running outside it (RF2/RF4's stated residual): a create landing
+        // after this write replaces the grants and the recorded owner with its
+        // create-time row. The owner drives GetBucketAcl and the ListBuckets
+        // owner filter, which is why that residual is the one the round
+        // records rather than hides.
         let _guard = self.lock_bucket_mutations(name).await;
         self.ensure_bucket(name).await?;
-        self.bucket_store.set_acl(name, grants).await
+        self.ops()
+            .put_bucket_acl(name, grants)
+            .await
+            .map_err(Error::from)
     }
 }
 
@@ -455,6 +560,40 @@ mod tests {
     async fn conformance_green() {
         let (_root, storage) = storage();
         assert_conformance(&storage).await;
+    }
+
+    #[tokio::test]
+    async fn a_read_only_store_serves_a_rowless_bucket_without_recording_it() {
+        // FR-023 amended ("Read paths"): a read over a planted root **degrades**
+        // — the lazy first sight answers `now` without writing the row back —
+        // while every other refusal still propagates. The fixture is the
+        // cucumber read-only one: a directory-only bucket, no `BUCKETS` row,
+        // and a state database the read-only handle cannot open, so every
+        // metadata write is refused at the handle.
+        use crate::{_core::mode::AccessMode, FsOptions, testutil::fs_options};
+
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("data")).unwrap();
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                access: AccessMode::ReadOnly,
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        let b = bucket::name("data").unwrap();
+        let before = SystemTime::now();
+        let head = storage.head_bucket(&b).await.unwrap();
+        assert_eq!(head.name, b);
+        assert!(
+            head.creation_time >= before,
+            "the first sight answers `now`, unrecorded"
+        );
+        assert!(
+            storage.bucket_store().load_all().await.unwrap().is_empty(),
+            "a read wrote nothing back"
+        );
     }
 
     #[tokio::test]
@@ -1259,13 +1398,12 @@ mod tests {
 
     #[tokio::test]
     async fn put_bucket_acl_waits_for_the_bucket_mutation_lock() {
-        // Review round 1, C1: the ACL write carries the recorded owner back
-        // into the row, so it must be serialized with the owner's writer —
-        // `create_bucket`, which holds this same per-bucket lock across its
-        // directory-plus-record critical section. This pins that the ACL
-        // path really sits inside that lock (without it, a create can commit
-        // its owner between the store's owner read and its ACL write, and
-        // the write clears it).
+        // This pins that the ACL path really sits inside the per-bucket lock:
+        // a held guard parks it. The section's reason is the other
+        // guard-takers — the delete teardown and the sibling element writes
+        // (the C1 review pinned the section; the create's own record write is
+        // outside the guard now — RF2/RF4's residual — so this test pins the
+        // ACL path's guard, never a defence against a concurrent create).
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
@@ -1295,11 +1433,13 @@ mod tests {
 
     #[tokio::test]
     async fn put_bucket_tags_waits_for_the_bucket_mutation_lock() {
-        // The tags write is element-targeted, but a `create_bucket`'s
-        // create-time record is a full-row upsert: unserialized, the record
-        // can land after this write and leave the bucket untagged (the C1
-        // lost update `put_bucket_acl` pins for the owner element). This
-        // pins that the tags path sits inside the same per-bucket lock.
+        // This pins that the tags path sits inside the per-bucket lock: a held
+        // guard parks it. The lock serializes it against the other
+        // guard-takers; it does **not** reach a concurrent `create_bucket`,
+        // whose create-time row write is a full-row upsert running outside the
+        // guard (RF2/RF4's residual), so the create can land after this write
+        // and leave the bucket untagged — the C1 lost update, recorded rather
+        // than denied.
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
@@ -1325,8 +1465,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_bucket_tags_waits_for_the_bucket_mutation_lock() {
-        // The clear rewrites an existing row's tag element; it must not race
-        // a create's create-time record either (the same C1 window).
+        // This pins that the clear sits inside the per-bucket lock: a held
+        // guard parks it. It is serialized against the other guard-takers, not
+        // against a concurrent create's outside-guard record write
+        // (RF2/RF4's residual).
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage
@@ -1356,8 +1498,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_bucket_cors_waits_for_the_bucket_mutation_lock() {
-        // The CORS clear rewrites an existing row's CORS element; it must not
-        // race a create's create-time record either (the same C1 window).
+        // This pins that the CORS clear sits inside the per-bucket lock: a held
+        // guard parks it. It is serialized against the other guard-takers, not
+        // against a concurrent create's outside-guard record write
+        // (RF2/RF4's residual).
         let (_root, storage) = storage();
         let b = bucket::name("data").unwrap();
         storage

@@ -36,6 +36,7 @@ uuid = { workspace = true, features = ["v4"] }
 
 tinio-blob.workspace = true
 tinio-core.workspace = true
+tinio-ops.workspace = true
 tinio-store-redb.workspace = true
 tinio-util.workspace = true
 tinio-version.workspace = true
@@ -60,7 +61,8 @@ criterion = { workspace = true, features = [
 proptest.workspace = true
 tempfile.workspace = true
 
-tinio-util = { workspace = true, features = ["testing"] }
+tinio-bench.workspace = true
+tinio-util = { workspace = true, features = ["bench", "testing"] }
 tinio-fs = { path = ".", features = ["versioning"] }
 
 [[bench]]
@@ -73,6 +75,10 @@ harness = false
 
 [[bench]]
 name = "set_batch"
+harness = false
+
+[[bench]]
+name = "ab"
 harness = false
 
 [package.metadata.cargo-machete]

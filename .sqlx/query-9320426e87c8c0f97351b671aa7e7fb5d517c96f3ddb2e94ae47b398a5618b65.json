@@ -1,22 +1,22 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT s.version_id, r.kind AS \"kind?: Kind\"\nFROM current_slots s\nLEFT JOIN version_rows r\n    ON r.bucket = s.bucket AND r.key = s.key AND r.seq = s.seq\nWHERE s.bucket = $1 AND s.key = $2\n",
+  "query": "SELECT id, kind AS \"kind: Kind\"\nFROM version_rows\nWHERE bucket = $1 AND key = $2 AND seq = $3\nFOR UPDATE\n",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "version_id",
+        "name": "id",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "current_slots",
-            "name": "version_id"
+            "table": "version_rows",
+            "name": "id"
           }
         }
       },
       {
         "ordinal": 1,
-        "name": "kind?: Kind",
+        "name": "kind: Kind",
         "type_info": {
           "Custom": {
             "name": "version_kind",
@@ -39,13 +39,14 @@
     "parameters": {
       "Left": [
         "Text",
-        "Text"
+        "Text",
+        "Int8"
       ]
     },
     "nullable": [
-      true,
-      true
+      false,
+      false
     ]
   },
-  "hash": "054b486e60dddcb5dedf25503f464b2b3861351cddda98ad2ea22d5b95705ad4"
+  "hash": "9320426e87c8c0f97351b671aa7e7fb5d517c96f3ddb2e94ae47b398a5618b65"
 }

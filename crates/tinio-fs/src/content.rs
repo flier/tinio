@@ -38,7 +38,7 @@ use crate::{
     },
     Error,
     backend::{
-        FsStorage, Publication, StagedBody, bucket_is_empty, prune_parents, remove_object_file,
+        FsStorage, Publication, StagedBytes, bucket_is_empty, prune_parents, remove_object_file,
     },
     fsutil,
     listing::WalkedFile,
@@ -84,9 +84,15 @@ impl FsContent {
         }
     }
 
-    /// The version engine's content port: the same plane, with publishes that
-    /// ride the bucket mutation lock their **caller** already holds.
-    #[cfg(feature = "versioning")]
+    /// The **non-owning** plane: the same handles, with the publishes and
+    /// moves that would take the bucket mutation lock riding the lock their
+    /// **caller** already holds instead. Two callers need it — the version
+    /// engine's port (a restore rides the delete path's one critical
+    /// section) and the ops engine's object group (`FsStorage::objects`,
+    /// whose bodies run inside the trait impl's own hold of that lock).
+    /// Taking the lock again there would
+    /// be a deadlock on the non-re-entrant per-bucket lock, not a critical
+    /// section.
     pub(crate) fn for_engine(storage: Arc<FsStorage>) -> Self {
         Self {
             storage,
@@ -133,12 +139,25 @@ impl FsStaged {
             None => Ok((None, self.etag.clone())),
         }
     }
+
+    /// Chown the staged temp before it is renamed into place. The rename
+    /// keeps the uid, so a refusal here never publishes and never moves a
+    /// version. A marker stage holds no file.
+    #[cfg(unix)]
+    pub(crate) async fn chown_temp(&self, uid: u32) -> Result<(), Error> {
+        let Some(staged) = &self.staged else {
+            return Ok(());
+        };
+        fsutil::chown_file(staged.path(), uid)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 impl Drop for FsStaged {
     fn drop(&mut self) {
         // Never published: remove the staged temp best-effort (the sweep
-        // would reclaim it otherwise). The same rule as `StagedBody`'s drop:
+        // would reclaim it otherwise). The same rule as `StagedBytes`'s drop:
         // the unlink runs off the async thread when a runtime is present, and
         // a shutting-down runtime's panicking `spawn_blocking` is caught — a
         // cancelled request's drop must not panic (the startup sweep is the
@@ -268,9 +287,21 @@ impl ObjectContent for FsContent {
                 // is the op's (D37) — publish writes none — and the contract
                 // carries no owner, so the landed file keeps the store
                 // user's ownership at `0600` (the row's owner element is the
-                // caller's own). `StagedBody` owns the temp from here and
+                // caller's own). `StagedBytes` owns the temp from here and
                 // removes it on every failure path (its own drop).
                 let (temp, etag) = staged.finish().await?;
+                // A marker is a directory, not a publish: its commit creates
+                // it (the staged bytes are dropped — a marker stage holds
+                // none) and no row describes it.
+                if key.is_folder_marker() {
+                    self.storage.commit_marker(bucket, key).await?;
+                    return Ok(());
+                }
+                // A real object's stage always holds a temp (`finish` returns
+                // `None` only for the marker sentinel, taken above).
+                let Some(temp) = temp else {
+                    return Err(IoError::other("a staged object always holds a temp file").into());
+                };
                 let publication = if self.own_lock {
                     Publication::Bytes
                 } else {
@@ -280,7 +311,7 @@ impl ObjectContent for FsContent {
                     .publish_object_file(
                         bucket,
                         key,
-                        StagedBody::staged(temp, etag),
+                        StagedBytes::staged(temp, etag),
                         None,
                         publication,
                     )
@@ -300,8 +331,10 @@ impl ObjectContent for FsContent {
                 // The part's atomic publish is the multipart write path's
                 // rename (same volume — the state dir); the temp was already
                 // flushed and content-synced (D1). The `PARTS` row is the
-                // multipart facade's, written with the same rename in its own
-                // critical section.
+                // row plane's, written by the ops engine's part body in the
+                // same critical section as this rename — the
+                // `tinio_ops::Hooks::lock_part` guard, whose home is the
+                // multipart store's per-upload map.
                 //
                 // `finish` took the temp out of the stage, so its drop no
                 // longer cleans anything up: the rename below must leave no

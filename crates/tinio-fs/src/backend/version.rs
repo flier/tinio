@@ -2,10 +2,33 @@
 //!
 //! The state machine is `tinio-version`'s (the `Versions` engine) running over
 //! this backend's ports (`crate::version_adapter`): the engine decides what a
-//! supersede, a materialize and an expire mean, and this module is the
-//! contract surface plus the policy the engine deliberately does not own —
-//! which version a request addresses, what a delete marker answers, and which
-//! sequence a new version (or marker) takes.
+//! supersede, a materialize and an expire mean, and this module is fs's own
+//! part of the contract surface — the namespace and key checks, the locks, the
+//! writes the D37 row-slot model owns, and the policy the engine deliberately
+//! does not own: which sequence a new version (or marker) takes, and what a
+//! version-addressed **removal** does.
+//!
+//! The version-addressed **reads** and the per-version **tag/ACL pairs** are
+//! the ops engine's (`tinio_ops::ObjectOps`'s version group): each trait method
+//! below is that body's call plus fs's own checks. Two consequences shape this
+//! module:
+//!
+//! - The engine's read-heal **preserves** an object row's recorded identity
+//!   (the contract's preserving write carries it over) while fs's gate
+//!   **clears** one it judged stale, so the version-addressed reads run the
+//!   gate's judgement first — the same pre-step, and the same ordering, the
+//!   plain read's `version_facts` takes. That step has **one home**
+//!   (`objects::resolve_object_slot_stamped`); each entry keeps only its own
+//!   address guard ([`FsStorage::retire_degraded_identity`] here, the
+//!   bucket's recorded state there).
+//! - The version-addressed **delete** stays here ([`FsStorage::delete_versioned`]
+//!   is its simple-delete sibling): its current-version arm restores whatever
+//!   version becomes current again, which moves the slot **backwards to a real
+//!   identity** — a move `advance_slot` refuses — and the commit is the
+//!   contract's own call ([`VersionMeta::restore_slot`], this plane's only
+//!   caller): one transaction over the object row the restored version
+//!   becomes, the version row and index entry it consumes and the cleared
+//!   retained part list. The scan, the publish and the prune stay fs's.
 //!
 //! # The current version, and the marker's home
 //!
@@ -22,7 +45,9 @@
 //!   removed, so a crash can never leave "file gone + row still naming an
 //!   object version" — the state the adapter's row guard refuses to
 //!   overwrite. The marker's version-table row appears when the marker is
-//!   superseded, like any other outgoing version.
+//!   superseded, like any other outgoing version. The engine's marker read
+//!   answers the marker's stamp from this row (its version row at the slot's
+//!   sequence first, which a **converged** store has and this one does not).
 //!
 //! # Sequences
 //!
@@ -238,12 +263,14 @@ impl FsStorage {
     }
 
     /// Whether the bucket records versions (state enabled or suspended) —
-    /// the producers' carrier for
+    /// the callers' carrier for
     /// [`Info::bucket_records_versions`](crate::_core::object::Info) on the
     /// paths that resolve no write plan: one point read of the bucket
     /// state, no bucket-existence check (every caller resolved the bucket
-    /// already). The feature off answers `false`: a stripped build answers
-    /// no version identity at all, exactly as its write plan does.
+    /// already). The version-addressed reads carry the same flag from the
+    /// engine's own state read, not from here. The feature off answers
+    /// `false`: a stripped build answers no version identity at all, exactly
+    /// as its write plan does.
     pub(crate) async fn records_versions(&self, bucket: &Name) -> Result<bool, Error> {
         #[cfg(feature = "versioning")]
         {
@@ -343,11 +370,7 @@ impl FsStorage {
 
 #[cfg(feature = "versioning")]
 mod enabled {
-    use std::{
-        io::Error as IoError,
-        path::{Path, PathBuf},
-        time::SystemTime,
-    };
+    use std::{io::Error as IoError, path::Path, time::SystemTime};
 
     use async_trait::async_trait;
     use tokio::fs;
@@ -359,11 +382,11 @@ mod enabled {
     use super::{Plan, stamp_superseded};
     use crate::{
         _core::{
-            ByteRange, ETag, GetObjectResult,
+            ByteRange, ETag,
             acl::Acl,
             bucket::Name,
             from_nanos,
-            meta::VersionMeta,
+            meta::{VersionMeta, object as object_row},
             object::{self, Tags},
             storage,
             storage::VersionOps,
@@ -385,34 +408,35 @@ mod enabled {
         version_adapter::Rows,
     };
 
-    /// The version a request resolved to.
+    /// The version a request resolved to — the version-addressed **delete**'s
+    /// resolution.
+    ///
+    /// The engine's version group resolves its own reads through the
+    /// contracts (its own `resolve`), so this one is the delete's: it carries
+    /// only what a removal acts on — the identity and sequence it removes, and
+    /// the row a noncurrent one names. The identity is the **gated** one
+    /// throughout: `None` is the null version, either recorded as null or
+    /// degraded there by the staleness rule, and a recorded identity the
+    /// content no longer matches is never acted on as if it still named it.
     enum Found {
-        /// The key's current version is content. `id` is the **gated**
-        /// identity: `None` is the null version, either recorded as null or
-        /// degraded there by the staleness rule — a recorded identity the
-        /// content no longer matches is never served as if it still named
-        /// it. `seq` is the gated sequence, for the crash window's
-        /// adopted-row match.
+        /// The key's current version is content.
         Current {
             /// The gated current identity.
             id: Option<Id>,
-            /// The gated current sequence.
+            /// The gated current sequence, for the crash window's
+            /// adopted-row match.
             seq: u64,
-            /// The `object_meta` row the gate was applied to (the raw row —
-            /// the metadata elements the served version carries).
-            stored: Box<object_meta::Stored>,
-            /// The key path the gate resolved and judged, when the key has a
-            /// file. The read arms open THIS path (one policy open) and
-            /// describe it from the handle, so a version-addressed GET or
-            /// HEAD resolves the key once — never by calling the plain read
-            /// again. `None` is the slot whose file is gone (an out-of-band
-            /// removal): there is no object to serve.
-            path: Option<PathBuf>,
         },
-        /// The key's current version is a delete marker: no file, an identity
-        /// and a stamp in the `object_meta` row. A marker's recorded identity
-        /// is the gated one (the gate has no content to compare it against).
-        Marker(Box<object_meta::Stored>),
+        /// The key's current version is a delete marker: no file, but a
+        /// recorded identity and stamp (the gate has no content to compare a
+        /// marker's identity against, so the recorded one is the gated one).
+        Marker {
+            /// The gated marker identity (`None` is the null-identity
+            /// marker).
+            id: Option<Id>,
+            /// The gated marker sequence.
+            seq: u64,
+        },
         /// A noncurrent version: the version-table row is the whole truth —
         /// its content lives in the bucket's block store.
         Row(Box<rows::Row>),
@@ -450,8 +474,10 @@ mod enabled {
         /// canonical sequence, not the one the slot took — so the write paths
         /// neither supersede it into history nor reuse 0 for it, and the
         /// shared write decision (`crate::_version::plan_write`) is where both
-        /// rules live. Every gated read of the current slot goes through here:
-        /// the callers cannot disagree about what is current.
+        /// rules live. Every gated read of the current slot goes through the
+        /// adapter's `current_with_row` — this helper here, the engine's reads
+        /// through the `CurrentRows` port — so no two callers can disagree
+        /// about what is current.
         async fn gated_current(
             &self,
             bucket: &Name,
@@ -579,7 +605,16 @@ mod enabled {
         /// superseded into history first.
         ///
         /// `Ok(None)` means the bucket is unversioned — the caller then runs
-        /// today's delete unchanged.
+        /// the ops engine's version-free delete.
+        ///
+        /// This body stays **backend-side**. A shared body that wrote the
+        /// marker as a **version row** (the shape whose slot resolves the
+        /// marker bit off that row) would let the store's one-null-version
+        /// rule displace the superseded null version's own row — losing a
+        /// version the shared conformance leg pins ("the superseded null
+        /// version must survive a suspended DELETE"). fs's model keeps the
+        /// current version in the **object row** (D37) and the version table
+        /// for history alone, so the marker is written there.
         pub(crate) async fn delete_versioned(
             &self,
             bucket: &Name,
@@ -657,36 +692,66 @@ mod enabled {
             }))
         }
 
-        /// The key's current slot, as the adapter's gate answers it, with the
-        /// stored row the gate was applied to and the key path it resolved.
-        /// `None` covers "no current version" and a domain-invalid recorded
-        /// row (the read path's self-heal territory); the gated read and its
-        /// rules live in [`Self::gated_current`].
+        /// The version-addressed reads' **address guard** over the G3
+        /// pre-step, whose one home is `objects::resolve_object_slot_stamped`
+        /// (the judgement itself, and why it must run before the engine body,
+        /// are documented there).
         ///
-        /// The path rides in the [`Found::Current`] answer so the read arms
-        /// open it directly: one resolution of the key per request, the same
-        /// one the plain read's `resolve_object_info` takes, never a second
-        /// resolve behind the first.
+        /// The address here is a version, not "the key": the step serves it
+        /// only while the key's slot still **names** that version, because
+        /// the engine serves the current arm through its read-heal alone — a
+        /// history version and a marker come from their own rows and never
+        /// touch the current one. The plain read's entry serves the other
+        /// address ([`Self::version_facts`], "the current version, whatever
+        /// it is") under its own guard, the bucket's recorded state. The
+        /// resolution's answer is discarded here: the engine body answers from
+        /// the version plane.
+        ///
+        /// A key whose file is gone is left to the body except where the
+        /// address is the **null version** and the row still records one: the
+        /// slot names it (a degraded row's gated identity *is* the null
+        /// version), so the step runs and answers the `NoSuchKey` its file
+        /// resolution finds — the same answer the body's content probe would
+        /// give for that state.
+        async fn retire_degraded_identity(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            version: Option<&Id>,
+        ) -> Result<(), Error> {
+            if let Some(Found::Current { id, .. }) = self.slot(bucket, key).await?
+                && id.as_ref() == version
+            {
+                // The step's one home, taken exactly as the element paths
+                // take it — the version-addressed reads simply carry no facts
+                // to fill, so the answer is dropped.
+                self.resolve_object_slot_stamped(bucket, key).await?;
+            }
+            Ok(())
+        }
+
+        /// The key's current slot, as the adapter's gate answers it. `None`
+        /// covers "no current version" and a domain-invalid recorded row (the
+        /// read path's self-heal territory); the gated read and its rules live
+        /// in [`Self::gated_current`].
         async fn slot(&self, bucket: &Name, key: &object::Key) -> Result<Option<Found>, Error> {
             let judged = Rows::new(self.clone())
                 .current_with_row(bucket, key)
                 .await
                 .map_err(Error::from)?;
-            let (current, stored) = (judged.current, judged.stored);
+            let current = judged.current;
             if !current.exists {
                 return Ok(None);
             }
-            let Some(stored) = stored else {
-                return Ok(None);
-            };
             Ok(Some(if current.is_delete_marker {
-                Found::Marker(Box::new(stored))
+                Found::Marker {
+                    id: current.version,
+                    seq: current.seq,
+                }
             } else {
                 Found::Current {
                     id: current.version,
                     seq: current.seq,
-                    stored: Box::new(stored),
-                    path: judged.path,
                 }
             }))
         }
@@ -704,8 +769,7 @@ mod enabled {
         ) -> Result<Found, Error> {
             if let Some(found) = self.slot(bucket, key).await? {
                 let identity = match &found {
-                    Found::Current { id, .. } => id.as_ref(),
-                    Found::Marker(stored) => stored.version_id.as_ref(),
+                    Found::Current { id, .. } | Found::Marker { id, .. } => id.as_ref(),
                     Found::Row(_) => None,
                 };
                 if identity == version {
@@ -773,11 +837,13 @@ mod enabled {
         /// Make the newest remaining version current again — the materialize
         /// half of the move, and the only path that turns history back into
         /// the key path. The version's content is published FIRST (a crash
-        /// between the publish and the state transaction leaves the version's
-        /// row — and so its content — recoverable); then ONE transaction
-        /// drops its row and index entry and writes the current-version
-        /// columns naming it, clears the stale part rows, or removes the
-        /// key's state when no version remains.
+        /// between the publish and the commit leaves the version's row — and
+        /// so its content — recoverable); then ONE transaction — the
+        /// contract's [`VersionMeta::restore_slot`], this plane's one caller
+        /// of it — drops its row and index entry, writes the object row the
+        /// restored version becomes (the slot columns included), and clears
+        /// the stale part rows; with no version remaining the key's state is
+        /// removed instead ([`Self::clear_current`]).
         ///
         /// The successor lookup reads only the two newest rows (the version
         /// being deleted and the one below it — the only two a restore can
@@ -848,9 +914,14 @@ mod enabled {
             };
             if row.kind == rows::Kind::Marker {
                 // The marker that becomes current holds no content: re-stamp
-                // the slot, publish nothing.
-                let stored = marker_row(seq, &row);
-                return self.commit_restore(bucket, key, seq, &row.id, stored).await;
+                // the slot onto the marker's own row, publish nothing. The row
+                // the restore installs takes the marker's own created stamp
+                // (its object row's) and matches no file.
+                let restored = restored_row(&row, 0, from_nanos(row.created), 0);
+                return adapter
+                    .restore_slot(bucket, key, &restored, row.id(), seq)
+                    .await
+                    .map_err(projected);
             }
             // Publish the version's content back onto the key path through
             // the engine's own streaming materialize, then describe what
@@ -889,13 +960,16 @@ mod enabled {
             // change what its ETag is, and a multipart-composed
             // `MD5-of-MD5s-N` form has no content-derived equivalent (the
             // publish's MD5 is the single-upload form of the same bytes).
-            let stored = row.stored(
-                seq,
+            let restored = restored_row(
+                &row,
                 published.size,
-                to_nanos(metadata.modified().map_err(Error::from)?),
+                metadata.modified().map_err(Error::from)?,
                 fsutil::file_identity(&path, &metadata),
             );
-            self.commit_restore(bucket, key, seq, &row.id, stored).await
+            adapter
+                .restore_slot(bucket, key, &restored, row.id(), seq)
+                .await
+                .map_err(projected)
         }
 
         /// Remove the key's current-version state (its `object_meta` row and
@@ -919,105 +993,60 @@ mod enabled {
                 .await
                 .map_err(Error::from)
         }
-
-        /// The state transaction of a restore: drop the materialized
-        /// version's row and index entry, and write the current-version
-        /// columns — ONE transaction, so the two never disagree. The caller
-        /// only reaches it with a version to restore (no successor is
-        /// `clear_current`'s arm), so `stored` is taken by value, never
-        /// absent.
-        async fn commit_restore(
-            &self,
-            bucket: &Name,
-            key: &object::Key,
-            seq: u64,
-            id: &str,
-            stored: object_meta::Stored,
-        ) -> Result<(), Error> {
-            let bucket = bucket.clone();
-            let key = key.clone();
-            let id = id.to_owned();
-            self.handle()
-                .write(move |txn| {
-                    {
-                        let mut table = object_meta::Table::open(txn)?;
-                        table.put(&bucket, &key, &stored)?;
-                    }
-                    {
-                        let mut parts = object_part::Table::open(txn)?;
-                        parts.remove_key(&bucket, &key)?;
-                    }
-                    {
-                        let mut rows = rows::Table::open(txn)?;
-                        rows.remove(&bucket, &key, seq)?;
-                    }
-                    {
-                        let mut index = version_index::Table::open(txn)?;
-                        index.remove_pointing_at(&bucket, &key, &id, seq)?;
-                    }
-                    Ok(())
-                })
-                .await
-                .map_err(Error::from)
-        }
-
-        /// Rewrite one version row's tags or ACL element (the row's other
-        /// elements untouched) — one write transaction; the identity and
-        /// sequence are unchanged, so the index needs nothing. The write
-        /// failure propagates: the caller must not answer success for a tag
-        /// or ACL set that was never stored (the same call against the
-        /// current version already fails loudly).
-        async fn rewrite_row<F>(
-            &self,
-            bucket: &Name,
-            key: &object::Key,
-            row: &rows::Row,
-            edit: F,
-        ) -> Result<(), Error>
-        where
-            F: FnOnce(&mut rows::Row) + Send + 'static,
-        {
-            let bucket = bucket.clone();
-            let key = key.clone();
-            let mut row = row.clone();
-            edit(&mut row);
-            self.handle()
-                .write(move |txn| {
-                    rows::Table::open(txn)?.put(&bucket, &key, &row)?;
-                    Ok(())
-                })
-                .await
-                .map_err(Error::from)
-        }
     }
 
-    /// The `object_meta` row a restored marker takes: its identity and stamp,
-    /// the empty-content ETag (`Row::stored` reads the row's own empty
-    /// element), and no file match (a marker publishes nothing).
-    fn marker_row(seq: u64, row: &rows::Row) -> object_meta::Stored {
-        row.stored(seq, 0, row.created, 0)
+    /// The contract row a restore installs, from the version row the successor
+    /// scan read plus the published file's facts: the version's own recorded
+    /// elements (the ETag included — a multipart-composed form has no
+    /// content-derived equivalent), the `size`/`mtime`/`identity` arguments
+    /// describing what landed on the key path, and no version columns — the
+    /// contract's object row carries none, so the commit
+    /// ([`VersionMeta::restore_slot`]) adds them. A marker publishes nothing,
+    /// so its arm passes no size, its own created stamp and no file identity.
+    fn restored_row(
+        row: &rows::Row,
+        size: u64,
+        mtime: SystemTime,
+        identity: u64,
+    ) -> object_row::Row {
+        object_row::Row {
+            etag: row.etag(),
+            size,
+            mtime,
+            identity,
+            tags: row.tags(),
+            checksum: row.checksum(),
+            owner: row.owner(),
+            acl: row.acl(),
+        }
     }
 
     #[async_trait]
     impl VersionOps for FsStorage {
+        /// The state engine's read, over the bucket's version plane. The
+        /// namespace check stays here: fs answers `NoSuchBucket` for a key in
+        /// a bucket that is not there, and the engine knows no path.
         async fn bucket_versioning(&self, bucket: &Name) -> Result<State, Error> {
             self.ensure_bucket(bucket).await?;
-            self.versions(bucket).state(bucket).await.map_err(projected)
+            self.objects()
+                .bucket_versioning(&self.version_plane(bucket), bucket)
+                .await
+                .map_err(Error::from)
         }
 
+        /// The engine's state write, under fs's bucket mutation lock: every
+        /// write path reads the state inside its own hold of this lock, so
+        /// the flip is serialized with them — without it a write that
+        /// overlapped the flip could act on the old state after the flip
+        /// answered (orderable, but only by an argument; the lock makes the
+        /// serialization the obvious reading).
         async fn set_bucket_versioning(&self, bucket: &Name, state: State) -> Result<(), Error> {
             self.ensure_bucket(bucket).await?;
-            // The state flip is serialized with the write path: every write
-            // reads the state inside its own hold of this lock, so without
-            // the same lock here a write that overlapped the flip could act
-            // on the old state after the flip answered (orderable, but only
-            // by an argument; the lock makes the serialization the obvious
-            // reading).
             let _guard = self.lock_bucket_mutations(bucket).await;
-            self.versions(bucket)
-                .set_state(bucket, state)
+            self.objects()
+                .set_bucket_versioning(&self.version_plane(bucket), bucket, state)
                 .await
-                .map_err(projected)
+                .map_err(Error::from)
         }
 
         async fn get_object_version(
@@ -1031,71 +1060,18 @@ mod enabled {
             if key.is_reserved() || key.is_folder_marker() {
                 return Err(storage::no_such_key(key).into());
             }
-            // The version-addressed answer's `Info` reports the bucket's
-            // state too (the carrier the server reads for the identity
-            // rule): the resolution runs no write plan, so the state is
-            // read here — one point read per version-addressed read.
-            let records_versions = self.records_versions(bucket).await?;
-            match self.locate(bucket, key, version).await? {
-                Found::Marker(stored) => Ok(ReadResult::Marker {
-                    id: stored.version_id,
-                    last_modified: from_nanos(stored.mtime),
-                }),
-                Found::Current { stored, path, .. } => {
-                    // The current object's read is the plain read's, exactly —
-                    // one policy open, the shared staleness gate on the open
-                    // handle, the read path's own heal where the gate degrades
-                    // the recorded identity — but from the slot already
-                    // resolved: the key is never resolved twice
-                    // (`serve_current`). A drifted slot serves the current
-                    // bytes as the null version, never under the stale
-                    // identifier.
-                    let Some(path) = path else {
-                        // The slot's row describes content whose file is gone
-                        // (an out-of-band removal): the plain read's own
-                        // answer for a key with no object.
-                        return Err(storage::no_such_key(key).into());
-                    };
-                    let (file, size, mtime, row, version_id) = self
-                        .serve_current(bucket, key, &path, stored.as_ref())
-                        .await?;
-                    let (body, served_range) = FsStorage::object_body(file, size, range).await?;
-                    Ok(ReadResult::Object(GetObjectResult {
-                        info: FsStorage::info_of(
-                            key,
-                            size,
-                            mtime,
-                            row,
-                            version_id,
-                            records_versions,
-                        ),
-                        body,
-                        served_range,
-                    }))
-                }
-                Found::Row(row) if row.kind == rows::Kind::Marker => Ok(ReadResult::Marker {
-                    id: row.id(),
-                    last_modified: from_nanos(row.created),
-                }),
-                Found::Row(row) => {
-                    // The resolve runs before the open (a bad range is
-                    // answered without touching the store); the open then
-                    // takes the caller's own option — one call, two
-                    // argument values.
-                    let served_range = range.map(|range| range.resolve(row.size)).transpose()?;
-                    let body = self
-                        .versions(bucket)
-                        .blobs()
-                        .open(&row.blob(), range)
-                        .await
-                        .map_err(projected)?;
-                    Ok(ReadResult::Object(GetObjectResult {
-                        info: row.info(key, records_versions),
-                        body,
-                        served_range,
-                    }))
-                }
-            }
+            // The G3 pre-step, run where — and only where — the address is
+            // the key's current version: `retire_degraded_identity` holds the
+            // guard and the reason the step must precede the engine body, and
+            // the step itself is `objects::resolve_object_slot_stamped`. A
+            // history version or a marker address never touches the current
+            // row, so it skips the step; the pre-step's own answer is
+            // discarded.
+            self.retire_degraded_identity(bucket, key, version).await?;
+            self.objects()
+                .get_object_version(&self.version_plane(bucket), bucket, key, version, range)
+                .await
+                .map_err(Error::from)
         }
 
         async fn head_object_version(
@@ -1108,39 +1084,34 @@ mod enabled {
             if key.is_reserved() || key.is_folder_marker() {
                 return Err(storage::no_such_key(key).into());
             }
-            let records_versions = self.records_versions(bucket).await?;
-            match self.locate(bucket, key, version).await? {
-                Found::Marker(stored) => Ok(HeadResult::Marker {
-                    id: stored.version_id,
-                    last_modified: from_nanos(stored.mtime),
-                }),
-                Found::Current { stored, path, .. } => {
-                    // The same resolution the get serves (and the plain
-                    // head): one open, one gate, one heal — the two can never
-                    // disagree about the current object's size or identity.
-                    let Some(path) = path else {
-                        return Err(storage::no_such_key(key).into());
-                    };
-                    let (_file, size, mtime, row, version_id) = self
-                        .serve_current(bucket, key, &path, stored.as_ref())
-                        .await?;
-                    Ok(HeadResult::Object(FsStorage::info_of(
-                        key,
-                        size,
-                        mtime,
-                        row,
-                        version_id,
-                        records_versions,
-                    )))
-                }
-                Found::Row(row) if row.kind == rows::Kind::Marker => Ok(HeadResult::Marker {
-                    id: row.id(),
-                    last_modified: from_nanos(row.created),
-                }),
-                Found::Row(row) => Ok(HeadResult::Object(row.info(key, records_versions))),
-            }
+            // The same pre-step as the get's, for the same reason.
+            self.retire_degraded_identity(bucket, key, version).await?;
+            self.objects()
+                .head_object_version(&self.version_plane(bucket), bucket, key, version)
+                .await
+                .map_err(Error::from)
         }
 
+        /// Kept backend-side — with `delete_versioned` beside it — for fs's own
+        /// half of the removal: the successor scan over the key's raw rows, the
+        /// content removal and the prefix prune, under the bucket mutation
+        /// lock. The **commit** is the contract's: the restore's slot move is
+        /// now expressible through [`VersionMeta::restore_slot`], whose only
+        /// caller on this plane is the removal's own restore step. That call
+        /// carries the move **backwards to a real identity** — the successor's
+        /// own sequence, below the version being removed — that `advance_slot`
+        /// refuses by its absolute guard, and commits it together with the
+        /// object row the successor becomes, the consumed version row and its
+        /// index entry, and the cleared retained part list, all-or-nothing.
+        /// The window a split would open stays closed: with the slot moved and
+        /// the row dropped in separate calls, the restored version's row would
+        /// outlive its own materialization while the old slot still named it,
+        /// so the key could list its current version twice. The marker-creating
+        /// simple delete is a **different** gap and stays fs's own
+        /// `delete_versioned`: a marker row that is a version row lets the
+        /// store's one-null rule displace the superseded null version's history
+        /// row, and closing that is a model decision — where a current marker's
+        /// identity lives — not a call.
         async fn delete_object_version(
             &self,
             bucket: &Name,
@@ -1158,7 +1129,7 @@ mod enabled {
             let dir = self.ensure_bucket(bucket).await?;
             let path = self.resolve_key(&dir, key).await?;
             match self.locate(bucket, key, version).await? {
-                Found::Current { id, seq, .. } => {
+                Found::Current { id, seq } => {
                     // The current object version is permanently removed: the
                     // newest remaining version becomes current again, or the
                     // key disappears with it. The removal goes through the
@@ -1182,14 +1153,14 @@ mod enabled {
                         is_delete_marker: false,
                     })
                 }
-                Found::Marker(stored) => {
+                Found::Marker { id, seq } => {
                     // Removing the current marker shows the version it hid.
                     remove_object_file(&path, *self.follow_symlinks()).await?;
-                    let removed = (wire_of(stored.version_id.as_ref()), stored.version_seq);
+                    let removed = (wire_of(id.as_ref()), seq);
                     self.restore(bucket, key, Some(&removed)).await?;
                     prune_parents(&path, &dir).await;
                     Ok(Marker {
-                        id: stored.version_id,
+                        id,
                         is_delete_marker: true,
                     })
                 }
@@ -1243,6 +1214,11 @@ mod enabled {
             list::page(self, bucket, &params).await
         }
 
+        /// The version's tags, from the row that records them: the object
+        /// row's element for the current version (a current version has no
+        /// version-table row of its own), the version row's for a noncurrent
+        /// one — and the contract's not-found class, naming the version, for
+        /// a delete marker, which holds no metadata.
         async fn version_tags(
             &self,
             bucket: &Name,
@@ -1250,11 +1226,10 @@ mod enabled {
             version: Option<&Id>,
         ) -> Result<Tags, Error> {
             self.ensure_bucket(bucket).await?;
-            match self.locate(bucket, key, version).await? {
-                Found::Current { stored, .. } => Ok(stored.tags),
-                Found::Row(row) if row.kind == rows::Kind::Object => Ok(row.tags()),
-                _ => Err(storage::marker_has_no_metadata(version)),
-            }
+            self.objects()
+                .version_tags(&self.version_plane(bucket), bucket, key, version)
+                .await
+                .map_err(Error::from)
         }
 
         async fn set_version_tags(
@@ -1265,20 +1240,10 @@ mod enabled {
             tags: Tags,
         ) -> Result<(), Error> {
             self.ensure_bucket(bucket).await?;
-            match self.locate(bucket, key, version).await? {
-                Found::Current { .. } => self
-                    .meta_store()
-                    .set_tags(bucket, key, &tags)
-                    .await
-                    .map(|_| ()),
-                Found::Row(row) if row.kind == rows::Kind::Object => {
-                    self.rewrite_row(bucket, key, &row, move |row| {
-                        row.tags = tags.to_wire();
-                    })
-                    .await
-                }
-                _ => Err(storage::marker_has_no_metadata(version)),
-            }
+            self.objects()
+                .set_version_tags(&self.version_plane(bucket), bucket, key, version, tags)
+                .await
+                .map_err(Error::from)
         }
 
         async fn version_acl(
@@ -1288,19 +1253,14 @@ mod enabled {
             version: Option<&Id>,
         ) -> Result<Acl, Error> {
             self.ensure_bucket(bucket).await?;
-            match self.locate(bucket, key, version).await? {
-                Found::Current { stored, .. } => Ok(Acl {
-                    owner: stored.owner,
-                    grants: stored.acl.grants,
-                }),
-                Found::Row(row) if row.kind == rows::Kind::Object => Ok(Acl {
-                    owner: row.owner(),
-                    grants: row.acl().grants,
-                }),
-                _ => Err(storage::marker_has_no_metadata(version)),
-            }
+            self.objects()
+                .version_acl(&self.version_plane(bucket), bucket, key, version)
+                .await
+                .map_err(Error::from)
         }
 
+        /// Replace-all on the grants, the version's owner preserved — the
+        /// object ACL put's contract, per version.
         async fn set_version_acl(
             &self,
             bucket: &Name,
@@ -1309,28 +1269,10 @@ mod enabled {
             acl: &Acl,
         ) -> Result<(), Error> {
             self.ensure_bucket(bucket).await?;
-            let grants = acl.grants.clone();
-            match self.locate(bucket, key, version).await? {
-                // Replace-all on the grants, owner preserved — the object ACL
-                // put's contract, per version.
-                Found::Current { .. } => self
-                    .meta_store()
-                    .set_acl(bucket, key, &grants)
-                    .await
-                    .map(|_| ()),
-                Found::Row(row) if row.kind == rows::Kind::Object => {
-                    let wire = Acl {
-                        owner: None,
-                        grants,
-                    }
-                    .to_grants_wire();
-                    self.rewrite_row(bucket, key, &row, move |row| {
-                        row.acl = wire;
-                    })
-                    .await
-                }
-                _ => Err(storage::marker_has_no_metadata(version)),
-            }
+            self.objects()
+                .set_version_acl(&self.version_plane(bucket), bucket, key, version, acl)
+                .await
+                .map_err(Error::from)
         }
     }
 }

@@ -206,6 +206,7 @@ impl<'ast> Visit<'ast> for Scan {
 /// stated allow in its crate instead of a cleanup.
 fn is_test_support_module(rel: &str) -> bool {
     const EXEMPT: &[&str] = &[
+        "crates/tinio-util/src/bench.rs",
         "crates/tinio-util/src/job.rs",
         "crates/tinio-util/src/testing/mod.rs",
         "crates/tinio-util/src/testing/metadata.rs",

@@ -49,6 +49,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [features]
+bench = []
 render = ["dep:handlebars"]
 testing = [
     "dep:proc-macro2",

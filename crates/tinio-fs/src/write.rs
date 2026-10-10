@@ -129,6 +129,13 @@ impl StagedFile {
         self.temp
     }
 
+    /// The temp path, while this stage still owns the file. Unix chown reads
+    /// it before the publish's rename, which keeps the uid.
+    #[cfg(unix)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.temp
+    }
+
     /// Append one chunk. Bounded slices: a single oversized chunk never
     /// buffers whole.
     pub(crate) async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), Error> {

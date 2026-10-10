@@ -10,12 +10,24 @@
 //! follows. The mem-local part_meta table keeps the size/mtime pair the content
 //! contract carries for objects only (D23 has no part stat): it is a stat
 //! plane, not a byte plane, and never passes through the counter.
+//!
+//! Five bodies are the ops engine's (`tinio_ops::MultipartOps`, built by
+//! [`MemoryStorage::multipart_ops`]): the create, the upload read, the part
+//! page, the abort and the uploads listing — every one of them a sequence of
+//! contract calls with no mem-local plane in it. Two stay here, and the reason
+//! is mem's alone: `upload_part` because a refused PARTS row must **restore**
+//! the bytes the number held before this call's publish (the surviving row
+//! describes them — a plain take-back would leave a live row without its
+//! bytes, and only mem can afford to read those bytes before publishing), and
+//! `complete_multipart_upload` because its write's version outcome is decided
+//! inside ONE transaction (the bucket's state can flip between the caller's
+//! read and the write) and its publish forgives the consumed parts' bytes in
+//! the same critical section — both mem-local by the E16/RW2 ruling.
 
-use std::{sync::Arc, time::SystemTime};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use uuid::Uuid;
 
 #[cfg(feature = "versioning")]
 use crate::_core::{meta::VersionMeta, version::Id};
@@ -29,10 +41,10 @@ use crate::{
         bucket::Name,
         checksum, collect_body,
         content::{ContentKey, ObjectContent, StagedObject},
-        from_nanos, key_marker_order,
-        meta::{ObjectMeta, UploadMeta, object as object_row, upload::Row as UploadRow},
+        from_nanos,
+        meta::{ObjectMeta, UploadMeta, object as object_row},
         multipart::{check_part_minimum, part_number},
-        now_nanos, object, split_uploads_order, storage,
+        now_nanos, object, storage,
     },
     _store_redb::part_meta,
     Error,
@@ -173,33 +185,15 @@ impl MultipartOps for MemoryStorage {
         if key.is_folder_marker() {
             return Err(invalid_key(key.to_string()));
         }
-        let initiated_at = SystemTime::now();
-        let upload_id = Uuid::new_v4().to_string();
-        let row = UploadRow {
-            upload_id: upload_id.clone(),
-            key: key.clone(),
-            initiated_at,
-            checksum: checksum.clone(),
-            tags: tags.clone(),
-            owner: owner.cloned(),
-            acl: acl.clone(),
-        };
-        // One contract transaction writes the upload row and its checksum
-        // spec, and refuses when the bucket row is gone: the guard closes the
-        // window the removed pre-check left open.
-        self.metadata()
-            .create_guarded(bucket, &upload_id, &row)
-            .await?;
-        Ok(MultipartUpload {
-            upload_id,
-            bucket: bucket.clone(),
-            key: key.clone(),
-            initiated_at,
-            checksum,
-            tags,
-            owner: owner.cloned(),
-            acl: acl.clone(),
-        })
+        // The engine's create body: a fresh UUID id and one contract
+        // transaction that writes the upload row and its checksum spec — under
+        // mem's policy, the **guarded** form, which refuses when the bucket row
+        // is gone (the guard closes the window the pre-check above leaves
+        // open).
+        self.multipart_ops()
+            .create_multipart_upload(bucket, key, checksum, tags, owner, acl)
+            .await
+            .map_err(Error::from)
     }
 
     async fn get_multipart_upload(
@@ -212,13 +206,13 @@ impl MultipartOps for MemoryStorage {
         if key.is_reserved() {
             return Err(access_denied(key));
         }
-        // One contract read serves the existence check, the stored-key
-        // identity match, initiated_at, the create-time tags and the checksum
-        // spec (the row is present only when it records this key).
-        let row = UploadMeta::get(&**self.metadata(), bucket, key, upload_id)
-            .await?
-            .ok_or_else(|| no_such_upload(upload_id))?;
-        Ok(row.to_upload(bucket))
+        // The engine's read: one contract lookup serves the existence check,
+        // the stored-key identity match, initiated_at, the create-time tags and
+        // the checksum spec (the row is present only when it records this key).
+        self.multipart_ops()
+            .get_multipart_upload(bucket, key, upload_id)
+            .await
+            .map_err(Error::from)
     }
 
     async fn upload_part(
@@ -356,37 +350,21 @@ impl MultipartOps for MemoryStorage {
         // Bucket existence first (the fs backend answers NoSuchBucket before
         // anything else).
         self.ensure_bucket(&params.bucket).await?;
-        // The upload's existence and its recorded key in one contract read.
-        if UploadMeta::get(
-            &**self.metadata(),
-            &params.bucket,
-            &params.key,
-            &params.upload_id,
-        )
-        .await?
-        .is_none()
-        {
-            return Err(no_such_upload(&params.upload_id));
-        }
-        // max_parts = 0 requests nothing — and no marker either, since an
-        // exclusive-after marker would skip the first part of the next page
-        // forever (the fs backend and the engine agree).
-        if params.max_parts == 0 {
-            return Ok(PartsListing {
-                parts: Vec::new(),
-                truncated: false,
-                next_part_number_marker: None,
-            });
-        }
-        let start = params
-            .part_number_marker
-            .map_or(0, |marker| marker.saturating_add(1));
-        // The page's PARTS rows with the PART_CHECKSUMS join, in one contract
-        // read transaction.
+        // The engine owns the upload's identity check, the marker arithmetic
+        // (the exclusive `+1`, and the `u32::MAX` and `max_parts = 0` corners)
+        // and the resume rule; the page's rows and the truncation flag are the
+        // contract's own read.
         let page = self
-            .metadata()
-            .list_parts_page(&params.bucket, &params.upload_id, start, params.max_parts)
-            .await?;
+            .multipart_ops()
+            .list_parts(
+                &params.bucket,
+                &params.key,
+                &params.upload_id,
+                params.part_number_marker,
+                params.max_parts,
+            )
+            .await
+            .map_err(Error::from)?;
         // The stat join (mem's own plane) for exactly the page's rows, one
         // read transaction.
         let b = params.bucket.as_ref().as_str();
@@ -406,13 +384,10 @@ impl MultipartOps for MemoryStorage {
             };
             parts.push(row.to_info(size, from_nanos(mtime)).map_err(Error::from)?);
         }
-        // The resume marker is the last RAW part number (a truncated page
-        // whose rows all vanished to a join skip still advances the client).
-        let next = if page.more { page.raw_last } else { None };
         Ok(PartsListing {
             parts,
-            truncated: page.more,
-            next_part_number_marker: next,
+            truncated: page.truncated,
+            next_part_number_marker: page.next_part_number_marker,
         })
     }
 
@@ -649,13 +624,17 @@ impl MultipartOps for MemoryStorage {
         // Bucket existence first (the fs backend answers NoSuchBucket before
         // anything else).
         self.ensure_bucket(bucket).await?;
-        // The identity check and the drain in ONE contract transaction, so a
-        // racing complete cannot slip between them: an absent or
-        // key-mismatched upload refuses with NoSuchUpload and drains nothing.
+        // The upload's own part numbers, read before its rows go: the bytes
+        // leave only after they can no longer be listed.
         let numbers = self.part_numbers(bucket, upload_id).await?;
-        self.metadata()
-            .drain_upload_checked(bucket, key, upload_id)
-            .await?;
+        // The engine's abort: the identity check and the drain in ONE contract
+        // transaction, so a racing complete cannot slip between them — an
+        // absent or key-mismatched upload refuses with NoSuchUpload and drains
+        // nothing.
+        self.multipart_ops()
+            .abort_multipart_upload(bucket, key, upload_id)
+            .await
+            .map_err(Error::from)?;
         // The mem-local stat plane leaves with the rows (the contract's drain
         // cannot know it).
         self.drain_part_meta(bucket, upload_id)?;
@@ -677,38 +656,13 @@ impl MultipartOps for MemoryStorage {
         params: ListUploadsParams,
     ) -> Result<UploadsListing, Error> {
         self.ensure_bucket(&params.bucket).await?;
-        // The resume marker (composite key plus upload_id; a bare key marker
-        // sorts after every upload of that key) is computed before the walk.
-        let marker = key_marker_order(
-            params.key_marker.as_deref(),
-            params.upload_id_marker.as_deref(),
-        );
-        // One contract read: the prefix filter, the delimiter rollup, the
-        // marker and the truncation/resume rules are the shared engine's.
-        let (uploads, common_prefixes, truncated, next) = self
-            .metadata()
-            .list_uploads_page(
-                &params.bucket,
-                &params.prefix,
-                params.delimiter.as_deref(),
-                marker.as_deref(),
-                params.max_uploads,
-            )
-            .await?;
-        let (next_key, next_upload_id) = match next {
-            Some(next) => {
-                let (key, upload_id) = split_uploads_order(&next);
-                (Some(key.to_string()), upload_id.map(str::to_string))
-            }
-            None => (None, None),
-        };
-        Ok(UploadsListing {
-            uploads,
-            common_prefixes,
-            truncated,
-            next_key_marker: next_key,
-            next_upload_id_marker: next_upload_id,
-        })
+        // The engine's page: the resume marker (the composite key plus
+        // upload_id, computed and split back in `tinio_core`), the prefix
+        // filter, the delimiter rollup and the truncation/resume rules.
+        self.multipart_ops()
+            .list_multipart_uploads(params)
+            .await
+            .map_err(Error::from)
     }
 }
 

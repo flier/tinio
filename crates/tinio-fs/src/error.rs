@@ -116,14 +116,28 @@ impl Error {
     /// spelling). The read paths that rewrite a row they could not hit
     /// ask this to serve the recomputed row without persisting it.
     ///
+    /// Both of this crate's error carriers answer: a failure raised on this
+    /// crate's own file/state paths ([`database::Error::is_read_only`]), and
+    /// the one an **ops-engine** body raises, which reaches this crate as a
+    /// contract error carrying the same marker
+    /// ([`storage::Error::is_read_only`] — the engine's bodies answer
+    /// `storage::Error`).
+    ///
     /// # Examples
     ///
     /// ```rust
+    /// use std::io;
+    ///
     /// use tinio_fs::{Error, database};
     ///
     /// // The shared handle's arm answer, nested like every shared failure.
     /// let refused: Error = database::Error::from(tinio_store_redb::Error::ReadOnly).into();
     /// assert!(refused.is_read_only());
+    ///
+    /// // The engine's own projection of the same refusal.
+    /// let engine: Error =
+    ///     tinio_core::storage::Error::from(io::Error::from(io::ErrorKind::ReadOnlyFilesystem)).into();
+    /// assert!(engine.is_read_only());
     ///
     /// // Anything else keeps propagating: only the read-only refusal is
     /// // the designed "recomputed but not written back" answer.
@@ -131,7 +145,11 @@ impl Error {
     /// assert!(!unrelated.is_read_only());
     /// ```
     pub fn is_read_only(&self) -> bool {
-        matches!(self, Self::Database(err) if err.is_read_only())
+        match self {
+            Self::Database(err) => err.is_read_only(),
+            Self::Storage(err) => err.is_read_only(),
+            _ => false,
+        }
     }
 }
 

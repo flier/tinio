@@ -44,7 +44,10 @@ use futures::lock::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use crate::{
     _core::{
         bucket,
-        content::{ContentEntry, ContentKey, ObjectContent, PublishId, StagedObject},
+        content::{
+            ContentEntry, ContentKey, ObjectContent, PublishId, StagedObject, body_matches_etag,
+        },
+        etag::ETag,
         multipart, object,
         storage::{BodyStream, ByteRange},
     },
@@ -274,22 +277,6 @@ where
     /// held.
     pub(crate) fn forget_publish_tag(&self, bucket: &bucket::Name, key: &ContentKey) {
         self.publish_tags().remove(&(bucket.clone(), key.clone()));
-    }
-
-    /// Retire this call's publish identity once the row describing it landed:
-    /// no compensation can follow a landed row write, so the tag leaves the
-    /// map instead of waiting for the key's next publish to replace it. A
-    /// writer that published after this one keeps its own tag (the take
-    /// compares). Call after the row write succeeded; a refused one
-    /// compensates instead.
-    pub(crate) async fn retire_publish_tag(
-        &self,
-        bucket: &bucket::Name,
-        key: &ContentKey,
-        id: PublishId,
-    ) {
-        let _section = self.lock_accounting().await;
-        let _ = self.take_publish_tag(bucket, key, id);
     }
 
     /// Remember that `key`'s bytes were released while its rows survived: the
@@ -971,6 +958,46 @@ where
         }
         self.remove_guarded_counted(bucket, key, expected, "tagged")
             .await
+    }
+
+    /// Hash the stored bytes under the accounting lock and take them back only
+    /// while they are still this publish and still this digest. The caller
+    /// supplies the ETag, not a second copy of the object.
+    async fn remove_if_etag(
+        &self,
+        bucket: &bucket::Name,
+        key: &ContentKey,
+        etag: &ETag,
+        id: PublishId,
+    ) -> Result<bool, Error> {
+        let ETag::Single(_) = etag else {
+            return Ok(false);
+        };
+        let _section = self.lock_accounting().await;
+        let tagged = {
+            let tags = self.publish_tags();
+            tags.get(&(bucket.clone(), key.clone()))
+                .is_some_and(|tag| *tag == id)
+        };
+        if !tagged {
+            return Ok(false);
+        }
+        let mut body = self
+            .inner
+            .open(bucket, key, None)
+            .await
+            .map_err(Into::into)?;
+        let matches = body_matches_etag(&mut body, etag)
+            .await
+            .map_err(Error::from)?;
+        if !matches {
+            return Ok(false);
+        }
+        if !self.take_publish_tag(bucket, key, id) {
+            return Ok(false);
+        }
+        self.remove_counted(bucket, key).await?;
+        Ok(true)
     }
 
     /// Move the source's bytes and drop the target's stored ones: the total

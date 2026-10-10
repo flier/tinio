@@ -4735,6 +4735,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinio-bench"
+version = "0.1.0"
+dependencies = [
+ "tinio-util",
+]
+
+[[package]]
 name = "tinio-blob"
 version = "0.1.0"
 dependencies = [
@@ -4896,9 +4903,11 @@ dependencies = [
  "strict-path",
  "tempfile",
  "thiserror 2.0.20",
+ "tinio-bench",
  "tinio-blob",
  "tinio-core",
  "tinio-fs",
+ "tinio-ops",
  "tinio-store-redb",
  "tinio-util",
  "tinio-version",
@@ -4919,8 +4928,28 @@ dependencies = [
  "thiserror 2.0.20",
  "tinio-core",
  "tinio-mem",
+ "tinio-ops",
  "tinio-store-redb",
  "tinio-util",
+ "tinio-version",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "tinio-ops"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "criterion",
+ "futures",
+ "md-5",
+ "tempfile",
+ "tinio-blob",
+ "tinio-core",
+ "tinio-store-redb",
  "tinio-version",
  "tokio",
  "tracing",
@@ -6125,6 +6154,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "thiserror 2.0.20",
+ "tinio-bench",
  "tinio-util",
 ]
 

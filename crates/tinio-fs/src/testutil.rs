@@ -168,9 +168,23 @@ pub(crate) async fn versioned_bucket(
     (b, key)
 }
 
+/// A `data` bucket over `storage` — the plain sibling of `versioned_bucket`
+/// (whose gate this helper deliberately does not carry): the same create,
+/// with no versioning state and no bodies.
+pub(crate) async fn bucket(storage: &FsStorage) -> bucket::Name {
+    use crate::_core::storage::BucketOps;
+
+    let b = bucket::name("data").unwrap();
+    storage
+        .create_bucket(&b, None, &acl::Acl::default_private(None))
+        .await
+        .unwrap();
+    b
+}
+
 /// A bucket `data` with `n` files `f00.txt..`, each with distinct content
-/// (`payload {i}`) — the shared producer fixture of the list and scanner
-/// tests (F39; the list tests add their own state store on top).
+/// (`payload {i}`) — the shared producer fixture of the scanner tests (F39),
+/// and what the scanner's own state store is built over.
 pub(crate) fn files(root: &Path, n: usize) {
     fs::create_dir(root.join("data")).unwrap();
     for i in 0..n {
@@ -302,11 +316,9 @@ async fn recv_job<O>(rx: &Arc<Mutex<mpsc::Receiver<Job<O>>>>) -> Option<Job<O>> 
 /// jobs off a bounded queue and run them on the test runtime's threads
 /// (the blocking-task model, Q4). An optional per-task `delay` parks the
 /// worker before running, so overlapping is deterministic no matter how
-/// fast the work itself is. Tracks the maximum number of tasks in `run()`
-/// simultaneously and the total enqueued count.
+/// fast the work itself is. Tracks the total enqueued count.
 pub(crate) struct PacedRunner<O> {
     tx: mpsc::Sender<Job<O>>,
-    max_in_run: Arc<AtomicUsize>,
     enqueued: Arc<AtomicUsize>,
 }
 
@@ -321,17 +333,14 @@ where
     pub(crate) fn new(workers: usize, capacity: usize, delay: Duration) -> Arc<Self> {
         let (tx, rx) = mpsc::channel::<Job<O>>(capacity);
         let rx = Arc::new(Mutex::new(rx));
-        let max_in_run = Arc::new(AtomicUsize::new(0));
         let in_run = Arc::new(AtomicUsize::new(0));
         let enqueued = Arc::new(AtomicUsize::new(0));
         for _ in 0..workers {
             let rx = Arc::clone(&rx);
-            let max_in_run = Arc::clone(&max_in_run);
             let in_run = Arc::clone(&in_run);
             task::spawn(async move {
                 while let Some((mut task, reply)) = recv_job(&rx).await {
-                    let now = in_run.fetch_add(1, Ordering::Relaxed) + 1;
-                    max_in_run.fetch_max(now, Ordering::Relaxed);
+                    in_run.fetch_add(1, Ordering::Relaxed);
                     if delay > Duration::ZERO {
                         time::sleep(delay).await;
                     }
@@ -340,22 +349,12 @@ where
                 }
             });
         }
-        Arc::new(Self {
-            tx,
-            max_in_run,
-            enqueued,
-        })
+        Arc::new(Self { tx, enqueued })
     }
 
     /// Tasks accepted so far (the producer's enqueue count).
     pub(crate) fn enqueued(&self) -> usize {
         self.enqueued.load(Ordering::Relaxed)
-    }
-
-    /// The maximum number of tasks in `run()` simultaneously — the
-    /// observed concurrency.
-    pub(crate) fn max_in_run(&self) -> usize {
-        self.max_in_run.load(Ordering::Relaxed)
     }
 }
 
@@ -444,33 +443,6 @@ where
         let (reply, done) = Completion::pair();
         self.enqueued.fetch_add(1, Ordering::Relaxed);
         self.tx.send((task, reply)).await.map_err(|_| ShutDown)?;
-        Ok(done)
-    }
-
-    fn shutdown(&self) {}
-
-    fn stats(&self) -> Stats {
-        Stats::default()
-    }
-}
-
-/// A [`Runner`] that **loses** every task without running it — the
-/// crash-loss simulation (a batch dropped before commit is equivalent to
-/// an uncommitted batch; the next pass recomputes). The completion
-/// resolves [`Error::Dropped`].
-pub(crate) struct LossyRunner;
-
-#[async_trait]
-impl<O> Runner<O> for LossyRunner
-where
-    O: Send + 'static,
-{
-    async fn enqueue(
-        &self,
-        _task: Box<dyn Task<Output = O>>,
-    ) -> Result<Completion<O>, pipeline::Error> {
-        let (reply, done) = Completion::pair();
-        drop(reply); // the task never ran — the handle reports Dropped
         Ok(done)
     }
 

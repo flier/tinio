@@ -4,8 +4,8 @@
 //! [`Store::set_batch`] — a single write transaction for the whole
 //! batch (per-entry last-write-wins), so the write-transaction count
 //! drops from N to ≈N/batch. Completion is the [`pipeline::Completion`]
-//! `enqueue` returns (Q3b/R8): the list producer awaits it; the scanner
-//! drops it (fire-and-forget).
+//! `enqueue` returns (Q3b/R8): the scanner awaits it where a page needed it
+//! and drops it elsewhere (fire-and-forget).
 
 use std::mem::take;
 

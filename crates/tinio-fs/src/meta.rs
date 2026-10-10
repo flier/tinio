@@ -35,8 +35,8 @@
 //! transaction per batch, per-entry last-write-wins — the write-pipeline
 //! task's commit), and the gating-load pair [`Store::load_entries`] /
 //! [`Store::load_bucket`] (one read transaction each, rows aligned with
-//! `get()` semantics and exposing the file identity — the producers'
-//! gate, P2/R1; the full-bucket form is the scanner's materialized
+//! `get()` semantics and exposing the file identity — the batched gate the
+//! scanner's producers use, P2/R1; the full-bucket form is the scanner's materialized
 //! snapshot — one short transaction loaded into memory before the walk,
 //! §3.7 whole-bucket-in-memory, never a held-open window).
 
@@ -87,10 +87,10 @@ pub(crate) const COMPOSED_MTIME_JITTER: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 pub struct TagRow {
     /// The row the tag write left behind (its other elements verbatim).
-    pub(crate) row: object_meta::Stored,
+    pub row: object_meta::Stored,
     /// Whether the bucket records versions (read off the same write
     /// transaction's state table).
-    pub(crate) records_versions: bool,
+    pub records_versions: bool,
 }
 
 /// The absolute time difference between two instants (symmetric — an
@@ -227,10 +227,10 @@ pub(crate) enum Verdict {
 }
 
 /// The staleness gate — the one home of the decision every current-slot
-/// reader takes: the plain read's `resolve_object_info` (which serves the
-/// gated identity and hands the rewrite the stale one) and the version
-/// adapter's `current_with_row` (the engine's view of the current slot) both
-/// call it, so the two can never disagree about what is current. The leaf
+/// reader takes: `resolve_object_slot` (the plain read's version facts, which
+/// serve the gated identity and hand the rewrite the stale one) and the
+/// version adapter's `current_with_row` (the engine's view of the current
+/// slot) both call it, so the two can never disagree about what is current. The leaf
 /// comparison is [`entry_matches`]; this is what the two readers make of it,
 /// including what a **missing** file means (the row's recorded marker flag,
 /// read and never inferred from the row's shape — a zero-byte object's row is
@@ -316,7 +316,7 @@ pub struct GatedMeta {
 }
 
 /// One entry of a [`Store::set_batch`] write batch (pipeline-spec.md
-/// §3.2): the producers (list/scanner) build it from an IO-pipeline
+/// §3.2): the scanner's producers build it from an IO-pipeline
 /// compute result plus the walk-time size/mtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchEntry {
@@ -824,83 +824,6 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// `set_tags` of an object file whose row may be missing (a
-    /// hand-dropped object): the plain tag update when the row exists,
-    /// else the content-hash heal + tag insert in ONE write
-    /// transaction — the first tagging of a hand-dropped object costs
-    /// one fsync, not three. The hash-time metadata rules the inserted
-    /// row (F19, like `ensure_row`); a row that appears between the
-    /// probe and the write is tag-updated, never clobbered. A file that
-    /// vanishes before the hash surfaces as the hash's `NotFound`
-    /// (the caller maps it to `NoSuchKey`). Answers the written row and
-    /// the bucket state ([`TagRow`]), the state read riding the same
-    /// transaction.
-    pub(crate) async fn ensure_tags(
-        &self,
-        bucket: &bucket::Name,
-        key: &object::Key,
-        path: &Path,
-        follow_symlinks: bool,
-        tags: &object::Tags,
-    ) -> Result<TagRow, Error> {
-        if let Some(written) = self.set_tags(bucket, key, tags).await? {
-            return Ok(written);
-        }
-        let (digest, size, mtime, identity) = md5_of_file(path, follow_symlinks).await?;
-        let etag = ETag::Single(digest);
-        let bucket = bucket.clone();
-        let key = key.clone();
-        let tags = tags.clone();
-        self.handle
-            .write(move |txn| {
-                // The bucket state first: the write handle borrows the
-                // transaction exclusively, so each table is a separate
-                // pass (the shared-handle rule).
-                let records_versions = bucket_versioning::Table::open(txn)?
-                    .get(bucket.as_ref().as_str())?
-                    .unwrap_or_default()
-                    .records_versions();
-                let mut table = object_meta::Table::open(txn)?;
-                // A row that appeared during the hash keeps its checksum,
-                // owner, ACL and current-version identity (the
-                // etag/size/mtime/identity are the hash-time ones — the row
-                // describes the same file read at hash time).
-                let (checksum, owner, acl, version_id, version_seq) =
-                    table.get(&bucket, &key)?.map_or_else(
-                        || (None, None, Acl::default_private(None), None, 0),
-                        |row| {
-                            (
-                                row.checksum,
-                                row.owner,
-                                row.acl,
-                                row.version_id,
-                                row.version_seq,
-                            )
-                        },
-                    );
-                let stored = object_meta::Stored {
-                    etag: etag.clone(),
-                    size,
-                    mtime: to_nanos(mtime),
-                    file_identity: identity,
-                    tags: tags.clone(),
-                    checksum,
-                    owner,
-                    acl,
-                    version_id,
-                    version_seq,
-                    is_delete_marker: false,
-                };
-                table.put(&bucket, &key, &stored)?;
-                Ok(TagRow {
-                    row: stored,
-                    records_versions,
-                })
-            })
-            .await
-            .map_err(Into::into)
-    }
-
     /// Clear the stored tag set of `key`, preserving the row's other
     /// elements (idempotent — a missing row is a no-op, and an
     /// already-empty set commits nothing). Answers the cleared row and
@@ -1003,8 +926,8 @@ impl Store {
     /// last occurrence; pipeline-spec.md §3.2). Each entry carries its
     /// file identity at record time (see `fsutil::file_identity`;
     /// `0` marks an unavailable platform identity). The batching policy
-    /// lives in the producers (pipeline-spec.md task 4) — this is the
-    /// primitive they call once per batch. An empty `entries` is a no-op:
+    /// lives in the scanner's producers (pipeline-spec.md task 4) — this is
+    /// the primitive they call once per batch. An empty `entries` is a no-op:
     /// no write transaction is opened (the streaming flusher may flush an
     /// empty accumulator — a pointless write-lock + fsync is skipped).
     ///
@@ -1142,9 +1065,10 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// The gating-load **batch point read** (pipeline-spec.md P2/R1) —
-    /// the list producer's page read: one read transaction, `get` per
-    /// requested key in request order, hot-path cost O(page). Returns
+    /// The gating-load **batch point read** (pipeline-spec.md P2/R1): one
+    /// read transaction, `get` per requested key in request order, hot-path
+    /// cost O(page) — the scanner's page read (the ops engine's listing takes
+    /// the row contract's own `load`). Returns
     /// one slot per requested key, **index-aligned with the request** —
     /// the caller maps slots back to its own keys (the list's page is
     /// already in key order; nothing is keyed by lookup). The keys are
@@ -1647,8 +1571,9 @@ mod tests {
         let b = bucket::name("data").unwrap();
         let k = object::key("a.txt").unwrap();
         let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
-        // A missing row: no update — the caller heals the row first
-        // (ensure_tags) and the `None` answers "row was not updated".
+        // A missing row: no update — the caller heals the row first (the
+        // ops engine's tag body does, through the contract's own heal) and
+        // the `None` answers "row was not updated".
         assert!(store.set_tags(&b, &k, &tags).await.unwrap().is_none());
         store
             .set(
@@ -1673,83 +1598,10 @@ mod tests {
         assert_eq!(row.size, 3);
         assert_eq!(row.file_identity, 7);
         // An identical set still reports a row: the `Some` is the
-        // "row exists" probe of [`Self::ensure_tags`] (it short-circuits
-        // the hash-heal), and the table's change-detection already
-        // skipped the row write.
+        // "row exists" probe of the hand-dropped-object path (it
+        // short-circuits the hash-heal), and the table's change-detection
+        // already skipped the row write.
         assert!(store.set_tags(&b, &k, &tags).await.unwrap().is_some());
-    }
-
-    /// `ensure_tags`'s missing-row branch: a hand-dropped object (a file
-    /// with no row) is hashed and its row inserted with the requested tag
-    /// set in ONE transaction. The second call takes the existing-row
-    /// short-circuit, preserving every content-derived element the insert
-    /// wrote.
-    #[tokio::test]
-    async fn ensure_tags_hashes_and_inserts_the_row_of_a_hand_dropped_object() {
-        let state = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let store = meta::store(state.path()).unwrap();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("a.txt").unwrap();
-        let path = root.path().join("a.txt");
-        fs::write(&path, b"hello").await.unwrap();
-        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
-
-        assert!(
-            store.stored_entry(&b, &k).await.unwrap().is_none(),
-            "a hand-dropped object has no row to start from"
-        );
-        store
-            .ensure_tags(&b, &k, &path, false, &tags)
-            .await
-            .unwrap();
-        let row = store
-            .stored_entry(&b, &k)
-            .await
-            .unwrap()
-            .expect("the insert branch wrote the row");
-        assert_eq!(
-            row.etag.as_str(),
-            "5d41402abc4b2a76b9719d911017c592",
-            "the row's etag is the content's MD5"
-        );
-        assert_eq!(row.size, 5);
-        assert_eq!(row.tags, tags, "the requested tags ride the insert");
-        assert!(row.checksum.is_none(), "no checksum is invented");
-        assert!(row.owner.is_none(), "no owner is invented");
-        assert_eq!(
-            row.acl,
-            Acl::default_private(None),
-            "the private default rides the insert"
-        );
-        assert!(row.version_id.is_none(), "no version identity is invented");
-        assert_eq!(row.version_seq, 0);
-        // The row describes the file it was hashed from (the F19 rules).
-        let metadata = fs::metadata(&path).await.unwrap();
-        assert!(entry_matches(
-            row.size,
-            row.mtime,
-            row.file_identity,
-            metadata.len(),
-            metadata.modified().unwrap(),
-            fsutil::file_identity(&path, &metadata),
-        ));
-
-        // The row now exists: the second call is the plain tag update, which
-        // preserves the content-derived elements the insert wrote.
-        let later = object::Tags::from_pairs([("env".into(), "staging".into())]).unwrap();
-        store
-            .ensure_tags(&b, &k, &path, false, &later)
-            .await
-            .unwrap();
-        let updated = store.stored_entry(&b, &k).await.unwrap().unwrap();
-        assert_eq!(updated.tags, later);
-        assert_eq!(updated.etag, row.etag);
-        assert_eq!(updated.size, row.size);
-        assert_eq!(updated.mtime, row.mtime);
-        assert_eq!(updated.file_identity, row.file_identity);
-        assert_eq!(updated.version_id, row.version_id);
-        assert_eq!(updated.version_seq, row.version_seq);
     }
 
     #[tokio::test]
@@ -2264,8 +2116,8 @@ mod tests {
 
     #[test]
     fn the_gate_is_one_decision_over_the_four_states_it_distinguishes() {
-        // The one home of the staleness verdict: the plain read
-        // (`resolve_object_info`) and the version adapter's current slot
+        // The one home of the staleness verdict: the plain read's version
+        // facts (`resolve_object_slot`) and the version adapter's current slot
         // (`current_with_row`) both call it, so no reader may carry its own
         // copy of this table. Each arm here is a state the two readers must
         // answer identically.

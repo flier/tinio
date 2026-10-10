@@ -104,35 +104,41 @@
 //! version and the source's history; an unversioned bucket keeps today's row
 //! move.
 
+// `object_result`'s own types: its gate (below) is these imports' too — the
+// stripped build compiles no part of the helper, so it needs none of them.
+#[cfg(feature = "versioning")]
 use std::time::SystemTime;
 
+#[cfg(feature = "versioning")]
 use bytes::Bytes;
+#[cfg(feature = "versioning")]
 use futures::stream::iter;
 use redb::WriteTransaction;
 
+// The feature-on `object_result` (below) is these imports' only user — gated
+// with it, so the stripped build carries none of them (the same shape as
+// `records_versions`' import above).
+#[cfg(feature = "versioning")]
+use crate::_core::{
+    BodyStream, ByteRange, ETag, GetObjectResult,
+    acl::{Acl, OwnerId},
+    checksum, object,
+    storage::invalid_range,
+    version::Id,
+};
 // The feature-on `records_versions` body is this import's only user — with
 // the feature off the body answers the constant `false` and the shared
 // state table is never opened.
 #[cfg(feature = "versioning")]
 use crate::_store_redb::bucket_versioning;
+use crate::{
+    _core::bucket::Name, _store_redb::bucket as store_bucket, Error, error::no_such_bucket,
+};
 // The feature-off `VersionOps` impl below is the only user, so the gate is
 // the import's too: the feature-on build (whose impl lives in `enabled`)
 // does not carry an unused import.
 #[cfg(not(feature = "versioning"))]
 use crate::{_core::storage::VersionOps, storage::MemoryStorage};
-use crate::{
-    _core::{
-        BodyStream, ByteRange, ETag, GetObjectResult,
-        acl::{Acl, OwnerId},
-        bucket::Name,
-        checksum, object,
-        storage::invalid_range,
-        version::Id,
-    },
-    _store_redb::bucket as store_bucket,
-    Error,
-    error::no_such_bucket,
-};
 
 /// The feature-off `VersionOps`: the trait's default bodies own every answer
 /// (the refusal class for the nine, `Unversioned` for `bucket_versioning`),
@@ -141,10 +147,15 @@ use crate::{
 impl VersionOps for MemoryStorage {}
 
 /// Build a served read's result over content already in hand: the shared
-/// ranged-read construction of both the version-addressed reads and the
-/// plain read (`object::get_object`), so the crate has exactly one. The
-/// body is one `Bytes` chunk — mem serves whole objects or a resolved
-/// slice of one, never a streamed file.
+/// ranged-read construction of the version-addressed reads, so the crate has
+/// exactly one (the plain read is the ops engine's body, which builds its own
+/// answer). The body is one `Bytes` chunk — mem serves whole objects or a
+/// resolved slice of one, never a streamed file.
+///
+/// The gate is the file's usual shape: the version-addressed reads inside
+/// `enabled` are the only callers and the import groups above are its own, so
+/// with the feature off neither the helper nor its imports are compiled.
+#[cfg(feature = "versioning")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn object_result(
     key: &object::Key,

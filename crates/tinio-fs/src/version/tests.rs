@@ -13,7 +13,7 @@ use crate::{
     _core::{
         BodyStream, ETag,
         acl::Acl,
-        bucket, collect_body, object,
+        bucket, collect_body, from_nanos, object,
         storage::{self, BucketOps, ObjectOps, VersionOps},
         version::{self, ListParams},
     },
@@ -374,6 +374,96 @@ async fn removing_a_marker_restores_the_version_it_hid() {
     assert_eq!(page.entries[0].id.as_ref(), Some(&only));
 }
 
+/// The restore's **marker-successor** arm: the newest remaining version is a
+/// delete marker, so the restore makes the marker current again — its own
+/// identity and stamp re-stamped onto the slot, nothing published.
+///
+/// The chain the steps below leave: a version, the marker a plain DELETE put
+/// over it, and a newer version that superseded both. Deleting the newest
+/// version leaves the marker as the newest row, which is the arm
+/// `removing_a_marker_restores_the_version_it_hid` (the object successor's
+/// journey) does not reach.
+#[tokio::test]
+async fn removing_a_version_restores_the_marker_it_superseded() {
+    let (root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let key = object::key("notes.txt").unwrap();
+    put(&storage, &b, &key, b"first").await;
+
+    // A plain DELETE hides the version behind a marker; a later write
+    // supersedes the marker, so the marker becomes history with a version
+    // row of its own — the row the restore below re-stamps the slot from.
+    let marker = storage
+        .delete_object(&b, &key)
+        .await
+        .unwrap()
+        .id
+        .expect("an enabled bucket's marker carries an identity");
+    // The marker's own stamp: what its object row records while it is current,
+    // and the stamp its later history row must carry.
+    let stamp = stored_row(&storage, &b, &key).await.mtime;
+    let newest = put(&storage, &b, &key, b"second").await.version_id.unwrap();
+    let recorded = version_rows(&storage, &b, &key)
+        .into_iter()
+        .find(|row| row.kind == rows::Kind::Marker)
+        .expect("the superseded marker has a history row");
+    assert_eq!(recorded.id(), Some(marker.clone()));
+    assert_eq!(
+        recorded.created, stamp,
+        "the marker's row carries the stamp its object row recorded"
+    );
+
+    // Deleting the newest version makes the marker current again.
+    let removed = storage
+        .delete_object_version(&b, &key, Some(&newest))
+        .await
+        .unwrap();
+    assert!(!removed.is_delete_marker);
+    assert_eq!(removed.id.as_ref(), Some(&newest));
+
+    let restored = stored_row(&storage, &b, &key).await;
+    assert!(restored.is_delete_marker, "the marker is current again");
+    assert_eq!(
+        restored.version_id.as_ref(),
+        Some(&marker),
+        "with the marker's own identity"
+    );
+    assert_eq!(
+        restored.version_seq, recorded.seq,
+        "and the marker's own sequence"
+    );
+    assert_eq!(
+        restored.mtime, stamp,
+        "and the marker's own stamp, never a fresh one"
+    );
+    assert_eq!(restored.size, 0, "a marker holds no content");
+    assert_eq!(restored.etag, ETag::EMPTY);
+    assert_eq!(restored.file_identity, 0, "a marker matches no file");
+    assert!(
+        !file_exists(&root, "notes.txt"),
+        "the marker publishes nothing onto the key path"
+    );
+    assert!(
+        storage.get_object(&b, &key, None).await.is_err(),
+        "a marker is not content to a plain read"
+    );
+
+    // The restored marker consumes its own row (a current version has no row
+    // of its own), and the listing answers the marker as the newest version.
+    assert!(
+        version_rows(&storage, &b, &key)
+            .iter()
+            .all(|row| row.id() != Some(marker.clone())),
+        "the restored marker's history row is consumed"
+    );
+    let page = list(&storage, &b).await;
+    assert_eq!(page.entries[0].id.as_ref(), Some(&marker));
+    assert!(page.entries[0].is_delete_marker);
+}
+
 #[tokio::test]
 async fn an_out_of_band_edit_degrades_the_version_addressed_reads_to_the_null_version() {
     let (root, storage, b) = fixture().await;
@@ -468,6 +558,60 @@ async fn an_out_of_band_edit_degrades_the_version_addressed_reads_to_the_null_ve
     assert_eq!(
         page.entries[0].etag, plain.info.etag,
         "the listing and the read serve one ETag for the current version"
+    );
+}
+
+#[tokio::test]
+async fn an_out_of_band_edit_then_tagging_or_acl_does_not_keep_the_stale_version_id() {
+    let (root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let key = object::key("notes.txt").unwrap();
+    let old = put(&storage, &b, &key, b"first")
+        .await
+        .version_id
+        .expect("an enabled write mints a version id");
+
+    // The edit: a different length, written behind the backend's back. The
+    // row still names `old` until a reader that knows the gate clears it.
+    let edited = b"an out-of-band edit, longer than the original";
+    fs::write(root.path().join("data").join("notes.txt"), edited).unwrap();
+
+    // An element read heals the row. It must clear the identity the bytes no
+    // longer match, the same verdict the plain read records.
+    storage.get_object_tags(&b, &key).await.unwrap();
+    storage.get_object_acl(&b, &key).await.unwrap();
+    let tagged = object::Tags::from_pairs([("team".to_owned(), "core".to_owned())]).unwrap();
+    let answer = storage.put_object_tags(&b, &key, &tagged).await.unwrap();
+    assert!(
+        answer.version_id.is_none(),
+        "the tag write must not answer {old} for the edited bytes"
+    );
+
+    let plain = storage.get_object(&b, &key, None).await.unwrap();
+    assert_eq!(collect_body(plain.body).await.unwrap(), edited);
+    assert!(
+        plain.info.version_id.is_none(),
+        "tagging must not weld {old} onto the edited bytes"
+    );
+    let healed = storage
+        .meta_store()
+        .stored_entry(&b, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        healed.version_id.is_none(),
+        "the heal leaves the row with no stale version id"
+    );
+    assert!(
+        storage
+            .get_object_version(&b, &key, Some(&old), None)
+            .await
+            .is_err(),
+        "the retired id does not resolve"
     );
 }
 
@@ -1084,8 +1228,9 @@ async fn an_unstamped_row_left_by_a_failed_publish_is_visible_to_retention_and_t
 #[tokio::test]
 async fn the_plain_read_and_the_version_slot_take_one_gate_verdict() {
     // The staleness gate's decision has one home (`meta::gate`). The two
-    // readers that need it — the plain read's `resolve_object_info` and the
-    // engine's current-slot view, `current_with_row` — must answer the same
+    // readers that need it — the plain read's version facts
+    // (`resolve_object_slot`) and the engine's current-slot view,
+    // `current_with_row` — must answer the same
     // verdict for the same row/file pair in every state the gate
     // distinguishes: matching, drifted, missing, marker. A path that
     // re-derived the decision its own way answers differently here.
@@ -1116,9 +1261,10 @@ async fn the_plain_read_and_the_version_slot_take_one_gate_verdict() {
     assert_eq!(slot.version.as_ref(), Some(&id));
     assert_eq!(slot.seq, row.version_seq, "the slot's own sequence");
     assert!(!slot.degraded);
-    // The version-addressed read answers from that one resolution — the
-    // slot's path, opened once — never by calling the plain read again: the
-    // same size, stamp, ETag and identity the plain head serves.
+    // The version-addressed read answers the same object: it resolves the
+    // slot through the engine's own gate and serves the current version
+    // through the plain read's body — the same size, stamp, ETag and identity
+    // the plain head serves.
     match storage
         .get_object_version(&b, &key, Some(&id), None)
         .await
@@ -1159,7 +1305,8 @@ async fn the_plain_read_and_the_version_slot_take_one_gate_verdict() {
     let head = storage.head_object(&b, &key).await.unwrap();
     assert!(head.version_id.is_none());
     // The version-addressed read answers the same (the gated identity is the
-    // null version's `None`), from the one resolution it takes.
+    // null version's `None`), and the pre-step retires the stale element the
+    // same way — before its own serve.
     match storage
         .get_object_version(&b, &key, None, None)
         .await
@@ -2329,4 +2476,591 @@ async fn a_window_budget_that_skips_a_key_still_pages_every_version() {
     }
     assert_eq!(pages, 12, "twenty-four versions at two per page");
     assert_eq!(collected, expected, "every version is listed exactly once");
+}
+
+/// RC1's pin (the wire behaviour FR-040 asserts): a **suspended PUT over a
+/// real current version** replaces the null version in place. The write
+/// succeeds, the answer carries the null identity (`x-amz-version-id: null`),
+/// the object is served under it, and the version the slot moved off survives
+/// addressable as history.
+///
+/// What this journey pins that no other does: the **incoming null's sequence
+/// sits below the outgoing slot's**. The shared conformance leg's journeys
+/// (`crates/tinio-util/src/testing/mod.rs`, the `versioned-journey` and
+/// converge buckets) also overwrite a live real version while suspended, but
+/// their keys already hold a superseded null row at 0, so their plan takes the
+/// free sequence 2 over the slot's 1 and never reaches the guard's refusal
+/// branch. Here the first write is enabled (no null row exists), so the plan's
+/// `(Null, 0)` is *below* the recorded 1 — the shape RC1's store fix admits
+/// and the pre-fix guard refused.
+#[tokio::test]
+async fn a_suspended_put_over_a_real_version_answers_the_null_identity() {
+    let (_root, storage, _b) = fixture().await;
+    let b = bucket::name("suspended-null").unwrap();
+    storage
+        .create_bucket(&b, None, &Acl::default_private(None))
+        .await
+        .unwrap();
+    let key = object::key("k.txt").unwrap();
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let real = put(&storage, &b, &key, b"one").await;
+    let real_id = real
+        .version_id
+        .clone()
+        .expect("an enabled write mints an identity");
+
+    storage
+        .set_bucket_versioning(&b, version::State::Suspended)
+        .await
+        .unwrap();
+    // The replacement over the live real version: the PUT must land, and its
+    // answer is the null identity.
+    let replaced = put(&storage, &b, &key, b"two").await;
+    assert!(
+        replaced.version_id.is_none(),
+        "a suspended write answers the null version"
+    );
+    assert_eq!(replaced.etag, ETag::from_content(b"two"));
+
+    // The key is served under the null identity, with the new bytes.
+    let head = storage.head_object(&b, &key).await.unwrap();
+    assert!(
+        head.version_id.is_none(),
+        "the served identity is the null version"
+    );
+    assert_eq!(head.etag, ETag::from_content(b"two"));
+    let get = storage.get_object(&b, &key, None).await.unwrap();
+    assert_eq!(collect_body(get.body).await.unwrap(), b"two");
+
+    // No torn state: the slot records the null's own sequence (0 — free on
+    // this key, no superseded null occupies it) and the version the slot moved
+    // off is addressable history.
+    let row = storage
+        .meta_store()
+        .stored_entry(&b, &key)
+        .await
+        .unwrap()
+        .expect("the replacement recorded the row");
+    assert!(row.version_id.is_none(), "the slot names the null version");
+    assert_eq!(row.version_seq, 0, "the null's own sequence");
+    assert!(!row.is_delete_marker);
+    match storage
+        .get_object_version(&b, &key, Some(&real_id), None)
+        .await
+        .unwrap()
+    {
+        version::ReadResult::Object(old) => {
+            assert_eq!(collect_body(old.body).await.unwrap(), b"one");
+        }
+        version::ReadResult::Marker { .. } => panic!("the superseded version is content"),
+    }
+}
+
+#[tokio::test]
+async fn the_current_versions_tags_and_acl_are_the_object_rows_own() {
+    let (_root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let key = object::key("notes.txt").unwrap();
+    let only = put(&storage, &b, &key, b"only")
+        .await
+        .version_id
+        .expect("an enabled write mints a version id");
+
+    // A current version has no version-table row (D37): its metadata home is
+    // the `object_meta` row, so the version-addressed element writes land
+    // there — the plain reads answer the same values, which is the cross-check
+    // that the two paths touched one row.
+    let tags = object::Tags::from_pairs([("env".to_owned(), "prod".to_owned())]).unwrap();
+    storage
+        .set_version_tags(&b, &key, Some(&only), tags.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.version_tags(&b, &key, Some(&only)).await.unwrap(),
+        tags
+    );
+    assert_eq!(storage.get_object_tags(&b, &key).await.unwrap(), tags);
+
+    // Replace-all on the grants, the row's owner element preserved (the write
+    // records no owner, and an ACL put never changes one).
+    let grants = vec![testutil::all_users_read_grant()];
+    storage
+        .set_version_acl(
+            &b,
+            &key,
+            Some(&only),
+            &Acl {
+                owner: Some(testutil::owner_id()),
+                grants: grants.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let acl = storage.version_acl(&b, &key, Some(&only)).await.unwrap();
+    assert_eq!(acl.grants, grants, "the grants replace");
+    assert_eq!(acl.owner, None, "the row's owner element is untouched");
+    assert_eq!(
+        storage.get_object_acl(&b, &key).await.unwrap().grants,
+        grants,
+        "the plain ACL read agrees"
+    );
+
+    // Neither the slot nor the content moved with the element writes.
+    assert_eq!(
+        stored_row(&storage, &b, &key).await.version_id.as_ref(),
+        Some(&only)
+    );
+    match storage
+        .get_object_version(&b, &key, Some(&only), None)
+        .await
+        .unwrap()
+    {
+        version::ReadResult::Object(got) => {
+            assert_eq!(collect_body(got.body).await.unwrap(), b"only");
+        }
+        version::ReadResult::Marker { .. } => panic!("the current version is content"),
+    }
+}
+
+#[tokio::test]
+async fn a_live_marker_answers_the_stamp_its_own_row_records() {
+    let (_root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let key = object::key("notes.txt").unwrap();
+    put(&storage, &b, &key, b"first").await;
+
+    let marker = storage
+        .delete_object(&b, &key)
+        .await
+        .unwrap()
+        .id
+        .expect("an enabled bucket's marker carries an identity");
+    // A **live** marker has no version-table row of its own: a current version
+    // carries no row (D37), so the `object_meta` row the delete wrote is the
+    // marker's only record — and the stamp the version-addressed read must
+    // answer. (The version the marker superseded does have its own history
+    // row; the marker does not.)
+    assert!(
+        version_rows(&storage, &b, &key)
+            .iter()
+            .all(|row| row.id() != Some(marker.clone())),
+        "a live marker records no version-table row of its own"
+    );
+    let recorded = stored_row(&storage, &b, &key).await;
+    assert!(recorded.is_delete_marker && recorded.version_id.as_ref() == Some(&marker));
+
+    match storage
+        .get_object_version(&b, &key, Some(&marker), None)
+        .await
+        .unwrap()
+    {
+        version::ReadResult::Marker { id, last_modified } => {
+            assert_eq!(id.as_ref(), Some(&marker));
+            assert_eq!(
+                last_modified,
+                from_nanos(recorded.mtime),
+                "the marker's own recorded stamp, never a fresh one"
+            );
+        }
+        version::ReadResult::Object(_) => panic!("a marker is not content"),
+    }
+    match storage
+        .head_object_version(&b, &key, Some(&marker))
+        .await
+        .unwrap()
+    {
+        version::HeadResult::Marker { last_modified, .. } => assert_eq!(
+            last_modified,
+            from_nanos(recorded.mtime),
+            "the head agrees with the get"
+        ),
+        version::HeadResult::Object(_) => panic!("a marker is not content"),
+    }
+}
+
+#[tokio::test]
+async fn a_null_identity_marker_answers_the_null_version_id() {
+    let (_root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Suspended)
+        .await
+        .unwrap();
+    let key = object::key("notes.txt").unwrap();
+    assert!(
+        put(&storage, &b, &key, b"only").await.version_id.is_none(),
+        "a suspended write records the null version"
+    );
+
+    // A suspended DELETE makes the null-identity marker current (the design's
+    // suspended rule): `versionId=null` addresses it, and the answer is a
+    // **marker** carrying the null identity — never the object version's
+    // identity, and never an error.
+    let marker = storage.delete_object(&b, &key).await.unwrap();
+    assert!(
+        marker.is_delete_marker && marker.id.is_none(),
+        "a suspended delete makes a null-identity marker current"
+    );
+    let recorded = stored_row(&storage, &b, &key).await;
+    assert!(recorded.is_delete_marker && recorded.version_id.is_none());
+    match storage
+        .get_object_version(&b, &key, None, None)
+        .await
+        .unwrap()
+    {
+        version::ReadResult::Marker { id, last_modified } => {
+            assert!(
+                id.is_none(),
+                "the null-identity marker carries the null version id"
+            );
+            assert_eq!(
+                last_modified,
+                from_nanos(recorded.mtime),
+                "the marker row's own stamp"
+            );
+        }
+        version::ReadResult::Object(_) => panic!("the null-identity marker is not content"),
+    }
+    match storage.head_object_version(&b, &key, None).await.unwrap() {
+        version::HeadResult::Marker { id, .. } => assert!(id.is_none(), "the head agrees"),
+        version::HeadResult::Object(_) => panic!("the null-identity marker is not content"),
+    }
+    // The per-version metadata pairs refuse it, naming the null identity.
+    assert!(
+        storage.version_tags(&b, &key, None).await.is_err(),
+        "a delete marker holds no tags"
+    );
+}
+
+#[tokio::test]
+async fn a_degraded_identity_never_comes_back_through_the_version_addressed_reads() {
+    let (root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let key = object::key("notes.txt").unwrap();
+    let old = put(&storage, &b, &key, b"first")
+        .await
+        .version_id
+        .expect("an enabled write mints a version id");
+
+    // The drift, then the null version's read: the gate's own heal serves the
+    // edited bytes **and retires the stale identifier in the same write** —
+    // before the engine's heal, which preserves whatever the row records.
+    fs::write(root.path().join("data").join("notes.txt"), b"edited").unwrap();
+    let served = match storage
+        .get_object_version(&b, &key, None, None)
+        .await
+        .unwrap()
+    {
+        version::ReadResult::Object(got) => got,
+        version::ReadResult::Marker { .. } => panic!("the drift is content, not a marker"),
+    };
+    assert!(
+        served.info.version_id.is_none(),
+        "the degraded slot names no version"
+    );
+    assert!(
+        stored_row(&storage, &b, &key).await.version_id.is_none(),
+        "the identity the gate judged stale is retired by the healing read"
+    );
+
+    // The retired identity never comes back: the refreshed row now matches the
+    // edited content, so a resolve that trusted the object row alone would
+    // serve the drift under it.
+    assert!(
+        storage
+            .get_object_version(&b, &key, Some(&old), None)
+            .await
+            .is_err(),
+        "a retired identity must not resolve against the refreshed row"
+    );
+    assert!(
+        storage
+            .head_object_version(&b, &key, Some(&old))
+            .await
+            .is_err(),
+        "the head takes the same verdict"
+    );
+}
+
+/// The engine's versioned bodies read fs's **real** gate.
+///
+/// The `tinio-ops` suite drives these bodies over an in-memory row plane whose
+/// `CurrentRows` port is hand-rolled (`TestMeta::current`, in that crate's
+/// `testutil`), so nothing there exercises them against a backend's own gate
+/// — the double answers for itself and can drift from both real
+/// implementations. `tinio-mem` is not the other leg it looks like: mem's
+/// whole version group is mem-local (the design's E16), so it has no
+/// `CurrentRows` implementation for the engine to read and no engine versioned
+/// body to run at all.
+///
+/// This leg is that missing run, against the one real gate that exists: it
+/// calls the engine bodies **directly**, over the plane `FsStorage` builds for
+/// its own version paths (`version_plane`, whose row handle is fs's `Rows` —
+/// `current` applies `meta::gate`), and with no fs pre-step in front
+/// (`retire_degraded_identity` is deliberately skipped, so what answers is the
+/// engine body plus the gate rather than fs's adapter).
+///
+/// The drifted file is the discriminator: the row still records an identity
+/// the bytes no longer match, so the gate's verdict is what turns the
+/// addressed read into the null version. A plan that read the recorded
+/// identity instead of the gate's answer would serve the stale id here.
+///
+/// Both bodies heal the row they read through the engine's preserving heal —
+/// which keeps the recorded identity, the trap fs's pre-step exists for — so
+/// the two legs run over two keys, each read while its row is still
+/// stale-named.
+#[tokio::test]
+async fn the_engine_versioned_bodies_read_the_real_gate() {
+    let (root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let key = object::key("drift.txt").unwrap();
+    let old = put(&storage, &b, &key, b"first")
+        .await
+        .version_id
+        .expect("an enabled write mints an identity");
+
+    // Drift the file behind the backend's back. Nothing has read the key
+    // since, so the row still records `old` and no heal has run.
+    let drifted = b"drifted out of band, longer than the original";
+    fs::write(root.path().join("data").join("drift.txt"), drifted).unwrap();
+    assert_eq!(
+        stored_row(&storage, &b, &key).await.version_id.as_ref(),
+        Some(&old),
+        "the row is still stale-named: the gate, not the row, is the truth"
+    );
+
+    let plane = storage.version_plane(&b);
+    let engine = storage.objects();
+    let slot = storage.versions(&b).current(&b, &key).await.unwrap();
+    assert!(
+        slot.is_null() && slot.degraded,
+        "the gate's slot for the drifted key: {slot:?}"
+    );
+
+    // The engine body, over that slot, serves the null version and the drifted
+    // bytes — the identity the *row* records (`old`) is never served. The head
+    // gets a key of its own: both bodies heal the row they read (preserving the
+    // recorded identity), so the second leg must not run behind the first.
+    match engine
+        .get_object_version(&plane, &b, &key, None, None)
+        .await
+        .unwrap()
+    {
+        version::ReadResult::Object(served) => {
+            assert!(
+                served.info.version_id.is_none(),
+                "the degraded slot names no version: {:?}",
+                served.info.version_id
+            );
+            assert_eq!(collect_body(served.body).await.unwrap(), drifted);
+        }
+        version::ReadResult::Marker { .. } => panic!("the drift is content, not a marker"),
+    }
+
+    // The head takes the same verdict from its own resolution, over its own
+    // drifted key.
+    let head_key = object::key("head-drift.txt").unwrap();
+    put(&storage, &b, &head_key, b"first")
+        .await
+        .version_id
+        .expect("an enabled write mints an identity");
+    fs::write(root.path().join("data").join("head-drift.txt"), drifted).unwrap();
+    match engine
+        .head_object_version(&plane, &b, &head_key, None)
+        .await
+        .unwrap()
+    {
+        version::HeadResult::Object(info) => {
+            assert!(info.version_id.is_none(), "{:?}", info.version_id);
+        }
+        version::HeadResult::Marker { .. } => panic!("the drift is content, not a marker"),
+    }
+}
+
+/// The **null-version address of a file-gone key whose row still records
+/// content** — the corner the refactor report left unsettled: *which* layer
+/// answers its `NoSuchKey`?
+///
+/// The state: an enabled bucket, one committed key, the file removed behind
+/// the backend's back. The row still records the identity the write minted,
+/// so the staleness gate (`meta::gate`) reads absent content against a row
+/// that still described content as `Verdict::Degraded` — the slot
+/// `Current { exists: true, version: None, degraded: true }`. The slot's
+/// gated identity **is** the null version, which is the address
+/// `get_object_version(None, ..)` carries.
+///
+/// The two layers, and the call chain that decides between them for this
+/// input (fs's version-path trait impl, `crates/tinio-fs/src/backend/version.rs`):
+///
+/// 1. `retire_degraded_identity` (`:716`) takes the G3 pre-step's address
+///    guard over the slot read (`slot`, `:737`): `id.as_ref() == version`
+///    (`:723`). For a degraded slot `id` is `None`, so the null-version
+///    address **matches**, and the pre-step runs.
+/// 2. `objects::resolve_object_slot_stamped` (`objects.rs:496`) resolves the
+///    object file first (`resolve_object_file`, `objects.rs:338` — the
+///    `open_object` at `:349`), and a missing file answers `NoSuchKey`
+///    there (`objects.rs:396`, the open's `NotFound` mapping).
+///    **Nothing after it runs**: not the row read (`:512`), not the gate,
+///    and not the heal (`ensure_row`, `:534`).
+/// 3. So the engine body (`self.objects().get_object_version(&plane, ..)`,
+///    `version.rs:1071`) — which answers the same state through
+///    `require_content`'s content probe (`tinio_ops/src/object.rs:739`) and
+///    would answer the same `NoSuchKey` — never runs.
+///
+/// What this test pins, and what it deliberately does not claim: the answer
+/// alone cannot attribute the layer, because **the body's own answer for
+/// this state is the same error** — the second half drives the body alone
+/// over this storage's own plane, the pre-step bypassed, and asserts that it
+/// is the very error the public call answered, wrapped by fs's projection.
+/// The side-effect question the report left open ("the pre-step's path can
+/// attempt a heal; the body's would not, or vice versa") is answered here:
+/// **neither layer heals**, because both probe the content before any heal
+/// call — `resolve_object_file` first in the pre-step, `require_content`
+/// first in the body — so the row comes back byte-identical and no file is
+/// re-materialized. The pin is therefore the whole observable contract of
+/// this corner: the answer, its two-source indistinguishability, and the
+/// untouched state.
+///
+/// The recorded-address leg is the contrast, and it is the observable that
+/// shows the guard is what routes the null address to the pre-step: an
+/// address the slot does **not** name (`Some(&old)`, while the slot's gated
+/// identity is the null version) fails the guard, so the pre-step is skipped
+/// and the body answers — and the body's answer for that address is
+/// `NoSuchVersion` (the version table names no such version), not the
+/// `NoSuchKey` the null address gets. The existing
+/// `an_out_of_band_removal_degrades_the_key_to_the_null_version_and_retires_the_id`
+/// asserts only `is_err()` for that address; this leg pins the variant the
+/// body actually answers.
+#[tokio::test]
+async fn a_null_address_of_a_gone_file_answers_one_nosuchkey_from_either_layer_with_no_heal() {
+    let (root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let key = object::key("gone.txt").unwrap();
+    let old = put(&storage, &b, &key, b"first")
+        .await
+        .version_id
+        .expect("an enabled write mints a version id");
+
+    // The removal, behind the backend's back: the row still describes the
+    // content the file held, and nothing has read the key since.
+    fs::remove_file(root.path().join("data").join("gone.txt")).unwrap();
+    let before = stored_row(&storage, &b, &key).await;
+    assert_eq!(
+        before.version_id.as_ref(),
+        Some(&old),
+        "the premise: the row still records the identity"
+    );
+    assert_eq!(before.size, 5, "and the content elements it described");
+
+    // The address is the null version: the gate reads the file-gone row as
+    // the key's degraded null slot, whose gated identity the address names.
+    let slot = storage.versions(&b).current(&b, &key).await.unwrap();
+    assert!(
+        slot.exists && slot.is_null() && slot.degraded && !slot.is_delete_marker,
+        "the degraded null slot, the address's own guard: {slot:?}"
+    );
+
+    // The public answer, on the null address: the pre-step's file
+    // resolution raises it before the engine body is called.
+    let err = storage
+        .get_object_version(&b, &key, None, None)
+        .await
+        .expect_err("the null-address read of a file-gone key");
+    assert!(
+        matches!(&err, crate::Error::Storage(storage::Error::NoSuchKey(k)) if k == &key),
+        "the get answers NoSuchKey for the key: {err:?}"
+    );
+    let head_err = storage
+        .head_object_version(&b, &key, None)
+        .await
+        .expect_err("the null-address head of a file-gone key");
+    assert!(
+        matches!(&head_err, crate::Error::Storage(storage::Error::NoSuchKey(k)) if k == &key),
+        "the head agrees with the get: {head_err:?}"
+    );
+
+    // The side-effect half: the pre-step's path did not heal. Its file
+    // resolution failed before `ensure_row`, so the row is byte-identical,
+    // no version row was stamped, and the file was not re-materialized.
+    assert_eq!(
+        stored_row(&storage, &b, &key).await,
+        before,
+        "no heal: the row the write left is the row the answer left"
+    );
+    assert_eq!(
+        version_rows(&storage, &b, &key).len(),
+        0,
+        "no version row was written"
+    );
+    assert!(
+        !file_exists(&root, "gone.txt"),
+        "the failed read re-materialized nothing"
+    );
+
+    // The layer question, as far as the surface reaches: the engine body
+    // alone — this storage's own plane, no fs pre-step in front — answers
+    // the *same* error for the same state, so the public answer carries no
+    // layer information (and the body heals nothing either: its content
+    // probe fails before its read-heal).
+    let plane = storage.version_plane(&b);
+    let body_err = storage
+        .objects()
+        .get_object_version(&plane, &b, &key, None, None)
+        .await
+        .expect_err("the engine body over the same state");
+    assert!(
+        matches!(&body_err, storage::Error::NoSuchKey(k) if k == &key),
+        "the body's own answer for the null address: {body_err:?}"
+    );
+    let crate::Error::Storage(inner) = err else {
+        panic!("the public answer is the storage class: {err:?}");
+    };
+    assert_eq!(
+        format!("{inner:?}"),
+        format!("{body_err:?}"),
+        "the two layers answer one error: the answer cannot attribute the layer"
+    );
+    assert_eq!(
+        stored_row(&storage, &b, &key).await,
+        before,
+        "and the body's own path heals nothing here either"
+    );
+    assert!(
+        !file_exists(&root, "gone.txt"),
+        "nor does it re-materialize the file"
+    );
+
+    // The contrast: an address the slot does not name (the recorded one)
+    // fails the pre-step's guard, so the body answers it — with the version
+    // table's verdict, not the content probe's.
+    let recorded = storage
+        .get_object_version(&b, &key, Some(&old), None)
+        .await
+        .expect_err("the recorded-address read of the file-gone key");
+    assert!(
+        matches!(&recorded, crate::Error::Storage(storage::Error::NoSuchVersion(id)) if id.as_str() == old.as_str()),
+        "the guard's other arm, answered by the body: {recorded:?}"
+    );
+    assert_eq!(
+        stored_row(&storage, &b, &key).await,
+        before,
+        "and that arm leaves the row alone too"
+    );
 }

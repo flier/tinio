@@ -3,6 +3,13 @@
 //! The S3 `ListObjectsV2` path over a generated tree: a flat listing, a
 //! delimiter-rolled listing, and a prefixed listing. Baselines are
 //! recorded in Phase 6 (T088) and regression-gated.
+//!
+//! The fixture's root and the run's flush control come from
+//! `tinio_util::bench` (the `bench` feature): its module docs carry why the
+//! root is pinned away from `TMP` and why every run records a flush
+//! measurement. It used to call `tempfile::tempdir()`, so the whole fixture
+//! followed the shell's `TMP` and a stored baseline's flush regime was not
+//! checkable after the fact.
 
 // This bench declares `harness = false`, so clippy's `allow-*-in-tests` keys do
 // not reach it (design 2026-10-09 D7), and a bench is not production code
@@ -22,7 +29,7 @@ use tinio_core::{
     storage::{BucketOps, ListObjectsParams, ObjectOps},
 };
 use tinio_fs::{FsStorage, testing::fs_options};
-use tinio_util::testing::body;
+use tinio_util::{bench, testing::body};
 use tokio::runtime::Runtime;
 
 /// Tree shape: 4 prefixes × 1000 objects each + 500 flat objects.
@@ -31,8 +38,10 @@ const PER_PREFIX: usize = 1000;
 const FLAT: usize = 500;
 
 fn listing(c: &mut Criterion) {
-    let root = tempfile::tempdir().unwrap();
-    let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+    // The run's flush regime, beside its numbers (see `bench`).
+    bench::flush_control(&bench::data_root());
+    let root = bench::cell_dir("listing");
+    let storage = FsStorage::new(&root, fs_options()).unwrap();
     let rt = Runtime::new().unwrap();
     let bname = bucket::name("data").unwrap();
     rt.block_on(async {

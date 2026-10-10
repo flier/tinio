@@ -140,8 +140,9 @@ fn object_row(
 }
 
 /// One object row, upserted: every column but the key is refreshed from the
-/// contract row, so an overwrite is a fresh object.
-async fn upsert_object(
+/// contract row, so an overwrite is a fresh object. Shared with the version
+/// plane's restore, which writes the restored version's row the same way.
+pub(crate) async fn upsert_object(
     tx: &mut PgTx,
     bucket: &bucket::Name,
     key: &object::Key,

@@ -26,20 +26,35 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use futures::lock::MutexGuard as AsyncMutexGuard;
+use redb::ReadableTable;
 
 #[cfg(test)]
 use crate::_core::bucket::name;
 #[cfg(test)]
-use crate::_store_redb::{bucket, scan::for_each_pair};
+use crate::_store_redb::bucket;
+#[cfg(feature = "versioning")]
+use crate::version;
 use crate::{
     _core::{
         Storage,
         bucket::Name,
         content::{ContentKey, ObjectContent, PublishId},
         meta::BucketMeta,
+        multipart, object,
+        storage::{self, not_empty},
     },
-    _store_redb::{Driver, RedbContent, RedbMetadata, ensure_all, objects, part_meta, store},
+    _ops::{
+        BucketOps, BucketRow, Guard, Hooks, MetadataFailure, MultipartOps as EngineMultipartOps,
+        NoGuard,
+    },
+    _store_redb::{
+        Driver, Error as StoreError, RedbContent, RedbMetadata, bucket as bucket_row, ensure_all,
+        object_meta, object_part, objects, part, part_checksum, part_data, part_meta,
+        scan::{drain_pair, drain_triple, for_each_pair, has_prefix_pair},
+        store, upload, upload_checksum,
+    },
     Error,
     counting::CountingContent,
     error::no_such_bucket,
@@ -164,6 +179,54 @@ impl MemoryStorage {
             metadata,
             content: Arc::new(content),
         })
+    }
+
+    /// The bucket-group receiver over this backend's handles.
+    ///
+    /// The two policies are mem's, declared and never inferred: a
+    /// metadata-row write that fails after the content is published is the
+    /// **engine's** to compensate (`Fail` — it publishes through the tagged
+    /// form and takes its own publish back with a compare-before-remove when
+    /// the row write is refused; the object group's receiver, which reads the
+    /// policy, is built in [`crate::object`]), and the bucket's row **is** the
+    /// bucket (`Guaranteed`). mem builds no version plane (spec E16): its
+    /// version group and its version-creating writes are one transaction each
+    /// and stay mem-local.
+    pub(crate) fn ops(&self) -> BucketOps<RedbMetadata, CountingContent<RedbContent>, MemHooks> {
+        BucketOps {
+            meta: Arc::clone(&self.metadata),
+            content: Arc::clone(&self.content),
+            hooks: MemHooks {
+                db: Arc::clone(&self.db),
+                content: Arc::clone(&self.content),
+            },
+            metadata_failure: MetadataFailure::Fail,
+            bucket_row: BucketRow::Guaranteed,
+        }
+    }
+
+    /// The multipart-group receiver over this backend's handles (spec E16: one
+    /// receiver per operation group, carrying only the handles that group
+    /// uses).
+    ///
+    /// The policy is mem's, declared and never inferred: the bucket's row
+    /// **is** the bucket, so an upload row is recorded guarded (the bucket row
+    /// is asserted inside the contract's transaction). The hooks are
+    /// [`MemHooks`]: its part guard is the no-op one — mem's part writes are
+    /// one transaction each, so no lock spans a commit phase (E15's guard is
+    /// fs's, through the same seam).
+    pub(crate) fn multipart_ops(
+        &self,
+    ) -> EngineMultipartOps<RedbMetadata, CountingContent<RedbContent>, MemHooks> {
+        EngineMultipartOps {
+            meta: Arc::clone(&self.metadata),
+            content: Arc::clone(&self.content),
+            hooks: MemHooks {
+                db: Arc::clone(&self.db),
+                content: Arc::clone(&self.content),
+            },
+            bucket_row: BucketRow::Guaranteed,
+        }
     }
 
     /// The shared metadata implementation — the handle every row operation
@@ -303,6 +366,183 @@ impl MemoryStorage {
 
 impl Storage for MemoryStorage {
     type Error = Error;
+}
+
+/// The `Hooks` implementation mem's bucket receiver carries.
+///
+/// It holds the two handles the teardown needs — the shared state database and
+/// the accounting decorator — rather than the backend, so the receiver stays a
+/// plain value of its own.
+#[derive(Clone)]
+pub(crate) struct MemHooks {
+    /// The shared state database: the teardown's one transaction.
+    db: Arc<store::Handle>,
+    /// The accounting decorator: the byte release and its lock.
+    content: Arc<CountingContent<RedbContent>>,
+}
+
+#[async_trait]
+impl Hooks for MemHooks {
+    async fn before_bucket_delete(&self, name: &Name) -> Result<(), storage::Error> {
+        self.teardown(name).await.map_err(Into::into)
+    }
+
+    async fn lock_part(&self, _bucket: &Name, _upload_id: &str) -> Box<dyn Guard> {
+        // mem's part writes are one transaction each (the part row and its
+        // bytes commit together), so no lock is needed across a commit phase.
+        Box::new(NoGuard)
+    }
+}
+
+impl MemHooks {
+    /// The bucket teardown: the bucket row, the emptiness probes, the row's
+    /// removal and the bucket's whole stored state in ONE write transaction.
+    ///
+    /// Elided the contract's `remove_if_empty` + `drain_bucket` to make the
+    /// pair atomic (ruling 2026-10-08): with two transactions, a bucket of the
+    /// same name re-created in the window between them would lose the new
+    /// bucket's version rows and blobs. This is mem's deliberate deviation —
+    /// P2's "second consumer proves the contract is expressible" — and the
+    /// probes below are the contract's semantics, spelled once here. The
+    /// engine's own probes ran before this (the commit point's precondition);
+    /// these re-run inside the transaction so nothing can slip between the
+    /// check and the removal.
+    ///
+    /// The accounting lock is held across the removal and the release so the
+    /// bytes this teardown retires and the tracked total move together (the
+    /// lock is not reentrant: no locking accounting entry point may run
+    /// inside it).
+    async fn teardown(&self, name: &Name) -> Result<(), Error> {
+        let guard = self.content.lock_accounting().await;
+        let name = name.clone();
+        let b = name.as_ref().as_str().to_owned();
+        // The decorator's released-but-present marks: a key whose bytes a
+        // failed removal already released must not join this release again.
+        let content = Arc::clone(&self.content);
+        let marks = name.clone();
+        let purge = name.clone();
+        let released = self.db.write(move |txn| -> Result<u64, Error> {
+            // The bucket row is the bucket: its absence is the contract's
+            // `Error::Refused(NoSuchBucket)` projection.
+            if bucket_row::Table::open(txn)?.row(&b)?.is_none() {
+                return Err(no_such_bucket(&name));
+            }
+            // The two occupancy probes in the deleting transaction — one
+            // key-range seek each, never a walk — so a concurrent write cannot
+            // slip between the check and the removal. S3 answers BucketNotEmpty
+            // for object rows and in-progress uploads alike.
+            let objects = {
+                let table = object_meta::Table::open(txn)?;
+                has_prefix_pair::<_, _, Error>(&*table, (b.as_str(), ""), |owner, _| {
+                    owner == b.as_str()
+                })?
+            };
+            if objects || upload::Table::open(txn)?.has_bucket(&b)? {
+                return Err(Error::from(not_empty(&name)));
+            }
+            bucket_row::Table::open(txn)?.remove(&b)?;
+            // The bucket's stored state dies with it (spec 2026-10-03): the
+            // object and upload planes' rows, mem's own part planes, and — under
+            // the `versioning` feature — the version plane and the history
+            // blobs, all in this same transaction. Whatever rows the probes
+            // above cannot see (a failed `remove_many`'s leftover) are swept
+            // by the bucket prefix here, and their metered bytes join the
+            // release: the tracked total drops by exactly what this transaction
+            // removes.
+            object_meta::Table::open(txn)?.drain_bucket(&b)?;
+            object_part::Table::open(txn)?.drain_bucket(&b)?;
+            upload::Table::open(txn)?.drain_bucket(&b)?;
+            upload_checksum::Table::open(txn)?.drain_bucket(&b)?;
+            part::Table::open(txn)?.drain_bucket(&b)?;
+            part_checksum::Table::open(txn)?.drain_bucket(&b)?;
+            // The content plane's two byte tables: `objects` (an object's
+            // bytes) and `part_data` (a part's). The occupancy probe reads the
+            // object ROWS and the upload ROWS, so a byte row those planes no
+            // longer name — what a failed `remove_many` leaves behind — is
+            // invisible to it: it would become unreachable bytes the tracked
+            // total still counts. The lengths summed here are the same bytes
+            // the decorator counted when they were published, so the release is
+            // exact. `part_meta` carries no bytes of its own (the size/mtime
+            // pair), so it is drained without a sum.
+            let mut released = {
+                let mut total = 0u64;
+                for_each_pair::<_, _, _, Error>(
+                    &*objects::Table::open(txn)?,
+                    (b.as_str(), ""),
+                    |owner, _| owner == b.as_str(),
+                    |_, key, value| {
+                        let marked = object::key(key).is_ok_and(|key| {
+                            content.released_undead(&marks, &ContentKey::Object(key))
+                        });
+                        if !marked {
+                            total += value.len() as u64;
+                        }
+                        Ok(())
+                    },
+                )?;
+                // `part_data` is keyed `(bucket, upload_id, part_number)` and
+                // the redb crate has no triple walk that hands the value over:
+                // the walk below is the bucket prefix with the first foreign key
+                // ending it (`scan`'s boundary rule), the same shape
+                // `part_data::Table::total_len` uses per upload. The handle
+                // drops before the drain runs (redb asserts when a page is freed
+                // under a live read reference — the rule `scan::drain_pair`
+                // documents).
+                let table = part_data::Table::open(txn)?;
+                for item in table
+                    .range((b.as_str(), "", 0)..)
+                    .map_err(StoreError::from)?
+                {
+                    let (key, value) = item.map_err(StoreError::from)?;
+                    let (owner, upload_id, number) = key.value();
+                    if owner != b.as_str() {
+                        break;
+                    }
+                    let marked = multipart::part_number(number).is_ok_and(|number| {
+                        content.released_undead(
+                            &marks,
+                            &ContentKey::Part {
+                                upload_id: upload_id.to_owned(),
+                                number,
+                            },
+                        )
+                    });
+                    if !marked {
+                        total += value.value().len() as u64;
+                    }
+                }
+                total
+            };
+            drain_pair(
+                &mut *objects::Table::open(txn)?,
+                (b.as_str(), ""),
+                |owner, _| owner == b.as_str(),
+            )?;
+            drain_triple(
+                &mut *part_data::Table::open(txn)?,
+                (b.as_str(), "", 0),
+                |owner, _, _| owner == b.as_str(),
+            )?;
+            drain_triple(
+                &mut *part_meta::Table::open(txn)?,
+                (b.as_str(), "", 0),
+                |owner, _, _| owner == b.as_str(),
+            )?;
+            // The version plane's history blobs are metered like the rest.
+            #[cfg(feature = "versioning")]
+            let version_bytes = version::drain_bucket_in_txn(txn, &name)?;
+            #[cfg(not(feature = "versioning"))]
+            let version_bytes = 0u64;
+            released += version_bytes;
+            Ok(released)
+        })?;
+        self.content.release_total_unlocked(-(released as i64));
+        // The marks this teardown consumed are spent, and one that matched no
+        // row named bytes already gone: the bucket's marks leave with it.
+        self.content.purge_released_undead(&purge);
+        drop(guard);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

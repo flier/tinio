@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE version_rows\nSET became_noncurrent = $4\nWHERE bucket = $1 AND key = $2 AND seq = $3 AND became_noncurrent = 0\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ab58f7efea404bcb05b635fad4e0fc246f00a7ab2055da367ba9b2976ae354c5"
+}

@@ -8,9 +8,12 @@
 //! the index names only the newest of them).
 //!
 //! The current slot is separate state (current_slots): the slot records the
-//! identity and the sequence, and current_slot resolves the marker bit from the
-//! version row at that sequence. Nothing is derived from an object row, so a
-//! content rewrite can never silently un-version an object.
+//! identity, the sequence and the delete-marker bit, and current_slot resolves
+//! the bit from the version row at that sequence when the row exists, falling
+//! back to the recorded column when it does not — a **restore** consumes the
+//! row whose kind the bit came from, so the bit must outlive it (migration
+//! 0002). Nothing is derived from an object row, so a content rewrite can never
+//! silently un-version an object.
 
 use async_trait::async_trait;
 use sqlx::{query_file_as, query_file_scalar};
@@ -23,13 +26,14 @@ use crate::{
         bucket, checksum,
         meta::{
             VersionMeta,
+            object::Row as ObjectRow,
             version::{Current, Kind, Stored, encode_blob},
         },
-        object,
+        object, storage,
         version::{Id, State, wire_of},
     },
     Error, begin,
-    meta::{acl_composite, assert_bucket_row},
+    meta::{acl_composite, assert_bucket_row, object::upsert_object},
     store::PgStore,
     timestamp::{from_timestamp, to_timestamp},
 };
@@ -56,11 +60,22 @@ struct StoredVersion {
     acl: Acl,
 }
 
-/// The slot read's two columns: the current version's identity wire, which the
-/// left join leaves NULL for a slot whose row is gone, and the row's kind.
+/// The slot read's columns: the current version's identity wire, which the
+/// left join leaves NULL for a slot whose row is gone; the bit the slot's own
+/// record carries (a restored marker outlives the row it came from); and the
+/// row's kind, NULL when the row is gone. The row's kind decides when the row
+/// is there; the recorded bit answers when it is not.
 struct StoredSlot {
     version_id: Option<String>,
+    is_delete_marker: bool,
     kind: Option<Kind>,
+}
+
+/// The columns `restore_slot` reads back for its premise: the identity the
+/// caller's `id` must equal and the kind that decides the slot's marker bit.
+struct StoredRestore {
+    id: String,
+    kind: Kind,
 }
 
 /// The columns `put_version` reads back for its conflict check: the identity,
@@ -162,7 +177,11 @@ impl VersionMeta for PgStore {
         Ok(row.map(|row| Current {
             exists: true,
             version: row.version_id.as_deref().and_then(Id::from_wire),
-            is_delete_marker: row.kind == Some(Kind::Marker),
+            // The row's kind decides when the row is there — a slot must never
+            // be overridden by a stale recorded bit — and the recorded bit
+            // answers when the row is gone, which is the state a restore
+            // leaves (it consumes the row it derived the bit from).
+            is_delete_marker: row.kind.map_or(row.is_delete_marker, Kind::is_marker),
         }))
     }
 
@@ -214,6 +233,115 @@ impl VersionMeta for PgStore {
         )
         .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The restore's commit, in one transaction: the bucket row is asserted;
+    /// the version row at `seq` is read `FOR UPDATE` and is the call's premise
+    /// (it must exist and name `id` — its kind is the slot's marker bit, never
+    /// the caller's); the row and its index entry are consumed; the object row
+    /// is upserted from the caller's row with the retained part list cleared;
+    /// the slot is written naming the restored version (a **backwards** move,
+    /// so no monotonic guard applies — [`VersionMeta::advance_slot`]'s rule
+    /// stays absolute); and the row the slot moves off is stamped noncurrent.
+    async fn restore_slot(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        row: &ObjectRow,
+        id: Option<Id>,
+        seq: u64,
+    ) -> Result<(), Error> {
+        let wire = wire_of(id.as_ref());
+        let seq_value = seq as i64;
+        let mut tx = begin(self.pool()).await?;
+        assert_bucket_row(&mut tx, bucket).await?;
+        // The row the slot moves off: the sequence the slot records, locked
+        // like `advance_slot`'s own read. A key with no slot moves off nothing.
+        let moved_off = query_file_scalar!("sql/meta/version/advance_slot.sql", bucket, key)
+            .fetch_optional(&mut *tx)
+            .await?;
+        // The version row at `seq` is the call's premise: it must exist and
+        // name the identity the caller hands in, else the refusal — never a
+        // slot naming a version the store does not hold.
+        let consumed = query_file_as!(
+            StoredRestore,
+            "sql/meta/version/restore_slot.sql",
+            bucket,
+            key,
+            seq_value
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(consumed) = consumed else {
+            tx.rollback().await?;
+            return Err(Error::RestoreConflict {
+                bucket: bucket.clone(),
+                key: key.to_string(),
+                seq,
+            });
+        };
+        if consumed.id != wire {
+            tx.rollback().await?;
+            return Err(Error::RestoreConflict {
+                bucket: bucket.clone(),
+                key: key.to_string(),
+                seq,
+            });
+        }
+        // The consumed row and its index entry retire in this same transaction
+        // (the `expire` body's two statements): the restored version IS the
+        // current version, so it has no row of its own. The `FOR UPDATE` read
+        // above holds the row, so the delete takes it; its answer (the wire) is
+        // already in hand. The index entry goes only when it still points at
+        // this row.
+        let _ = query_file_scalar!("sql/meta/version/expire.sql", bucket, key, seq_value)
+            .fetch_optional(&mut *tx)
+            .await?;
+        sqlx::query_file!(
+            "sql/meta/version/delete_version_index.sql",
+            bucket,
+            key,
+            consumed.id.as_str(),
+            seq_value
+        )
+        .execute(&mut *tx)
+        .await?;
+        // The object row, wholesale from the caller's elements, and a write is
+        // a fresh object: the retained part list goes in the same transaction.
+        upsert_object(&mut tx, bucket, key, row).await?;
+        sqlx::query_file!("sql/meta/object/clear_object_parts.sql", bucket, key)
+            .execute(&mut *tx)
+            .await?;
+        // The slot, naming the restored version at its own sequence and
+        // carrying the consumed row's kind: this write is what lets the bit
+        // outlive the row it came from.
+        sqlx::query_file!(
+            "sql/meta/version/restore_slot_upsert.sql",
+            bucket,
+            key,
+            id as _,
+            seq_value,
+            consumed.kind.is_marker()
+        )
+        .execute(&mut *tx)
+        .await?;
+        // The stamp the move owes the row it moves off, in this same commit,
+        // under RG5's two exemptions: a move at the same sequence moves off
+        // nothing, and a sequence holding no row has nothing to stamp — the
+        // statement's `became_noncurrent = 0` is the first-stamp-wins rule.
+        if let Some(moved_off) = moved_off.filter(|moved_off| *moved_off != seq_value) {
+            sqlx::query_file!(
+                "sql/meta/version/restore_slot_stamp.sql",
+                bucket,
+                key,
+                moved_off,
+                storage::now_nanos() as i64
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -494,6 +622,7 @@ mod tests {
             blob::{BlobRef, BlockHash},
             meta::{
                 ObjectMeta, VersionMeta,
+                object::Row as ObjectRow,
                 version::{Kind, Stored},
             },
             object,
@@ -525,6 +654,21 @@ mod tests {
         Stored {
             kind: Kind::Marker,
             ..version(None, seq)
+        }
+    }
+
+    /// The caller's object row for a restore: the marker's own shape — empty
+    /// content, no file identity.
+    fn restored_row() -> ObjectRow {
+        ObjectRow {
+            etag: ETag::EMPTY,
+            size: 0,
+            mtime: at(10),
+            identity: 0,
+            tags: object::Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
         }
     }
 
@@ -698,6 +842,79 @@ mod tests {
                 .await,
             Err(Error::NoSuchBucket(_))
         ));
+        db.drop_db().await;
+    }
+
+    /// S2/S7's marker arm: the restored marker's bit outlives the row it came
+    /// from — `restore_slot` consumes that row, so the recorded slot column
+    /// (migration 0002) is what `current_slot` answers from afterwards. The
+    /// shared suite cannot pin this (a shared leg may not depend on one store's
+    /// slot shape), so the store's own suite does.
+    #[tokio::test]
+    async fn restore_slot_restores_a_marker_and_the_bit_survives_its_row() {
+        let Some((db, store)) = scratch().await else {
+            return;
+        };
+        let data = name("plane-version-restore-marker");
+        bucket_row(&store, &data).await;
+        let target = key("restore.txt");
+        let v1 = Id::new("v1").expect("a valid version id");
+        let v3 = Id::new("v3").expect("a valid version id");
+        // The successor is a delete marker; the removed current version's row
+        // sits above it and the slot names that one.
+        let mut successor = version(Some(&v1), 1);
+        successor.kind = Kind::Marker;
+        successor.blob = BlobRef::empty();
+        successor.size = 0;
+        VersionMeta::put_version(&store, &data, &target, &successor)
+            .await
+            .unwrap();
+        VersionMeta::put_version(&store, &data, &target, &version(Some(&v3), 3))
+            .await
+            .unwrap();
+        VersionMeta::advance_slot(&store, &data, &target, Some(v3), 3)
+            .await
+            .unwrap();
+        assert!(
+            !VersionMeta::current_slot(&store, &data, &target)
+                .await
+                .unwrap()
+                .expect("the slot is recorded")
+                .is_delete_marker,
+            "the removed current version is an object version"
+        );
+
+        VersionMeta::restore_slot(&store, &data, &target, &restored_row(), Some(v1.clone()), 1)
+            .await
+            .unwrap();
+
+        let slot = VersionMeta::current_slot(&store, &data, &target)
+            .await
+            .unwrap()
+            .expect("the slot is recorded");
+        assert_eq!(slot.version.as_ref(), Some(&v1));
+        assert!(
+            slot.is_delete_marker,
+            "the restored marker's bit survives the row it came from"
+        );
+        assert!(
+            VersionMeta::get_version(&store, &data, &target, 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "the consumed marker row is gone"
+        );
+        // S5: the row the slot moved off stopped being current, in the same
+        // commit.
+        assert_ne!(
+            VersionMeta::get_version(&store, &data, &target, 3)
+                .await
+                .unwrap()
+                .expect("the moved-off row stays")
+                .became_noncurrent,
+            0,
+            "the restore stamps the row the slot moves off"
+        );
         db.drop_db().await;
     }
 

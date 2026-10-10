@@ -1,0 +1,21 @@
+[package]
+name = "tinio-bench"
+version.workspace = true
+edition.workspace = true
+description = "The measurement harness behind the workspace's A/B bench protocol: a counting allocator, the per-operation reading every leg prints, and the interleaved verdict rule"
+publish = false
+
+[dependencies]
+tinio-util = { workspace = true, features = ["bench"] }
+
+[lints.clippy]
+absolute_paths = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_used = "warn"
+
+[lints.rust]
+unsafe_code = "deny"

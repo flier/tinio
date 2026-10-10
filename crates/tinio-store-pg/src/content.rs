@@ -49,6 +49,7 @@ use sqlx::{PgPool, query_file_as, query_file_scalar};
 use tinio_core::{
     bucket,
     content::{ContentEntry, ContentKey, ObjectContent, PublishId, StagedObject},
+    etag::ETag,
     object,
     storage::{BodyStream, ByteRange},
 };
@@ -493,6 +494,48 @@ async fn remove_guarded(
     Ok(true)
 }
 
+/// The same commit as [`remove_guarded`], comparing a content MD5 instead of
+/// the raw bytes the caller would otherwise have to retain.
+async fn remove_guarded_etag(
+    store: &PgStore,
+    bucket: &bucket::Name,
+    key: &ContentKey,
+    etag: &ETag,
+    id: PublishId,
+) -> Result<bool, Error> {
+    let ETag::Single(_) = etag else {
+        return Ok(false);
+    };
+    let (kind, ckey) = content_key(key);
+    let wire = bucket.to_string();
+    let mut tx = begin(store.pool()).await?;
+    let Some(head) = lock_head(&mut tx, &wire, kind, &ckey).await? else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
+    let stored_id = head.publish_id.map(|bits| bits as u64);
+    if stored_id != Some(u64::from(id)) {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let stored = read_generation(
+        &mut tx,
+        bucket,
+        kind,
+        &ckey,
+        head.live_seq,
+        head.live_len as u64,
+    )
+    .await?;
+    if ETag::from_content(stored.as_slice()) != *etag {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    drain_key(&mut tx, &wire, kind, &ckey).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 #[async_trait]
 impl ObjectContent for PgStore {
     type Error = Error;
@@ -679,6 +722,16 @@ impl ObjectContent for PgStore {
         id: PublishId,
     ) -> Result<bool, Error> {
         remove_guarded(self, bucket, key, expected, Some(id)).await
+    }
+
+    async fn remove_if_etag(
+        &self,
+        bucket: &bucket::Name,
+        key: &ContentKey,
+        etag: &ETag,
+        id: PublishId,
+    ) -> Result<bool, Error> {
+        remove_guarded_etag(self, bucket, key, etag, id).await
     }
 
     /// Move an object's bytes and its head together, in one transaction. A self-move is the

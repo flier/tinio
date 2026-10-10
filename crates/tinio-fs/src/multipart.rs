@@ -25,6 +25,13 @@
 //! `list_parts` stays DB-driven (a part whose PARTS record never committed
 //! is invisible — the client retransmits, and the point query recomputes
 //! from the file as a fallback, §5.6).
+//!
+//! The backend's S3 multipart operations are the ops engine's bodies
+//! (`tinio_ops::MultipartOps`, called from this crate's backend module): they stage
+//! through this crate's content plane and take this store's per-upload part
+//! lock through `Hooks::lock_part`. The store's own `create` / `put_part` /
+//! `list_parts` / `abort` are its standalone and embedded entry points — the
+//! same primitives (the cap, the part files and the lock live here once).
 
 // `put_part_copy` (the unix copy_file_range fast path) takes the std
 // handle — tokio's `File` stays for the async assembly reads below.
@@ -204,8 +211,9 @@ pub struct Store {
     meta: Arc<RedbMetadata>,
     /// The cap on concurrently in-progress uploads (`[s3]
     /// max_concurrent_uploads`; default
-    /// [`DEFAULT_MAX_CONCURRENT_UPLOADS`]). `create` counts the live
-    /// `UPLOADS` rows and refuses new uploads at the cap.
+    /// [`DEFAULT_MAX_CONCURRENT_UPLOADS`]). [`Store::ensure_capacity`]
+    /// counts the live `UPLOADS` rows and refuses new uploads at the cap;
+    /// both the backend's create and [`Store::create`] run it.
     max_concurrent_uploads: u32,
     /// `<state-dir>/multipart/` — part content files only.
     root: PathBuf,
@@ -245,15 +253,43 @@ impl Store {
         self.max_concurrent_uploads = max;
     }
 
-    /// The per-upload part-write lock: held across `put_part`'s rename and
-    /// record transaction, so two concurrent same-part overwrites can
-    /// never leave the file and the record disagreeing (the last rename
-    /// and the last record must describe the same content — `complete`
-    /// verifies the record, then re-hashes the file).
-    async fn part_lock(&self, bucket: &bucket::Name, upload_id: &str) -> PartLock {
+    /// The per-upload part-write lock, held across a part write's rename and
+    /// record transaction, so two concurrent same-part overwrites can never
+    /// leave the file and the record disagreeing (the last rename and the last
+    /// record must describe the same content — `complete` verifies the record,
+    /// then re-hashes the file).
+    ///
+    /// Two callers take it, never nested: this store's own part writes
+    /// ([`Store::put_part`], [`Store::put_part_copy`]) under the lock their
+    /// `publish_part` takes, and the ops engine's `upload_part` body through
+    /// `tinio_ops::Hooks::lock_part`'s guard — which is this call, the
+    /// backend's `FsHooks` being the seam. The engine takes the guard **after**
+    /// the body has streamed and drops it once the part row is written (E15),
+    /// so the two spans are the same critical section, not two.
+    pub(crate) async fn part_lock(&self, bucket: &bucket::Name, upload_id: &str) -> PartLock {
         self.part_locks
             .lock((bucket.to_string(), upload_id.to_string()))
             .await
+    }
+
+    /// Refuse a new upload when the store already holds
+    /// `max_concurrent_uploads` of them (CWE-770): without a cap an
+    /// authenticated client can accumulate an unbounded number of uploads,
+    /// each holding up to 10,000 part files + `PARTS` rows. The count check is
+    /// best-effort atomic (a read snapshot before the insert write);
+    /// concurrent creators can overshoot by the number of simultaneous
+    /// creates, which the cap tolerates.
+    ///
+    /// The backend's `create_multipart_upload` runs this before the ops
+    /// engine's create body (the cap is this store's policy, not the
+    /// engine's), and [`Store::create`] runs it for its own callers — one
+    /// home for the rule.
+    pub(crate) async fn ensure_capacity(&self) -> Result<(), Error> {
+        let live = self.live_upload_ids().await?.len() as u32;
+        if live >= self.max_concurrent_uploads {
+            return Err(storage::too_many_uploads(self.max_concurrent_uploads).into());
+        }
+        Ok(())
     }
 
     /// Start a multipart upload (fresh UUID v4 id; the `UPLOADS` record is
@@ -264,6 +300,11 @@ impl Store {
     /// in the `UPLOADS` row and applied to the completed object (spec
     /// 2026-08-31). The bucket must already exist — callers check
     /// `head_bucket` first.
+    ///
+    /// The store-level primitive: the backend's `create_multipart_upload` runs
+    /// the ops engine's create body instead, behind the same concurrency cap
+    /// (`Store::ensure_capacity`). This entry point serves
+    /// standalone/embedded callers and this module's own tests.
     pub async fn create(
         &self,
         bucket: &bucket::Name,
@@ -273,16 +314,7 @@ impl Store {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
     ) -> Result<MultipartUpload, Error> {
-        // Cap the number of in-progress uploads (CWE-770): without a cap an
-        // authenticated client can accumulate an unbounded number of
-        // uploads, each holding up to 10,000 part files + PARTS rows. The
-        // count check is best-effort atomic (a read snapshot before the
-        // insert write); concurrent creators can overshoot by the number
-        // of simultaneous creates, which the cap tolerates.
-        let live = self.live_upload_ids().await?.len() as u32;
-        if live >= self.max_concurrent_uploads {
-            return Err(storage::too_many_uploads(self.max_concurrent_uploads).into());
-        }
+        self.ensure_capacity().await?;
         // Fresh UUID v4 (122 random bits): collisions cannot happen in
         // practice, so a failed insert is a real I/O error.
         let upload = MultipartUpload {
@@ -344,6 +376,13 @@ impl Store {
     /// persisted in the SAME transaction as the part row (atomic — no
     /// CAS), and the slot's `etag` cell supplies the part ETag.
     /// `NoSuchUpload` when the upload does not exist.
+    ///
+    /// The store-level primitive, with the store's own per-upload lock: the
+    /// backend's `upload_part` runs the ops engine's part body instead, which
+    /// stages through the same content plane and takes the **same** lock
+    /// through `Hooks::lock_part` (never nested — the two paths never call one
+    /// another). This entry point serves standalone/embedded callers and this
+    /// module's own tests.
     pub async fn put_part(
         &self,
         bucket: &bucket::Name,
@@ -462,21 +501,28 @@ impl Store {
             let _ = fs::remove_dir(&dir).await;
             return Err(database::map_contract_error(err));
         }
-        let metadata = fs::metadata(&part).await?;
-        Ok(PartInfo {
-            part_number,
-            size: metadata.len(),
+        // The part file's own stat; the digest committed atomically with the
+        // part row.
+        self.stamped_part(
+            bucket,
+            upload_id,
+            u32::from(part_number),
             etag,
-            last_modified: metadata.modified()?,
-            // The digest committed atomically with the part row.
-            checksum: checksum.as_ref().and_then(|c| c.digest.get()).cloned(),
-        })
+            checksum.as_ref().and_then(|c| c.digest.get()).cloned(),
+        )
+        .await
     }
 
     /// List the parts of an upload, in part-number order, paginated
     /// inside the read transaction (raw `PARTS` rows from the exclusive
     /// marker, capped at `max_parts` — the same order the shared engine
     /// uses, at O(page) rows per request).
+    ///
+    /// The store-level primitive: the backend's `list_parts` runs the ops
+    /// engine's page for the identity/marker/resume rules and joins the
+    /// stat itself, so the backend's listing and this method answer the same
+    /// page. This entry point serves standalone/embedded callers and this
+    /// module's own tests.
     ///
     /// DB-driven: only parts with a committed `PARTS` record appear (a part
     /// whose record never committed is invisible — the client retransmits,
@@ -496,7 +542,11 @@ impl Store {
         marker: Option<u32>,
         max_parts: usize,
     ) -> Result<(Vec<PartInfo>, bool, Option<u32>), Error> {
-        let dir = self.upload_dir(bucket, upload_id)?;
+        // The id's mapping is proven before anything else: the page's part
+        // files resolve through the same one, per served row, but a page no
+        // row reaches resolves none — and a client-supplied id that is not the
+        // UUID `create` allocated must answer `NoSuchUpload` either way.
+        self.upload_dir(bucket, upload_id)?;
         // The identity check and the page are two contract calls: `get`
         // does the key check (an absent or key-mismatched upload answers
         // NoSuchUpload) and `list_parts_page` does the page — committed
@@ -549,24 +599,19 @@ impl Store {
         } else {
             served_last
         };
-        // Pass 2: size/mtime from the part files of this page only.
+        // Pass 2: size/mtime from the part files of this page only. A part
+        // that vanished between the passes (a concurrent abort) is skipped
+        // rather than failing the listing.
         let mut parts = Vec::with_capacity(page.rows.len());
         for row in page.rows {
-            let path = part_path(&dir, row.number);
-            let metadata = match fs::metadata(&path).await {
-                Ok(metadata) => metadata,
-                // A part can vanish between the passes (a concurrent
-                // abort) — skip it rather than fail the listing.
-                Err(err) if err.kind() == ErrorKind::NotFound => continue,
-                Err(err) => return Err(err.into()),
-            };
-            parts.push(PartInfo {
-                part_number: part_number(row.number)?,
-                size: metadata.len(),
-                etag: row.etag,
-                last_modified: metadata.modified()?,
-                checksum: row.checksum,
-            });
+            match self
+                .stamped_part(bucket, upload_id, row.number, row.etag, row.checksum)
+                .await
+            {
+                Ok(part) => parts.push(part),
+                Err(Error::Io(err)) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            }
         }
         Ok((parts, page.more, raw_last))
     }
@@ -850,6 +895,11 @@ impl Store {
     /// complete cannot slip between the check and the removal; an absent
     /// or key-mismatched upload projects to `NoSuchUpload` and nothing is
     /// drained.
+    ///
+    /// The store-level primitive: the backend's `abort_multipart_upload` runs
+    /// the ops engine's abort body (the same checked drain) and then this
+    /// module's best-effort directory removal. This entry point serves
+    /// standalone/embedded callers and this module's own tests.
     pub async fn abort(
         &self,
         bucket: &bucket::Name,
@@ -1093,6 +1143,35 @@ impl Store {
             return Err(storage::no_such_upload(upload_id).into());
         }
         Ok(self.root.join(&**bucket).join(upload_id))
+    }
+
+    /// One part as this backend serves it: the part's identity (number, ETag,
+    /// checksum) joined with the **part file's own** stat — a part's size and
+    /// mtime are its file's, never the engine's counted length or wall clock
+    /// (the contract carries no part stat, D23).
+    ///
+    /// A missing part file (`NotFound`) is the caller's to classify: the
+    /// listings skip such a part (it vanished between the row read and this
+    /// join, and a stored number an S3 page cannot carry must not fail a
+    /// listing whose rows are gone anyway), while the point paths, which just
+    /// wrote the file, propagate the error.
+    pub(crate) async fn stamped_part(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        number: u32,
+        etag: ETag,
+        checksum: Option<checksum::Part>,
+    ) -> Result<PartInfo, Error> {
+        let path = self.part_file(bucket, upload_id, number)?;
+        let metadata = fs::metadata(&path).await?;
+        Ok(PartInfo {
+            part_number: part_number(number)?,
+            size: metadata.len(),
+            last_modified: metadata.modified()?,
+            etag,
+            checksum,
+        })
     }
 
     /// The content plane's part mapping: the same layout every multipart

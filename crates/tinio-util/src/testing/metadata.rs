@@ -38,8 +38,10 @@
 //! backend can plant one) and a **heal write failure** (only the backend can
 //! force one). Their named owners: P1 Task 6 Step 1
 //! (`crates/tinio-store-redb/src/meta/object.rs`, which holds the raw table
-//! handles — R7 moved the legs there), P2 Task 2 for `tinio-mem`, and the
-//! pg spike's raw-SQL leg for PostgreSQL.
+//! handles — R7 moved the legs there), P2 Task 2 for `tinio-mem`, and
+//! `crates/tinio-store-pg` for PostgreSQL (the raw-SQL leg the out-of-workspace
+//! spike once ran; the spike was deleted by `5304d33b` and the store is a
+//! workspace member now, so every gate sees it).
 //!
 //! The 8 MiB staged leg ([`assert_content_conformance`], D43) is deliberately
 //! the largest: 128 chunks of 64 KiB, read back whole and through a window.
@@ -155,6 +157,15 @@ fn bucket_at(created: SystemTime) -> bucket_row::Row {
     bucket_row::Row::at(created)
 }
 
+/// One retained part row of a completed multipart object.
+fn retained_part(number: u32, size: u64) -> PartRow {
+    PartRow {
+        number,
+        size,
+        checksum: None,
+    }
+}
+
 /// One decoded version row: an object version of five bytes, or a delete
 /// marker.
 fn version_row(seq: u64, id: Option<version::Id>, kind: Kind) -> Stored {
@@ -263,7 +274,8 @@ where
 /// They stay out of the aggregate suites on purpose. Both methods are
 /// defaulted, and the default forwards to the unguarded write: a backend whose
 /// bucket rows materialize lazily — or one that is not this process's redb at
-/// all, the pg spike being the live example — takes the default and would fail
+/// all, `crates/tinio-store-pg` being the live example (the out-of-workspace
+/// spike it once named was deleted by `5304d33b`) — takes the default and would fail
 /// a leg it never claimed. A backend that overrides them (redb's own
 /// implementation, and therefore tinio-mem and tinio-fs, which sit on it)
 /// calls this beside the aggregate.
@@ -657,6 +669,199 @@ where
     assert!(
         store.bucket_rows(&bucket).await.unwrap().is_empty(),
         "a second drain of a bucket with no rows is a no-op"
+    );
+
+    restore_leg(store).await;
+}
+
+/// The restore's commit ([`VersionMeta::restore_slot`]) over its own bucket, so
+/// no leg above has to be read for its state.
+///
+/// The section pins exactly what the design's §7 says a shared leg can: the
+/// `NoSuchBucket` refusal (R1), the written row's elements and the cleared
+/// retained part list (S3), the consumed row and its index entry (S4), the
+/// stamp on the row the slot moves off (S5), the **backwards real-identity
+/// move landing** (S6 — this assertion is the leg's reason to exist), and both
+/// of R2's refusals with the state each leaves untouched.
+///
+/// The **marker arm** of S2/S7 is deliberately not asserted here: it stays at
+/// the reference store's own suite, where the slot's read source is the
+/// store's own shape (a shared leg may not redden a store for a rule its slot
+/// record cannot answer).
+async fn restore_leg<V>(store: &V)
+where
+    V: Metadata + VersionMeta,
+{
+    let bucket = bucket_name("conf-version-restore");
+    let key = key("restore.txt");
+    let v1 = version::Id::new("v1").expect("a valid version id");
+    let v3 = version::Id::new("v3").expect("a valid version id");
+    let unmatched = version::Id::new("never-written").expect("a valid version id");
+    let absent = bucket_name("conf-version-restore-absent");
+    let restored = row(5, ETAG_B, 42);
+
+    // R1: the bucket row is asserted inside the restore's own transaction, and
+    // the refusal projects without writing anything.
+    let refusal = match store
+        .restore_slot(&absent, &key, &restored, Some(v1.clone()), 1)
+        .await
+    {
+        Ok(()) => panic!("restore_slot must refuse a bucket with no row"),
+        Err(refused) => refused.into(),
+    };
+    assert!(
+        matches!(refusal, storage::Error::NoSuchBucket(_)),
+        "the missing-bucket refusal must project to NoSuchBucket, got {refusal:?}"
+    );
+
+    // The premise: the successor's own row at a lower sequence, the removed
+    // current version's row above it, the slot at the removed one, and a
+    // retained part list behind the row the restore replaces.
+    BucketMeta::create(store, &bucket, &bucket_at(t0()))
+        .await
+        .unwrap();
+    store
+        .put_version(
+            &bucket,
+            &key,
+            &version_row(1, Some(v1.clone()), Kind::Object),
+        )
+        .await
+        .unwrap();
+    store
+        .put_version(
+            &bucket,
+            &key,
+            &version_row(3, Some(v3.clone()), Kind::Object),
+        )
+        .await
+        .unwrap();
+    store
+        .advance_slot(&bucket, &key, Some(v3.clone()), 3)
+        .await
+        .unwrap();
+    store
+        .put_with_parts(
+            &bucket,
+            &key,
+            &row(9, ETAG_A, 7),
+            &[retained_part(1, 5), retained_part(2, 5)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.parts(&bucket, &key).await.unwrap().len(),
+        2,
+        "the object the restore replaces has a retained part list"
+    );
+
+    // S6 and S3: the backwards move to the successor's own sequence lands, the
+    // object row is the caller's elements wholesale, and the slot answers the
+    // restored identity with the version row's kind (an object version).
+    store
+        .restore_slot(&bucket, &key, &restored, Some(v1.clone()), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.current_slot(&bucket, &key).await.unwrap(),
+        Some(Current {
+            exists: true,
+            version: Some(v1.clone()),
+            is_delete_marker: false,
+        }),
+        "a restore moves the slot backwards to a real identity"
+    );
+    assert_eq!(
+        ObjectMeta::get(store, &bucket, &key).await.unwrap(),
+        Some(restored.clone()),
+        "the restored row is the caller's elements"
+    );
+    // S3: a write is a fresh object.
+    assert!(
+        store.parts(&bucket, &key).await.unwrap().is_empty(),
+        "the restore clears the retained part list"
+    );
+    // S4: the restored version is current, so its row and index entry are gone.
+    assert!(
+        store.get_version(&bucket, &key, 1).await.unwrap().is_none(),
+        "the consumed version row is gone"
+    );
+    assert_eq!(
+        store
+            .version_seq_of(&bucket, &key, Some(&v1))
+            .await
+            .unwrap(),
+        None,
+        "…and so is its index entry"
+    );
+    // S5: the row the slot moved off says it stopped being current.
+    let moved_off = store
+        .get_version(&bucket, &key, 3)
+        .await
+        .unwrap()
+        .expect("the row the slot moved off stays");
+    assert_ne!(
+        moved_off.became_noncurrent, 0,
+        "the restore stamps the row the slot moves off"
+    );
+    assert_eq!(
+        store
+            .version_seq_of(&bucket, &key, Some(&v3))
+            .await
+            .unwrap(),
+        Some(3),
+        "the moved-off row's index entry is untouched"
+    );
+
+    // R2's two arms: a sequence holding no row, and a row naming another
+    // identity. Each refuses with the store's own error — never silently, never
+    // `NoSuchBucket` — and commits neither half.
+    let refusal = match store
+        .restore_slot(&bucket, &key, &restored, Some(unmatched.clone()), 9)
+        .await
+    {
+        Ok(()) => panic!("restore_slot must refuse a sequence that holds no row"),
+        Err(refused) => refused.into(),
+    };
+    assert!(
+        matches!(refusal, storage::Error::Io(_)),
+        "the absent-row refusal is the store's own error, got {refusal:?}"
+    );
+    let refusal = match store
+        .restore_slot(&bucket, &key, &restored, Some(unmatched), 3)
+        .await
+    {
+        Ok(()) => panic!("restore_slot must refuse a row naming another identity"),
+        Err(refused) => refused.into(),
+    };
+    assert!(
+        matches!(refusal, storage::Error::Io(_)),
+        "the identity-mismatch refusal is the store's own error, got {refusal:?}"
+    );
+    // Neither refusal moved anything: the slot, the object row, the moved-off
+    // row and its index entry are exactly as the landed restore left them.
+    assert_eq!(
+        store.current_slot(&bucket, &key).await.unwrap(),
+        Some(Current {
+            exists: true,
+            version: Some(v1),
+            is_delete_marker: false,
+        }),
+        "a refused restore leaves the slot alone"
+    );
+    assert_eq!(
+        ObjectMeta::get(store, &bucket, &key).await.unwrap(),
+        Some(restored),
+        "a refused restore writes no object row"
+    );
+    assert_eq!(
+        store
+            .get_version(&bucket, &key, 3)
+            .await
+            .unwrap()
+            .map(|row| row.id),
+        Some(Some(v3)),
+        "…and consumes no version row"
     );
 }
 

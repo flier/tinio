@@ -1,31 +1,28 @@
-//! Object listing over the storage root (task T043).
+//! The filesystem tree walk and the listing machinery around it (task T043).
 //!
-//! A directory-tree walk (buckets → files) with prefix filtering,
-//! delimiter-based grouping (common-prefix roll-up), and pagination per
-//! S3 semantics (FR-004) — the streaming walk fed into the shared
-//! bounded [`UnorderedPager`] engine: the page comes out in key order
-//! with only the `max_keys + 1` smallest entries ever held (no
-//! full-bucket collect and sort, P01).
+//! A directory-tree walk (buckets → files) with prefix filtering and
+//! delimiter-based grouping (common-prefix roll-up) per S3 semantics
+//! (FR-004), emitted one file at a time in walk order — the one source of
+//! truth for what an object is, shared by the **content plane's `scan`**
+//! (the window the ops engine's `list_objects` page walks through) and the
+//! **scanner**. The page itself — prefix/delimiter roll-up, pagination and
+//! the row batch — is the ops engine's (`tinio_ops`): nothing here
+//! assembles one.
 //!
-//! ETags are included: missing/stale entries of the emitted page are
-//! recomputed through the **IO pipeline** (`etag::ComputeTask`, pipeline-spec.md
-//! §3.2) and persisted in **write-pipeline batches** (`MetaWriteBatchTask`)
-//! — the documented one-time full-content pass over externally-added
-//! files, mitigated by the background scanner. Pagination happens on the
-//! walked keys first (P3), so only the emitted page's keys are gated and
-//! enqueued. `.tinio` entries are always skipped (FR-020); symlink entries
-//! are excluded when `follow_symlinks` is disabled. No listing latency
-//! bound is promised; listings remain correct and complete at all times.
+//! The page's ETags and its heal are the engine's too: a missing or stale
+//! row of the emitted page is recomputed from the content and persisted
+//! through the row contract as the page is assembled. The **scanner** is
+//! the path that still enqueues through the **IO pipeline**
+//! (`etag::ComputeTask`, pipeline-spec.md §3.2) and the **write-pipeline
+//! batches** (`MetaWriteBatchTask`) — the documented one-time full-content
+//! pass over externally-added files. `.tinio` entries are always skipped
+//! (FR-020); symlink entries are excluded when `follow_symlinks` is
+//! disabled. No listing latency bound is promised; listings remain correct
+//! and complete at all times.
 //!
-//! The list producer and the scanner walk the same tree through
-//! [`FsListing::walk_files_streaming`] — the one source of truth for
-//! what an object is, emitted one file at a time in walk order (no
-//! full-bucket collection, no sort: the scanner needs no order,
-//! pipeline-spec.md §3.7, and the pager needs only the page).
-//!
-//! This module also hosts the **streaming batch accumulator** shared with
-//! the scanner producer: [`MetaBatchAccumulator`] groups computed entries
-//! into write-pipeline batches, flushing on the `[storage.fs]
+//! This module also hosts the **streaming batch accumulator** the scanner
+//! producer uses: [`MetaBatchAccumulator`] groups computed entries into
+//! write-pipeline batches, flushing on the `[storage.fs]
 //! meta_batch_size` / `meta_batch_bytes` thresholds (Q5).
 
 use std::{
@@ -40,20 +37,14 @@ use std::{
 };
 
 use derive_more::Debug;
-use futures::{
-    FutureExt, Stream, StreamExt,
-    stream::{self, FuturesUnordered},
-};
+use futures::{Stream, stream};
 use tokio::fs;
 
 use crate::{
     _core::{
-        ETag, acl,
-        acl::Acl,
-        bucket, checksum,
-        object::{self, Info, Tags},
+        bucket, object,
         pipeline::{self, Completion},
-        storage::{self, ListObjectsParams, ObjectListing, UnorderedPager},
+        storage,
     },
     Error, etag, fsutil, meta, path,
     path::STATE_DIR_NAME,
@@ -61,7 +52,7 @@ use crate::{
 };
 
 /// The per-entry meta-batch size estimate (pipeline-spec.md Q5): a stored
-/// row is ≈ 56 B plus the key bytes. The producers use it for the
+/// row is ≈ 56 B plus the key bytes. The scanner producer uses it for the
 /// `meta_batch_bytes` flush trigger.
 pub(crate) const META_ENTRY_ESTIMATE_BYTES: u64 = 56;
 
@@ -70,10 +61,12 @@ pub(crate) const META_ENTRY_ESTIMATE_BYTES: u64 = 56;
 /// unix reads it from the stored metadata (zero extra cost); Windows
 /// opens the path on demand — a LIST gate pays the open only for the
 /// emitted page entries (≤ `max_keys`), never once per walked file. The
-/// identity is the producers' replacement detector (F01): a same-size
+/// identity is the page's replacement detector (F01): a same-size
 /// mtime-preserving replacement (`cp -p`, `rsync -a`) is invisible to
 /// the size+mtime pair but changes the identity — a gate that never
-/// consults it would serve the old ETag forever. The lazy form is as
+/// consults it would serve the old ETag forever (the walk's consumer on the
+/// page path is the engine's staleness gate, [`WalkedFile::identity`] being
+/// how `content.scan` hands it over). The lazy form is as
 /// conservative as the eager one: the identity is always the CURRENT
 /// file's at fetch time, so a replacement anywhere between the walk and
 /// the gate is a gate miss, never a false hit.
@@ -102,15 +95,14 @@ impl WalkedFile {
     }
 }
 
-/// The streaming meta-batch accumulator shared by the list and scanner
-/// producers (pipeline-spec.md Q5): computed entries accumulate into the
+/// The streaming meta-batch accumulator the scanner producer drives
+/// (pipeline-spec.md Q5): computed entries accumulate into the
 /// current batch, which flushes once its entry count reaches
 /// `meta_batch_size` **or** its estimated bytes reach `meta_batch_bytes`
 /// (either trigger; estimate ≈ [`META_ENTRY_ESTIMATE_BYTES`] + key
 /// length). One flush = one [`MetaWriteBatchTask`] = one write
 /// transaction. The caller decides what to do with the returned
-/// [`Completion`]: the list awaits it (Q2 final drain), the scanner drops
-/// it (Q3b fire-and-forget).
+/// [`Completion`]: the scanner drops it (Q3b fire-and-forget).
 pub(crate) struct MetaBatchAccumulator<'a> {
     bucket: &'a bucket::Name,
     meta: meta::Store,
@@ -159,9 +151,8 @@ impl<'a> MetaBatchAccumulator<'a> {
         }
     }
 
-    /// Fold one [`etag::Outcome`] into the batch (F38 — the shared Ok path
-    /// of both producers' compute-result folds; the failure policies stay
-    /// at the call sites). The batch entry uses the outcome's own
+    /// Fold one [`etag::Outcome`] into the batch (F38 — the compute-result
+    /// fold's Ok path; the failure policy stays at the call site). The batch entry uses the outcome's own
     /// hash-time metadata, so a row never pairs a hash-time ETag with
     /// walk-time size/mtime — a file changed between the walk and the
     /// hash yields a self-consistent row the next gate recomputes (F19).
@@ -181,7 +172,7 @@ impl<'a> MetaBatchAccumulator<'a> {
 
     /// Enqueue the accumulated entries as one write-pipeline batch. An
     /// empty accumulator is a no-op — no task, no write transaction (the
-    /// producers flush a possibly empty accumulator after the last
+    /// scanner flushes a possibly empty accumulator after the last
     /// result).
     pub(crate) async fn flush(
         &mut self,
@@ -200,65 +191,16 @@ impl<'a> MetaBatchAccumulator<'a> {
     }
 }
 
-/// Listing over one storage root (bucket dirs at the top level).
-///
-/// # Examples
-///
-/// ```rust
-/// use std::{
-///     fs::{create_dir, write},
-///     sync::Arc,
-/// };
-///
-/// use tinio_core::{
-///     bucket,
-///     pipeline::InlineRunner,
-///     storage::{DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE, ListObjectsParams},
-/// };
-/// use tinio_fs::{FsListing, meta};
-/// use tokio::runtime::Runtime;
-///
-/// let root = tempfile::tempdir().unwrap();
-/// let state = tempfile::tempdir().unwrap();
-/// let store = meta::store(state.path()).unwrap();
-/// let listing = FsListing::new(
-///     root.path(),
-///     store,
-///     true,
-///     Arc::new(InlineRunner::default()),
-///     Arc::new(InlineRunner::default()),
-///     DEFAULT_META_BATCH_SIZE,
-///     DEFAULT_META_BATCH_BYTES,
-/// );
-/// Runtime::new().unwrap().block_on(async {
-///     let b = bucket::name("data").unwrap();
-///     create_dir(root.path().join("data")).unwrap();
-///     write(root.path().join("data/a.txt"), b"a").unwrap();
-///     create_dir(root.path().join("data/dir")).unwrap();
-///     write(root.path().join("data/dir/b.txt"), b"b").unwrap();
-///     let page = listing
-///         .list(
-///             &ListObjectsParams {
-///                 bucket: b,
-///                 prefix: String::new(),
-///                 delimiter: Some("/".into()),
-///                 start_after: None,
-///                 max_keys: 1000,
-///             },
-///             false,
-///         )
-///         .await
-///         .unwrap();
-///     assert_eq!(page.objects.len(), 1);
-///     assert_eq!(page.common_prefixes, ["dir/"]);
-/// });
-/// ```
+/// Listing over one storage root (bucket dirs at the top level): the tree
+/// walk the content plane's `scan` and the scanner share, the pipelines the
+/// scanner produces into, and the batch accumulator that producer drives.
+/// The **page** is the ops engine's (`tinio_ops::ObjectOps::list_objects`) —
+/// it enumerates through `ObjectContent::scan`, which walks through this
+/// value — so nothing here assembles one.
 #[derive(Debug, Clone)]
 pub struct FsListing {
     /// Storage root (bucket dirs at the top level).
     root: PathBuf,
-    /// The meta store (ETags; recompute-on-stale during the walk).
-    meta: meta::Store,
     /// Exclude symlink entries (and do not descend symlink dirs) when
     /// `follow_symlinks` is disabled.
     follow_symlinks: bool,
@@ -278,12 +220,11 @@ pub struct FsListing {
 
 impl FsListing {
     /// Create a listing over `root`. The pipelines are mandatory (P4) —
-    /// the cold list path enqueues into them; offline contexts pass
+    /// the scanner producer enqueues into them; offline contexts pass
     /// [`pipeline::InlineRunner`]. `meta_batch_size`/`meta_batch_bytes`
     /// are the streaming flush thresholds (Q5, `[storage.fs]`).
     pub fn new(
         root: &Path,
-        meta: meta::Store,
         follow_symlinks: bool,
         io_pipeline: Arc<dyn pipeline::Runner<etag::Result>>,
         db_pipeline: Arc<dyn pipeline::Runner<Result<(), Error>>>,
@@ -292,7 +233,6 @@ impl FsListing {
     ) -> Self {
         Self {
             root: root.to_path_buf(),
-            meta,
             follow_symlinks,
             io_pipeline,
             db_pipeline,
@@ -323,291 +263,12 @@ impl FsListing {
         self.meta_batch_bytes
     }
 
-    /// List one page of objects per S3 semantics (prefix, delimiter,
-    /// pagination). `NoSuchBucket` when the bucket does not exist.
-    ///
-    /// The page's ETags resolve through the pipelines (pipeline-spec.md
-    /// §3.2): a gating load reads the page's keys in **one** read
-    /// transaction (R1), matching entries are served from the store
-    /// (P6 — no worker for a cache hit), and the missing/stale entries go
-    /// through the IO pipeline as `etag::ComputeTask`s (concurrency = the
-    /// pipeline's workers, Q4). The results stream back in COMPLETION
-    /// order (pipeline-spec.md §3.2 — no head-of-line blocking) into
-    /// write-pipeline batches (`MetaBatchAccumulator`, Q5) and — after
-    /// ALL batches are enqueued — the batch completions are awaited (the
-    /// final drain, Q2: every batch committed before the page is
-    /// answered).
-    ///
-    /// The page is selected incrementally during the walk (the bounded
-    /// [`UnorderedPager`] — P01): only the `max_keys + 1` smallest
-    /// entries are held, never a full-bucket collect and sort.
-    ///
-    /// `records_versions` is the bucket's versioning state, resolved by
-    /// the caller (the storage's `list_objects`, whose `Info` carrier the
-    /// server reads): the listing engine answers no version identity of
-    /// its own, so the flag is threaded rather than looked up here.
-    pub async fn list(
-        &self,
-        params: &ListObjectsParams,
-        records_versions: bool,
-    ) -> Result<ObjectListing, Error> {
-        // The engine's empty-page contract, answered after the bucket
-        // existence check (the walk's own await) but before the tree
-        // walk: a `max_keys = 0` request never pays the full-bucket stat
-        // sweep — it still answers NoSuchBucket for a missing bucket.
-        if params.max_keys == 0 {
-            // The stream is built purely for the existence probe and
-            // dropped un-polled — `let _` so the `#[must_use]` stream
-            // does not warn on every build (F10).
-            let _ = self
-                .walk_files_streaming(&params.bucket, &params.prefix)
-                .await?;
-            return Ok(ObjectListing {
-                objects: Vec::new(),
-                common_prefixes: Vec::new(),
-                truncated: false,
-                next_start_after: None,
-            });
-        }
-        // Paginate on the walked keys first — grouping, the marker skip,
-        // and the truncation probe need no per-object I/O. ETags are then
-        // resolved for the emitted page only: a `max_keys=1` request
-        // costs one meta read, not one per object in the bucket (P3).
-        // The walk is the STREAMING form fed into the bounded
-        // `UnorderedPager`: memory and the page sort drop to O(max_keys)
-        // (P01 — the old collect + sort paid O(M) memory and an O(M log
-        // M) sort per page). Syscalls stay O(M) per page — `read_dir`
-        // cannot seek. The `starts_with` re-filter stays: the walk's
-        // directory-level pruning does not guarantee every walked file
-        // matches the prefix. The keyed `offer_keyed` compares the
-        // borrowed key and materializes the order String only for
-        // entries that enter the heap — O(page) allocations, not
-        // O(entries).
-        let mut walk = self
-            .walk_files_streaming(&params.bucket, &params.prefix)
-            .await?;
-        let mut pager = UnorderedPager::new(
-            &params.prefix,
-            params.delimiter.as_deref(),
-            params.start_after.as_deref(),
-            params.max_keys,
-            |w: &WalkedFile| w.key.as_ref(),
-        );
-        while let Some(file) = walk.next().await {
-            let file = file?; // a mid-walk error is the stream's terminal item — propagates
-            if file.key.starts_with(&params.prefix) {
-                pager.offer_keyed(file);
-            }
-        }
-        let (page, common_prefixes, truncated, next) = pager.finish();
-        // R1: the page's keys in ONE read transaction; each slot aligns
-        // with `get()` — a missing or corrupt entry reports `None`
-        // (recompute + rewrite, self-healing, P2). The slots answer in
-        // request order, so they are **index-aligned with the page** —
-        // the assembly below never looks up by key, and the keys are
-        // passed by reference (no key `Vec`, no per-row key clones; the
-        // page's own key order IS the assembly order, item 3).
-        let gated = self
-            .meta
-            .load_entries(&params.bucket, page.iter().map(|w| &w.key))
-            .await?;
-        debug_assert_eq!(
-            gated.len(),
-            page.len(),
-            "the gating load is 1:1 with the page"
-        );
-
-        // One slot per page entry: `None` = missing/stale (compute
-        // pending) or a vanished file; `Some(etag)` = the served entry (a
-        // matching hit from the gate, or a compute result). The identity
-        // lives only in the batch entries (F36 — the slot never needed it).
-        let mut results: Vec<Option<ETag>> = vec![None; page.len()];
-        let mut compute_done = FuturesUnordered::new();
-        let mut batches: Vec<Completion<Result<(), Error>>> = Vec::new();
-        let mut accumulator = MetaBatchAccumulator::new(
-            &params.bucket,
-            self.meta.clone(),
-            &self.db_pipeline,
-            self.meta_batch_size,
-            self.meta_batch_bytes,
-        );
-
-        // P6: the in-memory matches gate — a matching entry is served
-        // from the store and never enqueued (no worker, no IO task). The
-        // gate consults the walked file identity (F01) — a same-size
-        // mtime-preserving replacement is a gate miss, never a stale
-        // serve. The page slots' tags/checksum/owner/ACL come from the
-        // same gated rows (spec 2026-08-31 — `Info.tags`/`Info.checksum`
-        // are always populated from the stored row, empty when the row
-        // is absent; spec 2026-09-05 — `Info.owner`/`Info.acl` ride the
-        // same row): the producer rewrites preserve the replaced row's
-        // elements, so the served page matches what the row holds after
-        // the walk.
-        let mut row_meta: Vec<(Tags, Option<checksum::Recorded>, Option<acl::OwnerId>, Acl)> =
-            Vec::with_capacity(page.len());
-        for (i, stored) in gated.into_iter().enumerate() {
-            row_meta.push(stored.as_ref().map_or_else(
-                || (Tags::empty(), None, None, Acl::default_private(None)),
-                |stored| {
-                    (
-                        stored.tags.clone(),
-                        stored.checksum.clone(),
-                        stored.owner.clone(),
-                        stored.acl.clone(),
-                    )
-                },
-            ));
-            let walked = &page[i];
-            match &stored {
-                Some(stored)
-                    if meta::entry_matches(
-                        stored.size,
-                        stored.mtime,
-                        stored.file_identity,
-                        walked.size,
-                        walked.mtime,
-                        walked.identity(),
-                    ) =>
-                {
-                    results[i] = Some(stored.etag.clone());
-                    continue;
-                }
-                _ => {} // missing or stale → compute through the IO pipeline
-            }
-            let task = etag::ComputeTask {
-                key: page[i].key.clone(),
-                path: walked.path.clone(),
-                size: walked.size,
-                stored,
-                follow_symlinks: self.follow_symlinks,
-            };
-            // Enqueue waits only for queue capacity (backpressure) — the
-            // completions resolve out of order below.
-            compute_done.push(self.io_pipeline.enqueue(Box::new(task)).await?);
-            // F17: drain whatever has already resolved while still
-            // enqueueing — a slow in-flight hash must not
-            // head-of-line-block the rest of the page's enqueues (the
-            // scanner producer drains the same way).
-            while let Some(Some(done)) = compute_done.next().now_or_never() {
-                self.fold_compute(done, &page, &mut results, &mut accumulator, &mut batches)
-                    .await?;
-            }
-        }
-
-        // Stream-flush (Q5): the results stream in COMPLETION ORDER (§3.2
-        // — a slow file never head-of-line-blocks the page); each lands
-        // in the current batch, which flushes when its entry count or
-        // estimated bytes reach the thresholds. A failed compute fails
-        // the whole listing (the existing per-entry-failure semantics);
-        // a vanished file (concurrent delete) skips the entry.
-        while let Some(done) = compute_done.next().await {
-            self.fold_compute(done, &page, &mut results, &mut accumulator, &mut batches)
-                .await?;
-        }
-        if let Some(done) = accumulator.flush().await? {
-            batches.push(done);
-        }
-        // Q2: the final drain — every enqueued batch commits before the
-        // page is answered. **A read-only handle's refusal is not a
-        // listing failure** (FR-023 amended, design 2026-10-03 **Read
-        // paths**): the recomputed ETags are already in `results`, and
-        // that mode's read "is simply not written back". Every other
-        // failure keeps the existing semantics — it fails the listing.
-        for done in batches {
-            match done.await? {
-                Ok(()) => {}
-                Err(err) if err.is_read_only() => {}
-                Err(err) => return Err(err),
-            }
-        }
-        // The page entries in page (key) order — the index-aligned
-        // assembly replaces the old HashMap + `sort_by` (item 3: page
-        // order IS key order; a vanished file's slot stays `None` and
-        // the entry is skipped).
-        let mut objects: Vec<Info> = Vec::with_capacity(page.len());
-        // The page is consumed here — the assembly is its last use, so
-        // the walked keys and paths are moved, not cloned.
-        for ((walked, result), (tags, checksum, owner, acl)) in
-            page.into_iter().zip(&results).zip(&row_meta)
-        {
-            if let Some(etag) = result {
-                objects.push(Info {
-                    key: walked.key,
-                    size: walked.size,
-                    last_modified: walked.mtime,
-                    etag: etag.clone(),
-                    tags: tags.clone(),
-                    checksum: checksum.clone(),
-                    owner: owner.clone(),
-                    acl: acl.clone(),
-                    version_id: None,
-                    bucket_records_versions: records_versions,
-                });
-            }
-        }
-        // T01: the pager's `(truncated, next)` propagate unconditionally —
-        // a page whose entries ALL vanished between the walk and the hash
-        // (mass concurrent deletion) still reports the resume marker. The
-        // marker is exclusive-after and does not require the marker key to
-        // exist: the client resumes past it and either finds the probe
-        // entry that set `truncated` (still live — a truncated page always
-        // has one) or an empty untruncated page. Either way the sweep
-        // terminates; suppressing the marker here would hide live keys
-        // (an F15-era guard did exactly that — the deleted keys are gone,
-        // but the truncated page's probe is a key the client must still
-        // see).
-        Ok(ObjectListing {
-            objects,
-            common_prefixes,
-            truncated,
-            next_start_after: next,
-        })
-    }
-
-    /// Fold one resolved compute completion into the page (the listing's
-    /// failure policy: a vanished file skips the entry, any other failure
-    /// fails the page). The Ok path is the shared
-    /// [`MetaBatchAccumulator::push_outcome`] (F38 — the scanner's
-    /// `fold_outcome` keeps its own failure policy).
-    async fn fold_compute(
-        &self,
-        done: Result<etag::Result, pipeline::Error>,
-        page: &[WalkedFile],
-        results: &mut [Option<ETag>],
-        accumulator: &mut MetaBatchAccumulator<'_>,
-        batches: &mut Vec<Completion<Result<(), Error>>>,
-    ) -> Result<(), Error> {
-        let outcome = match done {
-            Ok(outcome) => outcome,
-            Err(err) => return Err(err.into()),
-        };
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(Error::Io(err)) if err.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        // The result key is one of the page's keys (the task carried
-        // it) — a binary search on the page (key order) finds its
-        // slot, replacing the old HashMap lookup (item 3).
-        let idx = match page.binary_search_by(|w| w.key.as_ref().cmp(outcome.key.as_ref())) {
-            Ok(idx) => idx,
-            // Unreachable — the task's key is a page key (defensive;
-            // a foreign key is dropped like the old HashMap path).
-            Err(_) => return Ok(()),
-        };
-        results[idx] = Some(outcome.etag.clone());
-        if let Some(done) = accumulator.push_outcome(outcome).await? {
-            batches.push(done);
-        }
-        Ok(())
-    }
-
     /// The **streaming** form of the walk: every object file of a bucket,
     /// one at a time, in walk order (a directory's `read_dir` order,
     /// worklist-depth-first — never a key sort; the scanner needs no
-    /// order, pipeline-spec.md §3.7, and the list producer paginates
-    /// through the bounded `UnorderedPager`, which holds only the
-    /// page). Directories are never objects, `.tinio` entries are
+    /// order, pipeline-spec.md §3.7, and the ops engine's listing paginates
+    /// what it scans through the bounded `UnorderedPager`, which holds only
+    /// the page). Directories are never objects, `.tinio` entries are
     /// skipped at any depth (FR-020), symlink entries are excluded when
     /// `follow_symlinks` is disabled, and `key_prefix` prunes
     /// directories that cannot contain matching keys (a listing passes
@@ -714,8 +375,8 @@ struct WalkState {
 
 impl WalkState {
     /// Emit the next file, or `None` when the walk is exhausted. A fatal
-    /// error is emitted once, then the stream ends (the producers
-    /// propagate it immediately).
+    /// error is emitted once, then the stream ends (its consumers propagate
+    /// it immediately).
     async fn next_file(&mut self) -> Option<Result<WalkedFile, Error>> {
         if self.done {
             return None;
@@ -886,71 +547,219 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::{
-        fs::{File, OpenOptions, create_dir, create_dir_all, metadata, read, read_dir, write},
-        time::{Duration, Instant},
+        fs::{File, OpenOptions, create_dir, create_dir_all, metadata, read_dir, write},
+        time::Duration,
     };
 
+    use futures::StreamExt;
     use tokio::fs;
 
     use super::*;
     use crate::{
         _core::{
-            pipeline::{Error::Dropped, InlineRunner},
+            ETag,
+            pipeline::InlineRunner,
             storage::{
                 DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE, Error::NoSuchBucket,
-                ListObjectsParams,
+                ListObjectsParams, ObjectListing, ObjectOps,
             },
         },
         _store_redb::object_meta::Table,
         _util::testing,
-        database,
-        testutil::{GatedRunner, LossyRunner, PacedRunner, files, link_directory, wait_for},
+        FsOptions, FsStorage, database,
+        testutil::{fs_options, link_directory},
     };
 
-    /// The standard test listing: the fs defaults plus the mandatory
-    /// inline pipelines (P4/Q1).
-    fn listing(root: &Path, store: meta::Store, follow_symlinks: bool) -> FsListing {
-        listing_with(
-            root,
-            store,
-            follow_symlinks,
-            Arc::new(InlineRunner::default()),
-            Arc::new(InlineRunner::default()),
-            DEFAULT_META_BATCH_SIZE,
-            DEFAULT_META_BATCH_BYTES,
-        )
+    /// The listing fixture: the walk value (the walk tests drive
+    /// `walk_files_streaming` on it) and the backend that serves the page.
+    ///
+    /// The page's entry point is `FsStorage::list_objects` — the ops engine's
+    /// page, which walks through exactly this `FsListing` (`content.scan` is
+    /// the walk) — so `list` drives the backend, the same call a client's
+    /// ListObjects makes.
+    struct TestListing {
+        /// The tree walk the fixtures build (`walk_files_streaming`).
+        listing: FsListing,
+        /// The backend the page is served from.
+        storage: FsStorage,
     }
 
-    /// A listing over explicit pipelines and flush thresholds (the
-    /// producer tests observe the pipelines).
-    fn listing_with(
-        root: &Path,
-        store: meta::Store,
-        follow_symlinks: bool,
-        io: Arc<dyn pipeline::Runner<etag::Result>>,
-        db: Arc<dyn pipeline::Runner<Result<(), Error>>>,
-        batch_size: u16,
-        batch_bytes: u32,
-    ) -> FsListing {
-        FsListing::new(
-            root,
-            store,
-            follow_symlinks,
-            io,
-            db,
-            batch_size,
-            batch_bytes,
-        )
+    impl TestListing {
+        /// Both halves over one root (the walk and the backend the page is
+        /// served from).
+        fn over(root: &Path, follow_symlinks: bool) -> Self {
+            Self {
+                listing: FsListing::new(
+                    root,
+                    follow_symlinks,
+                    Arc::new(InlineRunner::default()),
+                    Arc::new(InlineRunner::default()),
+                    DEFAULT_META_BATCH_SIZE,
+                    DEFAULT_META_BATCH_BYTES,
+                ),
+                storage: FsStorage::new(
+                    root,
+                    FsOptions {
+                        follow_symlinks,
+                        ..fs_options()
+                    },
+                )
+                .unwrap(),
+            }
+        }
+
+        /// One page of the backend's own listing entry point.
+        async fn list(
+            &self,
+            params: &ListObjectsParams,
+            _records_versions: bool,
+        ) -> Result<ObjectListing, Error> {
+            // The versioning flag is the backend's own read now (its
+            // `list_objects` resolves the bucket state and hands it to the
+            // engine body); the callers' argument stays so the fixtures read
+            // the shape they always have.
+            self.storage.list_objects(params.clone()).await
+        }
+
+        /// The streaming walk, delegated so the walk tests read the shape
+        /// they always have.
+        async fn walk_files_streaming(
+            &self,
+            bucket: &bucket::Name,
+            key_prefix: &str,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<WalkedFile, Error>> + Send + 'static>>, Error>
+        {
+            self.listing.walk_files_streaming(bucket, key_prefix).await
+        }
     }
 
-    fn fixture() -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
-        FsListing,
-        bucket::Name,
-    ) {
+    // --- the storage-level page (the ops engine's listing) ---
+
+    /// The composed-ETag keep rule at the listing's own entry point: a stored
+    /// `MD5-of-MD5s-N` ETag on the same-size file survives a **touch** (an
+    /// mtime drift inside the jitter window), and the page heals the row it
+    /// served — the fs half of the engine's composed-keep rule
+    /// (`crates/tinio-fs/src/meta.rs`'s family pins it on the read path).
+    #[tokio::test]
+    async fn a_stored_composed_etag_survives_a_touch_on_the_page() {
+        let (root, listing, b) = fixture();
+        let file = root.path().join("data/a.txt");
+        let before = metadata(&file).unwrap();
+        let composed = testing::etag("5d41402abc4b2a76b9719d911017c592-2");
+        listing
+            .storage
+            .meta_store()
+            .set(
+                &b,
+                &object::key("a.txt").unwrap(),
+                &composed,
+                before.len(),
+                before.modified().unwrap(),
+                0,
+            )
+            .await
+            .unwrap();
+        // A touch: the same file, mtime pushed forward inside the window.
+        let handle = File::options().write(true).open(&file).unwrap();
+        handle
+            .set_modified(before.modified().unwrap() + Duration::from_secs(30))
+            .unwrap();
+        drop(handle);
+        let page = listing
+            .list(&params(&b, "a", None, None, 1000), false)
+            .await
+            .unwrap();
+        assert_eq!(page.objects[0].etag, composed);
+        assert!(matches!(page.objects[0].etag, ETag::Composed(_, 2)));
+        // The page healed the row it served: the next read is a hit.
+        let now = metadata(&file).unwrap();
+        let record = listing
+            .storage
+            .meta_store()
+            .get(&b, &object::key("a.txt").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.matches(now.len(), now.modified().unwrap()));
+    }
+
+    /// A same-size replacement that restores the mtime (`cp -p`, `rsync -a`)
+    /// is not a touch: the file identity changed, so the page recomputes the
+    /// content ETag rather than serving the old one (F01's hole, closed).
+    #[tokio::test]
+    async fn a_mtime_preserving_replacement_recomputes_the_etag_on_the_page() {
+        let (root, listing, b) = fixture();
+        let file = root.path().join("data/a.txt");
+        let first = listing
+            .list(&params(&b, "a", None, None, 1000), false)
+            .await
+            .unwrap();
+        assert_eq!(first.objects[0].etag, ETag::from_content(b"a.txt!"));
+        let before = metadata(&file).unwrap();
+        let replacement = root.path().join("data/replacement.txt");
+        write(&replacement, b"a.txt?").unwrap();
+        let handle = OpenOptions::new().write(true).open(&replacement).unwrap();
+        handle.set_modified(before.modified().unwrap()).unwrap();
+        drop(handle);
+        fs::rename(&replacement, &file).await.unwrap();
+        let page = listing
+            .list(&params(&b, "a", None, None, 1000), false)
+            .await
+            .unwrap();
+        assert_eq!(page.objects[0].etag, ETag::from_content(b"a.txt?"));
+    }
+
+    /// A row whose stored shape is corrupt (a domain-invalid ETag) reads as
+    /// absent, so the page recomputes the entry instead of failing the
+    /// listing — the same self-heal the read path takes.
+    #[tokio::test]
+    async fn a_corrupt_row_self_heals_on_the_page() {
         let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
+        // Corrupt the row BEFORE the backend opens the state database (redb's
+        // file lock is exclusive per handle).
+        {
+            let db = database::open(&root.path().join(STATE_DIR_NAME))
+                .unwrap()
+                .db;
+            let mut txn = db.begin_write().unwrap();
+            {
+                let mut table = Table::open(&mut txn).unwrap();
+                table
+                    .insert(
+                        ("data", "a.txt"),
+                        ("not-an-etag", 1, 1, 0, "", "", "", "", "null", 0, false),
+                    )
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        create_dir(root.path().join("data")).unwrap();
+        write(root.path().join("data/a.txt"), b"a").unwrap();
+        let listing = TestListing::over(root.path(), true);
+        let b = bucket::name("data").unwrap();
+        let page = listing
+            .list(&params(&b, "a", None, None, 1000), false)
+            .await
+            .unwrap();
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].etag, ETag::from_content(b"a"));
+        // The entry is valid again.
+        assert!(
+            listing
+                .storage
+                .meta_store()
+                .get(&b, &object::key("a.txt").unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A five-key tree (two flat keys, two under `dir/`, one under
+    /// `dir/sub/`), planted directly: the namespace exists without a create
+    /// call, exactly the shape the walk tests want.
+    fn fixture() -> (tempfile::TempDir, TestListing, bucket::Name) {
+        let root = tempfile::tempdir().unwrap();
         let b = bucket::name("data").unwrap();
         create_dir(root.path().join("data")).unwrap();
         for key in ["a.txt", "b.txt", "dir/c.txt", "dir/sub/d.txt", "dir/e.txt"] {
@@ -958,8 +767,8 @@ mod tests {
             create_dir_all(path.parent().unwrap()).unwrap();
             write(path, format!("{key}!")).unwrap();
         }
-        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
-        (root, state, listing, b)
+        let listing = TestListing::over(root.path(), true);
+        (root, listing, b)
     }
 
     fn params(
@@ -980,19 +789,38 @@ mod tests {
 
     #[tokio::test]
     async fn missing_bucket_is_no_such_bucket() {
-        let (_, _, listing, _) = fixture();
+        let (_root, listing, b) = fixture();
         let missing = bucket::name("ghost").unwrap();
         let err = listing
             .list(&params(&missing, "", None, None, 1000), false)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
+        // The empty-page request is the case the walk cannot answer: the
+        // engine returns the page **before** its first scan, so the listing's
+        // own namespace probe is what keeps `max-keys = 0` on a missing bucket
+        // `NoSuchBucket` (I1's pin — with `[s3] allow_zero_page_size = true`
+        // this is reachable from the wire).
+        let err = listing
+            .list(&params(&missing, "", None, None, 0), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err:?}");
+        // And the probe does not change a real bucket's empty page.
+        let empty = listing
+            .list(&params(&b, "nothing/", None, None, 0), false)
+            .await
+            .unwrap();
+        assert!(
+            empty.objects.is_empty() && empty.common_prefixes.is_empty() && !empty.truncated,
+            "{empty:?}"
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn dangling_symlink_is_skipped_not_fatal() {
-        let (root, _state, listing, b) = fixture();
+        let (root, listing, b) = fixture();
         // A link whose target does not exist must not fail the whole
         // bucket listing (or the scanner pass).
         symlink(
@@ -1016,7 +844,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn symlink_cycles_terminate() {
-        let (root, _state, listing, b) = fixture();
+        let (root, listing, b) = fixture();
         // `loop` points at the bucket itself: without cycle detection
         // the walk would descend forever.
         symlink(".", root.path().join("data/loop")).unwrap();
@@ -1034,45 +862,62 @@ mod tests {
 
     #[tokio::test]
     async fn symlink_entries_excluded_when_disabled() {
-        let (root, _state, _, _b) = fixture();
+        // The rule is a unix one, so the body's block is gated: on Windows it
+        // compiles away and only the tree below is planted.
+        let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("outside.txt"), b"out")
             .await
             .unwrap();
+        create_dir(root.path().join("data")).unwrap();
+        write(root.path().join("data/real.txt"), b"real").unwrap();
         #[cfg(unix)]
         {
-            let state = _state;
-            let b = _b;
+            let b = bucket::name("data").unwrap();
             symlink(
                 root.path().join("outside.txt"),
                 root.path().join("data/link.txt"),
             )
             .unwrap();
-            let no_link = listing(root.path(), meta::store(state.path()).unwrap(), false);
-            let page = no_link
+            // The page, through the backend's own entry point, under both
+            // symlink policies: the link is a key only when following is on.
+            let hidden = TestListing::over(root.path(), false);
+            let page = hidden
                 .list(&params(&b, "", None, None, 1000), false)
                 .await
                 .unwrap();
-            assert!(!page.objects.iter().any(|o| o.key.as_ref() == "link.txt"));
-            drop(no_link);
-            let with_link = listing(root.path(), meta::store(state.path()).unwrap(), true);
-            let page = with_link
+            let keys: Vec<&str> = page
+                .objects
+                .iter()
+                .map(|o| o.key.as_ref().as_str())
+                .collect();
+            assert_eq!(keys, ["real.txt"], "{keys:?}");
+            // The two fixtures share one root and a backend holds the state
+            // database's exclusive lock: the first must be gone before the
+            // second opens it (a backend per policy cannot share a root).
+            drop(hidden);
+            let followed = TestListing::over(root.path(), true);
+            let page = followed
                 .list(&params(&b, "", None, None, 1000), false)
                 .await
                 .unwrap();
-            assert!(page.objects.iter().any(|o| o.key.as_ref() == "link.txt"));
+            let keys: Vec<&str> = page
+                .objects
+                .iter()
+                .map(|o| o.key.as_ref().as_str())
+                .collect();
+            assert_eq!(keys, ["link.txt", "real.txt"], "{keys:?}");
         }
     }
 
     #[tokio::test]
     async fn bucket_dir_symlink_not_walked_when_disabled() {
         let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("secret.txt"), b"secret")
             .await
             .unwrap();
         link_directory(outside.path(), &root.path().join("data"));
-        let listing = listing(root.path(), meta::store(state.path()).unwrap(), false);
+        let listing = TestListing::over(root.path(), false);
         let b = bucket::name("data").unwrap();
         let page = listing
             .list(&params(&b, "", None, None, 1000), false)
@@ -1086,6 +931,19 @@ mod tests {
         assert!(
             keys.is_empty(),
             "must not list through a bucket-dir symlink: {keys:?}"
+        );
+        // The empty-page request: the bucket-existence probe the listing runs
+        // for it is the walk's own, so a namespace the symlink policy hides is
+        // the same empty answer here — never `NoSuchBucket` (which the direct
+        // object ops do give for it, and which `ensure_bucket` would have given
+        // here before the probe took the walk's shape).
+        let empty = listing
+            .list(&params(&b, "", None, None, 0), false)
+            .await
+            .unwrap();
+        assert!(
+            empty.objects.is_empty() && !empty.truncated,
+            "the symlink-hidden bucket answers its empty page: {empty:?}"
         );
     }
 
@@ -1129,8 +987,8 @@ mod tests {
     async fn walk_stream_emits_files_in_read_dir_order() {
         // The stream is the scanner's walk: files come out one at a
         // time, in the directory's OWN enumeration order — never a key
-        // sort (the scanner needs no order; the list producer's page
-        // sort is the pager's bounded heap, not the walk). The order is
+        // sort (the scanner needs no order; the page's sort is the pager's
+        // bounded heap, not the walk). The order is
         // pinned against a
         // fresh `read_dir` of the same static directory — deterministic
         // on the same filesystem (NTFS enumerates B-tree order, ext4
@@ -1138,7 +996,6 @@ mod tests {
         // changes the stream's order).
 
         let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
         let b = bucket::name("data").unwrap();
         fs::create_dir(root.path().join("data")).await.unwrap();
         // Created in non-lexicographic order on purpose.
@@ -1151,7 +1008,7 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let listing = TestListing::over(root.path(), true);
         let mut walked = listing.walk_files_streaming(&b, "").await.unwrap();
         let mut keys = Vec::new();
         while let Some(file) = walked.next().await {
@@ -1166,7 +1023,6 @@ mod tests {
     #[tokio::test]
     async fn walk_stream_collects_every_object_of_the_tree() {
         let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
         let b = bucket::name("data").unwrap();
         for key in [
             "a.txt",
@@ -1190,7 +1046,7 @@ mod tests {
             .unwrap();
         #[cfg(unix)]
         symlink(root.path().join("gone"), root.path().join("data/broken")).unwrap();
-        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let listing = TestListing::over(root.path(), true);
         let mut walked = listing.walk_files_streaming(&b, "").await.unwrap();
         let mut got = Vec::new();
         while let Some(file) = walked.next().await {
@@ -1205,8 +1061,7 @@ mod tests {
     #[tokio::test]
     async fn walk_stream_missing_bucket_is_no_such_bucket() {
         let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
-        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let listing = TestListing::over(root.path(), true);
         let missing = bucket::name("ghost").unwrap();
         let Err(err) = listing.walk_files_streaming(&missing, "").await else {
             panic!("a missing bucket must error at stream construction");
@@ -1218,9 +1073,8 @@ mod tests {
     #[tokio::test]
     async fn dangling_bucket_symlink_is_no_such_bucket() {
         let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
         symlink(root.path().join("gone"), root.path().join("data")).unwrap();
-        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let listing = TestListing::over(root.path(), true);
         let b = bucket::name("data").unwrap();
         let err = listing
             .list(&params(&b, "", None, None, 1000), false)
@@ -1232,7 +1086,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn duplicate_symlink_targets_descend_once() {
-        let (root, _state, listing, b) = fixture();
+        let (root, listing, b) = fixture();
         symlink(root.path().join("data/dir"), root.path().join("data/link1")).unwrap();
         symlink(root.path().join("data/dir"), root.path().join("data/link2")).unwrap();
         let page = listing
@@ -1265,472 +1119,6 @@ mod tests {
         );
     }
 
-    // --- the pipeline producers (pipeline-spec.md task 4) ---
-
-    /// A bucket with `n` files `f00.txt..`, each with distinct content.
-    /// The meta store lives under the caller's `root` tempdir (the state
-    /// dir must outlive the test).
-    fn files_fixture(root: &Path, n: usize) -> (meta::Store, bucket::Name) {
-        let state = root.join("state");
-        // The shared producer fixture (F39) — this test adds its own
-        // state store.
-        files(root, n);
-        (meta::store(&state).unwrap(), bucket::name("data").unwrap())
-    }
-
-    /// The etag of one fixture file.
-    fn file_etag(root: &Path, key: &str) -> ETag {
-        ETag::from_content(&read(root.join("data").join(key)).unwrap())
-    }
-
-    #[tokio::test]
-    async fn cold_list_writes_one_batch_per_flush_threshold() {
-        let root = tempfile::tempdir().unwrap();
-        let (_, b) = files_fixture(root.path(), 5);
-        for (size, expected) in [(2u16, 3usize), (1, 5)] {
-            let store = meta::store(&root.path().join(format!("state{size}"))).unwrap();
-            let db = PacedRunner::<Result<(), Error>>::new(1, 8, Duration::ZERO);
-            let listing = listing_with(
-                root.path(),
-                store.clone(),
-                true,
-                Arc::new(InlineRunner::default()),
-                db.clone(),
-                size,
-                DEFAULT_META_BATCH_BYTES,
-            );
-            let page = listing
-                .list(&params(&b, "", None, None, 1000), false)
-                .await
-                .unwrap();
-            assert_eq!(page.objects.len(), 5);
-            assert_eq!(
-                db.enqueued(),
-                expected,
-                "batch size {size}: one batch per flush threshold"
-            );
-            // Every entry landed (the batch tasks ran inline on the
-            // paced worker).
-            assert_eq!(store.walk(&b).await.unwrap().len(), 5);
-        }
-    }
-
-    #[tokio::test]
-    async fn hot_list_enqueues_nothing() {
-        let root = tempfile::tempdir().unwrap();
-        let (store, b) = files_fixture(root.path(), 3);
-        let io = PacedRunner::<etag::Result>::new(1, 8, Duration::ZERO);
-        let db = PacedRunner::<Result<(), Error>>::new(1, 8, Duration::ZERO);
-        let listing = listing_with(
-            root.path(),
-            store.clone(),
-            true,
-            io.clone(),
-            db.clone(),
-            1,
-            DEFAULT_META_BATCH_BYTES,
-        );
-        listing
-            .list(&params(&b, "", None, None, 1000), false)
-            .await
-            .unwrap();
-        assert_eq!(io.enqueued(), 3);
-        assert_eq!(db.enqueued(), 3);
-
-        let page = listing
-            .list(&params(&b, "", None, None, 1000), false)
-            .await
-            .unwrap();
-        assert_eq!(page.objects.len(), 3);
-        assert_eq!(io.enqueued(), 3, "hot path: no compute tasks (P6)");
-        assert_eq!(db.enqueued(), 3, "hot path: no write transactions");
-        for info in &page.objects {
-            assert_eq!(info.etag, file_etag(root.path(), info.key.as_ref()));
-        }
-    }
-
-    #[tokio::test]
-    async fn pagination_happens_before_enqueue() {
-        let root = tempfile::tempdir().unwrap();
-        let (store, b) = files_fixture(root.path(), 3);
-        let io = PacedRunner::<etag::Result>::new(1, 8, Duration::ZERO);
-        let db = PacedRunner::<Result<(), Error>>::new(1, 8, Duration::ZERO);
-        let listing = listing_with(
-            root.path(),
-            store.clone(),
-            true,
-            io.clone(),
-            db.clone(),
-            1,
-            DEFAULT_META_BATCH_BYTES,
-        );
-        let page = listing
-            .list(&params(&b, "", None, None, 1), false)
-            .await
-            .unwrap();
-        assert_eq!(page.objects.len(), 1);
-        assert_eq!(io.enqueued(), 1, "only the emitted page is enqueued (P3)");
-        assert_eq!(db.enqueued(), 1);
-        assert!(page.truncated);
-
-        // The second page rolls over with its own single enqueue.
-        let resume = page.next_start_after.unwrap();
-        listing
-            .list(&params(&b, "", None, Some(&resume), 1), false)
-            .await
-            .unwrap();
-        assert_eq!(io.enqueued(), 2);
-    }
-
-    #[tokio::test]
-    async fn io_concurrency_equals_the_workers() {
-        let root = tempfile::tempdir().unwrap();
-        let (store, b) = files_fixture(root.path(), 4);
-        let io = PacedRunner::<etag::Result>::new(2, 8, Duration::from_millis(40));
-        let listing = listing_with(
-            root.path(),
-            store.clone(),
-            true,
-            io.clone(),
-            Arc::new(InlineRunner::default()),
-            DEFAULT_META_BATCH_SIZE,
-            DEFAULT_META_BATCH_BYTES,
-        );
-        listing
-            .list(&params(&b, "", None, None, 1000), false)
-            .await
-            .unwrap();
-        assert_eq!(
-            io.max_in_run(),
-            2,
-            "four tasks over two workers must run two at a time"
-        );
-
-        // A fresh store (the first listing populated the previous one
-        // — a hot list enqueues nothing).
-        let store1 = meta::store(&root.path().join("state1")).unwrap();
-        let io1 = PacedRunner::<etag::Result>::new(1, 8, Duration::from_millis(40));
-        let listing1 = listing_with(
-            root.path(),
-            store1,
-            true,
-            io1.clone(),
-            Arc::new(InlineRunner::default()),
-            DEFAULT_META_BATCH_SIZE,
-            DEFAULT_META_BATCH_BYTES,
-        );
-        listing1
-            .list(&params(&b, "", None, None, 1000), false)
-            .await
-            .unwrap();
-        assert_eq!(io1.max_in_run(), 1, "one worker serializes");
-    }
-
-    #[tokio::test]
-    async fn slow_db_pipeline_backpressures_the_producer() {
-        let root = tempfile::tempdir().unwrap();
-        let (store, b) = files_fixture(root.path(), 3);
-        let db = PacedRunner::<Result<(), Error>>::new(1, 1, Duration::from_millis(150));
-        let listing = listing_with(
-            root.path(),
-            store.clone(),
-            true,
-            Arc::new(InlineRunner::default()),
-            db.clone(),
-            1,
-            DEFAULT_META_BATCH_BYTES,
-        );
-        let started = Instant::now();
-        let page = listing
-            .list(&params(&b, "", None, None, 1000), false)
-            .await
-            .unwrap();
-        let elapsed = started.elapsed();
-        assert_eq!(page.objects.len(), 3);
-        // Capacity 1, one worker: batch 2's enqueue does not block —
-        // the slot frees when the worker dequeues batch 1 (the queue
-        // slot, not the worker, is the backpressure bound). The
-        // enqueue that truly blocks is batch 3's (the slot holds
-        // batch 2 until batch 1's ≈ 150 ms run ends); that block plus
-        // the remaining serial drain meets the elapsed bound below.
-        assert!(
-            elapsed >= Duration::from_millis(250),
-            "the producer must block on the full DB queue: {elapsed:?}"
-        );
-        assert_eq!(store.walk(&b).await.unwrap().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn vanished_file_skips_the_entry() {
-        let root = tempfile::tempdir().unwrap();
-        let (store, b) = files_fixture(root.path(), 1);
-        let io = GatedRunner::<etag::Result>::new(1, 8);
-        let listing = listing_with(
-            root.path(),
-            store.clone(),
-            true,
-            io.clone(),
-            Arc::new(InlineRunner::default()),
-            DEFAULT_META_BATCH_SIZE,
-            DEFAULT_META_BATCH_BYTES,
-        );
-        let listing2 = listing.clone();
-        let b2 = b.clone();
-        let page = tokio::spawn(async move {
-            listing2
-                .list(&params(&b2, "", None, None, 1000), false)
-                .await
-        });
-        wait_for(|| io.enqueued() == 1).await;
-        // The walk is done (the task is parked); delete the file in
-        // the walk-to-hash window.
-        fs::remove_file(root.path().join("data/f00.txt"))
-            .await
-            .unwrap();
-        io.open_gate();
-        let page = page.await.unwrap().unwrap();
-        assert!(
-            page.objects.is_empty(),
-            "the vanished file must be skipped, not fail the page"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn failed_compute_fails_the_list() {
-        let root = tempfile::tempdir().unwrap();
-        let (store, b) = files_fixture(root.path(), 1);
-        let io = GatedRunner::<etag::Result>::new(1, 8);
-        // follow=false: the swapped-in link is REFUSED by the nofollow
-        // open (R3 — PermissionDenied), which must fail the listing. A
-        // follow-enabled listing would instead resolve the dangling
-        // link to NotFound and skip the vanished object (fold_compute's
-        // NotFound short-circuit) — correct snapshot semantics, not the
-        // escape signal this test drives.
-        let listing = listing_with(
-            root.path(),
-            store.clone(),
-            false,
-            io.clone(),
-            Arc::new(InlineRunner::default()),
-            DEFAULT_META_BATCH_SIZE,
-            DEFAULT_META_BATCH_BYTES,
-        );
-        let listing2 = listing.clone();
-        let b2 = b.clone();
-        let page = tokio::spawn(async move {
-            listing2
-                .list(&params(&b2, "", None, None, 1000), false)
-                .await
-        });
-        wait_for(|| io.enqueued() == 1).await;
-        let path = root.path().join("data/f00.txt");
-        fs::remove_file(&path).await.unwrap();
-        symlink(root.path().join("gone"), &path).unwrap();
-        io.open_gate();
-        let err = page.await.unwrap().unwrap_err();
-        assert!(
-            matches!(err, Error::Io(ref e) if e.kind() == ErrorKind::PermissionDenied),
-            "a swapped-in symlink must fail the list: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn lost_batches_error_the_list_and_self_heal_next_pass() {
-        let root = tempfile::tempdir().unwrap();
-        let (store, b) = files_fixture(root.path(), 2);
-        let listing = listing_with(
-            root.path(),
-            store.clone(),
-            true,
-            Arc::new(InlineRunner::default()),
-            Arc::new(LossyRunner),
-            DEFAULT_META_BATCH_SIZE,
-            DEFAULT_META_BATCH_BYTES,
-        );
-        let err = listing
-            .list(&params(&b, "", None, None, 1000), false)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::Pipeline(Dropped)),
-            "a lost batch must fail the list: {err:?}"
-        );
-        assert!(store.walk(&b).await.unwrap().is_empty());
-
-        // The next pass (healthy pipeline) recomputes and persists.
-        let listing = listing_with(
-            root.path(),
-            store.clone(),
-            true,
-            Arc::new(InlineRunner::default()),
-            Arc::new(InlineRunner::default()),
-            DEFAULT_META_BATCH_SIZE,
-            DEFAULT_META_BATCH_BYTES,
-        );
-        let page = listing
-            .list(&params(&b, "", None, None, 1000), false)
-            .await
-            .unwrap();
-        assert_eq!(page.objects.len(), 2);
-        assert_eq!(store.walk(&b).await.unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn composed_etag_kept_by_the_producer_on_identity_less_storage() {
-        let root = tempfile::tempdir().unwrap();
-        let (store, b) = files_fixture(root.path(), 1);
-        let file = root.path().join("data/f00.txt");
-        let metadata = fs::metadata(&file).await.unwrap();
-        let composed = testing::etag("5d41402abc4b2a76b9719d911017c592-2");
-        store
-            .set(
-                &b,
-                &object::key("f00.txt").unwrap(),
-                &composed,
-                metadata.len(),
-                metadata.modified().unwrap(),
-                0,
-            )
-            .await
-            .unwrap();
-        // A touch: same file, mtime pushed forward.
-        let handle = File::options().write(true).open(&file).unwrap();
-        handle
-            .set_modified(metadata.modified().unwrap() + Duration::from_secs(30))
-            .unwrap();
-        drop(handle);
-        let now = fs::metadata(&file).await.unwrap();
-        let listing = listing(root.path(), store.clone(), true);
-        let page = listing
-            .list(&params(&b, "", None, None, 1000), false)
-            .await
-            .unwrap();
-        assert_eq!(page.objects[0].etag, composed);
-        assert!(matches!(page.objects[0].etag, ETag::Composed(_, 2)));
-        // The batch refreshed the entry — the next list is a hit.
-        let record = store
-            .get(&b, &object::key("f00.txt").unwrap())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(record.matches(now.len(), now.modified().unwrap()));
-    }
-
-    #[tokio::test]
-    async fn mtime_preserving_replacement_recomputes_the_etag() {
-        let root = tempfile::tempdir().unwrap();
-        let (store, b) = files_fixture(root.path(), 1);
-        let file = root.path().join("data/f00.txt");
-        let listing = listing(root.path(), store.clone(), true);
-        let page = listing
-            .list(&params(&b, "", None, None, 1000), false)
-            .await
-            .unwrap();
-        assert_eq!(page.objects[0].etag, ETag::from_content(b"payload 0"));
-        // Replace with a NEW file, same size, mtime restored.
-        let metadata = fs::metadata(&file).await.unwrap();
-        let replacement = root.path().join("data/replacement.txt");
-        fs::write(&replacement, b"payload 9").await.unwrap();
-        let handle = OpenOptions::new().write(true).open(&replacement).unwrap();
-        handle.set_modified(metadata.modified().unwrap()).unwrap();
-        drop(handle);
-        fs::rename(&replacement, &file).await.unwrap();
-        let page = listing
-            .list(&params(&b, "", None, None, 1000), false)
-            .await
-            .unwrap();
-        assert_eq!(page.objects[0].etag, ETag::from_content(b"payload 9"));
-    }
-
-    #[tokio::test]
-    async fn page_whose_entries_all_vanish_keeps_the_resume_marker() {
-        // T01: a page whose entries ALL vanished between the walk and
-        // the hash (mass concurrent deletion) still reports the resume
-        // marker — the marker is exclusive-after and needs no live key:
-        // resuming past it either finds the truncation probe (still
-        // live — `truncated` was set by a real key) or an empty
-        // untruncated page, so the sweep terminates either way. The old
-        // F15 guard suppressed the marker over a dead page, which hid
-        // exactly those live keys from the client.
-        let root = tempfile::tempdir().unwrap();
-        let (store, b) = files_fixture(root.path(), 3);
-        let io = GatedRunner::<etag::Result>::new(1, 8);
-        let listing = listing_with(
-            root.path(),
-            store.clone(),
-            true,
-            io.clone(),
-            Arc::new(InlineRunner::default()),
-            DEFAULT_META_BATCH_SIZE,
-            DEFAULT_META_BATCH_BYTES,
-        );
-        let listing2 = listing.clone();
-        let b2 = b.clone();
-        let page =
-            tokio::spawn(
-                async move { listing2.list(&params(&b2, "", None, None, 2), false).await },
-            );
-        wait_for(|| io.enqueued() == 2).await;
-        // Delete every file in the walk-to-hash window.
-        for i in 0..3 {
-            fs::remove_file(root.path().join("data").join(format!("f{i:02}.txt")))
-                .await
-                .unwrap();
-        }
-        io.open_gate();
-        let page = page.await.unwrap().unwrap();
-        assert!(page.objects.is_empty());
-        assert!(
-            page.truncated,
-            "the probe entry set truncation, and it may still be live: {page:?}"
-        );
-        assert_eq!(page.next_start_after.as_deref(), Some("f01.txt"));
-    }
-
-    #[tokio::test]
-    async fn corrupt_entry_self_heals_through_the_producer() {
-        let root = tempfile::tempdir().unwrap();
-        // Corrupt the row BEFORE the store opens (redb's file lock is
-        // exclusive per handle).
-        let state = tempfile::tempdir().unwrap();
-        {
-            let db = database::open(state.path()).unwrap().db;
-            let mut txn = db.begin_write().unwrap();
-            {
-                let mut table = Table::open(&mut txn).unwrap();
-                table
-                    .insert(
-                        ("data", "f00.txt"),
-                        ("not-an-etag", 1, 1, 0, "", "", "", "", "null", 0, false),
-                    )
-                    .unwrap();
-            }
-            txn.commit().unwrap();
-        }
-        let b = bucket::name("data").unwrap();
-        fs::create_dir(root.path().join("data")).await.unwrap();
-        fs::write(root.path().join("data/f00.txt"), b"payload 0")
-            .await
-            .unwrap();
-        let store = meta::store(state.path()).unwrap();
-        let listing = listing(root.path(), store.clone(), true);
-        let page = listing
-            .list(&params(&b, "", None, None, 1000), false)
-            .await
-            .unwrap();
-        assert_eq!(page.objects.len(), 1);
-        assert_eq!(page.objects[0].etag, ETag::from_content(b"payload 0"));
-        // The entry is valid again.
-        assert!(
-            store
-                .get(&b, &object::key("f00.txt").unwrap())
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
     #[tokio::test]
     async fn walk_stream_bucket_dir_vanishing_mid_walk_is_no_such_bucket() {
         // The bucket directory vanishing between stream construction and
@@ -1738,11 +1126,10 @@ mod tests {
         // `read_dir` answers NotFound and the empty relative prefix maps
         // it to NoSuchBucket — never an empty, untruncated 200.
         let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
         let b = bucket::name("data").unwrap();
         create_dir(root.path().join("data")).unwrap();
         write(root.path().join("data/a.txt"), "x").unwrap();
-        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let listing = TestListing::over(root.path(), true);
         let mut stream = listing.walk_files_streaming(&b, "").await.unwrap();
         fs::remove_dir_all(root.path().join("data")).await.unwrap();
         let first = stream.next().await.unwrap();
@@ -1761,9 +1148,8 @@ mod tests {
         // with following enabled (the canonicalize path, F13).
         for follow in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            let state = tempfile::tempdir().unwrap();
             link_directory(&root.path().join("gone-target"), &root.path().join("data"));
-            let listing = listing(root.path(), meta::store(state.path()).unwrap(), follow);
+            let listing = TestListing::over(root.path(), follow);
             let b = bucket::name("data").unwrap();
             // The Ok side is the stream — never Debug — so the error is
             // extracted through `map(|_| ())`.
@@ -1786,7 +1172,6 @@ mod tests {
         // (the files behind it are objects); a cycle (the bucket linked
         // to itself) terminates through the visited set.
         let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
         let b = bucket::name("data").unwrap();
         create_dir_all(root.path().join("data/real/sub")).unwrap();
         write(root.path().join("data/real/sub/x.txt"), "x").unwrap();
@@ -1796,7 +1181,7 @@ mod tests {
         );
         // A self-cycle: the bucket linked to itself.
         link_directory(&root.path().join("data"), &root.path().join("data/cycle"));
-        let listing = listing(root.path(), meta::store(state.path()).unwrap(), true);
+        let listing = TestListing::over(root.path(), true);
         let page = listing
             .list(&params(&b, "", None, None, 1000), false)
             .await

@@ -1,14 +1,19 @@
 //! Object operations of the fs backend (task T042).
 //!
-//! Objects are files under `<root>/<bucket>/`. Writes stream through the
-//! atomic writer (last-write-wins, never a torn object, FR-011); reads
-//! stream with bounded buffers and support byte ranges; ETags come from the
-//! meta store with streaming recompute on missing/stale entries (FR-022).
-//! Folder-marker keys (ending in `/`) never become objects: PUT creates the
-//! directory, GET/HEAD report `NoSuchKey`, DELETE removes an empty
-//! directory and always succeeds. Reserved `.tinio` segments are refused
-//! (FR-020); symlink resolution is rejected when `follow_symlinks` is
-//! disabled.
+//! The bodies themselves are the ops engine's (`tinio_ops`): this module
+//! holds what only this backend can do — the file layer (the path mapping,
+//! the atomic writer, the versioned publish, the copy's inode fast path, the
+//! folder-marker directory) and the adapter steps the engine's plane-free
+//! bodies leave to their caller (the bucket mutation lock, the namespace
+//! probe, the marker branch and the version facts). Objects are files under
+//! `<root>/<bucket>/`; writes stream through the atomic writer
+//! (last-write-wins, never a torn object, FR-011) and reads stream with
+//! bounded buffers and byte ranges; a missing or stale row is healed from
+//! the content (FR-022) by the engine's read path. Folder-marker keys
+//! (ending in `/`) never become objects: PUT creates the directory, GET/HEAD
+//! report `NoSuchKey`, DELETE removes an empty directory and always succeeds.
+//! Reserved `.tinio` segments are refused (FR-020); symlink resolution is
+//! rejected when `follow_symlinks` is disabled.
 
 use std::{
     fs::remove_file,
@@ -27,35 +32,114 @@ use super::{Error, FsStorage};
 /// [`VersionOps::ensure_rename_allowed`] so the rule is never spelled here.
 #[cfg(feature = "versioning")]
 use crate::_core::storage::VersionOps;
+// The row type has one user in every build — the gate's judgement on one
+// stored row (`gated_live`), taken by the un-gated tag answer as well as by
+// the versioning-gated slot resolutions — and two in some: the
+// versioning-gated helpers name it (`resolve_object_slot`'s signature,
+// `info_of`), and the **unix**-gated copy record tail
+// (`commit_staged`/`record_committed`) writes the table directly.
+use crate::_store_redb::object_meta;
+// The copy fast path's record tail (`commit_staged`/`record_committed`) is
+// unix-only — Windows has no kernel copy primitive, so its copy arm is the
+// engine-backed portable route — and these are its imports.
+#[cfg(unix)]
+use crate::{_core::to_nanos, _store_redb::object_part, backend::version::stamp_superseded};
 use crate::{
     _core::{
         BodyStream, ETag, acl,
         acl::{Acl, AclGrants},
         bucket, checksum,
-        multipart::{ObjectPart, part_number},
+        multipart::ObjectPart,
         object::{self, Info, Tags},
         storage,
         storage::{
             ByteRange, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
             TagWriteResult, access_denied, no_such_bucket, no_such_key,
         },
-        to_nanos, version,
+        version,
     },
-    _store_redb::{object_meta, object_part},
-    backend::version::{Publication, Published, stamp_superseded},
+    _ops::StagedBody as EngineStagedBody,
+    backend::version::{Publication, Published},
+    content::FsStaged,
     fsutil,
     meta::{Content, Verdict, gate},
     write::AtomicWriter,
 };
 
-/// The bytes half of an object commit, as
-/// [`FsStorage::publish_object_file`] answers it.
-pub(crate) enum PublishedFile {
-    /// A folder marker: the directory exists and the commit is complete — a
-    /// marker holds no row, so this is the branch's whole answer.
-    Marker(Info),
-    /// A real object: its ETag and the version engine's publish stamp.
-    Object { etag: ETag, published: Published },
+/// The version facts a plane-free engine body cannot fill (G3), as fs's own
+/// rows answer them — with the file stamp the same resolution judged, kept
+/// for the callers that answer with it instead of re-opening the file.
+///
+/// The engine's object bodies serve `version_id: None` and
+/// `bucket_records_versions: false` — the object row carries no version
+/// columns (D37) and the plane-free receiver has no version handle — so the
+/// caller supplies what it already knows: the key's **gated** current slot
+/// (the recorded identity is served only while the content still matches the
+/// row's stamp, F01) and the bucket's versioning state. The stamp rides
+/// beside them because the resolution that produced the two already read it:
+/// the tag write's answer gate (`tag_answer`) judges the row against the very
+/// stamp the pre-step's gate did.
+struct VersionFacts {
+    /// The current version's identity, gated: the null version when the
+    /// recorded identity no longer names the content.
+    version_id: Option<version::Id>,
+    /// Whether the bucket records versions (state enabled or suspended).
+    records_versions: bool,
+    /// The file stamp the resolution read, when it read one. `None` means the
+    /// step resolved no file (an unversioned bucket, a stripped build, or a
+    /// file that was not there) — never "a file it found absent" — so a
+    /// caller that needs a stamp falls back to its own resolve.
+    stamp: Option<FileStamp>,
+}
+
+/// The three facts the staleness gate judges a row against, as the read
+/// paths' own resolution reads them (the already-open handle's stamp).
+#[derive(Clone, Copy)]
+struct FileStamp {
+    /// The file's length in bytes.
+    size: u64,
+    /// The file's modification time.
+    mtime: SystemTime,
+    /// The file's identity (F01).
+    identity: u64,
+}
+
+/// The staleness gate's verdict on one stored row against one file stamp, as
+/// boolean: "the recorded identity still names the content". The one home of
+/// the question every current-slot reader asks — the slot resolution that
+/// answers a read's version facts (`resolve_object_slot_stamped`) and the tag
+/// write's answer gate (`tag_answer`) both take it, so a row the tag write
+/// left is judged by the rule the read judges it by, and the two cannot
+/// disagree about a row the write never touched.
+fn gated_live(row: Option<&object_meta::Stored>, stamp: FileStamp) -> bool {
+    row.is_some_and(|row| {
+        gate(
+            row,
+            Content::Present {
+                size: stamp.size,
+                mtime: stamp.mtime,
+                identity: stamp.identity,
+            },
+        ) == Verdict::Live
+    })
+}
+
+impl VersionFacts {
+    /// The answer for a bucket that records no versions (or a stripped
+    /// build, where no row carries an identity): nothing to patch.
+    fn none() -> Self {
+        Self {
+            version_id: None,
+            records_versions: false,
+            stamp: None,
+        }
+    }
+
+    /// Ride the facts onto one served [`Info`].
+    fn apply(&self, info: &mut Info) {
+        info.version_id = self.version_id.clone();
+        info.bucket_records_versions = self.records_versions;
+    }
 }
 
 /// An empty body stream (a zero-byte object with no range).
@@ -115,63 +199,50 @@ pub(crate) async fn prune_parents(path: &Path, bucket_dir: &Path) {
     }
 }
 
-/// A staged object body: a temp file under `tmp/` (with its streaming
-/// MD5), or the folder-marker sentinel (no body — the commit creates the
-/// directory).
+/// The bytes one fs publish carries — this file layer's own staging value,
+/// **not** the trait's staged body: `ObjectOps::StagedBody` is the engine's
+/// [`tinio_ops::StagedBody`] (spec E8), which owns the streaming and holds
+/// the content plane's own stage ([`FsStaged`], whose drop removes an
+/// uncommitted temp).
 ///
-/// Dropping a staged body that was never committed removes the temp
-/// file: a rejected conditional PUT (412) or an aborted request must not
+/// This value is what the file layer passes inside one commit: the temp file
+/// the staged write left (absent for the folder-marker sentinel, whose commit
+/// creates the directory), the content ETag computed while the body streamed,
+/// and the stage's recorded checksum.
+///
+/// Dropping one that was never committed removes the temp file: a failed
+/// publish (a rejected conditional PUT's 412, an aborted request) must not
 /// leave its full body in `tmp/` for the sweep.
-///
-/// The `ObjectOps::StagedBody` associated type of the fs backend (the
-/// server's two-phase put staging contract); construction happens only
-/// through [`ObjectOps::stage_body`](tinio_core::storage::ObjectOps).
 #[derive(Debug)]
-pub struct StagedBody {
+pub(crate) struct StagedBytes {
     temp: Option<PathBuf>,
     etag: ETag,
-    /// The stage's recorded checksum (spec 2026-08-31): the explicit
-    /// `carried` value when the caller passed one (a version-addressed
-    /// copy's source version — kind included), else the validated
-    /// checksum computed while the body streamed under the server's
-    /// tee slot, recorded under the write path's FULL_OBJECT rule —
-    /// committed as the object's recorded checksum with no re-hashing.
-    /// `None` when the stage fixed neither.
-    checksum: Option<checksum::Recorded>,
 }
 
-impl StagedBody {
+impl StagedBytes {
     /// The content ETag (or the folder-marker sentinel's empty ETag).
     pub(crate) fn etag(&self) -> &ETag {
         &self.etag
     }
 
     /// The staged temp file, if any — consumed by the commit (a dropped
-    /// `StagedBody` then cleans nothing).
+    /// `StagedBytes` then cleans nothing).
     pub(crate) fn into_temp(mut self) -> Option<PathBuf> {
         self.temp.take()
     }
 
-    /// The stage's recorded checksum, when the stage fixed one: the
-    /// explicit carried value, else the tee's streamed digest.
-    pub(crate) fn checksum(&self) -> Option<&checksum::Recorded> {
-        self.checksum.as_ref()
-    }
-
-    /// A staged body from the content contract's chunked stage: the temp
-    /// file (or `None` for the folder-marker sentinel) plus the ETag
-    /// computed while it was written, with no recorded checksum — the
-    /// contract's stage has no checksum channel.
-    pub(crate) fn staged(temp: Option<PathBuf>, etag: ETag) -> Self {
+    /// The staged bytes of a real object: the temp file plus the ETag computed
+    /// while it was written. A folder marker never gets this far — its commit
+    /// is [`FsStorage::commit_marker`]'s.
+    pub(crate) fn staged(temp: PathBuf, etag: ETag) -> Self {
         Self {
-            temp,
+            temp: Some(temp),
             etag,
-            checksum: None,
         }
     }
 }
 
-impl Drop for StagedBody {
+impl Drop for StagedBytes {
     fn drop(&mut self) {
         // Never committed: remove the temp file best-effort (the startup
         // repair would sweep it otherwise). The unlink runs off the
@@ -315,9 +386,10 @@ impl FsStorage {
     /// reported Io (500).
     ///
     /// [`resolve_object_file`](Self::resolve_object_file) is this open plus
-    /// the handle's stamp; the version-addressed read calls it directly on
-    /// the path its own slot resolution already produced, so one request
-    /// never resolves the key twice.
+    /// the handle's stamp, and every read path takes the two together: the
+    /// plain read through the content plane, the version-addressed read
+    /// through the gate's own judgement (the version module's
+    /// `retire_degraded_identity`, which the stripped build does not carry).
     async fn open_object(&self, path: &Path, key: &object::Key) -> Result<File, Error> {
         match fsutil::open_file(path, self.follow_symlinks).await {
             Ok(file) => Ok(file),
@@ -371,173 +443,11 @@ impl FsStorage {
         })
     }
 
-    /// The current object's answer from a slot the version-addressed read
-    /// already resolved: ONE policy open of the resolved path, the shared
-    /// staleness gate applied to the open handle's own facts, and — only
-    /// where the gate degrades the recorded identity — the read path's own
-    /// heal (`ensure_row`, which clears the stale element in the same write
-    /// that rewrites the row). Answers what
-    /// [`resolve_object_info`](Self::resolve_object_info) answers for the
-    /// same state — the open file (the caller's body source), the handle's
-    /// stamp, the row the answer serves, and the gated identity, with the
-    /// path resolution, the row point-read and the gate taken once — except
-    /// the bucket's versioning state, which the version-addressed callers
-    /// read on their own (a version-addressed request runs no write plan,
-    /// and the flag rides the `Info` they build).
-    #[cfg(feature = "versioning")]
-    pub(crate) async fn serve_current(
-        &self,
-        bucket: &bucket::Name,
-        key: &object::Key,
-        path: &Path,
-        stored: &object_meta::Stored,
-    ) -> Result<
-        (
-            File,
-            u64,
-            SystemTime,
-            object_meta::Stored,
-            Option<version::Id>,
-        ),
-        Error,
-    > {
-        let mut file = self.open_object(path, key).await?;
-        let metadata = match file.metadata().await {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                return Err(no_such_key(key).into());
-            }
-            Err(err) => return Err(err.into()),
-        };
-        if metadata.is_dir() {
-            return Err(no_such_key(key).into());
-        }
-        let size = metadata.len();
-        let mtime = metadata.modified()?;
-        // The identity comes from the ALREADY-OPEN handle (R3) — the gate
-        // below judges the file the stream will read, never a second
-        // path-based view of it.
-        let identity = fsutil::file_identity_async(&mut file, &metadata).await;
-        match gate(
-            stored,
-            Content::Present {
-                size,
-                mtime,
-                identity,
-            },
-        ) {
-            // The recorded identity names the content: the row the read path
-            // serves is the judged one (`ensure_row` returns it unchanged on
-            // a match), and its identity is live.
-            Verdict::Live => Ok((file, size, mtime, stored.clone(), stored.version_id.clone())),
-            // The gate degraded the recorded identity: the heal answers the
-            // row (the content-derived ETag, the stale element cleared), and
-            // the degraded slot carries no identity.
-            Verdict::Degraded => {
-                let (row, _) = self
-                    .meta_store
-                    .ensure_row(
-                        bucket,
-                        key,
-                        path,
-                        size,
-                        mtime,
-                        identity,
-                        self.follow_symlinks,
-                        stored.version_id.as_ref(),
-                    )
-                    .await?;
-                Ok((file, size, mtime, row, None))
-            }
-        }
-    }
-
-    /// The stat-only object existence gate of the metadata-only ops
-    /// (`get_object_tags`/`list_object_parts` — the meta row supplies
-    /// the data, the file only proves existence): the
-    /// `resolve_object_file` gate minus the open. Same answers: a
-    /// missing file / folder marker (directory) / reserved key →
-    /// `NoSuchKey`; a symlink leaf under nofollow → `AccessDenied`
-    /// (the policy open's ELOOP answer, R3 — the `object_metadata`
-    /// lstat sees the link itself).
-    pub(crate) async fn ensure_object_file(
-        &self,
-        bucket: &bucket::Name,
-        key: &object::Key,
-    ) -> Result<(), Error> {
-        let bucket_dir = self.ensure_bucket(bucket).await?;
-        if key.is_reserved() {
-            return Err(no_such_key(key).into());
-        }
-        let path = self.resolve_key(&bucket_dir, key).await?;
-        let metadata = match fsutil::object_metadata(&path, self.follow_symlinks).await {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Err(no_such_key(key).into()),
-            Err(err) if err.kind() == ErrorKind::PermissionDenied && !self.follow_symlinks => {
-                return Err(access_denied(key).into());
-            }
-            Err(err) => return Err(err.into()),
-        };
-        if metadata.is_dir() {
-            return Err(no_such_key(key).into());
-        }
-        if !self.follow_symlinks && metadata.file_type().is_symlink() {
-            return Err(access_denied(key).into());
-        }
-        Ok(())
-    }
-
-    /// Resolve the object for a read — the shared head of
-    /// `get_object`/`head_object`: the file resolution plus the ensured
-    /// meta row (the ETag — and the tags/checksum elements the read
-    /// paths serve — against the meta store; spec 2026-08-31), the
-    /// current version identity the response carries, and whether the
-    /// bucket records versions (the state read the answer's
-    /// `Info::bucket_records_versions` carrier needs; the server no
-    /// longer reads it per request). Callers that build no `Info` (the
-    /// version listing's per-key slot resolution) take
-    /// [`Self::resolve_object_slot`] and skip the state read.
-    ///
-    /// The identity is gated (F01's size/mtime/identity rule): the row's
-    /// recorded identifier is served only while the content still matches
-    /// it. An out-of-band edit degrades the current version to the null
-    /// version — a stale identifier is never served as if it still named
-    /// content (the same rule the version adapter's `current` applies, so
-    /// the plain read and the version read never disagree about what is
-    /// current). The gate reads the row **before** `ensure_row`, and hands
-    /// the identity it invalidated to the ensure: the rewrite that answers it
-    /// clears the element in the same write transaction that writes the row
-    /// (`meta::Store::rewrite_preserving`'s `stale`), so one read leaves the
-    /// row already correct — no second write, and the next read can never
-    /// resurrect the identifier. The clear is a compare-and-set on the row
-    /// the rewrite itself read, so a concurrent write that installed a live
-    /// version between the two reads keeps its own identity.
-    pub(crate) async fn resolve_object_info(
-        &self,
-        bucket: &bucket::Name,
-        key: &object::Key,
-    ) -> Result<
-        (
-            File,
-            u64,
-            SystemTime,
-            object_meta::Stored,
-            Option<version::Id>,
-            bool,
-        ),
-        Error,
-    > {
-        // The carrier's state read — one point read on the read paths that
-        // answer an `Info`; the server used to run it per request.
-        let records_versions = self.records_versions(bucket).await?;
-        let (file, size, mtime, row, version_id) = self.resolve_object_slot(bucket, key).await?;
-        Ok((file, size, mtime, row, version_id, records_versions))
-    }
-
-    /// [`Self::resolve_object_info`]'s gate-and-row body, without the
+    /// The key's gated current slot and the row the gate judged, without the
     /// versioning-state read: the version listing resolves each key's
     /// current slot with this (its entries carry no `Info`, so the carrier
     /// would be discarded) and never pays a state read per key.
+    #[cfg(feature = "versioning")]
     pub(crate) async fn resolve_object_slot(
         &self,
         bucket: &bucket::Name,
@@ -552,23 +462,68 @@ impl FsStorage {
         ),
         Error,
     > {
+        let (file, size, mtime, _identity, row, version_id) =
+            self.resolve_object_slot_stamped(bucket, key).await?;
+        Ok((file, size, mtime, row, version_id))
+    }
+
+    /// **The G3 pre-step, its one home**: judge the key's current slot with
+    /// the staleness gate — the rewrite that **clears** an identity the gate
+    /// judged stale — and answer the slot and the stamp it read.
+    ///
+    /// The order this call must keep is the rule's whole point: the engine's
+    /// read-heal writes through the contract's **preserving** write, which
+    /// carries the row's recorded identity over, while this judgement's own
+    /// rewrite clears the identity it judged stale (F01) — so an engine body
+    /// served first would leave the retired identifier inside the refreshed
+    /// row, and the next request would resolve it against content it no
+    /// longer names.
+    ///
+    /// Two addresses take this step, and each keeps its **guard** where its
+    /// own question is asked, because the two questions are not the same:
+    /// [`Self::version_facts`]/[`Self::heal_degraded_identity`] serve "the
+    /// key's current version, whatever it is" — the read and element paths —
+    /// whenever the bucket records versions, while `backend::version`'s
+    /// `retire_degraded_identity` serves the version a request **addresses**,
+    /// only while the slot still names it (the engine serves the current arm
+    /// through its read-heal alone).
+    ///
+    /// The file stamp rides on the answer: the read path's version facts and
+    /// the tag write's answer gate both judge against it, so the element
+    /// pre-step hands it on instead of re-opening the unchanged file
+    /// ([`Self::resolve_object_slot`] is this answer without it).
+    #[cfg(feature = "versioning")]
+    pub(crate) async fn resolve_object_slot_stamped(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<
+        (
+            File,
+            u64,
+            SystemTime,
+            u64,
+            object_meta::Stored,
+            Option<version::Id>,
+        ),
+        Error,
+    > {
         let (path, file, size, mtime, identity) = self.resolve_object_file(bucket, key).await?;
         let judged = self.meta_store.stored_entry(bucket, key).await?;
         // The staleness gate, from its one home in the meta store (the same
         // call the version adapter's `current_with_row` takes): a recorded
         // identity the content no longer matches is stale, and the version
         // adapter reads that state as the null version — the two answer one
-        // verdict, never one each.
-        let matched = judged.as_ref().is_some_and(|stored| {
-            gate(
-                stored,
-                Content::Present {
-                    size,
-                    mtime,
-                    identity,
-                },
-            ) == Verdict::Live
-        });
+        // verdict, never one each. The judgement itself is `gated_live`'s,
+        // shared with the tag write's answer gate.
+        let matched = gated_live(
+            judged.as_ref(),
+            FileStamp {
+                size,
+                mtime,
+                identity,
+            },
+        );
         let stale = if matched {
             None
         } else {
@@ -590,38 +545,7 @@ impl FsStorage {
             )
             .await?;
         let version_id = matched.then(|| row.version_id.clone()).flatten();
-        Ok((file, size, mtime, row, version_id))
-    }
-
-    /// The [`Info`] of one stored row — the 11-field assembly every read
-    /// path that serves one shares (the plain `get`/`head` and the
-    /// version-addressed pair's current slot), so a field change lands
-    /// once. `size` and `mtime` are the caller's own resolution (the
-    /// open file's stamp) and `version_id` the identity its gate left
-    /// live; the row is **moved in**, because every site owns the row its
-    /// resolver answered and the `Info` takes the row's elements — the
-    /// same division [`tinio_store_redb::version::Row::info`] keeps for the
-    /// version rows, whose file size the caller passes likewise.
-    pub(crate) fn info_of(
-        key: &object::Key,
-        size: u64,
-        mtime: SystemTime,
-        row: object_meta::Stored,
-        version_id: Option<version::Id>,
-        records_versions: bool,
-    ) -> Info {
-        Info {
-            key: key.clone(),
-            size,
-            last_modified: mtime,
-            etag: row.etag,
-            tags: row.tags,
-            checksum: row.checksum,
-            owner: row.owner,
-            acl: row.acl,
-            version_id,
-            bucket_records_versions: records_versions,
-        }
+        Ok((file, size, mtime, identity, row, version_id))
     }
 
     /// The unix fast path of the copy primitive: the kernel's
@@ -645,24 +569,12 @@ impl FsStorage {
         acl: &Acl,
         checksum: Option<checksum::Recorded>,
     ) -> Result<Info, Error> {
-        // Folder-marker destination: the sentinel commit (mirrors
-        // `stage_body`'s marker handling) — no bytes are copied.
+        // Folder-marker destination: a marker is a directory, and its commit
+        // is the marker branch's (`commit_marker`, the same one the ops
+        // adapter takes) — no bytes are copied and the
+        // tags/owner/acl/checksum params are accept-and-dropped.
         if dst_key.is_folder_marker() {
-            return self
-                .commit_staged(
-                    dst_bucket,
-                    dst_key,
-                    StagedBody {
-                        temp: None,
-                        etag: ETag::EMPTY,
-                        checksum: None,
-                    },
-                    tags,
-                    owner,
-                    acl,
-                    checksum,
-                )
-                .await;
+            return self.commit_marker(dst_bucket, dst_key).await;
         }
         let (path, file, size, mtime, identity) =
             self.resolve_object_file(src_bucket, src_key).await?;
@@ -710,11 +622,7 @@ impl FsStorage {
         self.commit_staged(
             dst_bucket,
             dst_key,
-            StagedBody {
-                temp: Some(temp),
-                etag,
-                checksum: None,
-            },
+            StagedBytes::staged(temp, etag),
             tags,
             owner,
             acl,
@@ -723,22 +631,27 @@ impl FsStorage {
         .await
     }
 
-    /// The bytes half of an object commit: under the bucket mutation lock,
-    /// either create the folder-marker directory or publish the staged temp
+    /// The bytes half of a **real object's** commit: publish the staged temp
     /// with the version engine's rename (its supersede commits the outgoing
     /// version's row BEFORE the rename) and apply the unix ownership
-    /// hardening. The row describing the bytes is
-    /// [`Self::record_committed`]'s — [`Self::commit_staged`] calls both,
-    /// while the content contract's `publish` calls only this (publish is
-    /// the visibility point; nothing observes a half-published object).
+    /// hardening, answering the staged ETag and the publish's own stamp. The
+    /// row describing the bytes is [`Self::record_committed`]'s —
+    /// [`Self::commit_staged`] calls both, while the content contract's
+    /// `publish` calls only this (publish is the visibility point; nothing
+    /// observes a half-published object).
+    ///
+    /// A folder marker never reaches here: it is a directory, not a staged
+    /// temp, and its commit is [`Self::commit_marker`]'s — taken by every
+    /// caller before the publish (the ops engine's `commit_object` adapter,
+    /// the content plane's `publish`, the copy fast path).
     pub(crate) async fn publish_object_file(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-        staged: StagedBody,
+        staged: StagedBytes,
         owner: Option<&acl::OwnerId>,
         publication: Publication,
-    ) -> Result<PublishedFile, Error> {
+    ) -> Result<(ETag, Published), Error> {
         // The owner is the unix dir/object hardening input only.
         #[cfg(not(unix))]
         let _ = owner;
@@ -749,55 +662,9 @@ impl FsStorage {
         // followed bucket symlink retargeted between stage and rename
         // must not send the write to a stale target).
         let etag = staged.etag().clone();
-        // Folder markers are never objects (s3-surface.md): PUT creates
-        // the directory, idempotently. Under the mutation lock with the
-        // same guards as a real object — a concurrent delete_bucket must
-        // not be resurrected, and the symlink policy applies to markers
-        // too. Markers hold no row: the tags/owner/acl/checksum params
-        // are accept-and-dropped here.
-        if key.is_folder_marker() {
-            #[cfg(unix)]
-            use crate::fsutil::DirOwnerUid;
-            #[cfg(not(unix))]
-            use crate::fsutil::DirOwnerUid;
-
-            let _guard = self.lock_bucket_mutations(bucket).await;
-            let bucket_dir = self.ensure_bucket(bucket).await?;
-            let target = self.resolve_key(&bucket_dir, key).await?;
-            // The unix dir hardening (spec 2026-09-05 §5a): the marker
-            // dir is bucket content — `0700`, chowned to the bucket
-            // owner's mapped uid.
-            #[cfg(unix)]
-            let dir_owner_uid = self.bucket_owner_uid(bucket).await;
-            fsutil::ensure_dir(
-                &target,
-                #[cfg(unix)]
-                DirOwnerUid(dir_owner_uid),
-                #[cfg(not(unix))]
-                DirOwnerUid,
-            )
-            .await?;
-            let mtime = fs::metadata(&target).await?.modified()?;
-            // The marker's answer still carries the bucket's versioning
-            // state (the server's identity rule reads it off the `Info`):
-            // this branch never runs a write plan, so the state is read
-            // here — the one point read the marker path pays.
-            let records_versions = self.records_versions(bucket).await?;
-            return Ok(PublishedFile::Marker(Info {
-                key: key.clone(),
-                size: 0,
-                last_modified: mtime,
-                etag,
-                tags: Tags::empty(),
-                checksum: None,
-                owner: None,
-                acl: Acl::default_private(None),
-                version_id: None,
-                bucket_records_versions: records_versions,
-            }));
-        }
-        // A real object always arrives with a staged temp (the marker
-        // branch above consumed the sentinel).
+        // A real object always arrives with a staged temp: the folder-marker
+        // sentinel is the callers' branch (`commit_marker`) and never gets
+        // here.
         let Some(temp) = staged.into_temp() else {
             return Err(IoError::other("staged body without a temp file").into());
         };
@@ -840,7 +707,203 @@ impl FsStorage {
             let _ = fs::remove_file(&published.path).await;
             return Err(err.into());
         }
-        Ok(PublishedFile::Object { etag, published })
+        Ok((etag, published))
+    }
+
+    /// The folder-marker commit: PUT on a key ending in `/` creates the
+    /// directory, idempotently, under the same guards a real object's commit
+    /// runs under — the bucket mutation lock (a concurrent `delete_bucket`
+    /// must not be resurrected) and the symlink policy (a marker under a
+    /// linked parent must not create a directory outside the root).
+    ///
+    /// A marker holds no row and no content: the tags/owner/acl/checksum the
+    /// commit params carry are accept-and-dropped, and the answer's
+    /// `last_modified` is the **directory's own mtime** (D2) — the engine's
+    /// body answers the wall clock for the marker branch it owns, which no fs
+    /// caller may reach.
+    ///
+    /// The marker's answer still carries the bucket's versioning state (the
+    /// server's identity rule reads it off the `Info`): no write plan runs
+    /// here, so the state is read — the one point read the marker path pays.
+    pub(crate) async fn commit_marker(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<Info, Error> {
+        #[cfg(unix)]
+        use crate::fsutil::DirOwnerUid;
+        #[cfg(not(unix))]
+        use crate::fsutil::DirOwnerUid;
+
+        let _guard = self.lock_bucket_mutations(bucket).await;
+        let bucket_dir = self.ensure_bucket(bucket).await?;
+        let target = self.resolve_key(&bucket_dir, key).await?;
+        // The unix dir hardening (spec 2026-09-05 §5a): the marker dir is
+        // bucket content — `0700`, chowned to the bucket owner's mapped uid.
+        #[cfg(unix)]
+        let dir_owner_uid = self.bucket_owner_uid(bucket).await;
+        fsutil::ensure_dir(
+            &target,
+            #[cfg(unix)]
+            DirOwnerUid(dir_owner_uid),
+            #[cfg(not(unix))]
+            DirOwnerUid,
+        )
+        .await?;
+        let mtime = fs::metadata(&target).await?.modified()?;
+        let records_versions = self.records_versions(bucket).await?;
+        Ok(Info {
+            key: key.clone(),
+            size: 0,
+            last_modified: mtime,
+            etag: ETag::EMPTY,
+            tags: Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
+            version_id: None,
+            bucket_records_versions: records_versions,
+        })
+    }
+
+    /// The version facts a read must supply (G3): the bucket's state and, for
+    /// a bucket that records versions, the key's gated current identity —
+    /// plus the file stamp the same resolution read, which the callers that
+    /// answer with it take from here rather than re-open the file for it.
+    ///
+    /// The address this entry serves is "the key's current version, whatever
+    /// it is", and its guard is the bucket's state: a bucket whose state
+    /// reads `Unversioned` needs no step at all — a row only ever receives an
+    /// identity from a write that saw a versioning state, and no API path
+    /// sets a bucket back to `Unversioned` — so the common (unversioned) read
+    /// pays one state read, the same point read the pre-engine read path paid
+    /// for its `Info` carrier. The step itself, and why it must run before
+    /// the engine body, is [`Self::resolve_object_slot_stamped`]'s.
+    #[cfg(feature = "versioning")]
+    async fn version_facts(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<VersionFacts, Error> {
+        let records_versions = self.records_versions(bucket).await?;
+        if !records_versions {
+            return Ok(VersionFacts::none());
+        }
+        let (_file, size, mtime, identity, _row, version_id) =
+            self.resolve_object_slot_stamped(bucket, key).await?;
+        Ok(VersionFacts {
+            version_id,
+            records_versions,
+            stamp: Some(FileStamp {
+                size,
+                mtime,
+                identity,
+            }),
+        })
+    }
+
+    /// The same facts in a `versioning`-less build: the state is always
+    /// `Unversioned` there (no row can carry an identity), so the answer is
+    /// the empty one and no read rides.
+    #[cfg(not(feature = "versioning"))]
+    async fn version_facts(
+        &self,
+        _bucket: &bucket::Name,
+        _key: &object::Key,
+    ) -> Result<VersionFacts, Error> {
+        Ok(VersionFacts::none())
+    }
+
+    /// The version fields a tag write answers (G3): the row the write left,
+    /// gated against the object file's own stamp (the pre-engine body's rule —
+    /// an identity whose content no longer matches is not served), plus the
+    /// bucket's state.
+    ///
+    /// The file's absence is the caller's to read: `put_object_tags` fails
+    /// with `NoSuchKey` (the object must be there), while
+    /// `delete_object_tags` answers the null identity (a lenient delete names
+    /// nothing).
+    ///
+    /// The carrier flag is read **after** the element write, in its own point
+    /// read, where the pre-engine body read the row and the state in the
+    /// write's own transaction: a versioning-state flip landing between the two
+    /// can make this answer report the new state instead of the one the write
+    /// saw. The window is a state flip racing a tag write — the flip takes the
+    /// bucket mutation lock and the tag write takes none, exactly as before —
+    /// and the flag only decides whether the answer carries a version-id
+    /// member, so a client in that window sees the state it just set rather
+    /// than a stale one. The row is read here too, and must be: it is the row
+    /// the write left, not the one the pre-step judged.
+    ///
+    /// The file stamp, in contrast, is the pre-step's own (`facts`) whenever
+    /// the step resolved one: the tag write touches the element only, so the
+    /// file's stamp is the same one a post-write open would read — bar a
+    /// concurrent writer replacing the bytes, whose own answer the pre-engine
+    /// body's second resolve could report just as well. The fallback arms are
+    /// the buckets and builds whose pre-step resolves no file: an
+    /// unversioned bucket, a `versioning`-less build, and a file the step did
+    /// not find (its `NoSuchKey` is the caller's to answer), each re-resolving
+    /// here exactly as before.
+    async fn tag_answer(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        facts: &VersionFacts,
+    ) -> Result<TagWriteResult, Error> {
+        let records_versions = self.records_versions(bucket).await?;
+        let FileStamp {
+            size,
+            mtime,
+            identity,
+        } = match facts.stamp {
+            Some(stamp) => stamp,
+            None => {
+                let (_path, _file, size, mtime, identity) =
+                    self.resolve_object_file(bucket, key).await?;
+                FileStamp {
+                    size,
+                    mtime,
+                    identity,
+                }
+            }
+        };
+        let row = self.meta_store.stored_entry(bucket, key).await?;
+        // The gate's judgement, from its one home (`gated_live`) — the same
+        // call the slot resolution that carried this stamp makes, so the two
+        // answer one verdict for one row.
+        let live = gated_live(
+            row.as_ref(),
+            FileStamp {
+                size,
+                mtime,
+                identity,
+            },
+        );
+        Ok(TagWriteResult {
+            version_id: live.then(|| row.and_then(|row| row.version_id)).flatten(),
+            bucket_records_versions: records_versions,
+        })
+    }
+
+    /// [`Self::version_facts`] with the missing-file arm answered here: an
+    /// element path whose key has no file takes the engine body as its answer
+    /// — tagging a key that is not there is `NoSuchKey`, and deleting its
+    /// tags is the idempotent success — because the gate's judgement needs a
+    /// file to hash. The step itself is the one `version_facts` runs
+    /// ([`Self::resolve_object_slot_stamped`]); the returned facts are the
+    /// caller's to carry where it answers with them (the tag pair's
+    /// `tag_answer` gates against the stamp this step already read), and an
+    /// element read that carries no stamp of its own drops them.
+    async fn heal_degraded_identity(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<VersionFacts, Error> {
+        match self.version_facts(bucket, key).await {
+            Ok(facts) => Ok(facts),
+            Err(Error::Storage(storage::Error::NoSuchKey(_))) => Ok(VersionFacts::none()),
+            Err(err) => Err(err),
+        }
     }
 
     /// The bytes half of an object rename: resolve the live source (a
@@ -903,40 +966,36 @@ impl FsStorage {
         Ok((src_path, size, mtime, identity))
     }
 
-    /// The shared commit tail of the object write paths (`commit_object`
-    /// and the copy primitives): atomically publish a staged body onto
+    /// The **copy fast path's** commit tail (the portable arm and the
+    /// engine-backed `commit_object` path do not use it): atomically publish a
+    /// staged body onto
     /// `key` under the mutation lock (the same re-checks and guards as a
     /// plain commit), then write the object's `OBJECT_META` entry — the
     /// interface-validated `tags`, the caller's `owner`/`acl` (the owner
     /// rides its own row element; the stored ACL holds the grant set
     /// only — `Stored.acl.owner` stays `None` by construction) and the
-    /// recorded `checksum` (the FULL_OBJECT tee digest of a plain
-    /// commit, or the copy's carried value — kind included) ride in the
-    /// same row — and remove any stale `OBJECT_PARTS` rows of the key in
+    /// recorded `checksum` (the copy's carried value — kind included) rides
+    /// in the same row — and remove any stale `OBJECT_PARTS` rows of the key in
     /// ONE write transaction (a fresh object is single-part:
     /// overwriting a previously multipart-completed object must not
     /// leave its parts behind). Returns the committed object metadata.
+    #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     async fn commit_staged(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-        staged: StagedBody,
+        staged: StagedBytes,
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
         checksum: Option<checksum::Recorded>,
     ) -> Result<Info, Error> {
-        // The bytes half: the marker branch's answer is complete (a marker
-        // holds no row), while a real object's publish stamp is what the row
-        // below records.
-        let (etag, published) = match self
+        // The bytes half: the publish's own stamp is what the row below
+        // records.
+        let (etag, published) = self
             .publish_object_file(bucket, key, staged, owner, Publication::Versioned)
-            .await?
-        {
-            PublishedFile::Marker(info) => return Ok(info),
-            PublishedFile::Object { etag, published } => (etag, published),
-        };
+            .await?;
         // The object is committed. The stale-part removal and the
         // outgoing version's stamp ride in the same transaction; what a
         // meta-write failure means is decided below (I7). The guard the
@@ -1006,6 +1065,7 @@ impl FsStorage {
     /// (I7, the 2026-10-06 review) and fails, while an unversioned write
     /// keeps FR-022's best-effort rule — its entry self-heals on the next
     /// read and the failure is warned.
+    #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     async fn record_committed(
         &self,
@@ -1062,12 +1122,37 @@ impl FsStorage {
     }
 }
 
+// The object group: every body is the ops engine's (`tinio_ops`), called from
+// here with the adapter steps only this backend can take.
+//
+// What stays fs-side, and why:
+//
+// - the **bucket mutation lock**: the trait impl takes it around each
+//   mutating body, the same critical section the pre-engine bodies held (the
+//   receiver's content plane is the non-owning one, so nothing inside takes
+//   the lock a second time — it is not re-entrant);
+// - the **file layer** ([`StagedBytes`], `publish_object_file`,
+//   `move_object_file`, the copy's inode fast path, the versioned publish in
+//   `backend::version`), which is what the content plane composes;
+// - the **folder-marker branch** (D2): a marker is this crate's directory
+//   namespace and its `last_modified` is the directory's mtime, which the
+//   engine's marker branch (a wall clock) cannot answer;
+// - the **version facts** (G3): the engine's plane-free bodies serve
+//   `version_id: None` / `bucket_records_versions: false`, so the adapter
+//   fills them from this backend's own rows;
+// - the **guards**: `VersionOps::ensure_rename_allowed`, the reserved and
+//   marker destination checks, the namespace probe, and every error variant
+//   with its projection.
 #[async_trait::async_trait]
 impl ObjectOps for FsStorage {
-    /// A staged body: a temp file under `tmp/` (with its streaming MD5),
-    /// or the folder-marker sentinel (no body — the commit creates the
-    /// directory). Dropping an uncommitted staged body removes the temp.
-    type StagedBody = StagedBody;
+    /// The trait's staged body is the engine's (spec E8): this crate's content
+    /// plane supplies the stage ([`FsStaged`] — a temp file under `tmp/`, or
+    /// the folder-marker sentinel) and the engine owns everything else.
+    ///
+    /// Dropping an uncommitted staged body removes the temp file through the
+    /// stage's own drop: a rejected conditional PUT (412) or an aborted
+    /// request must not leave its full body in `tmp/` for the sweep.
+    type StagedBody = EngineStagedBody<FsStaged>;
 
     async fn stage_body(
         &self,
@@ -1076,61 +1161,107 @@ impl ObjectOps for FsStorage {
         body: BodyStream,
         tee: Option<Arc<checksum::PartChecksum>>,
         carried: Option<checksum::Recorded>,
-    ) -> Result<StagedBody, Error> {
-        let bucket_dir = self.ensure_bucket(bucket).await?;
-        // Symlink policy applies to markers too — a PUT `sub/dir/` whose
-        // parent is a link must not create a directory outside the root.
-        // The resolution is a validation gate here (commit re-resolves).
-        self.resolve_key(&bucket_dir, key).await?;
-        // Folder markers are never objects (s3-surface.md): no body is
-        // staged — the commit creates the directory. The sentinel
-        // carries the marker's empty-content ETag (and no tee digest —
-        // no bytes streamed).
-        if key.is_folder_marker() {
-            return Ok(StagedBody {
-                temp: None,
-                etag: ETag::EMPTY,
-                checksum: None,
-            });
-        }
-        // `tee` is the server's checksum slot (spec 2026-08-31 — the
-        // `upload_part` pattern): the interface wraps the body when the
-        // client sent a single `x-amz-checksum-*` header, the digest is
-        // computed while the body streams, a mismatch fails the staging
-        // as the tee's stream error (propagated here like any body
-        // failure — the fs adds no error of its own), and the validated
-        // digest rides into the commit as FULL_OBJECT (the write path's
-        // kind). Absent, no digest is computed. `carried` — a
-        // version-addressed copy's source version checksum, kind
-        // included — wins over the streamed digest.
-        let (temp, etag, _size) = self.writer.stage(body, tee.as_deref()).await?;
-        let computed = tee.as_ref().and_then(|c| c.digest.get()).cloned();
-        Ok(StagedBody {
-            temp: Some(temp),
-            etag,
-            checksum: carried.or(computed.map(|part| checksum::Recorded {
-                part,
-                kind: checksum::Type::FullObject,
-            })),
-        })
+    ) -> Result<Self::StagedBody, Error> {
+        // The engine owns the streaming: the stage opens through the content
+        // plane (which applies the bucket existence, the path mapping and the
+        // symlink policy before a byte moves — the checks the pre-engine body
+        // ran first, from the same calls), the content MD5 the commit records
+        // is computed while the body streams, and the tee's digest rides in
+        // under the write path's FULL_OBJECT rule. `carried` — a
+        // version-addressed copy's source checksum, kind included — wins over
+        // the streamed digest.
+        self.objects()
+            .stage_body(bucket, key, body, tee, carried)
+            .await
+            .map_err(Error::from)
     }
 
+    /// The mutation phase: publish the staged bytes at `key` and record the
+    /// row describing them.
+    ///
+    /// Two adapter steps decide which engine body runs:
+    ///
+    /// - a folder-marker key takes this crate's own branch (D2): the marker is
+    ///   the directory namespace and its `last_modified` is the **directory's
+    ///   mtime** — an engine answer of the wall clock must never reach the
+    ///   wire for fs;
+    /// - a bucket that records versions takes the version-creating shape
+    ///   (`put_object_versioned`, RI3), which supersedes the outgoing version,
+    ///   publishes, writes the object row **and its cleared retained part
+    ///   list** and then advances the current slot. Steps 4 and 5 are two
+    ///   transactions — accepted as such (RI3): the contract exposes no single
+    ///   call that writes the object row and moves the slot, and a crash
+    ///   between them leaves a superseded version's parts uncleared, a stale
+    ///   retained list rather than a lost object, for the repair pipeline.
+    ///
+    /// The bucket mutation lock spans the whole body: the supersede's rows,
+    /// the rename and the row write are one critical section against a
+    /// concurrent `delete_bucket`, exactly as the pre-engine commit held it
+    /// (the receiver's content plane is the non-owning one, so the publish
+    /// inside rides this lock instead of taking it again).
+    ///
+    /// fs's `MetadataFailure` is `Warn` (RI2): a row write refused after the
+    /// publish is logged and the answer is still the committed object — the
+    /// next read heals the row — and the published bytes are never taken back.
     async fn commit_object(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-        staged: StagedBody,
+        staged: Self::StagedBody,
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
     ) -> Result<Info, Error> {
-        // The stage's recorded checksum — the carried value or the tee
-        // digest, kind included — fixed by `stage_body`.
-        let checksum = staged.checksum().cloned();
-        self.commit_staged(bucket, key, staged, tags, owner, acl, checksum)
-            .await
+        if key.is_folder_marker() {
+            return self.commit_marker(bucket, key).await;
+        }
+        let _guard = self.lock_bucket_mutations(bucket).await;
+        // Ownership is decided on the temp, before any version moves. A
+        // failed chown drops the stage and leaves the current version in
+        // place; the publish's rename keeps the uid.
+        #[cfg(unix)]
+        if let Some(uid) = self.owner_uid(owner) {
+            staged.staged().chown_temp(uid).await?;
+        }
+        let info = {
+            #[cfg(feature = "versioning")]
+            {
+                let plane = self.version_plane(bucket);
+                self.objects()
+                    .put_object_versioned(&plane, bucket, key, staged, tags, owner, acl)
+                    .await
+                    .map_err(Error::from)?
+            }
+            #[cfg(not(feature = "versioning"))]
+            {
+                self.objects()
+                    .commit_object(bucket, key, staged, tags, owner, acl)
+                    .await
+                    .map_err(Error::from)?
+            }
+        };
+        Ok(info)
     }
 
+    /// Server-side copy of `src` into `dst` (S3 CopyObject).
+    ///
+    /// The copy keeps this crate's own byte route — the contract's
+    /// `copy_object` doc spells the override out ("a backend may override with
+    /// a filesystem-level copy"): on unix the kernel's `copy_file_range` moves
+    /// the source into the staged temp with no userspace buffering, the
+    /// source's single-form ETag is reused while the file is provably
+    /// unchanged (a mid-copy change is caught by the torn-copy guard), and the
+    /// carried checksum rides the same guard. The engine's content-side copy
+    /// is the contract's portable read-and-publish route, which would give
+    /// every same-filesystem copy a full userspace pass.
+    ///
+    /// The portable arm (no kernel copy primitive) is the contract's own
+    /// default shape over this backend's stage/commit pair, which is
+    /// engine-backed: read the source through the plain read, stage the
+    /// destination carrying the caller's checksum, commit it with the caller's
+    /// tags/owner/ACL. A copy is a fresh object either way — it inherits
+    /// neither the source's retained parts nor its owner/ACL, and its mtime is
+    /// the copy time.
     #[allow(clippy::too_many_arguments)]
     async fn copy_object(
         &self,
@@ -1152,18 +1283,11 @@ impl ObjectOps for FsStorage {
         }
         #[cfg(not(unix))]
         {
-            // No kernel copy primitive on Windows — stream the source
-            // through the body contract (get → stage → commit). The
-            // commit tail is the shared `commit_staged` so the copy's
-            // owner/ACL (the caller's — a copy never inherits the
-            // source's) and `checksum` (kind included) are recorded and
-            // the destination never inherits the source's retained
-            // parts.
             let get = self.get_object(src_bucket, src_key, None).await?;
             let staged = self
-                .stage_body(dst_bucket, dst_key, get.body, None, None)
+                .stage_body(dst_bucket, dst_key, get.body, None, checksum)
                 .await?;
-            self.commit_staged(dst_bucket, dst_key, staged, tags, owner, acl, checksum)
+            self.commit_object(dst_bucket, dst_key, staged, tags, owner, acl)
                 .await
         }
     }
@@ -1174,70 +1298,66 @@ impl ObjectOps for FsStorage {
         key: &object::Key,
         range: Option<ByteRange>,
     ) -> Result<GetObjectResult, Error> {
-        let (file, size, mtime, row, version_id, records_versions) =
-            self.resolve_object_info(bucket, key).await?;
-        let (body, served_range) = Self::object_body(file, size, range).await?;
-        Ok(GetObjectResult {
-            info: Self::info_of(key, size, mtime, row, version_id, records_versions),
-            body,
-            served_range,
-        })
+        // The namespace probe first: fs has always answered `NoSuchBucket` for
+        // a key in a bucket that is not there, while the content plane's own
+        // `stat` answers "no key" for an absent namespace (it swallows the
+        // missing bucket so a bucket-scoped probe stays total).
+        self.ensure_bucket(bucket).await?;
+        // The version facts (G3) are read **before** the engine body: the
+        // step's heal clears a stale recorded identity, and the engine's own
+        // heal preserves it, so an order with the engine first would leave the
+        // stale identifier in the row for the next read to resurrect.
+        let facts = self.version_facts(bucket, key).await?;
+        let mut got = self
+            .objects()
+            .get_object(bucket, key, range)
+            .await
+            .map_err(Error::from)?;
+        facts.apply(&mut got.info);
+        Ok(got)
     }
 
     async fn head_object(&self, bucket: &bucket::Name, key: &object::Key) -> Result<Info, Error> {
-        // The open is the metadata source too (the same merge as
-        // get_object) — the handle is dropped right away.
-        let (_file, size, mtime, row, version_id, records_versions) =
-            self.resolve_object_info(bucket, key).await?;
-        Ok(Self::info_of(
-            key,
-            size,
-            mtime,
-            row,
-            version_id,
-            records_versions,
-        ))
+        // The same two adapter steps as the get, without the body.
+        self.ensure_bucket(bucket).await?;
+        let facts = self.version_facts(bucket, key).await?;
+        let mut info = self
+            .objects()
+            .head_object(bucket, key)
+            .await
+            .map_err(Error::from)?;
+        facts.apply(&mut info);
+        Ok(info)
     }
 
-    /// Limitation: a rename has no versioning semantics — it would move one
-    /// key's file and row while the source key's version rows stay behind
-    /// (orphaning the source's version chain) and the destination's current
-    /// version is replaced without being superseded. The contract states the
-    /// rule ([`ObjectOps::rename_object`]) and the shared guard owns it
-    /// ([`VersionOps::ensure_rename_allowed`](crate::_core::storage::VersionOps::ensure_rename_allowed)):
-    /// a bucket that versions
-    /// anything (enabled or suspended) refuses with the contract's
-    /// `AccessDenied` class, and an unversioned bucket renames exactly as
-    /// before.
+    /// Rename `src` to `dst` (S3 RenameObject).
+    ///
+    /// The guards run first, exactly as they always have: a degenerate
+    /// self-move is the head (the interface answers 412 before calling, and a
+    /// read-then-move would delete the bytes), a bucket that records versions
+    /// refuses the key-moving operation (`VersionOps::ensure_rename_allowed`
+    /// — the engine's plane-free body cannot consult the version handles), a
+    /// reserved destination is refused like every other write (FR-020) and a
+    /// marker destination cannot hold an object.
+    ///
+    /// The bucket mutation lock then spans the engine body: the file move and
+    /// the state move are one critical section against a concurrent
+    /// `delete_bucket`. The engine moves the bytes by `ObjectContent::rename`
+    /// (the destination's parent chain, the unix dir hardening and the
+    /// directory sync are this crate's `move_object_file`) and the metadata by
+    /// `ObjectMeta::move_`, one contract call each — the row, its retained
+    /// parts and the source's metadata move together.
     async fn rename_object(
         &self,
         bucket: &bucket::Name,
         src: &object::Key,
         dst: &object::Key,
     ) -> Result<Info, Error> {
-        // A rename is a bucket-mutating pair (file move + state move):
-        // one critical section against `delete_bucket` — a concurrent
-        // delete must not remove a bucket a rename just wrote into. The
-        // file move and the row migration are the same rename semantics
-        // as every other write: file first (atomic), then the single
-        // all-or-nothing state transaction (a crash in between self-heals
-        // — the destination's row is recomputed on the next read).
         if src == dst {
-            // Degenerate — the interface answers 412 before calling; a
-            // backend-level guard keeps the move idempotent.
             return self.head_object(bucket, src).await;
         }
-        // The rename guard, from its one home in the contract: a bucket
-        // that records versions refuses the key-moving operation instead
-        // of corrupting. The shared leg's versioning tripwire fails a
-        // backend that skips the call.
         #[cfg(feature = "versioning")]
         self.ensure_rename_allowed(bucket, dst).await?;
-        // A reserved destination is never a legal rename target (FR-020
-        // — a write through the reserved segment, refused like every
-        // other write path); a marker destination cannot hold an object
-        // (mirror `complete_multipart_upload`'s refusal). A reserved or
-        // marker source is never an object — `NoSuchKey` like head.
         if dst.is_reserved() {
             return Err(access_denied(dst).into());
         }
@@ -1245,108 +1365,10 @@ impl ObjectOps for FsStorage {
             return Err(storage::invalid_key(dst.to_string()).into());
         }
         let _guard = self.lock_bucket_mutations(bucket).await;
-        // The source must be a live object (a marker source is never an
-        // object — `NoSuchKey` like head), and the move is the shared bytes
-        // half.
-        let (src_path, size, mtime, identity) = self.move_object_file(bucket, src, dst).await?;
-        // The source's row is ensured before the move (a hand-dropped
-        // source gets its etag healed — the moved row must be complete).
-        let (ensured, _) = self
-            .meta_store
-            .ensure_row(
-                bucket,
-                src,
-                &src_path,
-                size,
-                mtime,
-                identity,
-                self.follow_symlinks,
-                None,
-            )
-            .await?;
-        // The state move in ONE transaction: the src `OBJECT_META` row →
-        // dst (metadata — mtime, tags, checksum, owner, ACL — moves with
-        // the record, a rename is not a fresh object), the src
-        // `OBJECT_PARTS` rows → dst, and the dst's own stale parts rows
-        // removed (an overwritten destination's part list dies). A
-        // missing src row (a concurrent delete_object removed it between
-        // the ensure and here) leaves the dst file to self-heal —
-        // nothing to migrate.
-        let migrated: Option<(
-            ETag,
-            Tags,
-            Option<checksum::Recorded>,
-            Option<acl::OwnerId>,
-            Acl,
-        )> = {
-            let bucket = bucket.clone();
-            let src = src.clone();
-            let dst = dst.clone();
-            self.handle
-                .write(move |txn| {
-                    // The meta-row half: read the src row, remove it, and
-                    // re-insert it under dst (metadata — mtime, tags,
-                    // checksum, owner, ACL — moves with the record; the
-                    // whole 8-element row copies, nothing is
-                    // destructured away). One handle per table per
-                    // transaction (redb refuses a second open of one
-                    // table in a transaction) — the two halves run in
-                    // separate scopes.
-                    let row = {
-                        let mut object_meta = object_meta::Table::open(txn)?;
-                        let Some(row) = object_meta.get(&bucket, &src)? else {
-                            return Ok(None);
-                        };
-                        object_meta.remove(&bucket, &src)?;
-                        object_meta.put(&bucket, &dst, &row)?;
-                        row
-                    };
-                    // The parts rows migrate with the record: list the
-                    // src's rows, clear the dst's stale rows, re-key
-                    // under dst, drop the src's (one table handle serves
-                    // the read and the writes).
-                    let mut parts = object_part::Table::open(txn)?;
-                    let rows = parts.list(&bucket, &src)?;
-                    // Both range deletes precede the inserts — a redb
-                    // 4.2.0 debug build asserts when an insert precedes
-                    // another key's range delete in one transaction.
-                    parts.remove_key(&bucket, &dst)?;
-                    parts.remove_key(&bucket, &src)?;
-                    for row in rows {
-                        parts.put(&bucket, &dst, &row)?;
-                    }
-                    Ok(Some((row.etag, row.tags, row.checksum, row.owner, row.acl)))
-                })
-                .await
-                .map_err(Error::from)?
-        };
-        let (etag, tags, checksum, owner, acl) = match migrated {
-            Some((etag, tags, checksum, owner, acl)) => (etag, tags, checksum, owner, acl),
-            // No row to migrate (a concurrent delete): the ensured etag
-            // describes the moved file; the row self-heals on the next
-            // read.
-            None => (
-                ensured.etag,
-                ensured.tags,
-                ensured.checksum,
-                ensured.owner,
-                ensured.acl,
-            ),
-        };
-        Ok(Info {
-            key: dst.clone(),
-            size,
-            last_modified: mtime,
-            etag,
-            tags,
-            checksum,
-            owner,
-            acl,
-            version_id: None,
-            // The rename guard above passed, so the bucket is unversioned
-            // — it records no versions by construction.
-            bucket_records_versions: false,
-        })
+        self.objects()
+            .rename_object(bucket, src, dst)
+            .await
+            .map_err(Error::from)
     }
 
     async fn delete_object(
@@ -1354,16 +1376,16 @@ impl ObjectOps for FsStorage {
         bucket: &bucket::Name,
         key: &object::Key,
     ) -> Result<version::Marker, Error> {
+        // The namespace probe: DELETE has always answered `NoSuchBucket` for a
+        // bucket that is not there, while the content plane's own removal is
+        // idempotent by contract (an absent namespace is "already deleted").
         let bucket_dir = self.ensure_bucket(bucket).await?;
-        // Like every other object op: never resolve through a symlink
-        // when `follow_symlinks` is disabled (a DELETE through a linked
-        // directory would remove a file outside the storage root).
-        let path = self.resolve_key(&bucket_dir, key).await?;
         if key.is_folder_marker() {
             // Remove the directory only when it is empty; a non-empty
             // directory is left in place (s3-surface.md). Always 204 —
             // a missing or non-directory path (e.g. a symlink) is
             // idempotently "deleted".
+            let path = self.resolve_key(&bucket_dir, key).await?;
             match fs::remove_dir(&path).await {
                 Ok(()) => {}
                 Err(err)
@@ -1380,21 +1402,31 @@ impl ObjectOps for FsStorage {
             // marker.
             return Ok(version::Marker::none());
         }
-        // The versioned delete (feature): the outgoing version's row, the
-        // marker's row and the file removal run under one bucket mutation
-        // lock — the marker's identity is durable in the state row BEFORE
-        // the file goes, so a crash cannot strand "file gone + row still
-        // naming the object version". An unversioned bucket answers `None`
-        // and falls through to today's delete unchanged.
+        #[cfg(feature = "versioning")]
+        let path = self.resolve_key(&bucket_dir, key).await?;
+        // The versioned delete stays **backend-side** (`delete_versioned`), and
+        // the reason is a contract-level shape, not a lock or a file path: a
+        // shared body that wrote the delete marker as a **version row** — the
+        // shape whose slot resolves the marker bit off that row — would let the
+        // store's one-null-version rule displace the superseded null version's
+        // own row, losing a version the shared conformance leg pins ("the
+        // superseded null version must survive a suspended DELETE"). fs's model
+        // keeps the current version in the **object row** (D37) and the version
+        // table for history alone, so its delete writes the marker there and
+        // leaves the null's history row untouched. An unversioned bucket
+        // answers `None` and falls through to the engine's body below.
         #[cfg(feature = "versioning")]
         if let Some(marker) = self.delete_versioned(bucket, key, &path).await? {
             prune_parents(&path, &bucket_dir).await;
             return Ok(marker);
         }
-        remove_object_file(&path, self.follow_symlinks).await?;
-        self.meta_store.remove(bucket, key).await?;
-        prune_parents(&path, &bucket_dir).await;
-        Ok(version::Marker::none())
+        // The version-free delete: the engine's body — the content plane's own
+        // removal (the file and the parent pruning) and the row removal, both
+        // idempotent.
+        self.objects()
+            .delete_object(bucket, key)
+            .await
+            .map_err(Error::from)
     }
 
     async fn get_object_tags(
@@ -1402,12 +1434,15 @@ impl ObjectOps for FsStorage {
         bucket: &bucket::Name,
         key: &object::Key,
     ) -> Result<object::Tags, Error> {
-        // Existence is the object file (folder markers, reserved keys,
-        // and missing files answer `NoSuchKey` — mirroring head_object);
-        // the tags come from the stored row, empty when the file has no
-        // row yet (a hand-dropped object has never been tagged).
-        self.ensure_object_file(bucket, key).await?;
-        self.meta_store.tags(bucket, key).await
+        // The namespace probe first (NoSuchBucket, as every fs object op has
+        // answered); the existence rule itself is the engine's: a key the
+        // content plane does not hold is `NoSuchKey` on either row policy.
+        self.ensure_bucket(bucket).await?;
+        self.heal_degraded_identity(bucket, key).await?;
+        self.objects()
+            .get_object_tags(bucket, key)
+            .await
+            .map_err(Error::from)
     }
 
     async fn put_object_tags(
@@ -1416,36 +1451,19 @@ impl ObjectOps for FsStorage {
         key: &object::Key,
         tags: &object::Tags,
     ) -> Result<TagWriteResult, Error> {
-        // Existence is the object file (`NoSuchKey` when missing —
-        // mirroring head_object). The row update preserves the row's
-        // other elements; a file without a row (a hand-dropped object)
-        // is healed and tagged in one transaction (`ensure_tags`), which
-        // answers the row it wrote. The answer's identity is the row's
-        // current version under the read paths' staleness gate
-        // (`resolve_object_slot`'s rule): an out-of-band edit degrades
-        // it to the null identity, exactly as the head the interface
-        // used to read.
-        let (path, _file, size, mtime, identity) = self.resolve_object_file(bucket, key).await?;
-        let tagged = self
-            .meta_store
-            .ensure_tags(bucket, key, &path, self.follow_symlinks, tags)
+        self.ensure_bucket(bucket).await?;
+        // The pre-step's facts ride to the answer: its stamp is what the
+        // answer's gate judges the written row against, so the tag write does
+        // not re-open the file it did not touch.
+        let facts = self.heal_degraded_identity(bucket, key).await?;
+        // The element write is the engine's; the answer's version fields are
+        // this backend's (G3), from the row the write left (the engine body
+        // returns none of them).
+        self.objects()
+            .put_object_tags(bucket, key, tags)
             .await
-            .map_err(|err| match err {
-                Error::Io(err) if err.kind() == ErrorKind::NotFound => no_such_key(key).into(),
-                err => err,
-            })?;
-        let live = gate(
-            &tagged.row,
-            Content::Present {
-                size,
-                mtime,
-                identity,
-            },
-        ) == Verdict::Live;
-        Ok(TagWriteResult {
-            version_id: live.then(|| tagged.row.version_id.clone()).flatten(),
-            bucket_records_versions: tagged.records_versions,
-        })
+            .map_err(Error::from)?;
+        self.tag_answer(bucket, key, &facts).await
     }
 
     async fn delete_object_tags(
@@ -1453,55 +1471,32 @@ impl ObjectOps for FsStorage {
         bucket: &bucket::Name,
         key: &object::Key,
     ) -> Result<TagWriteResult, Error> {
-        // Idempotent like `delete_object`: only the bucket must exist
-        // (`NoSuchBucket` when missing) and a reserved key is refused the
-        // same way (FR-020 — mirroring `delete_object`); a missing
-        // object — file, marker, or row — is a no-op naming no identity.
-        let bucket_dir = self.ensure_bucket(bucket).await?;
-        let _ = self.resolve_key(&bucket_dir, key).await?;
-        let cleared = self.meta_store.clear_tags(bucket, key).await?;
-        // The file decides existence and the staleness gate, exactly as
-        // the head the interface used to read: a missing file names
-        // nothing (no row is named either, and no state is read), a
-        // hand-dropped file with no row is the null identity with the
-        // bucket state, and a cleared row answers its gated identity.
-        match self.resolve_object_file(bucket, key).await {
-            Ok((_path, _file, size, mtime, identity)) => match cleared {
-                Some(tagged) => {
-                    let live = gate(
-                        &tagged.row,
-                        Content::Present {
-                            size,
-                            mtime,
-                            identity,
-                        },
-                    ) == Verdict::Live;
-                    Ok(TagWriteResult {
-                        version_id: live.then(|| tagged.row.version_id.clone()).flatten(),
-                        bucket_records_versions: tagged.records_versions,
-                    })
-                }
-                None => Ok(TagWriteResult {
-                    version_id: None,
-                    bucket_records_versions: self.records_versions(bucket).await?,
-                }),
-            },
-            Err(Error::Storage(storage::Error::NoSuchKey(_))) => Ok(TagWriteResult {
-                version_id: None,
-                bucket_records_versions: false,
-            }),
+        self.ensure_bucket(bucket).await?;
+        // The same hand-off as the put: the pre-step's stamp is the answer's,
+        // when the step resolved one.
+        let facts = self.heal_degraded_identity(bucket, key).await?;
+        // The clear is the engine's one lenient call (its `Ok(false)` *is* the
+        // missing object, so no existence probe is paid before it); the
+        // answer's version fields are this backend's, and a file that is not
+        // there names nothing — the pre-engine body's missing-object arm.
+        self.objects()
+            .delete_object_tags(bucket, key)
+            .await
+            .map_err(Error::from)?;
+        match self.tag_answer(bucket, key, &facts).await {
+            Ok(answer) => Ok(answer),
+            Err(Error::Storage(storage::Error::NoSuchKey(_))) => Ok(TagWriteResult::untouched()),
             Err(err) => Err(err),
         }
     }
 
     async fn get_object_acl(&self, bucket: &bucket::Name, key: &object::Key) -> Result<Acl, Error> {
-        // Existence is the object file (folder markers, reserved keys,
-        // and missing files answer `NoSuchKey` — mirroring
-        // get_object_tags); the ACL comes from the stored row, the
-        // private default with no owner when the file has no row yet (a
-        // hand-dropped object has never had an ACL written).
-        self.ensure_object_file(bucket, key).await?;
-        self.meta_store.acl(bucket, key).await
+        self.ensure_bucket(bucket).await?;
+        self.heal_degraded_identity(bucket, key).await?;
+        self.objects()
+            .get_object_acl(bucket, key)
+            .await
+            .map_err(Error::from)
     }
 
     async fn put_object_acl(
@@ -1510,13 +1505,12 @@ impl ObjectOps for FsStorage {
         key: &object::Key,
         grants: &AclGrants,
     ) -> Result<(), Error> {
-        // Existence is the object file (`NoSuchKey` when missing —
-        // mirroring put_object_tags). The row update preserves the
-        // row's other elements — the owner element included, a put
-        // never changes it.
-        self.ensure_object_file(bucket, key).await?;
-        self.meta_store.set_acl(bucket, key, grants).await?;
-        Ok(())
+        self.ensure_bucket(bucket).await?;
+        self.heal_degraded_identity(bucket, key).await?;
+        self.objects()
+            .put_object_acl(bucket, key, grants)
+            .await
+            .map_err(Error::from)
     }
 
     async fn list_object_parts(
@@ -1524,1749 +1518,48 @@ impl ObjectOps for FsStorage {
         bucket: &bucket::Name,
         key: &object::Key,
     ) -> Result<Vec<ObjectPart>, Error> {
-        // Existence is the object file (T2-B ruling: a missing object
-        // answers `NoSuchKey`, mirroring `get_object_tags`); the
-        // retained rows of a multipart-completed object are served in
-        // part-number order — empty for an object that was never
-        // multipart-completed (a plain put or copy has no parts).
-        self.ensure_object_file(bucket, key).await?;
-        let rows = self
-            .handle
-            .read(|txn| {
-                object_part::Table::open_readonly(txn)?
-                    .list(bucket, key)
-                    .map_err(Into::into)
-            })
-            .map_err(Error::from)?;
-        // A stored part number is the row's, not a literal: it takes the
-        // validated constructor, so a row this crate did not write (0 or
-        // > 10000) is refused with `InvalidPartNumber` instead of panicking
-        // a `list_object_parts` read.
-        rows.into_iter()
-            .map(|row| {
-                Ok(ObjectPart {
-                    part_number: part_number(row.part_number)?,
-                    size: row.size,
-                    checksum: row.checksum,
-                })
-            })
-            .collect::<Result<Vec<_>, Error>>()
+        // The retained rows of a multipart-completed object, in part-number
+        // order — empty for an object that was never multipart-completed (a
+        // plain put or copy has no parts). The engine's body serves them
+        // through the contract's own projection, so a stored number outside
+        // the API's range refuses with `InvalidPartNumber` rather than
+        // panicking on a row this crate did not write.
+        self.ensure_bucket(bucket).await?;
+        self.heal_degraded_identity(bucket, key).await?;
+        self.objects()
+            .list_object_parts(bucket, key)
+            .await
+            .map_err(Error::from)
     }
 
     async fn list_objects(&self, params: ListObjectsParams) -> Result<ObjectListing, Error> {
-        // The page's `Info` rows all report the bucket's versioning
-        // state — one read for the page, resolved here (the listing
-        // engine answers no version identity of its own).
+        // The bucket-existence check the pre-engine listing made before its
+        // empty-page shortcut: the engine's body answers the empty page for
+        // `max_keys == 0` **before** its first scan, so that one request needs
+        // the walk's own probe here — the same `NoSuchBucket` for a bucket
+        // that is not there, and the same empty-stream answer for a bucket
+        // directory the symlink policy hides (`ensure_bucket` would refuse
+        // that one, which the listing never did). A larger page needs no
+        // probe: the engine's scan walks, and the walk answers for itself.
+        if params.max_keys == 0 {
+            // Built for the probe and dropped un-polled (F10's `let _`).
+            let _ = self
+                .listing()
+                .walk_files_streaming(&params.bucket, &params.prefix)
+                .await?;
+        }
+        // The page's `Info` rows all report the bucket's versioning state — one
+        // read for the page, resolved here (the engine's listing answers no
+        // version identity of its own, and neither did fs's: a listed entry
+        // names the current version implicitly).
         let records_versions = self.records_versions(&params.bucket).await?;
-        self.listing.list(&params, records_versions).await
+        self.objects()
+            .list_objects(params, records_versions)
+            .await
+            .map_err(Error::from)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-    #[cfg(windows)]
-    use std::os::windows::fs::symlink_dir;
-    use std::{io::Error as IoError, thread, time::Duration};
-
-    use bytes::Bytes;
-    use futures::StreamExt;
-    use md5::{Digest, Md5};
-    use tokio::{fs, time::timeout};
-
-    use super::*;
-    // MultipartOps' direct callers here are the #[cfg(unix)] fast-path
-    // tests — cfg-gated like the import above, or windows clippy reports
-    // it unused while the unix build cannot resolve the trait methods.
-    #[cfg(unix)]
-    use crate::_core::storage::MultipartOps;
-    // The ranged-stream tests assert the shared stream's chunking.
-    use crate::_util::fsutil::CHUNK_SIZE;
-    // The versioning leg is registered in the runner below, not inside
-    // `assert_conformance`: a backend compiled without its versioning
-    // machinery refuses every version operation by contract, so the shared
-    // suite cannot demand it. The gate carries the import with the call.
-    #[cfg(feature = "versioning")]
-    use crate::_util::testing::{conformance_versioning, unique_bucket};
-    #[cfg(unix)]
-    use crate::FsOptions;
-    use crate::{
-        _core::{
-            acl::Acl,
-            object,
-            storage::{BucketOps, Error as StorageError},
-        },
-        _util::testing::{assert_conformance, body, complete_single_part, etag, read_body},
-        database,
-        testutil::{all_users_read_grant, checksum_tee, fs_options, md5_wire, owner_id, storage},
-    };
-
-    #[tokio::test]
-    async fn conformance_green() {
-        let (_root, storage) = storage();
-        assert_conformance(&storage).await;
-        #[cfg(feature = "versioning")]
-        {
-            // The versioning leg runs beside the suite on its own bucket: the
-            // harness keeps the bucket it created to itself, and the leg
-            // leaves its bucket versioned.
-            let b = bucket::name(unique_bucket("conform-versioning")).unwrap();
-            storage
-                .create_bucket(&b, None, &Acl::default_private(None))
-                .await
-                .unwrap();
-            conformance_versioning(&storage, &b).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn put_get_head_delete_round_trip() {
-        let (root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("dir/a.txt").unwrap();
-
-        let put = storage.put_object(&b, &k, body(b"hello")).await.unwrap();
-        assert_eq!(put.etag, etag("5d41402abc4b2a76b9719d911017c592"));
-
-        // The file physically appears in the directory.
-        assert_eq!(
-            fs::read(root.path().join("data/dir/a.txt")).await.unwrap(),
-            b"hello"
-        );
-
-        let head = storage.head_object(&b, &k).await.unwrap();
-        assert_eq!(head.size, 5);
-        assert_eq!(head.etag, put.etag);
-
-        let get = storage.get_object(&b, &k, None).await.unwrap();
-        assert_eq!(read_body(get.body).await.unwrap(), b"hello");
-        assert!(get.served_range.is_none());
-        assert_eq!(get.info.etag, put.etag);
-
-        storage.delete_object(&b, &k).await.unwrap();
-        let err = storage.head_object(&b, &k).await.unwrap_err();
-        assert!(matches!(err.into(), StorageError::NoSuchKey(_)));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn copy_object_fast_path_preserves_content_and_etag() {
-        use crate::_core::acl::Acl;
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        let b2 = bucket::name("other").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        storage
-            .create_bucket(&b2, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let src = object::key("src.bin").unwrap();
-        let dst = object::key("dir/dst.bin").unwrap();
-        storage
-            .put_object(&b, &src, body(b"cross-bucket copy"))
-            .await
-            .unwrap();
-        let put = storage
-            .copy_object(
-                &b,
-                &src,
-                &b2,
-                &dst,
-                object::Tags::empty(),
-                None,
-                &Acl::default_private(None),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(put.etag, ETag::from_content(b"cross-bucket copy"));
-        let get = storage.get_object(&b2, &dst, None).await.unwrap();
-        assert_eq!(read_body(get.body).await.unwrap(), b"cross-bucket copy");
-        assert_eq!(get.info.etag, put.etag);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn copy_of_a_multipart_source_yields_the_content_md5() {
-        use crate::_core::{CompletedPart, acl::Acl, multipart::MIN_PART_BYTES};
-        // The fast path reuses the source ETag only in its SINGLE form:
-        // a composed source's copy is a fresh single-part object whose
-        // canonical ETag is the content MD5 of the copied bytes — never
-        // the stale `MD5-of-MD5s-N` form (the old stream path's re-hash
-        // behavior, preserved).
-
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("big.bin").unwrap();
-        let dst = object::key("copy.bin").unwrap();
-        let upload = storage
-            .create_multipart_upload(
-                &b,
-                &k,
-                None,
-                object::Tags::empty(),
-                None,
-                &Acl::default_private(None),
-            )
-            .await
-            .unwrap();
-        // The non-final part must meet the backend's 5 MiB minimum at
-        // complete (the shared `check_part_minimum`); only the final
-        // part may be small.
-        let min = MIN_PART_BYTES as usize;
-        let mut concat = vec![b'a'; min];
-        concat.extend_from_slice(b"part-two-");
-        let p1 = storage
-            .upload_part(
-                &b,
-                &k,
-                &upload.upload_id,
-                1.into(),
-                body(vec![b'a'; min]),
-                None,
-            )
-            .await
-            .unwrap();
-        let p2 = storage
-            .upload_part(
-                &b,
-                &k,
-                &upload.upload_id,
-                2.into(),
-                body(b"part-two-"),
-                None,
-            )
-            .await
-            .unwrap();
-        let completed = [
-            CompletedPart {
-                part_number: p1.part_number,
-                etag: p1.etag,
-            },
-            CompletedPart {
-                part_number: p2.part_number,
-                etag: p2.etag,
-            },
-        ];
-        let info = storage
-            .complete_multipart_upload(&b, &k, &upload.upload_id, &completed, None)
-            .await
-            .unwrap();
-        assert!(matches!(info.etag, ETag::Composed(_, 2)));
-        let put = storage
-            .copy_object(
-                &b,
-                &k,
-                &b,
-                &dst,
-                object::Tags::empty(),
-                None,
-                &Acl::default_private(None),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(put.etag, ETag::from_content(&concat));
-        let head = storage.head_object(&b, &dst).await.unwrap();
-        assert_eq!(head.etag, ETag::from_content(&concat));
-    }
-
-    #[tokio::test]
-    async fn copy_of_a_missing_source_is_no_such_key() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let missing = object::key("ghost.bin").unwrap();
-        let dst = object::key("dst.bin").unwrap();
-        let err = storage
-            .copy_object(
-                &b,
-                &missing,
-                &b,
-                &dst,
-                object::Tags::empty(),
-                None,
-                &Acl::default_private(None),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err.into(), StorageError::NoSuchKey(_)));
-    }
-
-    #[tokio::test]
-    async fn missing_bucket_is_no_such_bucket() {
-        let (_root, storage) = storage();
-        let ghost = bucket::name("ghost").unwrap();
-        let err: StorageError = storage
-            .put_object(&ghost, &"a".into(), body(b"x"))
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::NoSuchBucket(_)));
-    }
-
-    #[tokio::test]
-    async fn get_ranges() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("digits").unwrap();
-        storage
-            .put_object(&b, &k, body(b"0123456789"))
-            .await
-            .unwrap();
-
-        let get = storage
-            .get_object(&b, &k, Some(ByteRange::Inclusive(2, 5)))
-            .await
-            .unwrap();
-        assert_eq!(get.served_range, Some((2, 5)));
-        assert_eq!(read_body(get.body).await.unwrap(), b"2345");
-
-        let get = storage
-            .get_object(&b, &k, Some(ByteRange::From(7)))
-            .await
-            .unwrap();
-        assert_eq!(read_body(get.body).await.unwrap(), b"789");
-
-        let get = storage
-            .get_object(&b, &k, Some(ByteRange::Suffix(3)))
-            .await
-            .unwrap();
-        assert_eq!(read_body(get.body).await.unwrap(), b"789");
-
-        let err: StorageError = storage
-            .get_object(&b, &k, Some(ByteRange::From(99)))
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::InvalidRange { .. }));
-    }
-
-    #[tokio::test]
-    async fn get_stream_chunk_sequence() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("chunked.bin").unwrap();
-        let payload: Vec<u8> = (0..(2 * CHUNK_SIZE + 1234) as u32)
-            .map(|i| (i % 251) as u8)
-            .collect();
-        storage
-            .put_object(&b, &k, body(payload.clone()))
-            .await
-            .unwrap();
-
-        let get = storage.get_object(&b, &k, None).await.unwrap();
-        let mut stream = get.body;
-        let mut chunks = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            chunks.push(chunk.unwrap());
-        }
-        let sizes: Vec<usize> = chunks.iter().map(|chunk| chunk.len()).collect();
-        assert_eq!(sizes, vec![CHUNK_SIZE, CHUNK_SIZE, 1234]);
-        assert_eq!(chunks.concat(), payload);
-    }
-
-    #[tokio::test]
-    async fn get_stream_stops_at_the_range_end() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("ranged.bin").unwrap();
-        let payload: Vec<u8> = (0..(CHUNK_SIZE + 100) as u32)
-            .map(|i| (i % 251) as u8)
-            .collect();
-        storage
-            .put_object(&b, &k, body(payload.clone()))
-            .await
-            .unwrap();
-
-        let get = storage
-            .get_object(
-                &b,
-                &k,
-                Some(ByteRange::Inclusive(
-                    CHUNK_SIZE as u64 - 10,
-                    CHUNK_SIZE as u64 + 4,
-                )),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            read_body(get.body).await.unwrap(),
-            &payload[CHUNK_SIZE - 10..CHUNK_SIZE + 5]
-        );
-    }
-
-    #[tokio::test]
-    async fn streamed_chunks_own_their_memory() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("owned.bin").unwrap();
-        let payload = [vec![0xAB; CHUNK_SIZE], vec![0xCD; 100]].concat();
-        storage.put_object(&b, &k, body(payload)).await.unwrap();
-
-        let get = storage.get_object(&b, &k, None).await.unwrap();
-        let mut stream = get.body;
-        let first = stream.next().await.unwrap().unwrap();
-        // Pull the second chunk before inspecting the first.
-        let second = stream.next().await.unwrap().unwrap();
-        assert_eq!(first.len(), CHUNK_SIZE);
-        assert!(first.iter().all(|&byte| byte == 0xAB));
-        assert_eq!(second.len(), 100);
-        assert!(second.iter().all(|&byte| byte == 0xCD));
-    }
-
-    #[tokio::test]
-    async fn delete_of_a_directory_without_slash_is_204() {
-        let (root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        // 'dir' exists as a directory (a folder marker was PUT).
-        storage
-            .put_object(&b, &"dir/".into(), body(b""))
-            .await
-            .unwrap();
-        // DELETE 'dir' (no trailing slash): idempotent 204, the
-        // directory itself is untouched.
-        storage
-            .delete_object(&b, &object::key("dir").unwrap())
-            .await
-            .unwrap();
-        assert!(root.path().join("data/dir").is_dir());
-        storage
-            .delete_object(&b, &object::key("dir").unwrap())
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn folder_marker_semantics() {
-        let (root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let marker = object::key("dir/").unwrap();
-
-        // PUT creates the directory, idempotently.
-        storage.put_object(&b, &marker, body(b"")).await.unwrap();
-        storage.put_object(&b, &marker, body(b"")).await.unwrap();
-        assert!(root.path().join("data/dir").is_dir());
-
-        // GET/HEAD → NoSuchKey.
-        let err: StorageError = storage
-            .get_object(&b, &marker, None)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::NoSuchKey(_)));
-
-        // DELETE removes the empty directory, idempotently.
-        storage.delete_object(&b, &marker).await.unwrap();
-        storage.delete_object(&b, &marker).await.unwrap();
-        assert!(!root.path().join("data/dir").exists());
-
-        // A non-empty directory is left in place.
-        storage.put_object(&b, &marker, body(b"")).await.unwrap();
-        storage
-            .put_object(&b, &"dir/file.txt".into(), body(b"x"))
-            .await
-            .unwrap();
-        storage.delete_object(&b, &marker).await.unwrap();
-        assert!(root.path().join("data/dir").is_dir());
-        assert!(root.path().join("data/dir/file.txt").is_file());
-    }
-
-    #[tokio::test]
-    async fn reserved_keys_denied() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        for key in [".tinio", ".tinio/x", "a/.tinio", "a/.tinio/b"] {
-            let k = object::key(key).unwrap();
-            let err: StorageError = storage
-                .put_object(&b, &k, body(b"x"))
-                .await
-                .unwrap_err()
-                .into();
-            assert!(matches!(err, StorageError::AccessDenied(_)), "{key}");
-            let err: StorageError = storage.get_object(&b, &k, None).await.unwrap_err().into();
-            assert!(matches!(err, StorageError::NoSuchKey(_)), "{key}");
-        }
-    }
-
-    #[tokio::test]
-    async fn reserved_key_refused_with_follow_enabled() {
-        // FR-020 in BOTH follow modes (P5): the follow-enabled resolve
-        // used to skip the lexical mapping entirely — a `.tinio` PUT
-        // slipped through and wrote `<bucket>/.tinio/x`. The lexical
-        // validation now runs before the follow shortcut, refusing
-        // AccessDenied like every other op (contract doc: "refuse writes
-        // whose key is reserved ... with AccessDenied").
-        use crate::FsOptions;
-        let (root, _) = storage();
-        let b = bucket::name("data").unwrap();
-        fs::create_dir(root.path().join("data")).await.unwrap();
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                follow_symlinks: true,
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let k = object::key(".tinio/x").unwrap();
-        let err: StorageError = storage
-            .put_object(&b, &k, body(b"x"))
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::AccessDenied(_)), "{err:?}");
-        assert!(
-            !root.path().join("data/.tinio").exists(),
-            "the reserved segment must never be written"
-        );
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn lexical_validation_precedes_the_symlink_walk() {
-        // P5 ordering pin: the pure lexical validation runs before the
-        // symlink walk, so a key the mapping refuses (Windows-invalid
-        // chars) answers InvalidKey even when a path component is a link
-        // — the documented order ("rejected before any filesystem
-        // access", path.rs), where the walk-first code answered
-        // AccessDenied (the walk syscalled first).
-        use crate::FsOptions;
-        let (root, _) = storage();
-        let b = bucket::name("data").unwrap();
-        fs::create_dir(root.path().join("data")).await.unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        symlink_dir(outside.path(), root.path().join("data/a")).unwrap();
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                follow_symlinks: false,
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let k = object::key("a/b<c").unwrap();
-        let err: StorageError = storage
-            .put_object(&b, &k, body(b"x"))
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::InvalidKey(_)), "{err:?}");
-    }
-
-    #[tokio::test]
-    async fn head_of_folder_marker_is_no_such_key() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        storage
-            .put_object(&b, &"dir/".into(), body(b""))
-            .await
-            .unwrap();
-        let err: StorageError = storage
-            .head_object(&b, &object::key("dir/").unwrap())
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::NoSuchKey(_)));
-    }
-
-    #[tokio::test]
-    async fn commit_after_bucket_deleted_is_no_such_bucket() {
-        let (root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("a.txt").unwrap();
-        let staged = storage
-            .stage_body(&b, &k, body(b"hello"), None, None)
-            .await
-            .unwrap();
-        storage.delete_bucket(&b).await.unwrap();
-        let err: StorageError = storage
-            .commit_object(
-                &b,
-                &k,
-                staged,
-                object::Tags::empty(),
-                None,
-                &Acl::default_private(None),
-            )
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::NoSuchBucket(_)), "{err:?}");
-        assert!(!root.path().join("data").exists());
-        let tmp = root.path().join(".tinio/tmp");
-        let mut entries = fs::read_dir(&tmp).await.unwrap();
-        assert!(
-            entries.next_entry().await.unwrap().is_none(),
-            "no temp files may remain"
-        );
-    }
-
-    #[tokio::test]
-    async fn dropped_staged_body_leaves_no_temp() {
-        // A rejected conditional PUT (412) drops the staged body without
-        // a commit — the full body must not stay in `tmp/` for the sweep.
-        use crate::_core::storage::ObjectOps;
-        let (root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("big.bin").unwrap();
-        let staged = storage
-            .stage_body(&b, &k, body(b"x".repeat(1024)), None, None)
-            .await
-            .unwrap();
-        drop(staged); // the server's precondition-failure path
-        // The removal is async (item 7a — the unlink runs on the
-        // blocking pool); wait for it.
-        let tmp = root.path().join(".tinio/tmp");
-        timeout(Duration::from_secs(5), async {
-            loop {
-                let mut entries = fs::read_dir(&tmp).await.unwrap();
-                if entries.next_entry().await.unwrap().is_none() {
-                    return;
-                }
-                task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the dropped staged body's temp removal");
-    }
-
-    #[tokio::test]
-    async fn out_of_band_change_served_immediately() {
-        let (root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        // Hand-dropped file (SC-006).
-        fs::write(root.path().join("data/dropped.txt"), b"out-of-band")
-            .await
-            .unwrap();
-        let k = object::key("dropped.txt").unwrap();
-        let head = storage.head_object(&b, &k).await.unwrap();
-        assert_eq!(head.size, 11);
-        assert_eq!(head.etag, etag(&hex::encode(Md5::digest(b"out-of-band"))));
-        let get = storage.get_object(&b, &k, None).await.unwrap();
-        assert_eq!(read_body(get.body).await.unwrap(), b"out-of-band");
-    }
-
-    #[tokio::test]
-    async fn interrupted_upload_leaves_no_object() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("partial").unwrap();
-        let stream = stream::iter(vec![
-            Ok(Bytes::from_static(b"data")),
-            Err(IoError::other("boom")),
-        ]);
-        let err = storage
-            .put_object(&b, &k, Box::pin(stream))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Io(_)));
-        let err = storage.head_object(&b, &k).await.unwrap_err();
-        assert!(matches!(err.into(), StorageError::NoSuchKey(_)));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn symlinks_rejected_when_disabled() {
-        use crate::FsOptions;
-        let (root, _) = storage();
-        let b = bucket::name("data").unwrap();
-        fs::create_dir(root.path().join("data")).await.unwrap();
-        fs::write(root.path().join("outside.txt"), b"secret")
-            .await
-            .unwrap();
-        symlink(
-            root.path().join("outside.txt"),
-            root.path().join("data/link.txt"),
-        )
-        .unwrap();
-
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                follow_symlinks: false,
-                state_dir: None,
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let k = object::key("link.txt").unwrap();
-        let err: StorageError = storage.head_object(&b, &k).await.unwrap_err().into();
-        assert!(matches!(err, StorageError::AccessDenied(_)), "{err:?}");
-        let err: StorageError = storage.get_object(&b, &k, None).await.unwrap_err().into();
-        assert!(matches!(err, StorageError::AccessDenied(_)), "{err:?}");
-        // The PUT path rejects the same way (the stage gate refuses
-        // before the body is staged).
-        let err: StorageError = storage
-            .put_object(&b, &k, body(b"x"))
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::AccessDenied(_)), "{err:?}");
-        // DELETE through the link is refused the same way (it would
-        // otherwise remove a file outside the storage root).
-        let err: StorageError = storage.delete_object(&b, &k).await.unwrap_err().into();
-        assert!(matches!(err, StorageError::AccessDenied(_)), "{err:?}");
-        assert!(root.path().join("outside.txt").exists());
-
-        // With following enabled, the link is served.
-        drop(storage);
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                follow_symlinks: true,
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let head = storage.head_object(&b, &k).await.unwrap();
-        assert_eq!(head.size, 6);
-        // ... and DELETE resolves through it (the follow policy).
-        storage.delete_object(&b, &k).await.unwrap();
-        assert!(!root.path().join("outside.txt").exists());
-    }
-
-    #[tokio::test]
-    async fn commit_object_writes_to_bucket_target_at_rename() {
-        // Same race as multipart complete: a followed bucket symlink
-        // retargeted between commit's resolve and the rename must not
-        // leave the object on the stale path (stage_body is a validation
-        // gate; commit re-resolves under the mutation lock).
-        use crate::{
-            FsOptions,
-            testutil::{link_dir, retarget_bucket_during_commit, wait_for_lock_waiter},
-        };
-
-        let root = tempfile::tempdir().unwrap();
-        let target_a = tempfile::tempdir().unwrap();
-        let target_b = tempfile::tempdir().unwrap();
-        let link = root.path().join("data");
-        link_dir(target_a.path(), &link);
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                follow_symlinks: true,
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let b = bucket::name("data").unwrap();
-        let k = object::key("a.txt").unwrap();
-        let staged = storage
-            .stage_body(&b, &k, body(b"hello"), None, None)
-            .await
-            .unwrap();
-        let storage2 = storage.clone();
-        let b2 = b.clone();
-        let k2 = k.clone();
-        retarget_bucket_during_commit(
-            &storage,
-            &b,
-            &link,
-            target_b.path(),
-            wait_for_lock_waiter(),
-            move || async move {
-                storage2
-                    .commit_object(
-                        &b2,
-                        &k2,
-                        staged,
-                        object::Tags::empty(),
-                        None,
-                        &Acl::default_private(None),
-                    )
-                    .await
-                    .unwrap()
-            },
-        )
-        .await;
-        assert!(
-            target_b.path().join("a.txt").exists(),
-            "object must land under the bucket target at rename"
-        );
-        assert!(
-            !target_a.path().join("a.txt").exists(),
-            "stale pre-lock path must not receive the object"
-        );
-        let get = storage.get_object(&b, &k, None).await.unwrap();
-        assert_eq!(read_body(get.body).await.unwrap(), b"hello");
-    }
-
-    // --- tags + recorded checksums + retained parts (spec 2026-08-31) ---
-
-    #[tokio::test]
-    async fn fs_object_tags_round_trip_and_replace() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("t.txt").unwrap();
-        storage.put_object(&b, &k, body(b"x")).await.unwrap();
-        assert!(
-            storage.get_object_tags(&b, &k).await.unwrap().is_empty(),
-            "an untagged object answers the empty set"
-        );
-
-        // Put → Get round-trip (replace-all, no merge).
-        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
-        storage.put_object_tags(&b, &k, &tags).await.unwrap();
-        assert_eq!(storage.get_object_tags(&b, &k).await.unwrap(), tags);
-        let replaced = object::Tags::from_pairs([("env".into(), "dev".into())]).unwrap();
-        storage.put_object_tags(&b, &k, &replaced).await.unwrap();
-        assert_eq!(storage.get_object_tags(&b, &k).await.unwrap(), replaced);
-        // head/get carry the same tags (Info.tags — one source of truth).
-        assert_eq!(storage.head_object(&b, &k).await.unwrap().tags, replaced);
-
-        // Delete clears; the row's other elements survive the tag write.
-        storage.delete_object_tags(&b, &k).await.unwrap();
-        assert!(storage.get_object_tags(&b, &k).await.unwrap().is_empty());
-        let head = storage.head_object(&b, &k).await.unwrap();
-        assert_eq!(head.size, 1, "the etag/size row must survive tag ops");
-        assert!(head.tags.is_empty());
-
-        // Missing object: get/put → NoSuchKey, delete succeeds.
-        let missing = object::key("missing.txt").unwrap();
-        let err: StorageError = storage
-            .get_object_tags(&b, &missing)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::NoSuchKey(_)));
-        let err: StorageError = storage
-            .put_object_tags(&b, &missing, &tags)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::NoSuchKey(_)));
-        storage.delete_object_tags(&b, &missing).await.unwrap();
-        // A missing bucket answers NoSuchBucket (get and delete alike).
-        let ghost = bucket::name("ghost").unwrap();
-        let err: StorageError = storage
-            .get_object_tags(&ghost, &k)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::NoSuchBucket(_)));
-        let err: StorageError = storage
-            .delete_object_tags(&ghost, &k)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::NoSuchBucket(_)));
-    }
-
-    #[tokio::test]
-    async fn fs_commit_and_copy_carry_tags() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let a = object::key("a.txt").unwrap();
-        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
-        // The commit records the tags with the object — no post-commit
-        // tag window.
-        let staged = storage
-            .stage_body(&b, &a, body(b"hi"), None, None)
-            .await
-            .unwrap();
-        let info = storage
-            .commit_object(
-                &b,
-                &a,
-                staged,
-                tags.clone(),
-                None,
-                &Acl::default_private(None),
-            )
-            .await
-            .unwrap();
-        assert_eq!(info.etag, ETag::from_content(b"hi"));
-        assert_eq!(info.tags, tags);
-        assert_eq!(storage.head_object(&b, &a).await.unwrap().tags, tags);
-
-        // A copy is a fresh object whose tags are the caller's — never
-        // the source's.
-        let dst = object::key("b.txt").unwrap();
-        let copy_tags = object::Tags::from_pairs([("env".into(), "dev".into())]).unwrap();
-        storage
-            .copy_object(
-                &b,
-                &a,
-                &b,
-                &dst,
-                copy_tags.clone(),
-                None,
-                &Acl::default_private(None),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(storage.get_object_tags(&b, &dst).await.unwrap(), copy_tags);
-        assert_eq!(storage.get_object_tags(&b, &a).await.unwrap(), tags);
-    }
-
-    #[tokio::test]
-    async fn fs_commit_records_the_stage_tee_checksum() {
-        // spec 2026-08-31: a plain PUT under the checksum toggle records
-        // the tee's validated digest as the object's FULL_OBJECT checksum
-        // — the backend never re-hashes.
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("c.txt").unwrap();
-        let staged = storage
-            .stage_body(
-                &b,
-                &k,
-                body(b"hello"),
-                Some(checksum_tee(checksum::Algorithm::Crc32, "NhCmhg==")),
-                None,
-            )
-            .await
-            .unwrap();
-        storage
-            .commit_object(
-                &b,
-                &k,
-                staged,
-                object::Tags::empty(),
-                None,
-                &Acl::default_private(None),
-            )
-            .await
-            .unwrap();
-        let head = storage.head_object(&b, &k).await.unwrap();
-        let recorded = head.checksum.expect("the tee digest must be recorded");
-        assert_eq!(recorded.part.algorithm, checksum::Algorithm::Crc32);
-        assert_eq!(recorded.part.value.0, "NhCmhg==");
-        assert_eq!(recorded.kind, checksum::Type::FullObject);
-        // A put without a tee records none.
-        storage
-            .put_object(&b, &object::key("plain.txt").unwrap(), body(b"x"))
-            .await
-            .unwrap();
-        let head = storage
-            .head_object(&b, &object::key("plain.txt").unwrap())
-            .await
-            .unwrap();
-        assert!(head.checksum.is_none());
-    }
-
-    #[tokio::test]
-    async fn fs_content_recompute_preserves_tags_and_checksum() {
-        // The row's tags/checksum elements are NOT recomputable from the
-        // object file (spec 2026-08-31): a content-derived rewrite — an
-        // out-of-band file change forces an ETag recompute on the next
-        // read — carries them over. Only an API write clears them.
-        let (root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("a.txt").unwrap();
-        let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
-        let staged = storage
-            .stage_body(
-                &b,
-                &k,
-                body(b"hello"),
-                Some(checksum_tee(checksum::Algorithm::Md5, &md5_wire(b"hello"))),
-                None,
-            )
-            .await
-            .unwrap();
-        storage
-            .commit_object(
-                &b,
-                &k,
-                staged,
-                tags.clone(),
-                None,
-                &Acl::default_private(None),
-            )
-            .await
-            .unwrap();
-
-        // Out-of-band in-place rewrite (same size — only the identity
-        // gate and mtime detect it). The sleep lands the rewrite in a
-        // later Windows FILETIME tick (~16 ms granularity).
-        thread::sleep(Duration::from_millis(30));
-        fs::write(root.path().join("data/a.txt"), b"world")
-            .await
-            .unwrap();
-        let head = storage.head_object(&b, &k).await.unwrap();
-        assert_eq!(
-            head.etag,
-            ETag::from_content(b"world"),
-            "the etag recomputes"
-        );
-        assert_eq!(
-            head.tags, tags,
-            "the API-written tags survive the recompute"
-        );
-        assert_eq!(
-            head.checksum.as_ref().map(|c| c.part.value.0.as_str()),
-            Some(md5_wire(b"hello").as_str()),
-            "the recorded checksum survives the recompute"
-        );
-    }
-
-    #[tokio::test]
-    async fn fs_object_parts_lifecycle() {
-        // The OBJECT_PARTS lifecycle (spec 2026-08-31): an overwrite via
-        // commit removes the rows, delete removes them, rename migrates
-        // them with the record, and copy never inherits them.
-        let (root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("mp.bin").unwrap();
-        complete_single_part(&storage, &b, &k).await;
-        assert_eq!(storage.list_object_parts(&b, &k).await.unwrap().len(), 1);
-
-        // (a) An overwriting commit is a fresh single-part object: its
-        // parts rows are gone.
-        let staged = storage
-            .stage_body(&b, &k, body(b"plain"), None, None)
-            .await
-            .unwrap();
-        storage
-            .commit_object(
-                &b,
-                &k,
-                staged,
-                object::Tags::empty(),
-                None,
-                &Acl::default_private(None),
-            )
-            .await
-            .unwrap();
-        assert!(
-            storage.list_object_parts(&b, &k).await.unwrap().is_empty(),
-            "an overwrite must not leave the completed object's parts"
-        );
-
-        // (c) rename migrates the parts rows with the record.
-        complete_single_part(&storage, &b, &k).await;
-        let moved = object::key("moved.bin").unwrap();
-        storage.rename_object(&b, &k, &moved).await.unwrap();
-        assert!(
-            root.path().join("data/moved.bin").exists(),
-            "the file moves"
-        );
-        assert!(
-            !root.path().join("data/mp.bin").exists(),
-            "the source file is gone"
-        );
-        assert_eq!(
-            storage.list_object_parts(&b, &moved).await.unwrap().len(),
-            1
-        );
-        let err: StorageError = storage.list_object_parts(&b, &k).await.unwrap_err().into();
-        assert!(matches!(err, StorageError::NoSuchKey(_)));
-        // A rename over an existing destination replaces it (the dst's
-        // own stale rows die).
-        let dst = object::key("dst.bin").unwrap();
-        complete_single_part(&storage, &b, &dst).await;
-        storage.rename_object(&b, &moved, &dst).await.unwrap();
-        assert_eq!(storage.list_object_parts(&b, &dst).await.unwrap().len(), 1);
-
-        // (d) copy_object never inherits the source's parts.
-        let copy = object::key("copy.bin").unwrap();
-        storage
-            .copy_object(
-                &b,
-                &dst,
-                &b,
-                &copy,
-                object::Tags::empty(),
-                None,
-                &Acl::default_private(None),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(
-            storage
-                .list_object_parts(&b, &copy)
-                .await
-                .unwrap()
-                .is_empty(),
-            "a copy is single-part: the source's rows must not follow"
-        );
-
-        // (b) delete removes the rows — proved straight in the database
-        // (the object is gone, so the parts list answers NoSuchKey).
-        storage.delete_object(&b, &dst).await.unwrap();
-        let err: StorageError = storage
-            .list_object_parts(&b, &dst)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::NoSuchKey(_)));
-        drop(storage); // release the redb file lock
-        let db = database::open(&root.path().join(".tinio")).unwrap().db;
-        let txn = redb::ReadableDatabase::begin_read(&db).unwrap();
-        let parts = object_part::Table::open_readonly(&txn).unwrap();
-        assert!(
-            parts.list(&b, &dst).unwrap().is_empty(),
-            "delete must drain the rows"
-        );
-        assert!(
-            parts.list(&b, &copy).unwrap().is_empty(),
-            "copy never wrote rows"
-        );
-        assert!(
-            parts.list(&b, &moved).unwrap().is_empty(),
-            "rename migrated the rows away"
-        );
-    }
-
-    // --- owner + ACL (spec 2026-09-05) ---
-
-    #[tokio::test]
-    async fn fs_object_acl_replace_all() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("a.txt").unwrap();
-        storage.put_object(&b, &k, body(b"x")).await.unwrap();
-        assert_eq!(
-            storage.get_object_acl(&b, &k).await.unwrap(),
-            Acl::default_private(None),
-            "an unwritten ACL answers the private default"
-        );
-
-        // Put → Get round-trip (replace-all, no merge).
-        let grants = vec![all_users_read_grant()];
-        storage.put_object_acl(&b, &k, &grants).await.unwrap();
-        assert_eq!(storage.get_object_acl(&b, &k).await.unwrap().grants, grants);
-        storage.put_object_acl(&b, &k, &Vec::new()).await.unwrap();
-        assert_eq!(
-            storage.get_object_acl(&b, &k).await.unwrap().grants,
-            Vec::new()
-        );
-
-        // Missing object: get/put → NoSuchKey.
-        let missing = object::key("missing.txt").unwrap();
-        let err: StorageError = storage
-            .get_object_acl(&b, &missing)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::NoSuchKey(_)));
-        let err: StorageError = storage
-            .put_object_acl(&b, &missing, &grants)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(matches!(err, StorageError::NoSuchKey(_)));
-    }
-
-    #[tokio::test]
-    async fn fs_commit_records_owner_and_acl() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("a.txt").unwrap();
-        let owner = owner_id();
-        let grants = vec![all_users_read_grant()];
-        let write_acl = Acl {
-            owner: Some(owner.clone()),
-            grants: grants.clone(),
-        };
-        let staged = storage
-            .stage_body(&b, &k, body(b"hello"), None, None)
-            .await
-            .unwrap();
-        let info = storage
-            .commit_object(
-                &b,
-                &k,
-                staged,
-                object::Tags::empty(),
-                Some(&owner),
-                &write_acl,
-            )
-            .await
-            .unwrap();
-        assert_eq!(info.owner.as_ref(), Some(&owner));
-        assert_eq!(info.acl.grants, grants);
-        // head/get echo the recorded owner and ACL.
-        let head = storage.head_object(&b, &k).await.unwrap();
-        assert_eq!(head.owner.as_ref(), Some(&owner));
-        assert_eq!(head.acl.grants, grants);
-        // get_object_acl recombines the owner element with the grants.
-        let got = storage.get_object_acl(&b, &k).await.unwrap();
-        assert_eq!(got.owner.as_ref(), Some(&owner));
-        assert_eq!(got.grants, grants);
-        // A put_object_acl replaces the grants, never the owner.
-        let replaced = Vec::new();
-        storage.put_object_acl(&b, &k, &replaced).await.unwrap();
-        let got = storage.get_object_acl(&b, &k).await.unwrap();
-        assert_eq!(got.owner.as_ref(), Some(&owner));
-        assert_eq!(got.grants, replaced);
-    }
-
-    #[tokio::test]
-    async fn fs_copy_records_the_callers_owner_and_acl() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let src = object::key("src.bin").unwrap();
-        let dst = object::key("dst.bin").unwrap();
-        storage
-            .put_object(&b, &src, body(b"copy me"))
-            .await
-            .unwrap();
-        let owner = owner_id();
-        let grants = vec![all_users_read_grant()];
-        let info = storage
-            .copy_object(
-                &b,
-                &src,
-                &b,
-                &dst,
-                object::Tags::empty(),
-                Some(&owner),
-                &Acl {
-                    owner: Some(owner.clone()),
-                    grants: grants.clone(),
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(info.owner.as_ref(), Some(&owner));
-        assert_eq!(info.acl.grants, grants);
-        // The copy's ACL is the caller's — never the source's.
-        let head = storage.head_object(&b, &dst).await.unwrap();
-        assert_eq!(head.owner.as_ref(), Some(&owner));
-        assert_eq!(head.acl.grants, grants);
-        let head_src = storage.head_object(&b, &src).await.unwrap();
-        assert_eq!(head_src.owner, None, "the source is untouched");
-        assert_eq!(head_src.acl.grants, Vec::new());
-    }
-
-    #[tokio::test]
-    async fn fs_rename_moves_owner_and_acl() {
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let src = object::key("src.bin").unwrap();
-        let dst = object::key("dst.bin").unwrap();
-        let owner = owner_id();
-        let grants = vec![all_users_read_grant()];
-        let staged = storage
-            .stage_body(&b, &src, body(b"rename me"), None, None)
-            .await
-            .unwrap();
-        storage
-            .commit_object(
-                &b,
-                &src,
-                staged,
-                object::Tags::empty(),
-                Some(&owner),
-                &Acl {
-                    owner: Some(owner.clone()),
-                    grants: grants.clone(),
-                },
-            )
-            .await
-            .unwrap();
-        // A rename is not a fresh object: the owner and ACL move with
-        // the record.
-        let renamed = storage.rename_object(&b, &src, &dst).await.unwrap();
-        assert_eq!(renamed.owner.as_ref(), Some(&owner));
-        assert_eq!(renamed.acl.grants, grants);
-        let head = storage.head_object(&b, &dst).await.unwrap();
-        assert_eq!(head.owner.as_ref(), Some(&owner));
-        assert_eq!(head.acl.grants, grants);
-        let got = storage.get_object_acl(&b, &dst).await.unwrap();
-        assert_eq!(got.owner.as_ref(), Some(&owner));
-        assert_eq!(got.grants, grants);
-    }
-
-    // --- unix mode + ownership hardening (spec 2026-09-05 §5a) ---
-    //
-    // The chown-asserting tests run only as root (a foreign-uid chown
-    // would otherwise fail with EPERM — the fail-closed test runs only
-    // when NOT root, where that EPERM is exactly the failure it needs).
-    // Their real run is the Task 16 WSL2 gate; here they typecheck on the
-    // linux target and the mode tests run everywhere.
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fs_object_file_mode_0600() {
-        use std::{fs::metadata, os::unix::fs::PermissionsExt};
-
-        use crate::_core::acl::Acl;
-        let (root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("a.txt").unwrap();
-        storage.put_object(&b, &k, body(b"x")).await.unwrap();
-        let mode = metadata(root.path().join("data/a.txt"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "a fresh object file must be 0600");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fs_object_chowned_to_mapped_owner_uid() {
-        use std::{collections::HashMap, fs as std_fs, os::unix::fs::MetadataExt};
-
-        use crate::{_core::acl::Acl, testutil};
-        if testutil::euid() != 0 {
-            eprintln!("skipped: the chown tests need root");
-            return;
-        }
-        let uid = 2345;
-        let owner = testutil::owner_id();
-        let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                owner_uids: HashMap::from([(owner.clone(), uid)]),
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, Some(&owner), &Acl::default_private(Some(owner.clone())))
-            .await
-            .unwrap();
-        let k = object::key("a.txt").unwrap();
-        let staged = storage
-            .stage_body(&b, &k, body(b"x"), None, None)
-            .await
-            .unwrap();
-        storage
-            .commit_object(
-                &b,
-                &k,
-                staged,
-                object::Tags::empty(),
-                Some(&owner),
-                &Acl::default_private(Some(owner.clone())),
-            )
-            .await
-            .unwrap();
-        let metadata = std_fs::metadata(root.path().join("data/a.txt")).unwrap();
-        assert_eq!(metadata.uid(), uid, "the file must land chowned");
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fs_unmapped_owner_file_stays_server_user_owned() {
-        use std::{
-            fs as std_fs,
-            os::unix::fs::{MetadataExt, PermissionsExt},
-        };
-
-        use crate::{_core::acl::Acl, testutil};
-        let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        // An owner with no configured uid: no chown — the file stays
-        // server-user-owned, still 0600.
-        let owner = testutil::owner_id();
-        let k = object::key("unmapped.txt").unwrap();
-        let staged = storage
-            .stage_body(&b, &k, body(b"x"), None, None)
-            .await
-            .unwrap();
-        storage
-            .commit_object(
-                &b,
-                &k,
-                staged,
-                object::Tags::empty(),
-                Some(&owner),
-                &Acl::default_private(Some(owner.clone())),
-            )
-            .await
-            .unwrap();
-        let path = storage.root().join("data/unmapped.txt");
-        let metadata = std_fs::metadata(&path).unwrap();
-        assert_eq!(metadata.uid(), testutil::euid());
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        // The anonymous path (owner None) is the same.
-        let k2 = object::key("anon.txt").unwrap();
-        storage.put_object(&b, &k2, body(b"x")).await.unwrap();
-        let metadata = std_fs::metadata(storage.root().join("data/anon.txt")).unwrap();
-        assert_eq!(metadata.uid(), testutil::euid());
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fs_rename_preserves_ownership() {
-        use std::{collections::HashMap, fs as std_fs, os::unix::fs::MetadataExt};
-
-        use crate::{_core::acl::Acl, testutil};
-        if testutil::euid() != 0 {
-            eprintln!("skipped: the chown tests need root");
-            return;
-        }
-        let uid = 3456;
-        let owner = testutil::owner_id();
-        let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                owner_uids: HashMap::from([(owner.clone(), uid)]),
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("a.txt").unwrap();
-        let staged = storage
-            .stage_body(&b, &k, body(b"x"), None, None)
-            .await
-            .unwrap();
-        storage
-            .commit_object(
-                &b,
-                &k,
-                staged,
-                object::Tags::empty(),
-                Some(&owner),
-                &Acl::default_private(Some(owner.clone())),
-            )
-            .await
-            .unwrap();
-        // The inode moves — the uid is preserved, no chown.
-        let moved = object::key("b.txt").unwrap();
-        storage.rename_object(&b, &k, &moved).await.unwrap();
-        let metadata = std_fs::metadata(root.path().join("data/b.txt")).unwrap();
-        assert_eq!(metadata.uid(), uid);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fs_copy_overwrite_rechown_to_new_owner() {
-        use std::{collections::HashMap, fs as std_fs, os::unix::fs::MetadataExt};
-
-        use crate::{_core::acl::Acl, testutil};
-        if testutil::euid() != 0 {
-            eprintln!("skipped: the chown tests need root");
-            return;
-        }
-        let uid_a = 4567;
-        let uid_b = 5678;
-        let owner_a = testutil::owner_id();
-        let owner_b = testutil::other_owner_id();
-        let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                owner_uids: HashMap::from([(owner_a.clone(), uid_a), (owner_b.clone(), uid_b)]),
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let src = object::key("src.bin").unwrap();
-        let dst = object::key("dst.bin").unwrap();
-        let staged = storage
-            .stage_body(&b, &src, body(b"x"), None, None)
-            .await
-            .unwrap();
-        storage
-            .commit_object(
-                &b,
-                &src,
-                staged,
-                object::Tags::empty(),
-                Some(&owner_a),
-                &Acl::default_private(Some(owner_a.clone())),
-            )
-            .await
-            .unwrap();
-        // An overwriting copy records the NEW owner's uid.
-        storage
-            .copy_object(
-                &b,
-                &src,
-                &b,
-                &dst,
-                object::Tags::empty(),
-                Some(&owner_b),
-                &Acl::default_private(Some(owner_b.clone())),
-                None,
-            )
-            .await
-            .unwrap();
-        let metadata = std_fs::metadata(root.path().join("data/dst.bin")).unwrap();
-        assert_eq!(metadata.uid(), uid_b);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fs_prefix_dir_chowned_to_bucket_owner() {
-        use std::{
-            collections::HashMap,
-            fs::metadata,
-            os::unix::fs::{MetadataExt, PermissionsExt},
-        };
-
-        use crate::{_core::acl::Acl, testutil};
-        if testutil::euid() != 0 {
-            eprintln!("skipped: the chown tests need root");
-            return;
-        }
-        let uid = 6789;
-        let owner = testutil::owner_id();
-        let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                owner_uids: HashMap::from([(owner.clone(), uid)]),
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, Some(&owner), &Acl::default_private(Some(owner.clone())))
-            .await
-            .unwrap();
-        // A non-bucket-owner PutObject (owner None) creating prefix dirs:
-        // the dirs take the bucket owner's mapped uid, 0700.
-        let k = object::key("dir/sub/f.txt").unwrap();
-        storage.put_object(&b, &k, body(b"x")).await.unwrap();
-        let dir = metadata(root.path().join("data/dir")).unwrap();
-        assert_eq!(dir.uid(), uid, "the prefix dir must be bucket-owner-owned");
-        assert_eq!(dir.permissions().mode() & 0o777, 0o700);
-        let sub = metadata(root.path().join("data/dir/sub")).unwrap();
-        assert_eq!(sub.uid(), uid);
-        assert_eq!(sub.permissions().mode() & 0o777, 0o700);
-        // The object file itself is server-user-owned (its owner is
-        // unmapped) and 0600.
-        let file = metadata(root.path().join("data/dir/sub/f.txt")).unwrap();
-        assert_eq!(file.uid(), testutil::euid());
-        assert_eq!(file.permissions().mode() & 0o777, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fs_prefix_dir_chown_failure_removes_dirs_and_errors() {
-        use std::{collections::HashMap, fs};
-
-        use crate::{_core::acl::Acl, testutil};
-        // Review round 1: a prefix-dir chown failure is fail-closed —
-        // the write removes the components IT created (deepest first)
-        // and errors, so a wrongly-owned 0700 prefix dir never strands
-        // the mapped owner's own 0600 objects while the request
-        // reported success. Runs UNPRIVILEGED (the chown to uid 0 fails
-        // with EPERM — the failure the test needs); as root the chown
-        // succeeds, so the test skips.
-        if testutil::euid() == 0 {
-            eprintln!("skipped: the fail-closed tests need an UNPRIVILEGED process");
-            return;
-        }
-        let owner = testutil::owner_id();
-        let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                owner_uids: HashMap::from([(owner.clone(), 0)]),
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let b = bucket::name("data").unwrap();
-        // The bucket ROW records a mapped owner, but the bucket dir is
-        // hand-created (a pre-existing dir is never touched — an
-        // unprivileged create_bucket with a mapped owner would itself
-        // fail closed, see the buckets test).
-        storage
-            .bucket_store()
-            .record_full(
-                &b,
-                SystemTime::now(),
-                Some(&owner),
-                &Acl::default_private(Some(owner.clone())),
-            )
-            .await
-            .unwrap();
-        fs::create_dir(root.path().join("data")).unwrap();
-        // A non-bucket-owner PutObject creating a two-level prefix: the
-        // first created dir's chown fails — the created chain is
-        // removed and the PUT errors.
-        let k = object::key("dir/sub/f.txt").unwrap();
-        let err = storage.put_object(&b, &k, body(b"x")).await.unwrap_err();
-        assert!(matches!(err, Error::Io(_)), "{err:?}");
-        assert!(
-            !root.path().join("data/dir").exists(),
-            "the failed-hardening prefix chain must be removed"
-        );
-        assert!(
-            root.path().join("data").is_dir(),
-            "the pre-existing bucket dir is never touched"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn fs_chown_failure_after_rename_removes_file_and_errors() {
-        use std::collections::HashMap;
-
-        use crate::{_core::acl::Acl, testutil};
-        if testutil::euid() == 0 {
-            eprintln!("skipped: the fail-closed test needs an UNPRIVILEGED process");
-            return;
-        }
-        // The map points at uid 0 — an unprivileged process can never
-        // chown to root: the chown fails (EPERM) after the rename
-        // landed, and the fail-closed path must remove the file and
-        // error the request.
-        let owner = testutil::owner_id();
-        let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(
-            root.path(),
-            FsOptions {
-                owner_uids: HashMap::from([(owner.clone(), 0)]),
-                ..fs_options()
-            },
-        )
-        .unwrap();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let k = object::key("a.txt").unwrap();
-        let staged = storage
-            .stage_body(&b, &k, body(b"x"), None, None)
-            .await
-            .unwrap();
-        let err = storage
-            .commit_object(
-                &b,
-                &k,
-                staged,
-                object::Tags::empty(),
-                Some(&owner),
-                &Acl::default_private(Some(owner.clone())),
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Io(_)), "{err:?}");
-        assert!(
-            !root.path().join("data/a.txt").exists(),
-            "a wrongly-owned 0600 file must not be left behind"
-        );
-        let err: StorageError = storage.head_object(&b, &k).await.unwrap_err().into();
-        assert!(matches!(err, StorageError::NoSuchKey(_)));
-    }
-}
+#[path = "objects_tests.rs"]
+mod tests;

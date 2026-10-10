@@ -1,23 +1,46 @@
 //! The `ObjectOps` implementation for [`MemoryStorage`].
 //!
-//! Object put/get/head/delete/listing, the tag ops, rename, and the
-//! retained-part listing. The metadata access layer is the shared
-//! implementation's: every object row read and write goes through the
-//! ObjectMeta contract, and the object bytes go through the accounting
-//! decorator, content first and the row that describes it after (design
-//! 2026-10-03 §1 property 6).
+//! The shared ops engine ([`crate::_ops`]) owns the object group's bodies:
+//! every read (the read-heal included), the listing and its batch enrichment,
+//! the rename, the version-free delete, the tag and ACL bodies (all but the
+//! tag **clear**, which stays mem's — see below), the retained-parts listing,
+//! and the version-free write's publish-and-row step
+//! (with the compensation a refused row write takes — spec RI2). What stays
+//! mem-local is what the engine cannot express: the **staged body** and its
+//! stage (the version-creating commit writes the staged bytes raw, inside
+//! mem's one transaction, and the engine's staged value cannot hand its bytes
+//! back), the version-creating writes themselves ([`MemoryStorage::write_object`]'s
+//! versioned arm), `copy_object`'s read-then-write shape (the object-size cap,
+//! the folder-marker destination and a version-creating destination are mem's
+//! policy, and the engine's copy body carries none of them),
+//! `delete_object_tags`'s clear (the identity it names follows the clear's own
+//! write answer, which the engine's lenient body discards), and the
+//! version-plane facts the plane-free bodies cannot fill — the served
+//! `version_id` and the bucket's records-versions bit, both read from mem's own
+//! rows (spec G3).
 //!
-//! A bucket that **records versions** is the one exception: its write paths
-//! keep the version-domain single transaction, because the supersede must read
-//! the outgoing bytes before they are replaced, the slot columns the contract's
-//! row cannot carry (D37) must land with the row, and the object and history
-//! bytes share one all-or-nothing admission decision (see `write_object`).
+//! The metadata access layer is the shared implementation's: every object row
+//! read and write goes through the object contract, and the object bytes go
+//! through the accounting decorator. The write order is the engine's — publish
+//! the bytes, then the row that describes them (design 2026-10-03 §1 property
+//! 6) — and a bucket that **records versions** is the one exception: its write
+//! paths keep the version-domain single transaction, because the supersede must
+//! read the outgoing bytes before they are replaced, the slot columns the
+//! contract's row cannot carry (D37) must land with the row, and the object and
+//! history bytes share one all-or-nothing admission decision (see
+//! `write_object`).
 
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream;
 
+// The versioned write and delete — the one mem-local pair left in this file —
+// are the feature's only users: with the feature off, the plain paths answer
+// every write and none of these is compiled.
+#[cfg(feature = "versioning")]
+use crate::_core::{ETag, content::ContentKey, from_nanos, now_nanos};
 #[cfg(feature = "versioning")]
 use crate::_store_redb::{object_meta, object_part, objects};
 #[cfg(feature = "versioning")]
@@ -26,24 +49,23 @@ use crate::version::check_bucket_write;
 use crate::version::{insert_marker, prepare_publish, record_current_as_version};
 use crate::{
     _core::{
-        BodyStream, ByteRange, ETag, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
+        BodyStream, ByteRange, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
         TagWriteResult, acl,
         acl::{Acl, AclGrants},
         bucket::Name,
         checksum, collect_body,
-        content::{ContentKey, ObjectContent, StagedObject},
-        from_nanos, group_and_paginate,
-        meta::{ObjectMeta, VersionMeta, object::Row},
+        meta::{ObjectMeta, VersionMeta},
         multipart::ObjectPart,
-        now_nanos, object,
+        object,
         storage::VersionOps,
         version,
     },
+    _ops::{BucketRow, MetadataFailure, ObjectOps as EngineObjectOps},
+    _store_redb::{RedbContent, RedbMetadata},
     Error,
-    counting::report,
+    counting::CountingContent,
     error::{access_denied, invalid_key, no_such_key},
     storage::MemoryStorage,
-    version::object_result,
 };
 
 /// A staged object body: the buffered payload (the commit inserts it)
@@ -53,12 +75,37 @@ use crate::{
 /// computed while the body streamed under the server's tee slot and
 /// recorded as FULL_OBJECT (the write path's kind) — committed with no
 /// re-hashing. `None` when the stage fixed neither.
+///
+/// The type is mem's rather than the engine's ([`crate::_ops::StagedBody`])
+/// because a bucket that records versions must commit the staged **bytes**:
+/// mem's version-creating write is one transaction that inserts them raw
+/// (`write_object_recording_versions`), and the engine's staged value — the
+/// content plane's own handle — offers no way back to them. The version-free
+/// commit hands these bytes to the engine by staging them through it
+/// ([`MemoryStorage::write_object_plain`]).
 pub struct StagedBody {
     data: Vec<u8>,
     checksum: Option<checksum::Recorded>,
 }
 
 impl MemoryStorage {
+    /// The object-group receiver over this backend's handles (spec E16: one
+    /// receiver per operation group, carrying only the handles that group
+    /// uses — the object group reaches no hook).
+    ///
+    /// The two policies are mem's, declared and never inferred: a metadata-row
+    /// write that fails after the content is published is the **engine's** to
+    /// compensate (`Fail` — the tagged publish and the compare-before-remove),
+    /// and the bucket's row **is** the bucket (`Guaranteed`).
+    fn object_ops(&self) -> EngineObjectOps<RedbMetadata, CountingContent<RedbContent>> {
+        EngineObjectOps {
+            meta: Arc::clone(&self.metadata),
+            content: Arc::clone(&self.content),
+            metadata_failure: MetadataFailure::Fail,
+            bucket_row: BucketRow::Guaranteed,
+        }
+    }
+
     /// Whether the bucket records versions (enabled or suspended) — the write
     /// path's discriminator and the carrier bit every served Info reports. The
     /// bucket's versioning state is the version contract's bucket half (D26),
@@ -85,33 +132,36 @@ impl MemoryStorage {
         Ok(slot.and_then(|current| current.version))
     }
 
-    /// The tag-write transaction of the object trio — the shared body of
-    /// `put_object_tags` and `delete_object_tags` (the bucket and key
-    /// gates stay in the ops): the contract replaces the row's tags element,
-    /// and the key's current slot and the bucket's records-versions bit answer
-    /// the pair ([TagWriteResult]) in the same round. `None` when the row is
-    /// missing (nothing changed — nothing to name).
-    async fn rewrite_tags_element(
+    /// The pair a tag write answers ([TagWriteResult], spec G3): the engine's
+    /// plane-free bodies touch the row's tag element only and answer no
+    /// identity, so the caller supplies what it reads from its own rows — the
+    /// key's current slot (the version domain's fact, D37) and the bucket's
+    /// records-versions bit (the version contract's bucket half, D26).
+    async fn tag_write_result(
         &self,
         bucket: &Name,
         key: &object::Key,
-        tags: &object::Tags,
-    ) -> Result<Option<TagWriteResult>, Error> {
-        // The row write is the contract's (a missing row answers false). The
-        // version identity is the version domain's (D37) and the state bit is
-        // the version contract's bucket half (D26).
-        if !self
-            .metadata()
-            .set_tags(bucket, key, tags)
-            .await
-            .map_err(Error::from)?
-        {
-            return Ok(None);
-        }
-        Ok(Some(TagWriteResult {
+    ) -> Result<TagWriteResult, Error> {
+        Ok(TagWriteResult {
             version_id: self.current_version_id(bucket, key).await?,
             bucket_records_versions: self.bucket_records_versions(bucket).await?,
-        }))
+        })
+    }
+
+    /// The two version facts a plane-free body cannot answer (spec G3): the
+    /// served `version_id` — the key's current slot, because the object row
+    /// carries no version column (D37) — and the bucket's records-versions bit
+    /// (the version contract's bucket half, D26). mem reads both from its own
+    /// rows, exactly as the pre-engine bodies did.
+    async fn fill_version_facts(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        info: &mut object::Info,
+    ) -> Result<(), Error> {
+        info.version_id = self.current_version_id(bucket, key).await?;
+        info.bucket_records_versions = self.bucket_records_versions(bucket).await?;
+        Ok(())
     }
 
     /// The shared commit tail of the object write paths
@@ -122,8 +172,8 @@ impl MemoryStorage {
     ///
     /// A bucket that records versions keeps the version-domain single
     /// transaction ([Self::write_object_recording_versions]); every other
-    /// bucket takes the contract path ([Self::write_object_plain]) — bytes
-    /// first through the accounting decorator, then the guarded row.
+    /// bucket takes the engine's commit path ([Self::write_object_plain]) —
+    /// bytes first through the accounting decorator, then the guarded row.
     #[allow(clippy::too_many_arguments)]
     async fn write_object(
         &self,
@@ -149,9 +199,13 @@ impl MemoryStorage {
             tags = object::Tags::empty();
             checksum = None;
         }
-        // The per-object cap is the accounting decorator's alone (round 29):
-        // one gate for both write paths, after the marker normalization above
-        // and before anything is staged or published.
+        // The per-object cap (round 29): one gate for both write paths, after
+        // the marker normalization above and before anything is staged or
+        // published. It is the accounting decorator's rule on both — the
+        // versioned path writes its assembled bytes raw, and the plain path
+        // reaches the decorator through the engine's stage — but checking the
+        // whole body here is what makes the refusal report the length the
+        // write would have produced instead of the chunk that crossed the cap.
         self.content().check_object_bytes(data.len() as u64)?;
         #[cfg(feature = "versioning")]
         if self.bucket_records_versions(bucket).await? {
@@ -163,14 +217,21 @@ impl MemoryStorage {
             .await
     }
 
-    /// The contract write path of a bucket that records no versions: the bytes
-    /// are published through the accounting decorator first — it refuses
+    /// The write path of a bucket that records no versions: the engine's own
+    /// commit ([`EngineObjectOps::commit_object`]) over the bytes this call
+    /// already holds, staged through it.
+    ///
+    /// The engine publishes through the accounting decorator — which refuses
     /// max_object_bytes while the chunk is accepted and moves the shared total
-    /// by the difference the write makes — then the row through
-    /// [ObjectMeta::put_guarded] (D40's guaranteed bucket-row policy, so a
-    /// concurrent bucket delete cannot be raced). A refused row write removes
-    /// the published bytes again, so an object that was never recorded is
-    /// billed for nothing.
+    /// by the difference the write makes — then writes the row through the
+    /// contract's guarded form (D40's guaranteed bucket-row policy, so a
+    /// concurrent bucket delete cannot be raced). The receiver's policy is
+    /// mem's `MetadataFailure::Fail`, so a refused row write is **the engine's
+    /// to compensate** (spec RI2): it publishes through the tagged form and
+    /// takes its own publish back with the compare-before-remove, never a
+    /// newer writer's — byte-identical or not. An object that was never
+    /// recorded is therefore billed for nothing, exactly as when mem ran the
+    /// compensation itself.
     #[allow(clippy::too_many_arguments)]
     async fn write_object_plain(
         &self,
@@ -182,67 +243,23 @@ impl MemoryStorage {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
     ) -> Result<object::Info, Error> {
-        let size = data.len() as u64;
-        let etag = if key.is_folder_marker() {
-            ETag::EMPTY
-        } else {
-            ETag::from_content(&data)
-        };
-        let now = now_nanos();
-        let content = ContentKey::Object(key.clone());
-        // The published bytes stay reachable as a handle: a refused row write's
-        // refund must compare them against the key's content before it removes
-        // anything (a newer writer's bytes are not this call's to take).
-        let published = Bytes::from(data);
-        // The publish's identity, recorded with the bytes: a later writer can
-        // publish the same bytes (an empty body matches an empty body), and
-        // the refusal's refund must still tell its own publish from theirs.
-        let publish_id = self.content().mint_publish_id();
-        let mut staged = self.content().stage(bucket, &content).await?;
-        if !published.is_empty() {
-            staged.write(published.clone()).await?;
-        }
-        self.content()
-            .publish_tagged(bucket, staged, &content, publish_id)
+        // The engine consumes its own staged value, and the one mem's
+        // `stage_body` built cannot be handed to it (its bytes are
+        // unreachable — see `StagedBody`), so the adapter stages the buffered
+        // body through the engine here: the content plane still sees exactly
+        // one stage and one publish for this write. `tee` is `None` because
+        // the streamed digest is already folded into `checksum`, which the
+        // commit records as the carried value.
+        let body: BodyStream = Box::pin(stream::iter([Ok::<Bytes, io::Error>(Bytes::from(data))]));
+        let staged = self
+            .object_ops()
+            .stage_body(bucket, key, body, None, checksum)
             .await?;
-        let row = Row {
-            etag: etag.clone(),
-            size,
-            mtime: from_nanos(now),
-            identity: 0,
-            tags: tags.clone(),
-            checksum: checksum.clone(),
-            owner: owner.cloned(),
-            acl: acl.clone(),
-        };
-        if let Err(err) = self
-            .metadata()
-            .put_guarded(bucket, key, &row)
+        let info = self
+            .object_ops()
+            .commit_object(bucket, key, staged, tags, owner, acl)
             .await
-            .map_err(Error::from)
-        {
-            // The refused row write must not strand the bytes it staged — and
-            // must not take a newer writer's with them: the refund compares
-            // before it deletes (the contract's `remove_if_matches`, §4). A
-            // refund that itself fails is reported — it books its own release
-            // either way — and is never promoted over the refusal it
-            // compensates: the caller's error is the row write's.
-            if let Err(failure) = self
-                .roll_back_publish(bucket, &content, &published, publish_id, "OBJECT")
-                .await
-            {
-                report(format_args!(
-                    "object compensation after a refused row write failed: {failure}"
-                ));
-            }
-            return Err(err);
-        }
-        // The row landed, so no compensation can follow this publish: its
-        // identity leaves the map instead of waiting for the key's next
-        // publish to replace it.
-        self.content()
-            .retire_publish_tag(bucket, &content, publish_id)
-            .await;
+            .map_err(Error::from)?;
         // The bucket can begin recording versions between this write's dispatch
         // read and its row landing — only a concurrent `PutBucketVersioning`
         // can do that — and the row just written is then an unversioned one in a
@@ -280,17 +297,13 @@ impl MemoryStorage {
         };
         #[cfg(not(feature = "versioning"))]
         let (version_id, bucket_records_versions) = (None, false);
+        // The engine's answer is everything the write itself produced; mem
+        // adds the identity and the state bit the plane-free body cannot fill
+        // (spec G3).
         Ok(object::Info {
-            key: key.clone(),
-            size,
-            last_modified: from_nanos(now),
-            etag,
-            tags,
-            checksum,
-            owner: owner.cloned(),
-            acl: acl.clone(),
             version_id,
             bucket_records_versions,
+            ..info
         })
     }
 
@@ -385,9 +398,11 @@ impl MemoryStorage {
                     Ok((now, stored.version_id.clone(), records_versions))
                 })?;
         // The versioned write published bytes through its own transaction:
-        // give them an identity too, so a stale compensation of the plain
-        // path can never mistake this content for its own (the guard is held,
-        // so the unlocked entry point is the one to use).
+        // give them an identity too, so the engine's compensation for a
+        // refused plain-path row write can never mistake this content for its
+        // own — the removal matches the publish identity, and these bytes are
+        // this write's, not the engine's (the guard is held, so the unlocked
+        // entry point is the one to use).
         self.content().record_publish_tag(
             bucket,
             &ContentKey::Object(key.clone()),
@@ -489,10 +504,18 @@ impl MemoryStorage {
 
 #[async_trait]
 impl ObjectOps for MemoryStorage {
-    /// A staged body: the buffered payload (the commit inserts it) plus
-    /// the stage's tee digest (see `StagedBody`).
+    /// A staged body: the buffered payload (the versioned commit inserts it
+    /// raw, the plain path stages it through the engine's commit) plus the
+    /// stage's recorded checksum (see `StagedBody`).
     type StagedBody = StagedBody;
 
+    /// The streaming phase, mem's own body rather than the engine's
+    /// ([`EngineObjectOps::stage_body`]): the version-creating commit writes
+    /// the staged bytes raw inside its one transaction, and the engine's
+    /// staged value — the content plane's handle — cannot hand them back (see
+    /// `StagedBody`). Everything else the stage fixes is the shared rule: the
+    /// tee digest rides into the commit as FULL_OBJECT, and a carried value
+    /// wins over it.
     async fn stage_body(
         &self,
         bucket: &Name,
@@ -517,8 +540,9 @@ impl ObjectOps for MemoryStorage {
                 checksum: None,
             });
         }
-        // Stream the body before opening the transaction (the body future
-        // cannot borrow the transaction guard). `tee` is the server's
+        // Stream the body here, in the stage: the write lock and the
+        // versioned commit's transaction belong to the commit phase, so a
+        // slow client never stalls either. `tee` is the server's
         // checksum slot (spec 2026-08-31 — the `upload_part` pattern): the
         // interface wraps the body when the client sent a single
         // `x-amz-checksum-*` header, the digest is computed while the body
@@ -563,13 +587,20 @@ impl ObjectOps for MemoryStorage {
         acl: &Acl,
         checksum: Option<checksum::Recorded>,
     ) -> Result<object::Info, Error> {
-        // The contract's stream default (get → stage → commit) cannot
-        // carry `checksum` — the mem override commits the served bytes
-        // directly, so the copy's recorded checksum (kind included) rides
-        // into the destination row like the fs fast path. The copy is a
-        // fresh object: its tags are the caller's — never the source's —
-        // and the shared commit tail clears any retained parts the
-        // destination key held.
+        // The copy is the read-then-write primitive, not the engine's
+        // same-bucket `ObjectContent::copy` fast path: the destination's bytes
+        // go through mem's own write path, so the copy keeps the object cap,
+        // the folder-marker normalization (a marker destination becomes an
+        // empty marker, never the source's bytes) and the single-transaction
+        // branch a copy into a version-recording bucket must take — the
+        // engine's `copy_object` body can express none of the three, a
+        // `ContentKey` copy carrying no version and no marker. The contract's
+        // stream default (get → stage → commit) cannot carry `checksum`
+        // either, so the served bytes are committed directly and the copy's
+        // recorded value (kind included) rides into the destination row. The
+        // copy is a fresh object: its tags are the caller's — never the
+        // source's — and the commit clears any retained parts the destination
+        // key held.
         let get = self.get_object(src_bucket, src_key, None).await?;
         let data = collect_body(get.body).await?;
         self.write_object(dst_bucket, dst_key, data, tags, checksum, owner, acl)
@@ -582,46 +613,27 @@ impl ObjectOps for MemoryStorage {
         key: &object::Key,
         range: Option<ByteRange>,
     ) -> Result<GetObjectResult, Error> {
+        // The gates every mem read opens with — the engine's body knows no
+        // marker and no reserved segment: a missing bucket answers
+        // `NoSuchBucket` before any key validation, and a reserved or marker
+        // key is never an object (`NoSuchKey`, mirroring head).
         self.ensure_bucket(bucket).await?;
         if key.is_reserved() || key.is_folder_marker() {
             return Err(no_such_key(key));
         }
-        // The row is the existence gate (a domain-invalid etag row reads as
-        // missing — the shared self-heal). The records-versions bit is the
-        // version contract's bucket half (D26) and the version identity is the
-        // key's current slot (D37) — the object row carries no version column.
-        let row = self
-            .metadata()
-            .get(bucket, key)
+        // The engine's read: the content plane's `stat` is the existence
+        // authority, the row is read and **healed** against it (the shared
+        // read-heal, so the row a key earns is the content's own record), the
+        // range resolves against the served length, and the body is the
+        // content plane's own open — a partial read never copies the whole
+        // object. The version facts are the caller's to fill (spec G3).
+        let mut result = self
+            .object_ops()
+            .get_object(bucket, key, range)
             .await
-            .map_err(Error::from)?
-            .ok_or_else(|| no_such_key(key))?;
-        let records_versions = self.bucket_records_versions(bucket).await?;
-        let version_id = self.current_version_id(bucket, key).await?;
-        let size = row.size;
-        let served_range = match range {
-            None => None,
-            Some(r) => Some(r.resolve(size)?),
-        };
-        // The content plane windows the range itself, so a partial read never
-        // copies the whole object.
-        let content = ContentKey::Object(key.clone());
-        let data = collect_body(self.content().open(bucket, &content, range).await?).await?;
-        let mut result = object_result(
-            key,
-            size,
-            row.mtime,
-            row.etag,
-            row.tags,
-            row.checksum,
-            row.owner,
-            row.acl,
-            version_id,
-            records_versions,
-            &data,
-            None,
-        )?;
-        result.served_range = served_range;
+            .map_err(Error::from)?;
+        self.fill_version_facts(bucket, key, &mut result.info)
+            .await?;
         Ok(result)
     }
 
@@ -630,24 +642,14 @@ impl ObjectOps for MemoryStorage {
         if key.is_folder_marker() || key.is_reserved() {
             return Err(no_such_key(key));
         }
-        let row = self
-            .metadata()
-            .get(bucket, key)
+        // The engine's read and the same heal, without the body.
+        let mut info = self
+            .object_ops()
+            .head_object(bucket, key)
             .await
-            .map_err(Error::from)?
-            .ok_or_else(|| no_such_key(key))?;
-        Ok(object::Info {
-            key: key.clone(),
-            size: row.size,
-            last_modified: row.mtime,
-            etag: row.etag,
-            tags: row.tags,
-            checksum: row.checksum,
-            owner: row.owner,
-            acl: row.acl,
-            version_id: self.current_version_id(bucket, key).await?,
-            bucket_records_versions: self.bucket_records_versions(bucket).await?,
-        })
+            .map_err(Error::from)?;
+        self.fill_version_facts(bucket, key, &mut info).await?;
+        Ok(info)
     }
 
     async fn delete_object(
@@ -667,17 +669,15 @@ impl ObjectOps for MemoryStorage {
         if self.bucket_records_versions(bucket).await? {
             return self.delete_object_recording_versions(bucket, key).await;
         }
-        // Unversioned: the bytes leave through the decorator's own removal
-        // (which releases exactly what was counted), the row and its retained
-        // part list after — the delete's mirror of the write order.
-        self.content()
-            .remove(bucket, &ContentKey::Object(key.clone()))
-            .await?;
-        self.metadata()
-            .remove(bucket, key)
+        // Unversioned: the engine's body — the bytes leave through the
+        // decorator's own removal (which releases exactly what was counted),
+        // the row and its retained part list after, the delete's mirror of the
+        // write order. S3 semantics: idempotent, and the answer names no
+        // version (no marker was created).
+        self.object_ops()
+            .delete_object(bucket, key)
             .await
-            .map_err(Error::from)?;
-        Ok(version::Marker::none())
+            .map_err(Error::from)
     }
 
     /// Rename moves the object's rows — except on a bucket that records
@@ -717,37 +717,16 @@ impl ObjectOps for MemoryStorage {
         // The contract's rename guard: the whole policy, so a recording
         // bucket is refused before anything moves (the interface's rule).
         self.ensure_rename_allowed(bucket, dst).await?;
-        // The source row is read first: the move answers the metadata the old
-        // single transaction built from the moved row, and the contract's
-        // move_ does not answer it. A rename is not a fresh object — nothing
-        // is recomputed.
-        let row = self
-            .metadata()
-            .get(bucket, src)
+        // The engine's body: the source row is read and healed first (the
+        // answer is the moved row's own metadata, never a recomputation — a
+        // rename is not a fresh object), the bytes move by the content plane's
+        // own call, and the row with its retained part list follows in the
+        // contract's one move transaction. The answer names no version: the
+        // guard above passed, so the bucket records none.
+        self.object_ops()
+            .rename_object(bucket, src, dst)
             .await
-            .map_err(Error::from)?
-            .ok_or_else(|| no_such_key(src))?;
-        // The bytes move first (the move is a content-plane rename), the row
-        // and its retained part list after, in the contract's one move
-        // transaction.
-        self.content().rename(bucket, src, dst).await?;
-        self.metadata()
-            .move_(bucket, src, dst)
-            .await
-            .map_err(Error::from)?;
-        Ok(object::Info {
-            key: dst.clone(),
-            size: row.size,
-            last_modified: row.mtime,
-            etag: row.etag,
-            tags: row.tags,
-            checksum: row.checksum,
-            owner: row.owner,
-            acl: row.acl,
-            // The guard above passed, so the bucket records no versions.
-            version_id: None,
-            bucket_records_versions: false,
-        })
+            .map_err(Error::from)
     }
 
     async fn get_object_tags(
@@ -758,17 +737,16 @@ impl ObjectOps for MemoryStorage {
         // Object existence is the object row — head_object's gate (rows and
         // bytes are written together, so a row-less key is a missing object,
         // and folder-marker / reserved keys are never objects — NoSuchKey,
-        // mirroring head).
+        // mirroring head). The engine's body reads the row under the
+        // `Guaranteed` policy, so its `NoSuchKey` is the same answer.
         self.ensure_bucket(bucket).await?;
         if key.is_reserved() || key.is_folder_marker() {
             return Err(no_such_key(key));
         }
-        self.metadata()
-            .get(bucket, key)
+        self.object_ops()
+            .get_object_tags(bucket, key)
             .await
-            .map_err(Error::from)?
-            .map(|row| row.tags)
-            .ok_or_else(|| no_such_key(key))
+            .map_err(Error::from)
     }
 
     async fn put_object_tags(
@@ -786,9 +764,14 @@ impl ObjectOps for MemoryStorage {
         if key.is_reserved() || key.is_folder_marker() {
             return Err(no_such_key(key));
         }
-        self.rewrite_tags_element(bucket, key, tags)
-            .await?
-            .ok_or_else(|| no_such_key(key))
+        // The engine's body replaces the row's tag element and answers
+        // `NoSuchKey` for a missing row (the `Guaranteed` policy). The identity
+        // pair is mem's to read afterwards (spec G3).
+        self.object_ops()
+            .put_object_tags(bucket, key, tags)
+            .await
+            .map_err(Error::from)?;
+        self.tag_write_result(bucket, key).await
     }
 
     async fn delete_object_tags(
@@ -800,28 +783,32 @@ impl ObjectOps for MemoryStorage {
         // (NoSuchBucket when missing); a missing object — key, marker, or row —
         // is a no-op that names no identity.
         self.ensure_bucket(bucket).await?;
-        Ok(self
-            .rewrite_tags_element(bucket, key, &object::Tags::empty())
-            .await?
-            .unwrap_or(TagWriteResult {
-                version_id: None,
-                bucket_records_versions: false,
-            }))
+        // The clear is the contract's element write, and its answer is the rule
+        // the identity follows: it is `false` for a missing row AND for a row
+        // the write left unchanged (the store's unchanged-write no-op), and
+        // neither names an identity. The engine's lenient `delete_object_tags`
+        // body deliberately discards that answer (it names no identity on
+        // either row policy), so the write stays here and the pair follows it.
+        if !self
+            .metadata()
+            .set_tags(bucket, key, &object::Tags::empty())
+            .await
+            .map_err(Error::from)?
+        {
+            return Ok(TagWriteResult::untouched());
+        }
+        self.tag_write_result(bucket, key).await
     }
 
     async fn get_object_acl(&self, bucket: &Name, key: &object::Key) -> Result<Acl, Error> {
-        // Existence is the object row (NoSuchKey when missing); the ACL
-        // recombines the stored owner element with the stored grant set (the
-        // row form keeps them apart — the shared decode-home rule).
-        self.metadata()
-            .get(bucket, key)
+        // The engine's body: existence is the object row (NoSuchKey when
+        // missing — the `Guaranteed` policy), and the ACL recombines the
+        // stored owner element with the stored grant set (the row form keeps
+        // them apart — the shared decode-home rule).
+        self.object_ops()
+            .get_object_acl(bucket, key)
             .await
-            .map_err(Error::from)?
-            .map(|row| Acl {
-                owner: row.owner,
-                grants: row.acl.grants,
-            })
-            .ok_or_else(|| no_such_key(key))
+            .map_err(Error::from)
     }
 
     async fn put_object_acl(
@@ -830,22 +817,13 @@ impl ObjectOps for MemoryStorage {
         key: &object::Key,
         grants: &AclGrants,
     ) -> Result<(), Error> {
-        // Replace-all: the contract replaces the row's ACL element; the owner
-        // element is preserved — a put never changes it (contract ruling).
-        // NoSuchKey when the object is missing.
-        let Some(row) = self
-            .metadata()
-            .get(bucket, key)
+        // The engine's body: replace-all of the row's ACL element with the
+        // owner element preserved — a put never changes it (contract ruling) —
+        // and NoSuchKey when the object is missing.
+        self.object_ops()
+            .put_object_acl(bucket, key, grants)
             .await
-            .map_err(Error::from)?
-        else {
-            return Err(no_such_key(key));
-        };
-        self.metadata()
-            .set_acl(bucket, key, row.owner.as_ref(), grants)
-            .await
-            .map_err(Error::from)?;
-        Ok(())
+            .map_err(Error::from)
     }
 
     async fn list_object_parts(
@@ -862,89 +840,51 @@ impl ObjectOps for MemoryStorage {
         if key.is_reserved() || key.is_folder_marker() {
             return Err(no_such_key(key));
         }
-        if self
-            .metadata()
-            .get(bucket, key)
-            .await
-            .map_err(Error::from)?
-            .is_none()
-        {
-            return Err(no_such_key(key));
-        }
-        let parts = self
-            .metadata()
-            .parts(bucket, key)
-            .await
-            .map_err(Error::from)?;
-        // The contract's own projection: a stored part number outside
-        // `1..=10000` refuses the read with `InvalidPartNumber` rather than
+        // The engine's body under the `Guaranteed` policy: the row is the
+        // existence gate, and the contract's own projection refuses a stored
+        // part number outside `1..=10000` with `InvalidPartNumber` rather than
         // panicking on a row this crate did not write.
-        parts
-            .into_iter()
-            .map(ObjectPart::try_from)
-            .collect::<Result<Vec<_>, _>>()
+        self.object_ops()
+            .list_object_parts(bucket, key)
+            .await
             .map_err(Error::from)
     }
 
     async fn list_objects(&self, params: ListObjectsParams) -> Result<ObjectListing, Error> {
         self.ensure_bucket(&params.bucket).await?;
         // The page's objects all carry the bucket's state — one read for the
-        // page, the carrier's value on every row.
+        // page, the carrier's value on every row (the engine takes the bit as
+        // the parameter its plane-free body cannot read).
         let records_versions = self.bucket_records_versions(&params.bucket).await?;
-        // The healing walk is the old per-row validation: a domain-invalid row
-        // is treated as missing, where the strict `walk` would fail the whole
-        // listing instead.
-        let walked = self
-            .metadata()
-            .walk_healing(&params.bucket)
+        // The engine's listing: the content plane's own `scan` enumerates the
+        // keys (prefix-bounded, page by page), one batch row read enriches the
+        // page, the shared pager groups and paginates it, and a key whose row
+        // is absent or stale is healed — so the listing serves what the
+        // content holds, never a stale record of it.
+        let bucket = params.bucket.clone();
+        let mut page = self
+            .object_ops()
+            .list_objects(params, records_versions)
             .await
             .map_err(Error::from)?;
-        let mut rows: Vec<object::Info> = Vec::new();
-        for (key, row) in walked {
-            let Some(row) = row else {
-                continue; // a garbage-etag row is treated as missing
-            };
-            if key.is_folder_marker() || key.is_reserved() {
-                continue;
+        // Folder markers are never objects (s3-surface.md), and the rule is the
+        // engine's: mem's marker is a key in the content plane holding no bytes
+        // (fs's is a directory its scan never yields, so its entries arrive
+        // clean while mem's plane stores a marker as content and yields it), so
+        // the engine's listing skips a folder marker — and a reserved key —
+        // inside its scan loop, before the page engine sees the entry. The page
+        // mem serves is free of markers before this adapter touches it: nothing
+        // is filtered here.
+        // The identity of each listed version is the caller's to fill (spec
+        // G3): the object row carries no version column (D37), so a bucket
+        // that records versions pays one point read per listed key — a bucket
+        // that does not has nothing to look up.
+        if records_versions {
+            for info in &mut page.objects {
+                info.version_id = self.current_version_id(&bucket, &info.key).await?;
             }
-            if !key.as_ref().starts_with(&params.prefix) {
-                continue;
-            }
-            // The contract's row carries no version column (D37), so a bucket
-            // that records versions pays one point read per listed key; a
-            // bucket that does not has nothing to look up.
-            let version_id = if records_versions {
-                self.current_version_id(&params.bucket, &key).await?
-            } else {
-                None
-            };
-            rows.push(object::Info {
-                key,
-                size: row.size,
-                last_modified: row.mtime,
-                etag: row.etag,
-                tags: row.tags,
-                checksum: row.checksum,
-                owner: row.owner,
-                acl: row.acl,
-                version_id,
-                bucket_records_versions: records_versions,
-            });
         }
-        let (keys, common_prefixes, truncated, next_start_after) = group_and_paginate(
-            rows,
-            &params.prefix,
-            params.delimiter.as_deref(),
-            params.start_after.as_deref(),
-            params.max_keys,
-            |o| o.key.as_ref(),
-        );
-        Ok(ObjectListing {
-            objects: keys,
-            common_prefixes,
-            truncated,
-            next_start_after,
-        })
+        Ok(page)
     }
 }
 
@@ -957,8 +897,12 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            BodyStream, BucketOps, ListObjectsParams, ObjectListing, ObjectOps, acl::Acl, bucket,
-            checksum, object, storage::Error::*,
+            BodyStream, BucketOps, ListObjectsParams, ObjectListing, ObjectOps,
+            acl::Acl,
+            bucket, checksum,
+            content::{ContentKey, ObjectContent},
+            object,
+            storage::Error::*,
         },
         _util::testing::{body, complete_single_part, read_body},
         MemoryOptions,
@@ -975,13 +919,19 @@ mod tests {
         (storage, name)
     }
 
-    /// The refused row write's refund is conditional on the publish's identity
-    /// (ruling 2026-10-08): it takes back only this call's own publish, so a
-    /// newer writer at the same key keeps its content — even when that writer
-    /// published **byte-identical** content, which the byte compare alone
-    /// cannot tell from ours.
+    /// The refund a refused row write takes is conditional on the publish's
+    /// identity (ruling 2026-10-08), and the compensation that takes it is the
+    /// engine's now (spec RI2): under mem's `MetadataFailure::Fail` policy the
+    /// engine publishes through the tagged form and takes its own publish back
+    /// with [`ObjectContent::remove_if_tagged`] (`tinio_ops`' own
+    /// `compensate_publish`). The decorator is the half mem still owns, and
+    /// this pins it: a **stale** identity names its own publish and finds a
+    /// newer one — even when that writer published byte-identical content,
+    /// which the byte compare alone cannot tell from ours — so nothing is
+    /// deleted and nothing is released; the live identity does take its bytes
+    /// back, once (the removal consumes the tag).
     #[tokio::test]
-    async fn the_staged_bytes_refund_leaves_a_newer_writers_content_alone() {
+    async fn a_stale_compensation_leaves_a_newer_writers_content_alone() {
         let (storage, b) = with_bucket().await;
         let key = object::key("raced.bin").unwrap();
         let content = ContentKey::Object(key.clone());
@@ -993,12 +943,15 @@ mod tests {
         let theirs = storage.content().mint_publish_id();
         publish_tagged_bytes(&storage, &b, &content, b"same body", theirs).await;
 
-        // The stale compensation names its own publish and finds a newer
-        // one: nothing is deleted.
-        storage
-            .roll_back_publish(&b, &content, b"same body", ours, "OBJECT")
-            .await
-            .unwrap();
+        // The stale compensation finds a newer publish: nothing is deleted.
+        assert!(
+            !storage
+                .content()
+                .remove_if_tagged(&b, &content, b"same body", ours)
+                .await
+                .unwrap(),
+            "a stale identity must not match the key's publish"
+        );
         assert_eq!(
             read_body(storage.content().open(&b, &content, None).await.unwrap())
                 .await
@@ -1007,14 +960,27 @@ mod tests {
             "the newer writer's byte-identical content stays"
         );
 
-        // The live publish's refund does take its bytes back.
-        storage
-            .roll_back_publish(&b, &content, b"same body", theirs, "OBJECT")
-            .await
-            .unwrap();
+        // The live publish's own identity does take its bytes back — and the
+        // tag it consumed makes a second refund a no-op.
+        assert!(
+            storage
+                .content()
+                .remove_if_tagged(&b, &content, b"same body", theirs)
+                .await
+                .unwrap(),
+            "the live publish is taken back"
+        );
         assert!(
             storage.content().open(&b, &content, None).await.is_err(),
-            "the live publish is taken back"
+            "the live publish's bytes are gone"
+        );
+        assert!(
+            !storage
+                .content()
+                .remove_if_tagged(&b, &content, b"same body", theirs)
+                .await
+                .unwrap(),
+            "the identity was claimed once: no second refund exists"
         );
     }
 
@@ -1654,9 +1620,14 @@ mod tests {
         assert_metadata_conformance(storage.metadata().as_ref()).await;
     }
 
-    /// Review focus 1: a put whose guarded row write is refused (its bucket is
-    /// gone) must leave none of the staged bytes counted — the decorator's
-    /// publish happened, and the compensation removal takes it back out.
+    /// Review focus 1, and spec RI2's evidence: a put whose guarded row write
+    /// is refused (its bucket is gone) must leave none of the published bytes
+    /// behind and none of them counted — the engine's commit published them
+    /// through the tagged form, the refusal is the operation's answer, and the
+    /// engine's own compensation takes exactly its publish back out. That the
+    /// bytes and the meter both return to zero is what "once" means here: the
+    /// removal consumes the publish identity it matched, so a second
+    /// compensation has nothing left to take.
     #[tokio::test]
     async fn a_refused_guarded_row_write_leaves_the_total_unchanged() {
         let storage = MemoryStorage::with_options(MemoryOptions {
@@ -1690,6 +1661,16 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))), "{err}");
         assert_eq!(storage.total_bytes(), 0, "a refused write meters nothing");
+        // The engine's compensation, taken on its own publish: the bytes are
+        // gone from the key too, never stranded and never billed.
+        assert!(
+            storage
+                .content()
+                .open(&name, &ContentKey::Object(key.clone()), None)
+                .await
+                .is_err(),
+            "the refused write's own published bytes are taken back"
+        );
     }
 
     /// The window the repair exists for (ruling 2026-10-08), driven through the

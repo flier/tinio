@@ -176,6 +176,19 @@ pub enum Error {
         /// The sequence both rows name.
         seq: u64,
     },
+    /// A restore names a version row that is absent, or one whose identity is
+    /// not the version the caller named: the row at `seq` is the call's
+    /// premise, and a slot naming a version the store no longer holds must
+    /// never be written.
+    #[error("version restore refused at {bucket}/{key} seq {seq}")]
+    RestoreConflict {
+        /// The bucket the restored row was looked up in.
+        bucket: bucket::Name,
+        /// The key the restored row was looked up at.
+        key: String,
+        /// The sequence the caller named.
+        seq: u64,
+    },
     /// A version slot was asked to move backwards: the sequence the caller
     /// named is lower than the one the key's slot already records. A slot
     /// never moves backwards (an equal sequence is the crash window's re-run).
@@ -188,6 +201,9 @@ pub enum Error {
         /// The refused (lower) sequence the caller asked to advance to.
         seq: u64,
     },
+    /// A content-stream read failed while a digest compare re-read the body.
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
     /// The contract's own failure, absorbed whole: the projection of a
     /// not-found or a refusal would otherwise degrade to `Io` (D22).
     #[error(transparent)]
@@ -247,6 +263,7 @@ impl From<Error> for storage::Error {
                 io::ErrorKind::NotFound,
                 format!("no such block: {hash}"),
             )),
+            Error::Io(err) => storage::Error::Io(err),
             Error::Storage(inner) => inner,
             other => storage::Error::Io(io::Error::other(other.to_string())),
         }

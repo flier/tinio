@@ -3,6 +3,13 @@
 //! The composed-object path the S3 mapping layer drives: upload N parts,
 //! then `complete_multipart_upload` assembles them byte-exact into the
 //! object. Baselines are recorded in Phase 6 (T088) and regression-gated.
+//!
+//! The fixture's root and the run's flush control come from
+//! `tinio_util::bench` (the `bench` feature): its module docs carry why the
+//! root is pinned away from `TMP` and why every run records a flush
+//! measurement. It used to call `tempfile::tempdir()`, so the whole fixture
+//! followed the shell's `TMP` and a stored baseline's flush regime was not
+//! checkable after the fact.
 
 // This bench declares `harness = false`, so clippy's `allow-*-in-tests` keys do
 // not reach it (design 2026-10-09 D7), and a bench is not production code
@@ -24,7 +31,7 @@ use tinio_core::{
     storage::{BucketOps, MultipartOps, ObjectOps},
 };
 use tinio_fs::{FsStorage, testing::fs_options};
-use tinio_util::testing::body;
+use tinio_util::{bench, testing::body};
 use tokio::runtime::Runtime;
 
 /// Part count of the assembly benchmark: 12 parts at exactly the 5 MiB
@@ -34,11 +41,13 @@ const PARTS: usize = 12;
 const PART_SIZE: usize = MIN_PART_BYTES as usize;
 
 fn multipart_assembly(c: &mut Criterion) {
+    // The run's flush regime, beside its numbers (see `bench`).
+    bench::flush_control(&bench::data_root());
     let mut group = c.benchmark_group("multipart_assembly");
     group.throughput(Throughput::Bytes((PARTS * PART_SIZE) as u64));
     group.bench_function("complete_60MiB_12_parts", |b| {
-        let root = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let root = bench::cell_dir("multipart_assembly");
+        let storage = FsStorage::new(&root, fs_options()).unwrap();
         let rt = Runtime::new().unwrap();
         let bname = bucket::name("data").unwrap();
         let key = object::key("big.bin").unwrap();

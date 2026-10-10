@@ -887,6 +887,51 @@ impl VersionMeta for Fake {
         Ok(())
     }
 
+    /// The restore's commit over the double's own tables: the row at `seq` is
+    /// the premise (it must exist and name `id`, and its kind is the slot's
+    /// marker bit — never the caller's); the consumed row and its index entry
+    /// go together; the caller's object row is recorded; and the slot names the
+    /// restored version at its own sequence — a **backwards** move, so no guard
+    /// applies. The double keeps no retained part list (`ObjectMeta::parts` is
+    /// not a call the engine makes), so S3's clear has nothing to clear here.
+    async fn restore_slot(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        row: &object_row::Row,
+        id: Option<version::Id>,
+        seq: u64,
+    ) -> Result<(), storage::Error> {
+        let Some(consumed) = self.row_at(bucket, key, seq) else {
+            return Err(storage::io(io::Error::other(
+                "a restore names a version row that is absent",
+            )));
+        };
+        if id_wire(consumed.id.as_ref()) != id_wire(id.as_ref()) {
+            return Err(storage::io(io::Error::other(
+                "a restore names a version row of another identity",
+            )));
+        }
+        self.inner
+            .objects
+            .lock()
+            .unwrap()
+            .insert((bucket.to_string(), key.to_string()), row.clone());
+        self.drop_row(bucket, key, seq);
+        self.set_slot(
+            bucket,
+            key,
+            Current {
+                exists: true,
+                version: id,
+                is_delete_marker: consumed.kind.is_marker(),
+                seq,
+                degraded: false,
+            },
+        );
+        Ok(())
+    }
+
     async fn put_version(
         &self,
         bucket: &bucket::Name,

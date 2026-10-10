@@ -15,6 +15,7 @@ clap = { workspace = true, features = [
 ] }
 thiserror = { workspace = true }
 
+tinio-bench.workspace = true
 tinio-util.workspace = true
 
 [lints.clippy]

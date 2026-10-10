@@ -14,6 +14,8 @@
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
 #[doc(hidden)]
+pub extern crate tinio_ops as _ops;
+#[doc(hidden)]
 pub extern crate tinio_store_redb as _store_redb;
 #[cfg(test)]
 extern crate tinio_util as _util;

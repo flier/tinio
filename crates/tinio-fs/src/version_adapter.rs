@@ -39,7 +39,7 @@
 //!   check because the identity wire cannot separate two null versions, which
 //!   share it by construction.
 
-use std::{io::ErrorKind, path::PathBuf, sync::Arc, time::SystemTime};
+use std::{io::ErrorKind, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use tokio::fs;
@@ -65,24 +65,18 @@ use crate::{
     meta::{Content, Verdict, gate},
 };
 
-/// The key's current slot as the gate left it: the port's [`Current`],
-/// the `object_meta` row the gate judged, and the key path the gate resolved
-/// and judged.
+/// The key's current slot as the gate left it: the port's [`Current`] and the
+/// `object_meta` row the gate judged.
 ///
-/// One read serves both the engine (which takes `current` and `stored`) and
-/// the version-addressed read paths (which open `path` instead of resolving
-/// the key a second time), so a request never resolves the same key twice.
+/// One read serves both the engine (which takes `current`) and fs's own
+/// paths that need the judged row (the current-version probe), so a request
+/// never reads the row twice.
 #[derive(Debug, Clone)]
 pub(crate) struct Judged {
     /// The gated slot — the port's answer.
     pub(crate) current: Current,
     /// The judged `object_meta` row (`None` when none records the key).
     pub(crate) stored: Option<object_meta::Stored>,
-    /// The resolved key path, when the key has a file (`None` for a marker's
-    /// slot or a file removed out of band — the states with nothing to
-    /// open). Opening it is the caller's, so a metadata-only caller never
-    /// pays for a handle it does not use.
-    pub(crate) path: Option<PathBuf>,
 }
 
 /// The fs implementation of the contracts the engine runs on — [`Metadata`],
@@ -111,10 +105,9 @@ impl Rows {
     }
 
     /// The key's gated current slot — the port's [`CurrentRows::current`]
-    /// answer — with the `object_meta` row the gate was applied to and the
-    /// key path it judged, all from one read: a caller that needs the row or
-    /// the file (the version read paths' `slot`) neither reads the row nor
-    /// resolves the path again.
+    /// answer — with the `object_meta` row the gate was applied to, from one
+    /// read: a caller that needs the row (fs's own `slot`, and the current
+    /// version's judgement) never reads it twice.
     ///
     /// A row whose etag is domain-invalid is reported as absent — the port's
     /// own self-heal, so the two answers can never disagree.
@@ -134,7 +127,6 @@ impl Rows {
             return Ok(Judged {
                 current: Current::default(),
                 stored: None,
-                path: None,
             });
         };
         let dir = self.storage.ensure_bucket(bucket).await.map_err(contract)?;
@@ -161,9 +153,9 @@ impl Rows {
             Err(err) => return Err(contract(err)),
         };
         // The gate's verdict — the ONE home of the decision
-        // (`meta::gate`), shared with the plain read's
-        // `resolve_object_info`, so the two can never disagree about what is
-        // current — and the slot it names.
+        // (`meta::gate`), shared with the plain read's version facts
+        // (`resolve_object_slot`), so the two can never disagree about what
+        // is current — and the slot it names.
         let slot = match gate(&stored, content) {
             // The recorded identity names what the key holds, or the key
             // holds nothing and the row is the recorded delete marker, which
@@ -193,16 +185,9 @@ impl Rows {
                 degraded: stored.version_id.is_some(),
             },
         };
-        // The path rides along only when the key has a file to open: a
-        // marker's slot and a file removed out of band have nothing.
-        let path = match content {
-            Content::Present { .. } => Some(target),
-            Content::Missing => None,
-        };
         Ok(Judged {
             current: slot,
             stored: Some(stored),
-            path,
         })
     }
 }
@@ -789,6 +774,22 @@ impl VersionMeta for Rows {
             .map_err(Into::into)
     }
 
+    /// The restore's commit, delegated like every other version write: the
+    /// engine's own transaction reads the row, writes the object row and its
+    /// slot columns, and consumes the row and its index entry.
+    async fn restore_slot(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        row: &object_row::Row,
+        id: Option<version::Id>,
+        seq: u64,
+    ) -> Result<(), Self::Error> {
+        <RedbMetadata as VersionMeta>::restore_slot(&self.engine, bucket, key, row, id, seq)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn get_version(
         &self,
         bucket: &bucket::Name,
@@ -928,7 +929,7 @@ impl FsStorage {
 
 #[cfg(test)]
 mod tests {
-    use std::fs as std_fs;
+    use std::{fs as std_fs, path::PathBuf};
 
     use super::*;
     use crate::{

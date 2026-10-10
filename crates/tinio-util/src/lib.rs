@@ -1,6 +1,11 @@
 //! Shared runtime utilities for tinio: small backend-agnostic helpers
 //! built on by both the storage backends and the server.
 //!
+//! - `bench` — the benches' pinned data root and flush-cost control (behind
+//!   the `bench` feature: the one copy every bench target in the workspace
+//!   runs on, which is why it is a library module and not a bench-local
+//!   include; see the module's docs for the false "2.7× regression" a
+//!   `TMP`-following root produced).
 //! - [`fsutil`] — the filesystem primitives the storage backends are written
 //!   on, lifted here so there is one copy of each: the atomic commit protocol
 //!   ([`commit`](fsutil::commit) — parent creation, rename, the EXDEV
@@ -57,6 +62,18 @@
 
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
+
+// **Behind the `bench` feature, the way `testing` is**: this module hands out
+// directories and measures the host's flush latency, and `tinio-util` is a
+// production dependency of several crates — bench-only code must not compile
+// into a default build (the `expect`s below are fixture assertions on paths
+// the bench itself named, `docs/style.md` §Panics).
+#[allow(
+    clippy::expect_used,
+    reason = "test support: behind `bench` (docs/style.md §Panics)"
+)]
+#[cfg(feature = "bench")]
+pub mod bench;
 
 pub mod fsutil;
 pub mod lockmap;

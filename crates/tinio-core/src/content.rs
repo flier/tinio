@@ -22,17 +22,39 @@
 //! `crate::bucket::Name`], [`crate::object::Key`]); part numbers as
 //! [`crate::multipart::PartNumber`].
 
-use std::{error::Error as StdError, time::SystemTime};
+use std::{error::Error as StdError, io::Error as IoError, time::SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use derive_more::{From, Into};
 use futures::StreamExt;
+use md5::{Digest as _, Md5};
 
 use crate::{
-    bucket, multipart, object,
+    bucket,
+    etag::ETag,
+    multipart, object,
     storage::{self, BodyStream, ByteRange},
 };
+
+/// Whether `body` is the single-part content `etag` names.
+///
+/// A composed ETag is never a content MD5, so it does not match. The body is
+/// hashed as it arrives; nothing here retains it.
+///
+/// # Errors
+///
+/// The stream's own I/O failure.
+pub async fn body_matches_etag(body: &mut BodyStream, etag: &ETag) -> Result<bool, IoError> {
+    let ETag::Single(want) = etag else {
+        return Ok(false);
+    };
+    let mut hasher = Md5::new();
+    while let Some(chunk) = body.next().await {
+        hasher.update(&chunk?);
+    }
+    Ok(<[u8; 16]>::from(hasher.finalize()) == *want)
+}
 
 /// The key a content-plane call addresses: an object key, or one multipart
 /// part's key.
@@ -168,8 +190,9 @@ pub trait StagedObject: Send + Sync + 'static {
 /// ```
 #[async_trait]
 pub trait ObjectContent: Send + Sync + 'static {
-    /// This backend's content error; it must project into [`storage::Error`].
-    type Error: StdError + Send + Sync + 'static + Into<storage::Error>;
+    /// This backend's content error; it must project into [`storage::Error`]
+    /// and absorb a stream's I/O failure (the digest compare re-reads the body).
+    type Error: StdError + Send + Sync + 'static + Into<storage::Error> + From<IoError>;
 
     /// The backend's staged-write handle. Its error **is** this contract's
     /// error, so a typed refusal survives the stage/publish pair.
@@ -327,6 +350,40 @@ pub trait ObjectContent: Send + Sync + 'static {
         self.remove_if_matches(bucket, key, expected).await
     }
 
+    /// Remove `key` when it is still publish `id` and a content MD5 of the
+    /// stored bytes equals `etag`.
+    ///
+    /// A composed ETag never matches: the compare is the single-part digest,
+    /// so a multipart object is left in place. The default re-reads the body
+    /// and, on a match, hands those bytes to
+    /// [`remove_if_tagged`](Self::remove_if_tagged) — the byte compare is what
+    /// a plane with no publish identity can still decide. A plane that already
+    /// holds the bytes overrides this and hashes them in place, so the caller
+    /// keeps no second copy of the object.
+    async fn remove_if_etag(
+        &self,
+        bucket: &bucket::Name,
+        key: &ContentKey,
+        etag: &ETag,
+        id: PublishId,
+    ) -> Result<bool, Self::Error> {
+        let ETag::Single(want) = etag else {
+            return Ok(false);
+        };
+        let mut body = self.open(bucket, key, None).await?;
+        let mut hasher = Md5::new();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(Self::Error::from)?;
+            hasher.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
+        if <[u8; 16]>::from(hasher.finalize()) != *want {
+            return Ok(false);
+        }
+        self.remove_if_tagged(bucket, key, &bytes, id).await
+    }
+
     /// Rename an object's bytes. `Err` when the source holds nothing — the
     /// metadata move is the caller's, and a rename that moved no bytes must not
     /// be recorded as a move. A move **onto the same key** (`from == to`) is a
@@ -401,6 +458,9 @@ pub trait ObjectContent: Send + Sync + 'static {
 /// recording a row must record (the read path's staleness gate compares the row
 /// against the file).
 ///
+/// The pump itself is [`stage_body_md5`], which is this call with the digest
+/// kept: a write path that records a content ETag takes that form.
+///
 /// A chunk's error projects onto [`storage::Error`] through
 /// [`storage::io`]; a stage's own typed refusal keeps its
 /// projection ([StagedObject::Error] is required to have one).
@@ -416,14 +476,75 @@ pub async fn stage_body<S>(staged: &mut S, body: BodyStream) -> Result<u64, stor
 where
     S: StagedObject + ?Sized,
 {
+    stage_body_md5(staged, body).await.map(|(landed, _)| landed)
+}
+
+/// Stream `body` into `staged`, one chunk at a time, and answer both the
+/// number of bytes that landed and the content MD5 over them.
+///
+/// The one implementation of the body pump: [`stage_body`] is this function
+/// with the digest dropped, and [`hash_body`] is it with a stage that keeps
+/// nothing. The answer's count is the same **landed** byte count
+/// [`stage_body`] explains, and the digest is what a write path recording a
+/// content ETag stores (a multipart part's MD5, an object commit's).
+///
+/// A chunk's error projects onto [`storage::Error`] through
+/// [`storage::io`]; a stage's own typed refusal keeps its
+/// projection ([StagedObject::Error] is required to have one).
+///
+/// # Examples
+///
+/// ```ignore
+/// let mut staged = store.stage(bucket, &key).await?;
+/// let (landed, digest) = stage_body_md5(&mut staged, body).await?;
+/// let etag = ETag::Single(digest);
+/// store.publish(bucket, staged, &key).await?;
+/// ```
+pub async fn stage_body_md5<S>(
+    staged: &mut S,
+    body: BodyStream,
+) -> Result<(u64, [u8; 16]), storage::Error>
+where
+    S: StagedObject + ?Sized,
+{
     let mut body = body;
     let mut landed = 0u64;
+    let mut hasher = Md5::new();
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(storage::io)?;
         landed += chunk.len() as u64;
+        hasher.update(&chunk);
         staged.write(chunk).await.map_err(Into::into)?;
     }
-    Ok(landed)
+    Ok((landed, hasher.finalize().into()))
+}
+
+/// The content MD5 of `body`, hashed as it arrives, with nothing kept.
+///
+/// The stage-less form of [`stage_body_md5`]: the pump drains into a stage
+/// that drops every chunk, for a caller that holds bytes it did not write (a
+/// read-path heal re-hashing the object it just opened).
+/// [`body_matches_etag`] is the comparison form of the same walk.
+///
+/// # Errors
+///
+/// The stream's own failure, projected the way the pump projects it.
+pub async fn hash_body(body: BodyStream) -> Result<[u8; 16], storage::Error> {
+    stage_body_md5(&mut Discard, body)
+        .await
+        .map(|(_, digest)| digest)
+}
+
+/// The pump's sink for a caller that has no stage: every chunk is dropped.
+struct Discard;
+
+#[async_trait]
+impl StagedObject for Discard {
+    type Error = storage::Error;
+
+    async fn write(&mut self, _chunk: Bytes) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -476,6 +597,47 @@ mod tests {
         let err = stage_body(&mut stage, body).await.unwrap_err();
         assert!(matches!(err, storage::Error::Io(_)));
         assert_eq!(stage.0, b"head", "the tail never reaches the stage");
+    }
+
+    /// `stage_body_md5` is the same pump with the digest kept: the count is
+    /// `stage_body`'s, and the digest is the content MD5 of what landed.
+    #[tokio::test]
+    async fn stage_body_md5_answers_the_landed_count_beside_the_digest() {
+        let body: BodyStream = Box::pin(stream::iter([
+            Ok(Bytes::from_static(b"hel")),
+            Ok(Bytes::from_static(b"lo")),
+        ]));
+        let mut stage = Collect(Vec::new());
+        let (landed, digest) = stage_body_md5(&mut stage, body).await.unwrap();
+        assert_eq!(landed, 5, "the count is `stage_body`'s");
+        assert_eq!(stage.0, b"hello", "every chunk lands, in order");
+        assert_eq!(
+            ETag::Single(digest),
+            ETag::from_content(b"hello"),
+            "the digest is the content MD5 of what landed"
+        );
+    }
+
+    /// `hash_body` is the pump with no stage: nothing is kept, the digest is
+    /// the one the stage form answers, and a failed chunk is the projection.
+    #[tokio::test]
+    async fn hash_body_hashes_the_stream_and_keeps_nothing() {
+        let body: BodyStream = Box::pin(stream::iter([
+            Ok(Bytes::from_static(b"hel")),
+            Ok(Bytes::from_static(b"lo")),
+        ]));
+        assert_eq!(
+            ETag::Single(hash_body(body).await.unwrap()),
+            ETag::from_content(b"hello"),
+            "the digest is the content MD5 of the whole stream"
+        );
+
+        let failing: BodyStream = Box::pin(stream::iter([
+            Ok(Bytes::from_static(b"head")),
+            Err(io::Error::other("boom")),
+        ]));
+        let err = hash_body(failing).await.unwrap_err();
+        assert!(matches!(err, storage::Error::Io(_)));
     }
 
     #[test]

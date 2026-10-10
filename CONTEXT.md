@@ -42,6 +42,14 @@ Domain glossary for the tinio workspace. English only. This file is a glossary �
 - **Visibility point** — `ObjectContent::publish` returns only once the bytes are visible; the metadata row that describes them is written after it. A staged write is invisible by construction.
 - **Byte accounting decorator** — the `ObjectContent` wrapper that owns a backend's byte limits and total (`CountingContent`), so no operation body counts bytes itself.
 
+## The ops engine
+
+- **Ops engine** — the `tinio-ops` layer: the S3 operation bodies the backends share, written once over the persistence contracts and called from each backend's own `Storage`/`VersionOps` implementations. It is not a `Storage` implementation and not a framework — a backend keeps its error enum, its `Hooks`, its locks and its `Cleanup`.
+- **Group receiver** — the per-group value an operation body hangs off (`BucketOps`, `ObjectOps`, `MultipartOps`, with the version plane beside them for the bodies that touch versions); it carries only the handles its group uses, and `mem` builds no version plane at all.
+- **Hooks seam** — the two-method trait a backend implements for the steps only it can take: the bucket-delete action and the per-upload part lock. A third method needs a named consumer, a spec amendment and the operator's ruling.
+- **The two policies** — `MetadataFailure` (what a metadata-row write that fails after the content is published means) and `BucketRow` (whether object rows require a bucket row); declared per backend and read by the bodies, never inferred.
+- **Read-heal** — the engine's rule that a read or listing whose row is absent or stale against the content recomputes the row from the content and persists it, so a file the scanner has not recorded is still served.
+
 ## CLI and management plane
 
 - **Management plane** — the control surface beside the S3 data plane (FR-018): one local channel (a unix socket or a Windows named pipe) or one configured TCP HTTP(S) listener, carrying `/status`, `/stop`, `/metrics` and `/openapi.json` under the token rule its bind address selects.

@@ -1,10 +1,11 @@
 //! The argument grammar for `cargo xtask`, in clap's derive API.
 //!
 //! `sqlx` takes one mode subcommand, `check` or `update`, and each leaf takes
-//! three options. Every field's doc comment is its help text, and clap itself
-//! rejects a missing or unknown subcommand, an unknown flag or a missing value
-//! -- printing the usage line and exiting 2, which is the contract the
-//! hand-rolled grammar used to keep.
+//! three options; `bench-ab` takes the two legs and the shape of the run. Every
+//! field's doc comment is its help text, and clap itself rejects a missing or
+//! unknown subcommand, an unknown flag or a missing value -- printing the usage
+//! line and exiting 2, which is the contract the hand-rolled grammar used to
+//! keep.
 
 use std::path::PathBuf;
 
@@ -28,6 +29,42 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Generate, compare or rewrite the PostgreSQL statement cache.
     Sqlx(SqlxArgs),
+    /// Measure one operation between two builds, interleaved, and decide.
+    BenchAb(BenchAbArgs),
+}
+
+/// The `bench-ab` command: one named operation, two builds, alternating rounds.
+#[derive(Debug, Args)]
+pub(crate) struct BenchAbArgs {
+    /// The measurement binary both legs run (the `ab` bench target).
+    #[arg(long, value_name = "PATH")]
+    pub(crate) exe: PathBuf,
+    /// The second build's measurement binary; defaults to `--exe`, which
+    /// compares two operations of one build.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) exe_b: Option<PathBuf>,
+    /// The operation leg A measures.
+    #[arg(long, value_name = "OP")]
+    pub(crate) a: String,
+    /// The operation leg B measures.
+    #[arg(long, value_name = "OP")]
+    pub(crate) b: String,
+    /// Timed samples per leg per round.
+    #[arg(long, default_value_t = 2000, value_name = "N")]
+    pub(crate) iters: u32,
+    /// Untimed invocations per leg per round.
+    #[arg(long, default_value_t = 200, value_name = "N")]
+    pub(crate) warmup: u32,
+    /// Rounds; each runs both legs, in the order that round alternates to.
+    #[arg(long, default_value_t = 7, value_name = "N")]
+    pub(crate) rounds: u32,
+    /// The factor by which a round's two flush controls may differ before the
+    /// round is dropped as regime-mixed.
+    #[arg(long, default_value_t = 2.0, value_name = "F")]
+    pub(crate) flush_band: f64,
+    /// The surviving rounds a verdict needs.
+    #[arg(long, default_value_t = 5, value_name = "N")]
+    pub(crate) min_rounds: usize,
 }
 
 /// The `sqlx` command and the mode it runs in.
@@ -86,7 +123,7 @@ mod tests {
 
     use clap::{Parser, error::ErrorKind};
 
-    use super::{Cli, Command, Mode, SqlxCacheArgs, SqlxCommand};
+    use super::{BenchAbArgs, Cli, Command, Mode, SqlxCacheArgs, SqlxCommand};
 
     /// The subcommand of a command line that must parse.
     fn command_of(argv: &[&str]) -> SqlxCommand {
@@ -95,6 +132,18 @@ mod tests {
             .command
         {
             Command::Sqlx(args) => args.command,
+            Command::BenchAb(_) => panic!("not a sqlx command line"),
+        }
+    }
+
+    /// The `bench-ab` options of a command line that must parse.
+    fn bench_ab_of(argv: &[&str]) -> BenchAbArgs {
+        match Cli::try_parse_from(argv)
+            .expect("the command line should parse")
+            .command
+        {
+            Command::BenchAb(args) => args,
+            Command::Sqlx(_) => panic!("not a bench-ab command line"),
         }
     }
 
@@ -170,6 +219,66 @@ mod tests {
         );
         assert_eq!(args.cache_dir.as_deref(), Some(Path::new("some/cache")));
         assert_eq!(args.scratch_dir.as_deref(), Some(Path::new("some/scratch")));
+    }
+
+    #[test]
+    fn bench_ab_takes_both_legs_and_defaults_the_run_shape() {
+        let args = bench_ab_of(&[
+            "xtask",
+            "bench-ab",
+            "--exe",
+            "ab.exe",
+            "--a",
+            "noop",
+            "--b",
+            "spin_20us",
+        ]);
+        assert_eq!(args.exe, Path::new("ab.exe"));
+        assert!(args.exe_b.is_none(), "one binary compares two operations");
+        assert_eq!(args.a, "noop");
+        assert_eq!(args.b, "spin_20us");
+        assert_eq!(args.iters, 2000);
+        assert_eq!(args.warmup, 200);
+        assert_eq!(args.rounds, 7);
+        assert_eq!(args.flush_band, 2.0);
+        assert_eq!(args.min_rounds, 5);
+    }
+
+    #[test]
+    fn bench_ab_takes_a_second_build_and_the_run_shape() {
+        let args = bench_ab_of(&[
+            "xtask",
+            "bench-ab",
+            "--exe",
+            "a.exe",
+            "--exe-b",
+            "b.exe",
+            "--a",
+            "head_object_plain",
+            "--b",
+            "head_object_plain",
+            "--rounds",
+            "11",
+            "--iters",
+            "5000",
+            "--flush-band",
+            "1.5",
+            "--min-rounds",
+            "9",
+        ]);
+        assert_eq!(args.exe_b.as_deref(), Some(Path::new("b.exe")));
+        assert_eq!(args.rounds, 11);
+        assert_eq!(args.iters, 5000);
+        assert_eq!(args.flush_band, 1.5);
+        assert_eq!(args.min_rounds, 9);
+    }
+
+    #[test]
+    fn bench_ab_requires_both_operations() {
+        assert_eq!(
+            error_kind(&["xtask", "bench-ab", "--exe", "ab.exe", "--a", "noop"]),
+            ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

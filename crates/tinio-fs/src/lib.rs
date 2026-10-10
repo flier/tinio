@@ -19,6 +19,8 @@ pub extern crate tinio_blob as _blob;
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
 #[doc(hidden)]
+pub extern crate tinio_ops as _ops;
+#[doc(hidden)]
 pub extern crate tinio_store_redb as _store_redb;
 #[doc(hidden)]
 pub extern crate tinio_util as _util;
@@ -61,7 +63,7 @@ mod write_task;
 pub use self::{
     backend::{FsOptions, FsStorage, StagedBody},
     cleanup::FsCleanup,
-    content::FsContent,
+    content::{FsContent, FsStaged},
     error::Error,
     fsutil::is_symlink_or_reparse,
     listing::FsListing,

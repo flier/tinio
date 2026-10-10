@@ -22,7 +22,7 @@ use sqlx::migrate::{Migration, Migrator};
 /// A literal rather than a walk over [`MIGRATOR`], so it stays usable in a
 /// `const`; `the_schema_version_is_the_newest_embedded_migration` pins it to
 /// the embedded set.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Every migration, embedded at compile time, in version order.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./sql/migrations");

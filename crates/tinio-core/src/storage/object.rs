@@ -45,10 +45,7 @@ pub struct PutObjectResult {
 /// ```rust
 /// use tinio_core::storage::TagWriteResult;
 ///
-/// let untouched = TagWriteResult {
-///     version_id: None,
-///     bucket_records_versions: false,
-/// };
+/// let untouched = TagWriteResult::untouched();
 /// assert!(untouched.version_id.is_none() && !untouched.bucket_records_versions);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +60,30 @@ pub struct TagWriteResult {
     /// `false` when the write touched nothing — a missing object names
     /// no identity and answers no state.
     pub bucket_records_versions: bool,
+}
+
+impl TagWriteResult {
+    /// The identity-free pair a write that touched nothing answers: the
+    /// store is left as it was, so there is no version to name and no
+    /// records-versions state to report.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_core::storage::TagWriteResult;
+    ///
+    /// assert_eq!(
+    ///     TagWriteResult::untouched().version_id,
+    ///     None,
+    ///     "a write that touched nothing names no identity"
+    /// );
+    /// ```
+    pub fn untouched() -> Self {
+        Self {
+            version_id: None,
+            bucket_records_versions: false,
+        }
+    }
 }
 
 /// Result of a successful object read.

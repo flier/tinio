@@ -132,6 +132,35 @@ pub enum Error {
     Io(#[from] io::Error),
 }
 
+impl Error {
+    /// Whether this failure is the **read-only refusal** of a non-writable
+    /// store (FR-023): a write was asked of a handle opened read-only.
+    ///
+    /// The read paths that recompute or record a row they could not hit ask
+    /// this before deciding the work "is simply not written back" — the
+    /// store's refusal spells itself as an I/O failure whose kind is
+    /// [`io::ErrorKind::ReadOnlyFilesystem`] (the workspace's one spelling of
+    /// read-only), so no caller hand-rolls a match over the inner error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::io;
+    ///
+    /// use tinio_core::storage;
+    ///
+    /// let refused = storage::Error::from(io::Error::from(io::ErrorKind::ReadOnlyFilesystem));
+    /// assert!(refused.is_read_only());
+    /// assert!(
+    ///     !storage::Error::from(io::Error::other("boom")).is_read_only(),
+    ///     "a real I/O fault is never read as the read-only refusal"
+    /// );
+    /// ```
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Self::Io(err) if err.kind() == io::ErrorKind::ReadOnlyFilesystem)
+    }
+}
+
 /// The subject of an [`Error::AccessDenied`] refusal: the object key a
 /// key-scoped operation named, or the bucket a bucket-scoped one named. A
 /// bucket-scoped operation has no key, and fabricating one (the reserved

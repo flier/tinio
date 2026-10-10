@@ -110,7 +110,7 @@ tinio-sandbox-linux = { workspace = true, features = ["testing"] }
 # harness spells it (`tinio_sandbox::windows::testing`). Cargo unifies the two
 # edges, so the harness and this one are one build of that crate.
 tinio-sandbox-windows = { workspace = true, features = ["testing"] }
-tinio-util = { workspace = true, features = ["testing"] }
+tinio-util = { workspace = true, features = ["bench", "testing"] }
 
 [[test]]
 name = "sandbox_e2e"

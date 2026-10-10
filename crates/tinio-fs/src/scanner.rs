@@ -1224,8 +1224,7 @@ mod tests {
     // --- the pipeline producers (pipeline-spec.md task 4) ---
 
     /// A bucket with `n` files `f00.txt..`, each with distinct content —
-    /// the shared producer fixture (F39; the listing tests' store-owning
-    /// `files_fixture` builds on it).
+    /// the shared producer fixture (F39).
     fn files(root: &Path, n: usize) {
         testutil::files(root, n);
     }

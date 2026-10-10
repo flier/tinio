@@ -9,14 +9,17 @@
 //! decoded form — the id is an `Option<version::Id>` (the literal `null` is
 //! the null version) and the blob a decoded [`BlobRef`].
 //!
-//! The key's **current slot** is the newest version row's identity and
+//! The key's **current slot** is the current version's identity and
 //! delete-marker state, answered by [`VersionMeta::current_slot`] as a
 //! [`Current`] — never a `(id, seq)` tuple (round-2 item 3: the null version
-//! and a delete marker are both legitimate currents). It is version-domain
-//! state, so it rides neither the object row (D37) nor a version element of its
-//! own. A row's **sequence** is its key's third element, and the rule that turns
-//! a row into history is [`Stored::is_history`], whose [`Slot`] input is the
-//! caller's slot fact.
+//! and a delete marker are both legitimate currents). It is normally the newest
+//! version row's identity; a restore moves it back to a real identity
+//! ([`VersionMeta::restore_slot`], the one move [`VersionMeta::advance_slot`]
+//! refuses). It is version-domain state, so it rides neither the object row
+//! (D37) nor a version element of its own — the backend records it where its
+//! own slot facts live. A row's **sequence** is its key's third element, and
+//! the rule that turns a row into history is [`Stored::is_history`], whose
+//! [`Slot`] input is the caller's slot fact.
 //!
 //! The blob codec here is the port of the table crate's `encode_blob`/
 //! `decode_blob` (R3: tinio-core may not depend on the table crate, so the
@@ -431,13 +434,15 @@ pub trait VersionMeta: Send + Sync + 'static {
     ///
     /// - `exists` is `true` (a slot is recorded);
     /// - `version` is the recorded identity (`None` is the null version);
-    /// - `is_delete_marker` is `true` exactly when the version row at the slot's
-    ///   sequence exists and its [`Kind`] is a marker.
+    /// - `is_delete_marker` is `true` exactly when the row at the slot's
+    ///   sequence is a marker, **or** the slot's own record carries the bit a
+    ///   restore wrote ([`VersionMeta::restore_slot`] consumes the row it
+    ///   derived the bit from, so that row alone cannot answer it).
     ///
     /// A slot advanced to a sequence with no version row — no foreign key binds
     /// the two, so a row can be expired out of band — is still `Some`: its
-    /// identity is the recorded fact and its marker bit is `false`, because a
-    /// missing row is not a marker.
+    /// identity is the recorded fact, and a slot that records no marker bit
+    /// answers `false`, because a missing row is not a marker.
     ///
     /// The read is **not** gated: [`Metadata::get`](super::ObjectMeta::get)
     /// stays the caller's current view (the backend's F01/F04 rule), and the
@@ -451,10 +456,13 @@ pub trait VersionMeta: Send + Sync + 'static {
 
     /// Move the key's current slot to `(id, seq)` in one transaction.
     ///
-    /// **This is the only writer of a key's current slot**, and beside the
-    /// delete-marker path it is the only caller allowed to move the version
-    /// identity the object row's slot columns record: the ordinary object-row
-    /// writers ([`ObjectMeta::put`](super::ObjectMeta::put),
+    /// **This is the only forward writer of a key's current slot**: the sole
+    /// other writer is [`VersionMeta::restore_slot`], the restore's commit,
+    /// whose move is backwards to a real identity by definition — this call's
+    /// guard is absolute and stays that way. Beside the delete-marker path it
+    /// is the only caller allowed to move the version identity the object row's
+    /// slot columns record: the ordinary object-row writers
+    /// ([`ObjectMeta::put`](super::ObjectMeta::put),
     /// [`ObjectMeta::put_batch`](super::ObjectMeta::put_batch),
     /// [`ObjectMeta::put_preserving`](super::ObjectMeta::put_preserving))
     /// **preserve** the stored version columns, so a content rewrite can never
@@ -465,17 +473,23 @@ pub trait VersionMeta: Send + Sync + 'static {
     /// identity and the marker bit from, so advancing to a marker's sequence
     /// records the marker without a flag. A sequence with no row is legal — the
     /// slot is the recorded fact — and reads back with `is_delete_marker:
-    /// false`.
+    /// false` (a restore's marker is the one slot whose bit outlives its row).
     ///
-    /// **A slot never moves backwards.** The implementation compares `seq`
-    /// against the sequence the slot already records and **refuses** a lower
-    /// one, projecting the refusal into [`storage::Error`] the way
-    /// [`VersionMeta::put_version`]'s same-sequence conflict is projected; a
-    /// move to the **same** sequence is the crash window's own re-run and is
-    /// allowed. Without the guard a lower-sequence advance committing after a
-    /// higher-sequence one would leave the slot below the newest version it
-    /// already named, so [`VersionMeta::current_slot`] would resolve the marker
-    /// bit off the stale row — the state the slot exists to prevent.
+    /// **A slot never moves backwards — within one identity.** The
+    /// implementation compares `seq` against the sequence the slot already
+    /// records and **refuses** a lower one **when the incoming identity is a
+    /// version** (`Some`), projecting the refusal into [`storage::Error`] the
+    /// way [`VersionMeta::put_version`]'s same-sequence conflict is projected;
+    /// a move to the **same** sequence is the crash window's own re-run and is
+    /// allowed. An incoming **`None`** (the null version) is admitted in place
+    /// whatever the sequence: the null slot's numbering is its own space, and
+    /// the D37 model writes the null version by replacing the current one, so
+    /// `(Some(id), n) → (None, 0)` is not a backward move (round 41, the
+    /// suspended-bucket PUT). Without the guard a lower-sequence advance of the
+    /// **same** identity committing after a higher-sequence one would leave the
+    /// slot below the newest version it already named, so
+    /// [`VersionMeta::current_slot`] would resolve the marker bit off the stale
+    /// row — the state the slot exists to prevent.
     ///
     /// A key with **no** `object_meta` row gets one materialized to carry the
     /// slot columns, its content-derived elements (ETag, size, mtime, file
@@ -495,6 +509,72 @@ pub trait VersionMeta: Send + Sync + 'static {
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
+        id: Option<version::Id>,
+        seq: u64,
+    ) -> Result<(), Self::Error>;
+
+    /// Make a version current again — the **restore's commit**, in one
+    /// transaction: the object row the restored version becomes, the slot moved
+    /// back to the version's own sequence, the version row and the index entry
+    /// the restore consumes, and the key's cleared retained part list.
+    ///
+    /// The slot move is deliberate and is the one move
+    /// [`VersionMeta::advance_slot`] refuses: a restore moves the slot
+    /// **backwards to a real identity**, so this call applies **no monotonic
+    /// guard** — the guard stays absolute for [`VersionMeta::advance_slot`],
+    /// because the exception is the call, never a parameter on the shared one.
+    /// Everything below commits together or not at all:
+    ///
+    /// - **The bucket row is asserted inside this transaction.** A bucket with
+    ///   no row refuses, projecting to [`storage::Error::NoSuchBucket`] (the
+    ///   guarded-writer precedent: [`ObjectMeta::put_guarded`](super::ObjectMeta::put_guarded),
+    ///   [`ObjectMeta::put_with_parts`](super::ObjectMeta::put_with_parts),
+    ///   [`VersionMeta::advance_slot`]).
+    /// - **The version row at `seq` is this call's premise.** It must exist and
+    ///   its identity must be `id`'s (`None` is the null version), or the call
+    ///   refuses with the implementation's own error, projecting into
+    ///   [`storage::Error`] — never `Ok`, never a panic (the
+    ///   [`VersionMeta::put_version`] same-sequence conflict's precedent). Its
+    ///   [`Kind`] is what the written object row's marker bit records: the
+    ///   caller never carries a kind, because the slot is a version-row fact.
+    /// - **The object row is written wholesale**: the caller's content and
+    ///   recorded elements (a [`super::object::Row`]), the slot columns naming
+    ///   `(id, seq)`, and the derived marker bit. The write **clears the key's
+    ///   retained part list** in the same transaction (the
+    ///   [`ObjectMeta::put`](super::ObjectMeta::put) rule — an overwrite is a
+    ///   fresh object).
+    /// - **The consumed row at `seq` and its index entry are removed** in the
+    ///   same transaction: the restored version is the current version, and a
+    ///   current version has no history row of its own — leaving one would make
+    ///   it both current and addressable as history.
+    /// - **The row the slot moves off is stamped [`Stored::became_noncurrent`]**
+    ///   in the same commit, under the rule and the two exemptions
+    ///   [`VersionMeta::advance_slot`] applies: a move at the **same** sequence
+    ///   moves off nothing, and a sequence holding no row has nothing to stamp.
+    ///   A row that already carries a stamp keeps it (the first stamp wins).
+    /// - **The marker bit survives the row it came from**:
+    ///   [`VersionMeta::current_slot`] answers `is_delete_marker: true` after a
+    ///   restored marker, because the bit is recorded where the slot's facts
+    ///   live rather than derived again from the row this call consumed.
+    ///
+    /// The call is **not idempotent**, and that is deliberate: it is written
+    /// once per restore, not re-run by a crash-window adoption path — a second
+    /// run finds the row consumed and refuses.
+    ///
+    /// What the call deliberately does not do: it **publishes nothing** (the
+    /// content half stays the caller's — the version's bytes are streamed back
+    /// onto the key path **before** this call, so a crash between the two
+    /// leaves the version's row, and so its content, recoverable); it **writes
+    /// no part list** (it clears it); it touches no upload records; it takes no
+    /// `backwards: bool`; it **does not decide which version becomes current**
+    /// (the successor rule is [`Stored::is_history`] over the caller's own slot
+    /// fact, and the scan is the caller's); and it **does not create the
+    /// version's row when absent** — it consumes it.
+    async fn restore_slot(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        row: &super::object::Row,
         id: Option<version::Id>,
         seq: u64,
     ) -> Result<(), Self::Error>;

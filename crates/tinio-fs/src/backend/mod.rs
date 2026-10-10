@@ -22,20 +22,20 @@ use std::{
     fs::canonicalize,
     io::{self, ErrorKind},
     path::{Path, PathBuf, absolute},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
 
 // The content plane ([`crate::content`]) composes the same file-half
 // primitives the object ops do: the removal tail and the bucket emptiness
 // probe are re-exported because their modules are private to `backend`.
+use async_trait::async_trait;
 pub(crate) use buckets::bucket_is_empty;
 use derive_more::Debug;
 use garde::Validate;
 use getset::{CopyGetters, Getters};
 use lockmap::Map;
-pub use objects::StagedBody;
-pub(crate) use objects::{prune_parents, remove_object_file};
+pub(crate) use objects::{StagedBytes, prune_parents, remove_object_file};
 #[cfg(windows)]
 use soft_canonicalize::soft_canonicalize;
 use tokio::fs;
@@ -47,10 +47,17 @@ pub(crate) use version::Publication;
 use crate::_blob::{LocalBlocks, Store as BlobStore};
 #[cfg(feature = "versioning")]
 use crate::_core::version::State;
+/// The staged body of this backend's `ObjectOps` implementation: the ops
+/// engine's value (spec E8) over this crate's content-plane stage
+/// (`content::FsStaged`) — re-exported so callers can name
+/// `ObjectOps::StagedBody`
+/// without depending on `tinio-ops` directly. This module's own staged value
+/// (`objects::StagedBytes`) is the file layer's, crate-internal.
+pub use crate::_ops::StagedBody;
+#[cfg(feature = "versioning")]
+use crate::_ops::VersionPlane;
 #[cfg(feature = "versioning")]
 use crate::_version::Versions;
-#[cfg(feature = "versioning")]
-use crate::content::FsContent;
 pub use crate::error::Error;
 #[cfg(feature = "versioning")]
 use crate::error::projected;
@@ -65,20 +72,25 @@ use crate::{
         mode::AccessMode,
         object, pipeline,
         storage::{
-            COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT,
+            self, COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT,
             DEFAULT_MAX_CONCURRENT_UPLOADS, META_BATCH_BYTES_MAX, META_BATCH_BYTES_MIN,
             META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN, Storage, no_such_bucket,
         },
         to_nanos,
         version::Id,
     },
+    _ops::{
+        BucketOps as EngineBucketOps, BucketRow, Guard, Hooks, MetadataFailure,
+        ObjectOps as EngineObjectOps,
+    },
     _store_redb::{
-        bucket, bucket_versioning, decode_acl_wire, decode_owner_wire, object_meta, object_part,
-        upload, version as version_rows, version_index,
+        RedbMetadata, bucket, bucket_versioning, decode_acl_wire, decode_owner_wire, object_meta,
+        object_part, upload, version as version_rows, version_index,
     },
     _util::{lockmap, path::contains_under_any_spelling},
     backend::version::stamp_superseded,
     bucket::Store as BucketStore,
+    content::FsContent,
     database::{self, Driver, compact_if_needed},
     etag, fsutil,
     listing::FsListing,
@@ -175,14 +187,17 @@ pub struct FsOptions {
     )]
     pub compact_threshold_percent: u8,
     /// The meta-batch entry-count threshold (`[storage.fs]
-    /// meta_batch_size`, 1..=4096): the cold list/scanner producers flush
-    /// one write-pipeline batch once it holds this many entries
-    /// (pipeline-spec.md Q5; default from the task-2.5 benchmark, Q6).
+    /// meta_batch_size`, 1..=4096): the scanner's producers flush one
+    /// write-pipeline batch once it holds this many entries
+    /// (pipeline-spec.md Q5; default from the task-2.5 benchmark, Q6). The
+    /// listing path goes through the ops engine's own row batch instead and
+    /// does not read this.
     #[garde(range(min = META_BATCH_SIZE_MIN, max = META_BATCH_SIZE_MAX))]
     pub meta_batch_size: u16,
     /// The meta-batch byte threshold (`[storage.fs] meta_batch_bytes`,
-    /// 1024..=16 MiB): the producers flush once the estimated batch size
-    /// (≈ 56 B + key length per entry) reaches this (pipeline-spec.md Q5).
+    /// 1024..=16 MiB): the scanner's producers flush once the estimated
+    /// batch size (≈ 56 B + key length per entry) reaches this
+    /// (pipeline-spec.md Q5).
     #[garde(range(min = META_BATCH_BYTES_MIN, max = META_BATCH_BYTES_MAX))]
     pub meta_batch_bytes: u32,
     /// The config-supplied `OwnerId → uid` map (unix ownership
@@ -195,8 +210,8 @@ pub struct FsOptions {
     /// isolate).
     #[garde(skip)]
     pub owner_uids: HashMap<acl::OwnerId, u32>,
-    /// The IO pipeline (pipeline-spec.md §3.1): the cold list/scanner
-    /// paths enqueue `etag::ComputeTask` instances here. Mandatory
+    /// The IO pipeline (pipeline-spec.md §3.1): the cold scanner path
+    /// enqueues `etag::ComputeTask` instances here. Mandatory
     /// (P4) — the pipeline (or `InlineRunner` in offline contexts) is a
     /// construction-time decision. Typed to [`etag::Result`] (P4/P7).
     #[garde(skip)]
@@ -340,6 +355,43 @@ pub struct FsStorage {
     #[cfg(feature = "versioning")]
     #[getset(skip)]
     block_epoch: Arc<AtomicU64>,
+    /// The group receivers' handles, built once on first use and shared by
+    /// every clone of this storage ([`ReceiverHandles`]). The `Arc` around
+    /// the `OnceLock` is what lets one operation's receiver construction be
+    /// a pointer bump instead of a copy of every path and the owner map.
+    #[getset(skip)]
+    #[debug("<receivers>")]
+    receivers: Arc<OnceLock<ReceiverHandles>>,
+}
+
+/// The handles the group receivers are built from, resolved once per storage
+/// and shared by every clone of it.
+///
+/// Every group needs the same two things — a content plane over this storage
+/// and the storage itself for the hooks — and the receivers are immutable, so
+/// one build is observationally identical to the per-call one the extraction
+/// introduced (which deep-copied the whole `FsStorage` for every operation;
+/// `read_meta` pins that cost now).
+///
+/// Two shapes are deliberate. `storage` is a clone with its **own cache left
+/// empty**: the content planes and the hooks each hold an `Arc<FsStorage>`,
+/// so a cache field pointing back at the storage that filled it would be a
+/// reference cycle, and that storage would never drop. And the clone is safe
+/// because every field carrying *state* is shared through it — the database
+/// handle, the three stores, the per-bucket mutation locks, the part locks,
+/// the boundary cache, the block epoch and the pipelines are all `Arc`s
+/// inside, so the receivers observe exactly the state the storage they were
+/// built for does (the same property the per-call clone relied on).
+#[derive(Debug)]
+struct ReceiverHandles {
+    /// The storage clone the content planes and the hooks hold.
+    storage: Arc<FsStorage>,
+    /// The non-owning content plane: the object group's, whose bodies run
+    /// under the trait impl's own bucket-mutation hold
+    /// ([`FsContent::for_engine`](crate::content::FsContent)).
+    engine_content: Arc<FsContent>,
+    /// The owning content plane: the bucket and multipart groups'.
+    own_content: Arc<FsContent>,
 }
 
 /// The per-bucket mutation-lock wait above which [`FsStorage::lock_bucket_mutations`]
@@ -676,7 +728,6 @@ impl FsStorage {
             compact_threshold_percent,
             listing: FsListing::new(
                 &canonical,
-                MetaStore::from_handle(handle.clone()),
                 follow_symlinks,
                 io_pipeline,
                 db_pipeline,
@@ -696,6 +747,7 @@ impl FsStorage {
             writer: AtomicWriter::new(&state_dir),
             bucket_mutation_locks: Map::new(),
             boundary_cache: BoundaryCache::new(),
+            receivers: Arc::new(OnceLock::new()),
             #[cfg(feature = "versioning")]
             block_epoch: Arc::new(AtomicU64::new(0)),
             root: canonical,
@@ -1139,6 +1191,169 @@ impl FsStorage {
 impl Storage for FsStorage {
     type Error = Error;
 }
+
+impl FsStorage {
+    /// The bucket-group receiver over this backend's handles.
+    ///
+    /// The two policies are fs's, declared and never inferred: a metadata-row
+    /// write that fails after the content is published is a warning (the object
+    /// is committed and the next read heals the row — [`MetadataFailure::Warn`]),
+    /// and a bucket row is recorded lazily ([`BucketRow::Lazy`]: a directory
+    /// that was never sighted through the API is still a bucket, and its reads
+    /// serve the empty defaults).
+    ///
+    /// The receiver carries no version plane (spec E16): fs's version handles
+    /// are **per bucket** — the block root is `<state>/blobs/<bucket>` — so the
+    /// version-touching bodies build one from [`Self::versions`] and take it
+    /// beside the receiver.
+    pub(crate) fn ops(&self) -> EngineBucketOps<RedbMetadata, FsContent, FsHooks> {
+        // The content plane and the hooks share one `Arc` of this backend's
+        // handles ([`ReceiverHandles`]): its root, state dir, single
+        // state-database handle and per-bucket lock map (the receiver's clone
+        // shares every `Arc` inside, so the locks the trait impls take are the
+        // same slots) — built once for the storage rather than per operation.
+        let handles = self.receiver_handles();
+        EngineBucketOps {
+            meta: self.meta_store().engine(),
+            content: Arc::clone(&handles.own_content),
+            hooks: FsHooks {
+                storage: Arc::clone(&handles.storage),
+            },
+            metadata_failure: MetadataFailure::Warn,
+            bucket_row: BucketRow::Lazy,
+        }
+    }
+
+    /// The object-group receiver over this backend's handles.
+    ///
+    /// The two policies are fs's, declared and never inferred: a metadata-row
+    /// write that fails after the content is published is a **warning** (the
+    /// object is committed, the failure is logged, and the next read heals the
+    /// row — [`MetadataFailure::Warn`], RI2), and a bucket row is recorded
+    /// lazily ([`BucketRow::Lazy`]: a directory that was never sighted through
+    /// the API is still a bucket).
+    ///
+    /// The content plane is the **non-owning** one
+    /// ([`FsContent::for_engine`](crate::content::FsContent)): every object
+    /// body here is called from the `ObjectOps` trait impl under the bucket
+    /// mutation lock that impl takes, exactly the critical section the
+    /// pre-engine bodies held, so the plane's publish must ride that lock
+    /// instead of taking it again — the per-bucket lock is not re-entrant.
+    ///
+    /// The receiver's handles are the storage's own, resolved once
+    /// ([`ReceiverHandles`]): the pre-engine bodies cloned nothing on a read,
+    /// and the extraction's per-call `FsStorage` deep copy — the two
+    /// `PathBuf`s, the owner map and the two `Arc` allocations per operation —
+    /// is gone with it. The `read_meta` bench pins the result: its three legs
+    /// drive `head_object` (plain, version-recording and version-addressed)
+    /// through this constructor.
+    pub(crate) fn objects(&self) -> EngineObjectOps<RedbMetadata, FsContent> {
+        let handles = self.receiver_handles();
+        EngineObjectOps {
+            meta: self.meta_store().engine(),
+            content: Arc::clone(&handles.engine_content),
+            metadata_failure: MetadataFailure::Warn,
+            bucket_row: BucketRow::Lazy,
+        }
+    }
+
+    /// The handles the group receivers are built from, resolved on first use
+    /// ([`ReceiverHandles`]).
+    ///
+    /// The clone inside is made **once per storage** and left with an empty
+    /// cache of its own: the receivers it feeds hold `Arc<FsStorage>`s, so a
+    /// cache pointing back at the storage that filled it would be a reference
+    /// cycle, while the receivers' own clone only needs the shared handles
+    /// (see the struct's note).
+    fn receiver_handles(&self) -> &ReceiverHandles {
+        self.receivers.get_or_init(|| {
+            let storage = Arc::new(Self {
+                receivers: Arc::new(OnceLock::new()),
+                ..self.clone()
+            });
+            ReceiverHandles {
+                engine_content: Arc::new(FsContent::for_engine(Arc::clone(&storage))),
+                own_content: Arc::new(FsContent::new(Arc::clone(&storage))),
+                storage,
+            }
+        })
+    }
+
+    /// The version plane a version-creating object body takes (spec E16,
+    /// RW2).
+    ///
+    /// fs's version handles are **per bucket** — the block root is
+    /// `<state-dir>/blobs/<bucket>` and the version state machine is built
+    /// over that bucket's rows, adapter and block store — so the plane is
+    /// built for the one bucket the body is about, from the same
+    /// [`Self::versions`] the rest of the version paths use (the pre-engine
+    /// versioned bodies built the same state machine per op, so the plane's
+    /// own construction is not a new cost; its `Arc` wrapper and the
+    /// `version_rows` handle are). The row handle
+    /// beside it is the version adapter ([`Rows`]), whose `CurrentRows` port
+    /// applies fs's staleness gate: the body reads the current slot the same
+    /// way every read path does.
+    #[cfg(feature = "versioning")]
+    pub(crate) fn version_plane(
+        &self,
+        bucket: &Name,
+    ) -> VersionPlane<Versions<Rows, FsContent, LocalBlocks>, Rows, LocalBlocks> {
+        VersionPlane {
+            versions: Arc::new(self.versions(bucket)),
+            version_rows: Arc::new(Rows::new(self.clone())),
+            blobs: BlobStore::new(LocalBlocks::new(self.blobs_dir().join(bucket.as_ref()))),
+        }
+    }
+}
+
+/// The `Hooks` implementation fs's bucket receiver carries.
+///
+/// The two steps only this backend can take: the bucket teardown — the
+/// tombstone move, the derived state's removal and the removal pipeline's
+/// reclaim — and the per-upload part lock, whose guard the part-write bodies
+/// hold across their commit phase.
+#[derive(Debug, Clone)]
+pub(crate) struct FsHooks {
+    /// The backend whose tombstone move and part lock the hooks take.
+    #[debug("<storage>")]
+    storage: Arc<FsStorage>,
+}
+
+#[async_trait]
+impl Hooks for FsHooks {
+    async fn before_bucket_delete(&self, bucket: &Name) -> Result<(), storage::Error> {
+        // The caller — `delete_bucket`'s trait impl — holds this bucket's
+        // mutation guard and has run the emptiness probes; this is the
+        // teardown body under that guard (it takes no lock of its own: the
+        // per-bucket lock is not re-entrant).
+        self.storage
+            .unpublish_bucket_locked(bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn lock_part(&self, bucket: &Name, upload_id: &str) -> Box<dyn Guard> {
+        // The part lock's one home is the multipart store's map; the guard
+        // releases it on drop.
+        Box::new(FsPartGuard {
+            _lock: self
+                .storage
+                .multipart_store()
+                .part_lock(bucket, upload_id)
+                .await,
+        })
+    }
+}
+
+/// fs's part-write guard: the per-upload lock the multipart store hands out,
+/// held for as long as this value lives.
+pub(crate) struct FsPartGuard {
+    /// The held lock (released when this guard drops). The field is never
+    /// read: holding it IS the guard.
+    _lock: lockmap::Guard<(String, String)>,
+}
+
+impl Guard for FsPartGuard {}
 
 #[cfg(test)]
 mod tests;

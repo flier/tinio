@@ -98,7 +98,7 @@
 //! (`tests/spawn_guard.rs`) take their rules from here, so neither spells a
 //! second copy of one.
 //!
-//! Three more are how those gates reach the files at all: [`workspace_root`] and
+//! Three more are how those gates reach the files at all: [`workspace_root()`] and
 //! its macro twin [`workspace_root!`] — the root, in the two spellings a caller
 //! needs, because the `env!("CARGO_MANIFEST_DIR")` half is a fact of the
 //! *calling* crate and only a macro expands there — plus [`repo_rel`], the name,
@@ -4241,14 +4241,14 @@ pub fn workspace_root(manifest_dir: &Path) -> PathBuf {
     manifest_dir.join("..").join("..")
 }
 
-/// [`workspace_root`] with the `env!` already read — **the spelling a gate wants**, and the one
+/// [`workspace_root()`] with the `env!` already read — **the spelling a gate wants**, and the one
 /// place the `env!("CARGO_MANIFEST_DIR")` half is written: the three parsed gates used to spell it
 /// themselves, four times under three names.
 ///
 /// **Why a macro rather than a second function.** `env!("CARGO_MANIFEST_DIR")` expands to the
 /// manifest of the crate the macro is *expanded in*, and a function body is expanded where it is
 /// written — so a `fn` here would answer `crates/tinio-util` for every caller, which is exactly
-/// why [`workspace_root`] takes its directory as a parameter. A `macro_rules!` body expands at the
+/// why [`workspace_root()`] takes its directory as a parameter. A `macro_rules!` body expands at the
 /// call site, the one place the caller's own manifest directory is known.
 ///
 /// Re-exported into this module below, so `tinio_util::testing::workspace_root!` is the spelling

@@ -1,0 +1,6 @@
+INSERT INTO current_slots (bucket, key, version_id, seq, is_delete_marker)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (bucket, key) DO UPDATE SET
+    version_id = excluded.version_id,
+    seq = excluded.seq,
+    is_delete_marker = excluded.is_delete_marker

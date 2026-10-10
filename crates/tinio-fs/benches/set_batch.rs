@@ -20,6 +20,11 @@
 //! `meta_batch_size` default and calibrates `meta_batch_bytes`; the
 //! numbers and reasoning are recorded in task-2.5-report.md (Q6 — the
 //! spec default is wired by task 4, not here).
+//!
+//! The cells' data root and the run's flush control come from
+//! `tinio_util::bench` (the `bench` feature): its module docs carry why the
+//! root is pinned away from `TMP` and why every run records a flush
+//! measurement.
 
 // This bench declares `harness = false`, so clippy's `allow-*-in-tests` keys do
 // not reach it (design 2026-10-09 D7), and a bench is not production code
@@ -40,6 +45,7 @@ use std::{
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tinio_core::{ETag, bucket, object};
 use tinio_fs::meta;
+use tinio_util::bench;
 use tokio::runtime::Runtime;
 
 /// The stored value of one entry: etag hex (32 B) + size/mtime/identity
@@ -115,6 +121,10 @@ fn set_batch_cell(
     key_fn: fn(usize) -> String,
     key_bytes: usize,
 ) {
+    // The run's flush regime, beside its numbers (see `bench`): this
+    // bench's whole measurement is a durable commit, so it is the one most
+    // exposed to a regime change between a stored baseline and a fresh run.
+    bench::flush_control(&bench::data_root());
     let entry_bytes = ENTRY_VALUE_BYTES + key_bytes;
     let mut group = c.benchmark_group(format!("{group_name}_entry_{entry_bytes}B"));
     group.sample_size(30);
@@ -123,8 +133,8 @@ fn set_batch_cell(
     for batch in BATCH_SIZES {
         group.throughput(Throughput::Elements(batch as u64));
         group.bench_function(format!("batch_{batch}"), |b| {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
+            let state = bench::cell_dir(&format!("{group_name}/batch_{batch}"));
+            let store = meta::store(&state).unwrap();
             let bucket = bucket::name("data").unwrap();
             let pool = entry_pool(key_fn, key_bytes);
             let rt = Runtime::new().unwrap();

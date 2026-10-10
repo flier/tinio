@@ -464,6 +464,18 @@ where
         );
     }
 
+    /// Whether an ascending scan has offered enough distinct views to decide
+    /// the page.
+    ///
+    /// True once the heap holds `max + 1` entries. Later keys of an ascending
+    /// scan sort at or after the ones already kept, so none of them can change
+    /// the `max` smallest. `max = 0` is never saturated: the page was empty
+    /// before the first offer.
+    #[must_use]
+    pub fn saturated(&self) -> bool {
+        self.max > 0 && self.heap.len() >= self.max.saturating_add(1)
+    }
+
     /// Yield the page — `(keys, common_prefixes, truncated, next)` with
     /// the same semantics as [`group_and_paginate_unordered`]: the `max`
     /// smallest distinct entries after the marker, the truncation flag
@@ -665,6 +677,23 @@ mod tests {
         let (keys, prefixes, truncated, next) =
             group_and_paginate(iter, prefix, delim, marker, max, String::as_str);
         (keys, prefixes, truncated, next, n)
+    }
+
+    #[test]
+    fn an_ascending_scan_saturates_at_one_past_the_page() {
+        let mut pager = UnorderedPager::new("", None, None, 2, |key: &String| key.as_str());
+        assert!(!pager.saturated());
+        pager.offer_keyed("a".to_owned());
+        pager.offer_keyed("b".to_owned());
+        assert!(
+            !pager.saturated(),
+            "the page itself is not yet one past max"
+        );
+        pager.offer_keyed("c".to_owned());
+        assert!(pager.saturated());
+        let (keys, _, truncated, _) = pager.finish();
+        assert_eq!(keys, ["a", "b"]);
+        assert!(truncated);
     }
 
     #[test]

@@ -599,11 +599,12 @@ impl<'a> Walk<'a> {
 /// marker when the file is gone — and then its noncurrent versions newest
 /// first.
 ///
-/// `resolve_object_slot` is the call a `GET`/`HEAD` of the key makes (the
-/// path policy, one open, the handle's own size/stamp/identity, the gated row
-/// and its heal), so the listing can never disagree with the read about the
-/// current version: a drifted file is the null version, never the stale
-/// identifier, and its ETag is the content-derived one the heal wrote. The
+/// `resolve_object_slot` is the call a `GET`/`HEAD` of a **versioned** key
+/// makes for its version facts (the path policy, one open, the handle's own
+/// size/stamp/identity, the gated row and its heal), so the listing can never
+/// disagree with the read about the current version: a drifted file is the
+/// null version, never the stale identifier, and its ETag is the
+/// content-derived one the heal wrote. The
 /// file's absence is that resolution's own `NoSuchKey` — no second path stat
 /// to choose the arm — and what it means is the row's shape: a row whose
 /// **recorded** marker flag is set is the delete marker the API created, a

@@ -645,7 +645,7 @@ pub fn sid_for(root: &Path) -> sid::PackageSid {
 /// Run `f` while the **capability probe's own throwaway profile** is alive, handing it the
 /// package SID that probe created.
 ///
-/// **The recipe is [`probe_window`]'s — the predicate's, and not a second one.** The fixed name,
+/// **The recipe is `probe_window`'s — the predicate's, and not a second one.** The fixed name,
 /// the clear-before-create order and the `ProfileLock` are the window `can_confine` runs, so a
 /// caller that needs a real AppContainer SID takes it from the predicate's own probe rather than
 /// deriving a profile of its own, and the refusal that can end the window is `cannot_confine`'s

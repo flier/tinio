@@ -1,0 +1,46 @@
+[package]
+name = "tinio-ops"
+version.workspace = true
+edition.workspace = true
+description = "The S3 operation bodies the tinio backends share, written once over the persistence contracts"
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+md-5.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+tinio-blob.workspace = true
+tinio-core.workspace = true
+tinio-version.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+criterion = { workspace = true, features = [
+    "async_tokio",
+    "rayon",
+    "cargo_bench_support",
+] }
+futures.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+tinio-store-redb.workspace = true
+
+[[bench]]
+name = "listing"
+harness = false
+
+[lints.clippy]
+absolute_paths = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_used = "warn"
+
+[lints.rust]
+unsafe_code = "forbid"

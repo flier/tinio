@@ -432,6 +432,31 @@ jobs:
       - name: feature-matrix check (tinio-mem)
         run: cargo hack check --package tinio-mem --each-feature --profile ci
 
+      # tinio-util's features gate what is not production: the shared
+      # conformance suites (`testing`) and the pinned bench data root
+      # (`bench`, moved here by P4's close-out so every bench target in the
+      # workspace stops following `TMP`). Both must compile alone and
+      # together, and the default build must carry neither.
+      - name: feature-matrix check (tinio-util)
+        run: cargo hack check --package tinio-util --each-feature --profile ci
+
+      # Feature-gated docs are a cell no gate compiles: the `docs` job rustdocs
+      # the default graph only (so `testing`'s module docs were never checked)
+      # and the feature-matrix step above is `cargo check`, which never runs
+      # rustdoc. Three intra-doc links that are both a function and a macro
+      # (`tinio-util/src/testing/mod.rs`'s `workspace_root`) sat there unseen
+      # until a `--features testing` doc run found them — the same "a cell no
+      # gate compiles breaks unseen" class the checks above exist for.
+      #
+      # The workspace-wide shape is affordable: the one defect that used to
+      # block it (tinio-sandbox-windows' `testing` doc linking the private
+      # `probe_window`) is fixed, so this leg covers every crate's feature
+      # graph, not one crate's.
+      - name: doc (all features, no warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --profile ci --workspace --no-deps --all-features
+
       # tinio-store-pg is a plain workspace member (the P1 spike that was
       # excluded from the workspace is gone) that *is* the PostgreSQL
       # implementation: it carries no feature at all (P3 Task 13), so every run

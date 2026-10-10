@@ -30,6 +30,14 @@
 //! iteration inserts 2048 rows, so the redb file grows monotonically
 //! across the measurement window — a within-cell drift, disclosed in the
 //! report.
+//!
+//! The cells' data root and the run's flush control come from
+//! `tinio_util::bench` (the `bench` feature): its module docs carry why the
+//! root is pinned away from `TMP` and why every run records a flush
+//! measurement. Every store this bench commits to used to come from
+//! `tempfile::tempdir()`, so the whole measurement followed the shell's
+//! `TMP` — and this bench's cells are dominated by the commit's durable
+//! flush.
 
 // This bench declares `harness = false`, so clippy's `allow-*-in-tests` keys do
 // not reach it (design 2026-10-09 D7), and a bench is not production code
@@ -45,7 +53,6 @@ use std::{
     fs::{self, File},
     hint::black_box,
     io::Read,
-    mem,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -64,6 +71,7 @@ use tinio_fs::{
     meta::{self},
 };
 use tinio_server::pipeline::{Pipeline, Pipelines as PipelinePair};
+use tinio_util::bench;
 use tokio::runtime::Runtime;
 
 /// Entries per iteration (one cold-list workload).
@@ -324,8 +332,12 @@ fn cold_list_cell(
     group.bench_function(
         format!("workers_{io_workers}_batch_{batch_size}_db_{db_workers}"),
         |b| {
-            let state = tempfile::tempdir().unwrap();
-            let store = meta::store(state.path()).unwrap();
+            // One cell per (workers, batch, db) triple, so each starts from a
+            // database of its own under the pinned root.
+            let state = bench::cell_dir(&format!(
+                "{group_name}/meta/workers_{io_workers}_batch_{batch_size}_db_{db_workers}"
+            ));
+            let store = meta::store(&state).unwrap();
             let pipelines = build_pipelines(io_workers, db_workers);
             let bucket = bucket::name("data").unwrap();
             let rt = Runtime::new().unwrap();
@@ -344,25 +356,27 @@ fn cold_list_cell(
     group.finish();
 }
 
-/// One entry-size axis: the shared tree (leaked — it must outlive the
-/// whole run), then the workers × batch cells.
+/// One entry-size axis: the shared tree (under the pinned root — it must
+/// outlive the whole run), then the workers × batch cells.
 fn pipeline_axis(
     c: &mut Criterion,
     group_name: &str,
     key_fn: fn(usize) -> String,
     key_bytes: usize,
 ) {
-    let root = tempfile::tempdir().unwrap();
-    let objects = build_tree(root.path(), key_fn);
+    // The run's flush regime, beside its numbers (see `bench`).
+    bench::flush_control(&bench::data_root());
+    // The tree's root outlives the whole run by construction: it is a plain
+    // path under the pinned `data_root`, not a tempdir guard that would drop
+    // it (criterion exits the process afterwards).
+    let root = bench::cell_dir(&format!("{group_name}/tree"));
+    let objects = build_tree(&root, key_fn);
     // The nominal key size is asserted unconditionally (the tree is
     // built outside the timed region, so the check is free) — a key-shape
     // edit cannot silently drift the measured entry size.
     for object in &objects {
         assert_eq!(object.key.len(), key_bytes, "key drifted from nominal size");
     }
-    // Leak the tempdir guard: the tree must outlive the whole benchmark
-    // run (criterion exits the process afterwards).
-    mem::forget(root);
     for io_workers in IO_WORKERS {
         for batch in BATCH_SIZES {
             cold_list_cell(c, group_name, &objects, io_workers, 1, batch);
@@ -382,9 +396,10 @@ fn pipeline_long_key(c: &mut Criterion) {
 /// is single-writer, so 2 db workers must not beat 1 (pipeline-spec.md
 /// task 5).
 fn pipeline_db_workers(c: &mut Criterion) {
-    let root = tempfile::tempdir().unwrap();
-    let objects = build_tree(root.path(), short_key);
-    mem::forget(root);
+    // The run's flush regime, beside its numbers (see `bench`).
+    bench::flush_control(&bench::data_root());
+    let root = bench::cell_dir("pipeline_db_workers/tree");
+    let objects = build_tree(&root, short_key);
     for db_workers in [1, 2] {
         cold_list_cell(c, "pipeline_db_workers", &objects, 4, db_workers, 128);
     }

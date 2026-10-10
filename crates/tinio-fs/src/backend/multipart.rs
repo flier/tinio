@@ -1,19 +1,45 @@
 //! Multipart operations of the fs backend (task T044).
 //!
-//! Uploads and part ETags live in the state database; part contents stay
+//! The bodies are the ops engine's (`tinio_ops`): the upload lifecycle, the
+//! part pipeline and the part lock live once, in `tinio_ops::MultipartOps`,
+//! and this module calls them with the adapter steps only this backend can
+//! take. Uploads and part ETags live in the state database; part contents stay
 //! under `<state-dir>/multipart/`. Completion assembles into a temp file,
 //! renames under the bucket mutation lock (the symlink policy is
 //! re-checked there), consumes the upload and writes `OBJECT_META` in one
 //! transaction, then removes the part directory best-effort. Reserved
 //! `.tinio` keys and folder markers are refused up front.
+//!
+//! What stays fs-side, and why:
+//!
+//! - the **part files and their layout** (`<state>/multipart/<bucket>/<upload_id>/part-<n>`,
+//!   the upload id validated as the UUID a create allocated — a
+//!   client-supplied id never reaches the filesystem unvalidated), which the
+//!   content plane's [`tinio_core::content::ContentKey::Part`] mapping owns, and the per-part file
+//!   stat the listing joins (the contract has no part stat, D23);
+//! - the **assembly and the completion's commit**, which are not expressible
+//!   as contract calls here: the assembled object, the version branch and the
+//!   consumed upload land in **one** state transaction
+//!   (`complete_object_state`) under the bucket mutation lock, and the
+//!   versioned publish is `publish_versioned`'s;
+//! - the **part lock's home** ([`multipart::Store::part_lock`]) and its guard's
+//!   construction ([`FsHooks::lock_part`]), which the engine takes across the
+//!   commit phase only (E15);
+//! - the unix **`copy_file_range` fast path** of `copy_part` (the store's
+//!   `put_part_copy`, which commits through the same part lock); the portable
+//!   arm is the engine's, called from this module's `#[cfg(not(unix))]`
+//!   branch behind the same destination guards;
+//! - the **reserved/folder-marker refusals**, the concurrency cap
+//!   ([`multipart::Store::ensure_capacity`]) and every error variant with its
+//!   projection.
 
-// The Windows stream fallback of `copy_part` calls the ObjectOps trait
-// method (the unix fast path never does).
-use std::sync::Arc;
+// The Windows stream fallback of `copy_part` reads the source through the
+// `ObjectOps` trait method (the unix fast path never does).
+use std::{io::ErrorKind, sync::Arc};
 
 use tokio::fs;
 
-use super::{Error, FsStorage};
+use super::{Error, FsHooks, FsStorage};
 #[cfg(not(unix))]
 use crate::_core::storage::ObjectOps;
 #[cfg(unix)]
@@ -27,10 +53,13 @@ use crate::{
         object::{self, Info},
         storage::{
             ByteRange, ListPartsParams, ListUploadsParams, MultipartOps, PartsListing,
-            UploadsListing, access_denied, invalid_key, key_marker_order, split_uploads_order,
+            UploadsListing, access_denied, invalid_key, no_such_upload,
         },
     },
+    _ops::{BucketRow, MultipartOps as EngineMultipartOps},
+    _store_redb::RedbMetadata,
     backend::version::Publication,
+    content::FsContent,
 };
 
 /// The unix fast path of the part-copy primitive: `copy_file_range` the
@@ -99,9 +128,16 @@ impl MultipartOps for FsStorage {
         if key.is_folder_marker() {
             return Err(invalid_key(key.to_string()).into());
         }
-        self.multipart_store
-            .create(bucket, key, checksum, tags, owner, acl)
+        // The concurrency cap is this store's policy (CWE-770), not the
+        // engine's: it runs before the upload row is recorded.
+        self.multipart_store.ensure_capacity().await?;
+        // The engine records the row and allocates the id. fs's policy is the
+        // lazy one: the bucket row is recorded by the bucket's own paths, and
+        // an upload row needs none of it.
+        self.multipart_ops()
+            .create_multipart_upload(bucket, key, checksum, tags, owner, acl)
             .await
+            .map_err(Error::from)
     }
 
     async fn get_multipart_upload(
@@ -114,9 +150,16 @@ impl MultipartOps for FsStorage {
         if key.is_reserved() {
             return Err(access_denied(key).into());
         }
-        self.multipart_store
-            .get_upload(bucket, key, upload_id)
+        // The facade's identity guard: a client-supplied id may only name a
+        // UUID (as the create allocates) — anything else answers NoSuchUpload
+        // rather than a record no part path can address.
+        if uuid::Uuid::parse_str(upload_id).is_err() {
+            return Err(no_such_upload(upload_id).into());
+        }
+        self.multipart_ops()
+            .get_multipart_upload(bucket, key, upload_id)
             .await
+            .map_err(Error::from)
     }
 
     async fn upload_part(
@@ -132,9 +175,21 @@ impl MultipartOps for FsStorage {
         if key.is_reserved() {
             return Err(access_denied(key).into());
         }
-        self.multipart_store
-            .put_part(bucket, key, upload_id, part_number, body, checksum)
+        // The engine's part body: the upload identity first (no body is read
+        // and no part file is created for an aborted or completed upload),
+        // the body streamed into this crate's content plane under
+        // `tinio_core::content::ContentKey::Part`, then the publish and the `PARTS` row under
+        // `Hooks::lock_part`'s guard — the same store lock this backend's
+        // other part path takes.
+        let info = self
+            .multipart_ops()
+            .upload_part(bucket, key, upload_id, part_number, body, checksum)
             .await
+            .map_err(Error::from)?;
+        // The engine's answer carries the streamed byte count and the wall
+        // clock; fs's part stamp has always been the part file's own — the
+        // same single stat the pre-engine body read.
+        self.stamp_part(bucket, upload_id, info).await
     }
 
     async fn copy_part(
@@ -162,26 +217,40 @@ impl MultipartOps for FsStorage {
         }
         #[cfg(not(unix))]
         {
-            // No kernel copy primitive on Windows — the contract's
-            // stream default (get range → upload part). The copy path
-            // carries no client checksum (R1) — no tee slot.
+            // No kernel copy primitive on Windows — the ops engine's portable
+            // arm (the part pipeline with no client checksum, R1). The source
+            // is read FIRST, exactly as the pre-engine arm did (`get_object`
+            // then the trait's `upload_part`), so a request invalid at both
+            // ends still answers the source's error; the destination guards
+            // the fast path applies then follow — the bucket probe (the
+            // engine's stage probes it again) and the reserved-key refusal —
+            // and the part file's own stamp (the engine's answer carries the
+            // counted bytes and a wall clock).
             let get = self.get_object(src_bucket, src_key, range).await?;
-            self.upload_part(dst_bucket, dst_key, upload_id, part_number, get.body, None)
+            self.ensure_bucket(dst_bucket).await?;
+            if dst_key.is_reserved() {
+                return Err(access_denied(dst_key).into());
+            }
+            let info = self
+                .multipart_ops()
+                .copy_part(dst_bucket, dst_key, upload_id, part_number, get.body)
                 .await
+                .map_err(Error::from)?;
+            self.stamp_part(dst_bucket, upload_id, info).await
         }
     }
 
     async fn list_parts(&self, params: ListPartsParams) -> Result<PartsListing, Error> {
         self.ensure_bucket(&params.bucket).await?;
-        // The store applies the marker skip and the page cut inside its
-        // scan (a page costs O(page) reads); `max_parts = 0` is an empty,
-        // untruncated page with no marker (the store's contract). The
-        // resume marker is the store's RAW last part number: a truncated
-        // page whose parts all vanished in the store's pass 2 must still
-        // advance the client (marker from the emitted page would loop
-        // forever).
-        let (parts, truncated, raw_last) = self
-            .multipart_store
+        // The engine owns the upload's identity check, the marker arithmetic
+        // and the resume rule; the store applies the marker skip and the page
+        // cut inside its scan (a page costs O(page) reads), and `max_parts = 0`
+        // is an empty, untruncated page with no marker. The resume marker is
+        // the RAW last part number: a truncated page whose parts all vanished
+        // in the join must still advance the client (a marker from the emitted
+        // page would loop forever).
+        let page = self
+            .multipart_ops()
             .list_parts(
                 &params.bucket,
                 &params.key,
@@ -189,12 +258,39 @@ impl MultipartOps for FsStorage {
                 params.part_number_marker,
                 params.max_parts,
             )
-            .await?;
-        let next = if truncated { raw_last } else { None };
+            .await
+            .map_err(Error::from)?;
+        // The fs half of the listing: the size and mtime of each served row
+        // are its part file's (the contract carries no part stat, D23), and a
+        // part whose file vanished between the read and this join is skipped
+        // rather than failing the listing. `stamped_part` stats before it
+        // reads the number, so a **tampered** raw row — a number outside the
+        // legal range *and* a missing file — is skipped here where this site
+        // once answered `InvalidPartNumber`: no writer produces that shape and
+        // no test pins it, and the store's own `list_parts` pins the
+        // stat-first order (its `u32::MAX` marker test).
+        let mut parts = Vec::with_capacity(page.rows.len());
+        for row in &page.rows {
+            match self
+                .multipart_store
+                .stamped_part(
+                    &params.bucket,
+                    &params.upload_id,
+                    row.number,
+                    row.etag.clone(),
+                    row.checksum.clone(),
+                )
+                .await
+            {
+                Ok(part) => parts.push(part),
+                Err(Error::Io(err)) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            }
+        }
         Ok(PartsListing {
             parts,
-            truncated,
-            next_part_number_marker: next,
+            truncated: page.truncated,
+            next_part_number_marker: page.next_part_number_marker,
         })
     }
 
@@ -338,7 +434,22 @@ impl MultipartOps for FsStorage {
         if key.is_reserved() {
             return Err(access_denied(key).into());
         }
-        self.multipart_store.abort(bucket, key, upload_id).await
+        // The identity check and the four-table drain are ONE contract
+        // transaction (the engine body), so a racing complete cannot slip
+        // between them; an absent or key-mismatched upload answers
+        // NoSuchUpload and drains nothing.
+        self.multipart_ops()
+            .abort_multipart_upload(bucket, key, upload_id)
+            .await
+            .map_err(Error::from)?;
+        // The part files are residue once their rows are gone — the removal is
+        // best-effort (a failure is what the startup orphan stage reclaims
+        // after the idle grace, never a client-visible error).
+        let _ = self
+            .multipart_store
+            .remove_part_dir(bucket, upload_id)
+            .await;
+        Ok(())
     }
 
     async fn list_multipart_uploads(
@@ -350,38 +461,67 @@ impl MultipartOps for FsStorage {
         // `tinio_core::storage::uploads_order`), so the page can resume
         // inside a same-key group (S3 `upload-id-marker`); a bare key
         // marker skips the whole key group — the conversion has one home
-        // in tinio-core (shared with the mem backend).
-        let marker = key_marker_order(
-            params.key_marker.as_deref(),
-            params.upload_id_marker.as_deref(),
-        );
-        // The store pages inside its scan — bounded memory, off the
-        // async thread (item 7e): page size, resume marker, and order
-        // are identical to the old full-load pagination.
-        let (uploads, common_prefixes, truncated, next) = self
-            .multipart_store
-            .list_uploads_page(
-                &params.bucket,
-                &params.prefix,
-                params.delimiter.as_deref(),
-                marker.as_deref(),
-                params.max_uploads,
+        // in tinio-core (shared with the mem backend), and the store pages
+        // inside its scan — bounded memory, off the async thread (item 7e).
+        let mut page = self
+            .multipart_ops()
+            .list_multipart_uploads(params)
+            .await
+            .map_err(Error::from)?;
+        // The facade's identity guard (see `get_multipart_upload`): only a
+        // UUID id can name a part path, so a tampered or corrupt `UPLOADS`
+        // row is dropped from the served page. The page's marker,
+        // truncation and prefixes stay the raw read's — the resume protocol
+        // survives a shorter page (the marker is exclusive-after).
+        page.uploads
+            .retain(|upload| uuid::Uuid::parse_str(&upload.upload_id).is_ok());
+        Ok(page)
+    }
+}
+
+impl FsStorage {
+    /// The multipart-group receiver over this backend's handles.
+    ///
+    /// The policy is fs's, declared and never inferred: an upload row is
+    /// recorded plainly ([`BucketRow::Lazy`] — the
+    /// store's buckets outlive their rows, so an upload needs no bucket row).
+    /// The hooks are [`FsHooks`], whose part lock is the multipart store's own
+    /// map slot.
+    ///
+    /// The receiver's handles are the storage's own, resolved once
+    /// ([`ReceiverHandles`](super::ReceiverHandles)) — the same content plane
+    /// and hooks the bucket group takes, where the pre-engine body cloned
+    /// nothing: no `FsStorage` deep copy rides an upload any more.
+    pub(crate) fn multipart_ops(&self) -> EngineMultipartOps<RedbMetadata, FsContent, FsHooks> {
+        let handles = self.receiver_handles();
+        EngineMultipartOps {
+            meta: self.meta_store().engine(),
+            content: Arc::clone(&handles.own_content),
+            hooks: FsHooks {
+                storage: Arc::clone(&handles.storage),
+            },
+            bucket_row: BucketRow::Lazy,
+        }
+    }
+
+    /// The fs part stamp: the part file's own size and mtime, which this
+    /// backend's listings and responses have always served (the engine's
+    /// answer carries the counted byte count and a wall clock instead).
+    async fn stamp_part(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        info: PartInfo,
+    ) -> Result<PartInfo, Error> {
+        self.multipart_store
+            .stamped_part(
+                bucket,
+                upload_id,
+                u32::from(info.part_number),
+                info.etag,
+                info.checksum,
             )
-            .await?;
-        let (next_key_marker, next_upload_id_marker) = match next {
-            Some(next) => {
-                let (key, upload_id) = split_uploads_order(&next);
-                (Some(key.to_string()), upload_id.map(str::to_string))
-            }
-            None => (None, None),
-        };
-        Ok(UploadsListing {
-            uploads,
-            common_prefixes,
-            truncated,
-            next_key_marker,
-            next_upload_id_marker,
-        })
+            .await
     }
 }
 
@@ -399,10 +539,12 @@ mod tests {
             acl::Acl,
             multipart::MIN_PART_BYTES,
             object,
-            storage::{BucketOps, ObjectOps},
+            storage::{BucketOps, Error as StorageError, ObjectOps},
         },
         _util::testing::{body, read_body},
-        testutil::{all_users_read_grant, checksum_tee, fs_options, md5_wire, owner_id, storage},
+        testutil::{
+            all_users_read_grant, bucket, checksum_tee, fs_options, md5_wire, owner_id, storage,
+        },
     };
 
     #[tokio::test]
@@ -410,11 +552,7 @@ mod tests {
         // A body stream that errors mid-way (the checksum tee fails the
         // stream the same way) must leave no part file and no PARTS row.
         let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
+        let b = bucket(&storage).await;
         let k = object::key("big.bin").unwrap();
         let upload = storage
             .create_multipart_upload(
@@ -441,7 +579,14 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        // The engine answers the layering error (`storage::Error`), which this
+        // crate's `#[from]` projection nests under `Storage` — the same shape
+        // every ops-engine body's failure has, and the same wire error
+        // (`From<Error> for storage::Error` unwraps it).
+        assert!(
+            matches!(err, Error::Storage(StorageError::Io(_))),
+            "{err:?}"
+        );
         let listing = storage
             .list_parts(ListPartsParams {
                 bucket: b.clone(),
@@ -465,11 +610,7 @@ mod tests {
     #[tokio::test]
     async fn multipart_lifecycle_via_contract() {
         let (root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
+        let b = bucket(&storage).await;
         let k = object::key("big.bin").unwrap();
         let upload = storage
             .create_multipart_upload(
@@ -556,11 +697,7 @@ mod tests {
     #[tokio::test]
     async fn part_number_marker_pagination() {
         let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
+        let b = bucket(&storage).await;
         let k = object::key("big.bin").unwrap();
         let upload = storage
             .create_multipart_upload(
@@ -620,11 +757,7 @@ mod tests {
     #[tokio::test]
     async fn list_multipart_uploads_filters_by_prefix() {
         let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
+        let b = bucket(&storage).await;
         storage
             .create_multipart_upload(
                 &b,
@@ -669,11 +802,7 @@ mod tests {
     #[tokio::test]
     async fn delimiter_rollup_paginates_and_resumes() {
         let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
+        let b = bucket(&storage).await;
         for key in ["dir/a.bin", "dir/b.bin", "dir/sub/c.bin", "z.bin"] {
             storage
                 .create_multipart_upload(
@@ -728,11 +857,7 @@ mod tests {
     #[tokio::test]
     async fn bare_key_marker_skips_the_whole_key_group() {
         let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
+        let b = bucket(&storage).await;
         let k = object::key("same.bin").unwrap();
         let u1 = storage
             .create_multipart_upload(
@@ -774,11 +899,7 @@ mod tests {
     #[tokio::test]
     async fn same_key_uploads_paginate_without_skipping() {
         let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
+        let b = bucket(&storage).await;
         let k = object::key("same.bin").unwrap();
         storage
             .create_multipart_upload(
@@ -912,11 +1033,7 @@ mod tests {
         // the completion's tags and the interface-computed composite
         // checksum (the backend never hashes).
         let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
+        let b = bucket(&storage).await;
         let k = object::key("big.bin").unwrap();
         let tags = object::Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
         let upload = storage
@@ -1041,11 +1158,7 @@ mod tests {
         // applied by the completion — never re-ferried through the
         // interface (the tags precedent, spec 2026-09-05).
         let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
+        let b = bucket(&storage).await;
         let k = object::key("big.bin").unwrap();
         let owner = owner_id();
         let grants = vec![all_users_read_grant()];
@@ -1108,11 +1221,7 @@ mod tests {
         };
 
         let (_root, storage) = storage();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
+        let b = bucket(&storage).await;
         storage
             .set_bucket_versioning(&b, version::State::Enabled)
             .await
@@ -1312,5 +1421,121 @@ mod tests {
             restored.info.etag, composed,
             "the restored current-version row records the composed ETag, never the publish's MD5"
         );
+    }
+
+    /// The portable arm of `copy_part` (the platforms without a kernel copy
+    /// primitive): the source is read through the object group and rides the
+    /// ops engine's `copy_part` — the part pipeline with no client checksum
+    /// (R1) — behind the same destination guards the fast path runs.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn the_windows_copy_arm_reads_the_source_and_uploads_the_part() {
+        // The ETag is this test's own import: nothing else in this module is
+        // unix-compiled out with it, so a module-level import would be unused
+        // (and denied) on unix.
+        use crate::_core::ETag;
+
+        let (_root, storage) = storage();
+        let b = bucket(&storage).await;
+        let src = object::key("src.bin").unwrap();
+        storage
+            .put_object(&b, &src, body(b"hello world".to_vec()))
+            .await
+            .unwrap();
+        let dst = object::key("dst.bin").unwrap();
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &dst,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+
+        // A range is the part's own bytes: the ETag is that range's content
+        // MD5, never the source's.
+        let ranged = storage
+            .copy_part(
+                &b,
+                &src,
+                &b,
+                &dst,
+                &upload.upload_id,
+                1.into(),
+                Some(ByteRange::Inclusive(0, 4)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ranged.size, 5);
+        assert_eq!(ranged.etag, ETag::from_content(b"hello"));
+
+        // The whole source, as the completion's final part.
+        let whole = storage
+            .copy_part(&b, &src, &b, &dst, &upload.upload_id, 2.into(), None)
+            .await
+            .unwrap();
+        assert_eq!(whole.size, 11);
+        assert_eq!(whole.etag, ETag::from_content(b"hello world"));
+
+        // A reserved destination is refused by this arm's own guard (FR-020)
+        // — which runs **after** the source read (the guard order the revert
+        // restored); the source here is valid, so the answer is the
+        // destination's refusal.
+        let reserved = object::key(".tinio/part.bin").unwrap();
+        let err = storage
+            .copy_part(&b, &src, &b, &reserved, &upload.upload_id, 3.into(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(StorageError::AccessDenied(_))),
+            "{err:?}"
+        );
+
+        // Both ends invalid: the source key does not exist *and* the
+        // destination is reserved. The order above is the discriminator — the
+        // source read runs first, so the answer is the **source's**
+        // `NoSuchKey`, never the destination's `AccessDenied` the unix fast
+        // path answers (its guards run destination-first: reserved key, then
+        // source). A revert to the destination-first order would answer the
+        // other error here and nowhere else.
+        let missing = object::key("missing.bin").unwrap();
+        let err = storage
+            .copy_part(
+                &b,
+                &missing,
+                &b,
+                &reserved,
+                &upload.upload_id,
+                4.into(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(StorageError::NoSuchKey(_))),
+            "the source is read first, so its error wins: {err:?}"
+        );
+
+        // The copied part completes: the object serves the source's bytes
+        // (the unlisted range part is discarded).
+        let info = storage
+            .complete_multipart_upload(
+                &b,
+                &dst,
+                &upload.upload_id,
+                &[CompletedPart {
+                    part_number: whole.part_number,
+                    etag: whole.etag,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.size, 11);
+        let get = storage.get_object(&b, &dst, None).await.unwrap();
+        assert_eq!(read_body(get.body).await.unwrap(), b"hello world");
     }
 }

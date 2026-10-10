@@ -4,6 +4,11 @@
 //! entry counts. Guards the redb lookup against regression vs the old
 //! fan-out JSON layout. Baselines are recorded in Phase 6 (T088) and
 //! regression-gated.
+//!
+//! The cells' data root and the run's flush control come from
+//! `tinio_util::bench` (the `bench` feature): its module docs carry why the
+//! root is pinned away from `TMP` and why every run records a flush
+//! measurement.
 
 // This bench declares `harness = false`, so clippy's `allow-*-in-tests` keys do
 // not reach it (design 2026-10-09 D7), and a bench is not production code
@@ -24,6 +29,7 @@ use std::{
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tinio_core::{bucket, object};
 use tinio_fs::{_store_redb::object_meta::Table, database, meta};
+use tinio_util::bench;
 use tokio::runtime::Runtime;
 
 /// Entries in the populated `OBJECT_META` table (inserted in one bulk
@@ -36,10 +42,10 @@ const ENTRIES: u32 = 100_000;
 /// no bench-local schema that can drift); the populate handle is dropped
 /// before the store opens the file (redb's file lock is exclusive per
 /// handle).
-fn populated_store() -> (tempfile::TempDir, meta::Store) {
-    let state = tempfile::tempdir().unwrap();
+fn populated_store(cell: &str) -> meta::Store {
+    let state = bench::cell_dir(cell);
     {
-        let db = database::open(state.path()).unwrap().db;
+        let db = database::open(&state).unwrap().db;
         {
             let mut txn = db.begin_write().unwrap();
             {
@@ -70,8 +76,7 @@ fn populated_store() -> (tempfile::TempDir, meta::Store) {
         }
         drop(db);
     }
-    let store = meta::store(state.path());
-    (state, store.unwrap())
+    meta::store(&state).unwrap()
 }
 
 /// The hit key: `dir/obj-050000` (present at `ENTRIES` scale).
@@ -80,7 +85,9 @@ fn hit_key() -> object::Key {
 }
 
 fn meta_hits(c: &mut Criterion) {
-    let (_state, store) = populated_store();
+    // The run's flush regime, beside its numbers (see `bench`).
+    bench::flush_control(&bench::data_root());
+    let store = populated_store("meta_hits");
     let bucket = bucket::name("data").unwrap();
     let key = hit_key();
 
@@ -133,7 +140,7 @@ fn meta_hits(c: &mut Criterion) {
 
 /// The whole-bucket range scan (walk/listing/remove_bucket path).
 fn meta_walk(c: &mut Criterion) {
-    let (_state, store) = populated_store();
+    let store = populated_store("meta_walk");
     let bucket = bucket::name("data").unwrap();
 
     let mut group = c.benchmark_group("meta_walk");
