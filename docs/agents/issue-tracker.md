@@ -1,20 +1,17 @@
 # Issue tracker
 
-Work tracked in-repo. `github.com/flier/tinio` carries no issues and no PRs in use (measured 2026-10-01); `gh` installed and authenticated, nothing to read.
+Work tracked in-repo; `github.com/flier/tinio` carries no issues or PRs in use, and `gh` has nothing to read.
 
 ## Where work lives
 
 - Feature work: `specs/<feature>/tasks.md` — task rows, `- [ ]`/`- [X]`, dated tick notes each. Row = ticket.
-- Phase plan: `docs/superpowers/plans/<date>-<name>.md` — one checkbox per step, ticked as it happens (`docs/superpowers/README.md` §Plan progress).
-- Design: `docs/superpowers/specs/<date>-<name>-design.md` + feature's `specs/<feature>/` contract and checklist files.
+- Phase plan: `docs/superpowers/plans/<date>-<name>.md` — a checkbox per step, ticked as it happens.
+- Design: `docs/superpowers/specs/<date>-<name>-design.md` + feature's `specs/<feature>/` contract files.
 - Reviews: `docs/superpowers/reviews/`.
 
-## Rules binding a ticket-shaped artifact
+## Rules for ticket-shaped work
 
 - One definer per fact, record rule, plan progress: `docs/superpowers/README.md`.
-- English only: `docs/compress.md`.
-- Git: ask before every write, never auto-commit, index untouched: `docs/git.md`.
-
-## For the skills
-
-No `issue create`. New work item = task row appended to owning `specs/<feature>/tasks.md` with spec ID, plus plan under `docs/superpowers/plans/` when design needed. Triage role annotates that row; no tracker object to label.
+- English only: `docs/compress.md`. Git: ask before every write, never auto-commit: `docs/git.md`.
+- No `issue create`: a new work item = a task row in the owning `specs/<feature>/tasks.md` with spec ID.
+- A plan under `docs/superpowers/plans/` when design is needed; triage annotates the row, no tracker object.

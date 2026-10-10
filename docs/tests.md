@@ -2,48 +2,105 @@
 
 ## Rust
 
-- Async stays async (no blocking-runtime wrap); sync is ordinary. Exempt: runtime-shape. Conformance harness is a non-default test feature; cucumber does not re-assert Rust.
-- One-off scripts: any language. Standing unit / e2e: Rust only. Scratch outside the repo and not `target/`; delete at round end; reap spawned processes else the next build cannot replace the binary.
-- Placement (2026-10-01, test-placement plan): unit next to the subject (sibling file once the module outgrows one file — not a crate-level gather). Flow cucumber iff the migration rule admits, else integration (crate boundary / foreign oracle / bench-shared / public-API properties). One-module property suite moves inline with its subject.
-- Shared harness = lib behind a test feature. Shared include = file-scope (path resolution differs by platform). Spawn sites outside the guard's scan: record at the guard.
-- Drop a duplicate only when the survivor covers the same rule; fold missing asserts first. State-dir layout: closed set the fs backend tests pin — `meta.redb`, `tmp/`, `multipart/`, `blobs/` and the tool-state files.
+- Async stays async (no blocking-runtime wrap); sync is ordinary. Exempt: runtime-shape.
+- Conformance harness = non-default test feature; cucumber does not re-assert Rust.
+- One-off scripts: any language; standing unit / e2e: Rust only.
+- Scratch outside the repo and not `target/`; clear stale leftovers before a round, the round's own at its end.
+- Placement: unit next to the subject; cucumber iff the migration rule admits, else integration.
+
+## Harness & guards
+
+- Shared harness = lib behind a test feature; shared include = file-scope.
+- Integration for crate boundary / foreign oracle / bench-shared / public-API properties.
+- One-module property suite inline with its subject; spawn sites outside the guard's scan: record at the guard.
+- Drop a duplicate only when the survivor covers the same rule; fold missing asserts first.
+- State-dir layout: closed set the fs backend tests pin — `meta.redb`, `tmp/`, `multipart/`, `blobs/`, tool-state files.
 
 ## Standard acceptance (pre-push gate)
 
-- Local cmds cover every CI workflow leg. CI profile = dev. CI unit = nextest; local = cargo test; doctest separate. Out of gate: interop (external tools on `PATH`), audit, semver (constitution VI). Platform: [Platform-gated verification](#platform-gated-verification).
-- Doc gate: workspace rustdoc with warnings denied — not doctests. Public docs must not rustdoc-link private items.
-- Doctests compile only under `cargo test`: `cargo doc` renders a doctest but never compiles one, so the doc gate cannot see a broken example (`--doc` runs just that target). The case that motivated this: a `crates/tinio-store-redb/src/object_meta.rs` doctest took three `E0433`s from a module rename while the `cargo doc` gate stayed green, and only the workspace test gate caught it.
-- Feature-gate breakage needs each-feature — the default graph cannot see it. Matrix: facade + server + `tinio-fs`'s feature-off leg, not a powerset. Feature-off: lib-only check/clippy (dev-deps re-enable; Unix lints on Linux) — `tinio-fs`'s self dev-dependency unifies `versioning` back on for every test build, so `cargo hack check --package tinio-fs --each-feature` (a check builds no dev-deps) is the leg that compiles the stripped arm; test-run the refusal arm. Versioning graph is a runtime seam (`docs/cargo.md`). Sandbox e2e requires the sandbox feature; the feature gates the body, not the program — the binary must still compile and serve with features off.
-- Feature-off, the `not(unix)` cell (2026-10-10): no Windows leg compiled `#[cfg(not(unix))]` with `versioning` **off** — every Windows test/bench build is `--all-targets`-shaped and the self dev-dependency unifies the feature back on, while `--each-feature` on Linux compiles the stripped cell only *with* `unix` — so the stripped Windows cell needs its own leg: `cargo check -p tinio-fs --no-default-features` (no `--all-targets`, which re-unifies).
-- Windows gates never compile `#[cfg(unix)]` (2026-10-07): `cargo check --workspace --all-targets` and `cargo clippy --workspace --all-targets -- -D warnings` both pass on Windows while CI's ubuntu jobs (`.github/workflows/ci.yml` — the check job around :98, the clippy job around :173) compile that code and can fail. Measured: two defects in `crates/tinio-fs` — an `E0433` (`meta::Stored` unresolvable in a `#[cfg(unix)]` *test*, one of seven sites a crate rename updated and the only one Windows could not see) and a `clippy::absolute_paths` failure in `#[cfg(unix)] pub async fn upload_owner` — were invisible to every Windows gate and would have made both ubuntu jobs red.
-- Rule: a change that touches anything platform-gated is checked on Linux before it is committed. WSL2: name the distro (`Ubuntu-26.04`; the default is `docker-desktop`), checkout `/mnt/e/GitHub/tinio`, `cargo` at `$HOME/.cargo/bin/cargo`, `CARGO_TARGET_DIR=$HOME/tinio-target` keeps artifacts on ext4, and cross the boundary with a script file — inline commands lose shell variables and redirect targets. Minimum legs, both `--locked`: `cargo check -p tinio-fs --all-targets` and `cargo clippy --package tinio-fs --all-targets -- -D warnings`. The fs chown success path is **root-only** (the tests in `crates/tinio-fs/src/backend/objects_tests.rs` self-skip under uid 1000), so the Linux acceptance needs one root-side run of that test binary as well (`wsl -u root`); a uid-1000-only run certifies the failure and unmapped paths alone.
+- Local cmds cover every CI leg; CI profile = dev; CI unit = nextest, local = cargo test, doctest separate.
+- Out of gate: interop (tools on `PATH`), audit, semver (constitution VI). Platform legs: below.
+- Doc gate: workspace rustdoc, warnings denied — not doctests; public docs must not link private items.
+- Doctests compile only under `cargo test` (`--doc` runs just that target) — the `cargo doc` gate sees no broken example.
+- Feature-gate breakage needs each-feature; matrix = facade + server + `tinio-fs` feature-off, not a powerset.
+
+## Feature-off legs
+
+- Feature-off: lib-only check/clippy; an each-feature check of the fs crate compiles the stripped arm.
+- Test-run the refusal arm; versioning graph is a runtime seam (`docs/cargo.md`).
+- `#[cfg(not(unix))]` with `versioning` off needs a no-default-features check (no `--all-targets`).
+- Sandbox e2e requires the sandbox feature (gates the body, not the program — the binary still serves off).
+
+## Platform legs
+
+- Platform-gated change ⇒ checked on Linux first: WSL2 `Ubuntu-26.04` (not the default `docker-desktop`).
+- There: checkout on the Linux filesystem, artifacts on ext4; cross the boundary with a script file, not inline commands.
+- Legs (`--locked`): the fs check and the fs clippy, on that host.
+- fs chown success path is **root-only**: one root-side run owed (it self-skips as uid 1000).
 
 ## Cucumber (tinio-e2e)
 
-- Layout / tags / env: e2e README. Features ↔ S3 surface contract. `Given`/`When`=act, `Then`=assert; 1st-person; one behavior/scenario.
-- Default filter owns platform / external / confinement (`TINIO_E2E_CONFINEMENT`: unset=platform default, force in, force out); replacing it restates every exclusion.
-- Gate: fs, mem, parquet, spec-ID traceability. Migrate iff spec + product-surface observable (cucumber migration design); no spec ID → Rust. Keep the shared util harness.
-- Clean target dir: `cargo build -p tinio` first. `crates/tinio-e2e` owns no binary, so cargo never sets `CARGO_BIN_EXE_tinio` and `assert_cmd`'s legacy fallback needs `<target>/<profile>/tinio.exe`; without it ~89 scenarios fail spuriously (fs 247/293, mem 200/243) where the numbers are fs 293/293, mem 243/243, traceability 20/20 (measured from a clean target dir, 2026-10-10).
+- Layout / tags / env: e2e README; features ↔ S3 surface contract.
+- `Given`/`When`=act, `Then`=assert; 1st-person; one behavior/scenario.
+- Default filter owns platform / external / confinement (`TINIO_E2E_CONFINEMENT`); replacing it restates every exclusion.
+- Gate: fs, mem, parquet, spec-ID traceability; no spec ID → Rust; keep the shared util harness.
+- Clean target dir: build the binary first, else a large slice of scenarios fails spuriously.
 
 ## Product surfaces
 
-- T056 via the Plane API, never raw transport; process legs cucumber. Busy-pipe successor: **T147** — do not paper over. Pipe-pool needs a multi-thread runtime (`open` blocks the calling thread).
-- CLI process legs cucumber (build the binary first). Windows console drain stays Rust. Confinement: feature-off refuses at build, never by platform; feature-on must reach readiness; honour is macOS CI only, else operator opt-in.
-- Service verbs: supervisor + elevation — no auto leg; logic without elevation: inline unit tests. Doctor (T057): cucumber for repair flows; Rust for JSON key set vs schema. Credential policy stays Rust by ruling — loopback-only built-in fallback.
-- Read-only (FR-023): cucumber for backend wire, genuine read-only root (unix), mode / FR-016 / state via the real binary. Derived default state-dir stays Rust — CLI children always get an explicit state dir.
+- T056 via the Plane API, never raw transport; pipe-pool needs a multi-thread runtime.
+- Busy-pipe successor: **T147** — do not paper over.
+- CLI process legs cucumber (build the binary first); Windows console drain stays Rust.
+- Confinement: feature-off refuses at build; feature-on must reach readiness; honour = macOS CI only.
+- Service verbs: supervisor + elevation — no auto leg; logic without elevation: inline unit tests.
+
+## Rust-owned rulings
+
+- Doctor (T057): cucumber for repair flows; Rust for JSON key set vs schema.
+- Credential policy stays Rust by ruling — loopback-only built-in fallback.
+- Read-only (FR-023): cucumber for backend wire, genuine root, mode / FR-016 / state via the real binary.
+- Derived default state-dir stays Rust — CLI children always get an explicit state dir.
 
 ## Platform-gated verification
 
-- Shared: confinement **fails**, never skips, when the host cannot do the leg — skip certifies nothing (`TINIO_SANDBOX_ALLOW_SKIP=1`). Readiness is SSE (decision 19), not a scraped line. Undriveable arms: sandbox bdd plan §7. Guest artifacts: [Concurrency](#concurrency).
-- Linux / Windows: operator-owned, not CI (userns / console). CI compiles/lints jail and signal binaries; run is filtered — re-enable via ignore-default-filter or a non-ci profile. Confinement e2e is cucumber except oracles with no step-reachable surface, and feature-off confinement refusal (Rust). Default workspace run excludes confinement off macOS; operator opt-in (`TINIO_E2E_CONFINEMENT=1`).
-- Windows: confinement out of CI (cost); confined timeout separate; ACE shape design §6; launcher does not clean stale ACEs; network: unconfined reachability first, then confined denial. End-to-end readiness-timeout induction is undriveable; the core launcher covers the abort.
-- Windows Low-integrity image label (measured 2026-10-07): the confinement failures on this host are not the tool sandbox, not the session token and not a machine policy (all three tested and falsified) — `E:\GitHub\tinio` carries an explicit `Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)` ACE (explicit, not inherited; `E:\`, `E:\GitHub`, `E:\Temp`, `%LOCALAPPDATA%\Temp` and `C:\Users\Admin` carry none), and Windows sets a new process's integrity level to the **minimum of the launching token's integrity and the image file's**, so every test binary built under that root runs at Low (S-1-16-4096) whatever launches it — the session token itself is Medium.
-- Two failure families, both Low-writes-Medium: `HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\<profile>` is Medium, so `RegCreateKeyExW` is denied and `CreateAppContainerProfile` gives `hr=0x80070005`; and `%TEMP%` / `E:\Temp` are Medium, so `tempfile` gives `PermissionDenied` (code 5) and `mklink /J` says "Access is denied" — the familiar `1314` was never a `SeCreateSymbolicLinkPrivilege` problem (Developer Mode is on). Evidence: one `whoami.exe` copy in `E:\Temp` reports `Mandatory Label\Medium Mandatory Level S-1-16-8192` while an identical copy under `E:\GitHub\tinio\target\tmp` reports `S-1-16-4096`; relaunching from `cmd` / PowerShell / Task Scheduler changes nothing, because the discriminating variable is the image's label.
-- Fix — move the build, not the label: `$env:CARGO_TARGET_DIR = 'E:\Temp\tinio-target'` (any path outside the labelled tree) plus `$env:TMP = 'E:\Temp\tinio-tmp'; $env:TEMP = $env:TMP`. Measured out-of-tree on this host: `tinio-fs --lib` 367 passed / 0 failed, `tinio-sandbox-windows --lib` 127/0, and that crate's `confine` / `events` / `signals` 4/3/4 all 0 failed — the six junction legs and the AppContainer legs pass, with nothing skipped, weakened or `#[ignore]`d. Clearing the label instead (`icacls E:\GitHub\tinio /setintegritylevel (OI)(CI)Medium /T /C`) needs an **elevated** terminal and removes a containment measure that appears deliberate — the operator's call, not a fix to apply silently. Nothing here says the whole suite is green out-of-tree: `tinio-server --test sandbox_e2e_windows` still has one failing leg for an unrelated reason (a fixture whose induction no longer holds), and it is not this cause.
-- macOS: real-Mac gate; off-Mac certifies nothing; fail closed without the host helper. CI records refusals; confinement serial, parallel pass forced off (sandbox bdd plan §6). Two mechanisms (`TINIO_SANDBOX_MACOS_MECHANISM`); both must be green. Nested Seatbelt is environment. Socket-path overflow: harness.
+- Confinement **fails**, never skips, when the host cannot do the leg (`TINIO_SANDBOX_ALLOW_SKIP=1`).
+- Readiness is SSE (decision 19), not a scraped line; undriveable arms: sandbox bdd plan §7.
+- Linux / Windows: operator-owned, not CI; CI compiles/lints, the run is filtered.
+- Confinement e2e = cucumber except oracles with no step-reachable surface, and feature-off refusal (Rust).
+- Default workspace run excludes confinement off macOS; operator opt-in via `TINIO_E2E_CONFINEMENT`.
+
+## Windows: gates & network
+
+- Windows gates never compile `#[cfg(unix)]`: verify such tests/fns on Linux.
+- Windows: confinement out of CI (cost); ACE shape design §6; launcher does not clean stale ACEs.
+- Network: unconfined reachability first, then confined denial; readiness-timeout induction is undriveable.
+
+## Windows: the low-integrity label
+
+- Low integrity: binaries built in this tree run Low — the confinement failures are that label, not the tool.
+- Symptoms: AppContainer profile creation denied (`hr=0x80070005`); temp-directory writes denied (`PermissionDenied`).
+- Never a `SeCreateSymbolicLinkPrivilege` problem — not the familiar `1314`.
+- Relaunching from another shell or the task scheduler changes nothing — the image's label wins.
+- One server e2e leg keeps an unrelated failure (fixture induction).
+
+## Windows: the fix
+
+- Fix — move the build, not the label: target and temp dirs redirected outside the labelled tree.
+- Out-of-tree on this host: the fs and sandbox suites pass with nothing skipped or ignored.
+- Clearing the label needs elevation and drops containment — operator's call, not a silent fix.
+
+## macOS
+
+- macOS: real-Mac gate; off-Mac certifies nothing; fail closed without the host helper.
+- Two mechanisms (`TINIO_SANDBOX_MACOS_MECHANISM`), both green; confinement serial (parallel pass off).
+- Nested Seatbelt is environment; socket-path overflow: harness.
 
 ## Concurrency
 
-- Child-spawning suites serial. ≤4 agents; distinct `CARGO_TARGET_DIR`; prefer one suite; serialise when compile-or-confine stacks.
-- Guest fork failed → restart the guest, not pkill. Scratch: named list only. Single-thread probe: standalone binary. Otherwise a re-exec of the test binary is allowed.
-- Guest failures = **harness artifacts, not product defects**. Sync must carry vendor, config, specs, packaging, crates, and manifests. CRLF on unix unit files: pin LF in attributes; recurs → re-ship packaging. Socket-path overflow → harness depth first. Never two agents on the same VM.
+- Child-spawning suites serial; ≤4 agents; distinct `CARGO_TARGET_DIR`; prefer one suite; serialise when compile-or-confine stacks.
+- Guest fork failed → restart the guest, not pkill.
+- Scratch: named list only; single-thread probe = standalone binary.
+- Guest failures = **harness artifacts, not product defects**.
+- Sync must carry vendor, config, specs, packaging, crates, manifests.
+- CRLF on unix unit files: pin LF in attributes; recurs → re-ship packaging.
+- Socket-path overflow → harness depth first; never two agents on the same VM.

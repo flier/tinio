@@ -1,6 +1,6 @@
 # Triage labels
 
-Skills speak five canonical triage roles; this file maps each to this repo's label string.
+Five canonical triage roles → this repo's label string.
 
 | Role | Label here | Meaning |
 | --- | --- | --- |
@@ -10,6 +10,6 @@ Skills speak five canonical triage roles; this file maps each to this repo's lab
 | `ready-for-human` | `ready-for-human` | Needs human implementation |
 | `wontfix` | `wontfix` | Not actioned |
 
-Skill names a role → use middle column. Edit that column to match tracker vocabulary.
+Skill names a role → use middle column; edit it to match tracker vocabulary.
 
-Tracker in-repo (`docs/agents/issue-tracker.md`): label = annotation on task row, not tracker object.
+In-repo tracker (`docs/agents/issue-tracker.md`): label = annotation on task row, not tracker object.

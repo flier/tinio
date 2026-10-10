@@ -1,45 +1,67 @@
 # `--sandbox`: what an operator has to know
 
-`--sandbox` confines server to given paths — private mount namespace, `pivot_root`, seccomp deny eleven syscalls + whole x32 ABI. Notes below = Linux unless heading names other platform (Linux first; macOS + Windows landed since). Each item = confinement working as designed, not defect — all three read as bugs first time without warning.
+`--sandbox` confines the server to the given paths — private mount namespace, `pivot_root`, seccomp denying eleven syscalls + the whole x32 ABI.
 
-**A platform selector's value outside its accepted set is a usage error (exit 2) on every platform**, naming the variable and the values it takes rather than falling back to a default: `TINIO_SANDBOX_MODEL` (`userns` / `root`), `TINIO_SANDBOX_MACOS_MECHANISM` (`sandbox-exec` / `sandbox-init`), `TINIO_SANDBOX_CAPABILITIES` (the three AppContainer names). One operator mistake, one exit code, whichever selector it was typed into (`crates/tinio-sandbox-core/src/error.rs`'s `Error::Usage { detail }` variant is the class itself — `is_usage` deleted 2026-10-01, each platform's sentence now the variant's own `detail`, operator-visible refusal and exit code unchanged; each platform's own section below repeats the rule where its typo has a local consequence).
+Notes = Linux unless a heading names another platform. Each item = confinement working as designed — all three read as bugs the first time.
 
-## Linux: the confinement's own log lines are not in a production run's log
+- **A selector's value outside its accepted set is a usage error (exit 2) on every platform**, never a fallback default.
+- Selectors: `TINIO_SANDBOX_MODEL` (`userns` / `root`), `TINIO_SANDBOX_MACOS_MECHANISM`, `TINIO_SANDBOX_CAPABILITIES`.
 
-In-place arm installs the tracing subscriber **after** `confine` — a thread started before it would stay outside the namespaces, the dropped capabilities and the filter — so the jail's own events (`unshare`, mounts, cap drop, seccomp install) are emitted where no subscriber exists yet and are lost. Failure still reaches operator: returned error, non-zero exit, message on stderr. Trade accepted by operator; rule + reasoning = design decision 26.
+## Linux: log lines and the exposure bind
 
-## Linux: the exposure bind resolves each path once, and the fallback needs `/proc`
+The in-place arm installs the tracing subscriber **after** `confine` — the jail's own events are lost. Failure still reaches the operator: error, exit code, stderr (design decision 26).
 
-Every exposure is opened as its own descriptor before the mounts and the bind uses that descriptor, never the path again: `open_tree(OPEN_TREE_CLONE | AT_RECURSIVE)` clones the subtree and `move_mount` lands it, so what is bound is the object the descriptor holds. The symlink policy rides on that open as well as on the startup walk — one `openat2` resolution with `RESOLVE_NO_SYMLINKS`, or on a kernel below 5.6 an `O_PATH | O_NOFOLLOW` open whose components are re-checked immediately after it — so exposing a link fails at startup with the path named. Two windows remain the arm's own rather than the interval's: the `O_PATH` fallback's open-to-re-check gap, in which a link swapped in and restored is resolved by the open and invisible to the walk, so the linked directory can land (`enter.rs`'s `open_exposure` carries the bound), and the read-only overlay fallback's re-read of its source by path. A rename *before* the open can still change which directory is exposed; the substitution the descriptor closes is the one that tries to slip a link in after the policy has run.
+Each exposure is bound from a descriptor opened once — never the path again; exposing a link fails at startup with the path named. A rename *before* the open can still change what is exposed.
 
-Kernels below 5.2 have no `open_tree` and answer `ENOSYS`; the bind then falls back to `mount --bind` of the descriptor's `/proc/self/fd/<n>` link, which **requires `/proc` mounted** where the jail is built. Without it that step fails — there is no path-based bind left to fall back to, so a host with no `/proc` refuses to confine rather than resolving the exposure a second time. `TINIO_SANDBOX_FORCE_PROC_FALLBACK` set to any value (empty included) forces the fallback, so both arms are reachable on one host; it is read in release builds too, it selects between two descriptor-bound paths, and it grants no authority.
+Kernels below 5.2 fall back to a procfs-based bind, which **requires procfs mounted** where the jail is built — without it the host refuses to confine.
+
+- `TINIO_SANDBOX_FORCE_PROC_FALLBACK` (any value) forces the fallback; it grants no authority.
 
 ## macOS: two mechanisms, `sandbox-exec` by default
 
-`TINIO_SANDBOX_MACOS_MECHANISM` selects how profile reaches confined child. `sandbox-exec` (default) wraps child's `exec` with Apple's deprecated-but-shipped helper. `sandbox-init` invokes no helper: launcher hands rendered profile on launch payload; child applies via `sandbox_init_with_parameters` before it serves. Either name accepted, nothing else — typo = usage error (exit 2) naming variable + two values, never silent run under default.
-
-Two operator consequences. On `sandbox-init`, confinement = **one-shot and irreversible** in child; confined process can neither fork nor exec afterwards — wrong profile costs restart, not repair. Rendered profile **one rule shorter** there: `process-exec` exists only for `sandbox-exec` (helper needs it to exec child), so same one-exposure run: `sandbox-init` `rules=4` vs helper `rules=5` = measurement, not missing grant — serving run counts more, one rule per exposure launcher adds (design decision 6; design §5 owns count).
+- `TINIO_SANDBOX_MACOS_MECHANISM` selects how the profile reaches the confined child.
+- `sandbox-exec` (default) wraps the child's `exec` with Apple's deprecated-but-shipped helper.
+- `sandbox-init` invokes none — the child applies the rendered profile before serving; typo = usage error (exit 2).
+- `sandbox-init` confinement is **one-shot and irreversible** — no fork or exec afterwards; a wrong profile costs a restart.
+- Its profile is **one rule shorter** (`process-exec` is helper-only) — a measurement, not a missing grant (decision 6).
 
 ## Windows: a served root behind a junction is granted at its target, and the child resolves the operator's spelling
 
-Windows launcher grants **canonical** spelling of every exposure — path that is or passes through reparse point refused; remainder resolved before ACE written. Served root arrives already canonical (CLI canonicalises root before exposure set). Root handed as directory junction therefore granted on junction's *target*; junction's own spelling nowhere in grant. Child re-invoked with operator's argv, so first act = canonicalise junction itself as confined process: AppContainer access check needs ACE for own SID; junction directory carries none; child cannot resolve root — refuses before dispatch with `resolve_root`'s `— pass an existing DIR` on inherited stderr.
+The launcher grants the **canonical** spelling of every exposure; a path through a reparse point is refused. A root handed as a directory junction is therefore granted on the junction's *target*.
 
-Symptom reported, not silent: launcher's `error` frame reaches caller (child dies before readiness = parent's answer); child's refusal on log beside it. macOS does not meet this shape: profile adds resolved spelling **beside** operator's, so link in exposure set matches either. **Ruled: Windows serves canonical spelling alone** — spelled path that is or passes through reparse point refused outright, never granted beside resolved one; granting both would re-open exactly what refusal prevents (ACE on link's own object, or on target outside exposure) — record = `docs/superpowers/plans/2026-09-25-sandbox-followups.md` §22. Served root = directory junction: serve directory the junction names (its target), never junction's own spelling.
+The child re-invokes with the operator's argv and refuses before dispatch when it cannot resolve the junction as a confined process.
+
+- macOS adds the resolved spelling *beside* the operator's; **ruled: Windows serves the canonical spelling alone**.
+- Record: `docs/superpowers/plans/2026-09-25-sandbox-followups.md` §22.
 
 ## Windows: two per-user files, and the re-grant the salt costs
 
-`%LOCALAPPDATA%\tinio\` holds the two files the mechanism keeps per user. `acl-salt` — 32 CSPRNG bytes, current-user-only DACL, created once — is mixed into the profile name's derivation, because without it a name (= SID = a profile any local account can create) is a pure function of the served root. `acl-ledger.jsonl` is the audit record of what a run granted — the file, its fields and why it appends and never removes are design §6's — and the operator-facing half of that is: **revocation stays manual** (`icacls <dir> /remove:g "*<SID>"`), because nothing in the ledger removes. **The directory itself is repaired rather than only created**: an existing `%LOCALAPPDATA%\tinio` whose DACL is not this user's alone is re-described — every machine that has already run a launcher carries `%LOCALAPPDATA%`'s inherited grants there, and an account those grants reach could plant a file in it — and the propagation that costs reaches the files inside, so a third-party file placed in that directory loses its inherited entries; the rule and its measurements are design §6's. Operator consequences: **the first run after the salt lands re-grants every served root** — new SID, fresh ACE, and the old unsalted ACEs stay standing as residue (decision 15) until removed by hand; a salt that cannot be read or created, or whose DACL is not this user's alone, warns and that run derives the *unsalted* name, so the pre-computation exposure stands for it; the program directory's `ALL APPLICATION PACKAGES` RX is unchanged and stays readable by any AppContainer app on the machine. Rules + measurements = design §6 and decision 15; item = `docs/superpowers/plans/2026-09-25-sandbox-followups.md` §10.
+- The local app-data directory holds the two per-user files: `acl-salt` (created once) and `acl-ledger.jsonl`.
+- The salt is mixed into the profile name — without it the name is a pure function of the served root.
+- The ledger records what a run granted (design §6); **revocation stays manual**.
+- The directory is **repaired, not only created** when its DACL is not this user's alone.
+- **The first run after the salt lands re-grants every served root**; old unsalted ACEs stay as residue (decision 15).
+- An unreadable or uncreatable salt warns; that run derives the *unsalted* name.
+- The program directory's `ALL APPLICATION PACKAGES` RX is unchanged.
 
 ## The process has no capabilities, even when it runs as root
 
-Confinement drops every capability before server starts, `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` among them — process reads files as account it runs as, not as superuser it still is: under root model = uid 0 with empty capability set apart from single `CAP_CHOWN` `local_uid` mapping needs. File under served root that service account does not own and others cannot read is refused; S3 client sees `AccessDenied` for objects readable before flag added. User-namespace model same rule other side: namespace maps exactly one uid — invoking user's — so file owned by any other host id unreadable inside jail. Run server as account that owns data, or `chown -R` served root to that account.
+- Capabilities are dropped before the server starts — files are read as the account, not the superuser.
+- `root` model = uid 0 with only the `CAP_CHOWN` the `local_uid` mapping needs; `userns` = the one mapped uid.
+- A file the account cannot read is refused (`AccessDenied`).
+- Run the server as the account that owns the data, or `chown -R` the served root to it.
 
 ## Outbound connections are denied, and the filter cannot see the address family
 
-Seccomp denies **eleven** syscalls by number, not four: `connect`, `sendto`, `sendmsg`, `sendmmsg` (socket paths out); three `io_uring` ring calls (`io_uring_setup`, `io_uring_enter`, `io_uring_register` — 425/426/427) that submit `IORING_OP_CONNECT` / `IORING_OP_SENDMSG` without those four; ptrace family (`ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd` — last copies a same-uid peer's descriptor out, so `openat` can walk a host directory the mount view does not show) — not about network. **x32 ABI refused whole, not only those eleven**: one `JSET 0x4000_0000` mask on syscall number ahead of every comparison, so x32 `connect` (`0x4000_002a`) meets `EPERM` like rest of that ABI — do not conclude filter denies eleven things and nothing else. No address family let through: `connect(AF_UNIX)` denied with TCP ones — inside jail, `/dev/log` (syslog), Docker socket, D-Bus all fail `EPERM`. Deliberate — filter that could see family = different larger program — survivable because server logs go stderr not syslog. No allowance to add: Unix socket inside exposed directory unreachable too (refusal at `connect`, not path).
-
-**Ptrace half costs operator debuggers inside jail — belongs beside syslog consequence, not footnote.** `gdb`, `perf`, `strace` each attach via one of those three — none works on confined server (`ptrace` / `process_vm_*` answer `EPERM`). Must deny: jail confines served root not rest of machine; confined process still operator's uid; same-uid process outside jail otherwise fair game (read/write neighbour memory, follow `/proc/<pid>/root` across mount view). **Cost stated from syscall semantics, not measured** — jail holds exposure set + four device files, no such tool inside; host copies outside.
+- Seccomp denies **eleven** syscalls by number — the socket paths out and three `io_uring` calls.
+- The ptrace family too; the whole x32 ABI is refused.
+- No address family passes: syslog, the Docker socket and D-Bus fail `EPERM` inside; so does a Unix socket in an exposed dir.
+- Deliberate — server logs go to stderr. Debuggers die inside the jail (`gdb`, `perf`, `strace`); must deny.
 
 ## The host's path namespace does not exist inside the jail
 
-Jail = private mount namespace with `pivot_root`; contains exposure set + four device files every `serve` jail binds — `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom` — each at original absolute path. Everything else absent, not refused: `/etc`, `/proc`, host `/tmp`, operator home do not exist; path neither exposure nor those four fails "no such file or directory", not permission error. Linux differs from other two platforms (confine by policy — Windows AppContainer DACLs, macOS Seatbelt profile) where host paths visible and refused. Config, helper binary, or data path server needs on Linux must be exposed — what would be permission error at startup = missing file instead.
+- Jail = private mount namespace with `pivot_root`: the exposure set + the four device files `serve` binds.
+- The device files: null, zero, random and urandom, each at its original absolute path.
+- Everything else absent, not refused — a path that is neither fails "no such file or directory".
+- Linux differs: Windows (AppContainer DACLs) and macOS (Seatbelt) confine by policy — host paths visible, refused.
+- Config, helper binary or data path the server needs must be exposed.
