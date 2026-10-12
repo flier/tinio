@@ -557,7 +557,10 @@ impl FsStorage {
     /// and ACL (a copy is a fresh object — never the source's) and
     /// recorded checksum.
     #[cfg(unix)]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the contract's `copy_object` shape — source and destination bucket/key plus the carried tags, owner, ACL and checksum — which this unix fast path must match to override it"
+    )]
     async fn copy_object_fast(
         &self,
         src_bucket: &bucket::Name,
@@ -980,7 +983,10 @@ impl FsStorage {
     /// overwriting a previously multipart-completed object must not
     /// leave its parts behind). Returns the committed object metadata.
     #[cfg(unix)]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the commit's own field set — bucket, key, staged bytes, tags, owner, ACL and checksum — one publish and one row write take them together"
+    )]
     async fn commit_staged(
         &self,
         bucket: &bucket::Name,
@@ -1066,7 +1072,10 @@ impl FsStorage {
     /// keeps FR-022's best-effort rule — its entry self-heals on the next
     /// read and the failure is warned.
     #[cfg(unix)]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per element the row records — etag, size, mtime, identity, tags, checksum, owner, ACL and the version fields — the transaction writes them as one row"
+    )]
     async fn record_committed(
         &self,
         bucket: &bucket::Name,
@@ -1262,7 +1271,6 @@ impl ObjectOps for FsStorage {
     /// tags/owner/ACL. A copy is a fresh object either way — it inherits
     /// neither the source's retained parts nor its owner/ACL, and its mtime is
     /// the copy time.
-    #[allow(clippy::too_many_arguments)]
     async fn copy_object(
         &self,
         src_bucket: &bucket::Name,

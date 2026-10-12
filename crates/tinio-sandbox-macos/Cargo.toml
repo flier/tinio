@@ -14,9 +14,6 @@ thiserror.workspace = true
 tracing.workspace = true
 
 tinio-sandbox-core.workspace = true
-# **The `render` feature and not `testing`**: this crate renders a template in production, so
-# the shared renderer is a production dependency. The `testing` half stays a dev-dependency
-# below, which is what keeps the harness out of a shipped build.
 tinio-util = { workspace = true, features = ["render"] }
 
 [dev-dependencies]
@@ -26,20 +23,13 @@ tinio-util = { workspace = true, features = ["testing"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
-# **`fs` is deliberately absent, and it is not a feature a caller happens to
-# bring back in.** This crate names no `rustix::fs` item: the one it had — the
-# probe pipe's `fcntl_setfl` in `apply` — went with the handshake that replaced
-# it, and in `rustix` the `fs` feature gates `pub mod fs` and nothing else. What
-# is left asks for `io` (`fcntl_setfd`, and the tests' `fcntl_getfd` — neither is
-# feature-gated), `pipe` (`apply`'s verdict pipe for the probe handshake) and
-# `process` (`Pid` for `await_verdict`, and the `Signal`/`kill_process` the relay
-# and the launcher end a child with).
 rustix = { workspace = true, features = ["pipe", "process"] }
 signal-hook = { workspace = true, features = ["iterator"] }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "rt"] }
 
 [lints.clippy]
 absolute_paths = "warn"
+allow_attributes = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"

@@ -153,10 +153,11 @@ pub(crate) fn invalid_etag(err: etag::Error) -> Error {
 
 /// Part number outside `1..=10000`.
 ///
-/// The storage contract validates part numbers via [`tinio_core::PartNumber`];
-/// this constructor remains for `From` / tests and future defensive checks.
+/// The storage contract validates part numbers via [`tinio_core::PartNumber`], so no production
+/// path reaches this constructor: it exists for the test that pins the rendered message, and
+/// `#[cfg(test)]` is what says so rather than an annotation claiming the deadness is deliberate.
 #[inline]
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn invalid_part_number(part_number: u32) -> Error {
     Error::Storage(storage::invalid_part_number(part_number))
 }

@@ -453,7 +453,10 @@ pub fn self_confinement(adopted: &Adopted) -> result::Result<Option<Applied>, Re
 /// validator("(version 1)\n(deny default)\n", &[])?;
 /// # Ok::<(), tinio_sandbox_core::Error>(())
 /// ```
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "an `unsafe` site of its own: the apply forks, and the child touches only its own frame, one pipe and libSystem before exiting"
+)]
 pub fn validator(profile: &str, params: &[(String, String)]) -> Result<()> {
     // A child that applies the profile and a parent that never does: the answer
     // travels as one byte, and the child exits without running anything else of

@@ -32,7 +32,10 @@ pub struct FromClause {
 // The plan's pinned interface keeps `Item` owning the parsed `Expr`
 // (Task 5 evaluates it directly); the size gap vs the unit `Wild` variant
 // is the price of that shape.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the plan's pinned interface keeps `Item` owning the parsed `Expr` (Task 5 evaluates it directly); the size gap against the unit `Wild` variant is the price of that shape"
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Projection {
     Wild,

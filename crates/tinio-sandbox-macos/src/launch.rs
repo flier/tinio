@@ -581,7 +581,7 @@ fn spawn(
                 // with no second owner to reason about. The route through
                 // `as_raw_fd` plus `mem::forget` would move ownership just as well,
                 // but it needs an `unsafe` block where this needs none — and this
-                // crate's enumerated `#[allow(unsafe_code)]` sites are the
+                // crate's enumerated `#[expect(unsafe_code)]` sites are the
                 // inherited-descriptor rebuild in `inherited_fd` and the pair in
                 // `apply` (the libSystem FFI module and the validator's `fork`;
                 // decision 14), so an `unsafe` here would be one site more, with no
@@ -919,7 +919,7 @@ pub fn command_args(
 /// plane's socket and [`control`] for the control channel's — because the step
 /// that is `unsafe` is the same step in both and the reason is the same reason.
 /// One site with two callers is the shape decision 14 asks for: the exception is
-/// `#[allow(unsafe_code)]` on the enumerated site alone, and the enumeration
+/// `#[expect(unsafe_code)]` on the enumerated site alone, and the enumeration
 /// counts a site, not a call.
 ///
 /// **The obvious-looking safe route is not one.** `BorrowedFd::try_clone_to_owned`
@@ -959,7 +959,10 @@ pub fn command_args(
 ///
 /// An I/O error when the number does not fit in a `RawFd` (the core carries it
 /// as an `i64`, the kernel wants an `i32`).
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "an `unsafe` site of its own: it adopts the launcher's inherited descriptor — held open across the exec for this process's whole lifetime and owned by nothing else in it"
+)]
 fn inherited_fd(raw: i64) -> io::Result<OwnedFd> {
     let fd = RawFd::try_from(raw)
         .map_err(|_| io::Error::other("an inherited descriptor is out of range"))?;
@@ -1363,7 +1366,7 @@ fn preflight(profile: &Profile) -> Result<()> {
 /// The wrapper is safe **because the objects themselves are the arguments**: `TcpListener` and
 /// `ControlHandle` implement `AsFd`, so `rustix::io::fcntl_setfd` is handed real borrowed
 /// descriptors and nothing here reconstructs one from an integer. That is why this function
-/// needs no `#[allow(unsafe_code)]`: the crate's enumerated sites are the child's
+/// needs no `#[expect(unsafe_code)]`: the crate's enumerated sites are the child's
 /// descriptor rebuild (`inherited_fd`) and the pair in [`crate::apply`] — the
 /// libSystem FFI module and the validator's `fork` (decision 14).
 fn make_inheritable(listener: Option<&TcpListener>, controls: &[ControlHandle]) -> Result<()> {

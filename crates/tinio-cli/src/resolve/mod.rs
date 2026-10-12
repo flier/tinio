@@ -22,9 +22,8 @@
 //! is the only level [`pick`] still reads, because it is the only one clap has no answer for.
 
 #[cfg(test)]
-use std::{cell::Cell, ffi::OsString};
+use std::{cell::Cell, ffi::OsString, fs};
 use std::{
-    fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -43,13 +42,16 @@ use crate::{
     _server::{identity, pipeline::Pipelines as ServerPipelines},
     Error,
     cli::{self, Provenance},
-    commands::{DirArgs, EnvArgs, start},
+    commands::{DirArgs, EnvArgs, is_pg_root, start},
 };
 
 mod locate;
+pub mod pg;
 
 use locate::chain;
 pub(crate) use locate::current_dir;
+#[cfg(test)]
+pub(crate) use locate::locate_from;
 pub use locate::{
     Located, apply_env_file, config_path, locate, locate_confined, pick, resolve_mode,
     resolve_root, resolve_state_dir, state_dir_candidates,
@@ -115,6 +117,7 @@ pub type Pipelines = ServerPipelines<etag::Result, Result<(), FsError>, Result<(
 /// use tinio_config::Config;
 ///
 /// let resolution = Resolution {
+///     pg_root: None,
 ///     root: PathBuf::from("/srv/data"),
 ///     config: Config::default(),
 ///     config_text: String::new(),
@@ -128,7 +131,9 @@ pub type Pipelines = ServerPipelines<etag::Result, Result<(), FsError>, Result<(
 /// ```
 #[derive(Debug)]
 pub struct Resolution {
-    /// The served storage root, canonical.
+    /// The served storage root, canonical — or, for a pg run, the **synthetic** root its
+    /// configuration and tool state live under (PG5/PG13; the root is a database's, not a
+    /// directory's).
     pub root: PathBuf,
     /// The effective configuration: the file, with the flags and `.env` folded in.
     pub config: Config,
@@ -139,6 +144,10 @@ pub struct Resolution {
     pub config_path: PathBuf,
     /// The resolved mode (decision 4).
     pub read_only: bool,
+    /// The synthetic root [`locate`]'s pg arm resolved the run to, when it took that arm — the
+    /// record `Resolution::is_pg` reads, carried here rather than threaded beside the
+    /// value so every reader of the pg decision reads it off the resolution it already holds.
+    pub pg_root: Option<PathBuf>,
     /// The resolved state directory.
     pub state_dir: PathBuf,
     /// `TINIO_STATE_DIR` as the discovery parse read it: the directory's **source**, and the
@@ -162,6 +171,7 @@ impl Resolution {
     /// use tinio_config::Config;
     ///
     /// let resolution = Resolution {
+    ///     pg_root: None,
     ///     root: PathBuf::from("/srv/data"),
     ///     config: Config::parse("version = 1\n[server]\nhost = \"0.0.0.0\"\nport = 8080\n")
     ///         .expect("config"),
@@ -183,6 +193,21 @@ impl Resolution {
             &self.config.server.host,
             self.config.server.port,
         )
+    }
+
+    /// Whether this run is a **pg** one: the resolved configuration selects the pg backend
+    /// ([`Config::backend`]), or the resolution took [`locate`]'s pg arm — which
+    /// [`pg_root`](Self::pg_root) records, so a dsn-addressed run with no document is a pg one too
+    /// (PG5/PG13).
+    ///
+    /// **This is the one definition of the decision**, so the serving half's refusal
+    /// (`crate::commands::start::run`) and the doctor's check list and pg leg cannot disagree
+    /// about which runs those are. It reads the arm's own record ([`is_pg_root`]) and never a
+    /// value a filesystem run could also produce, which is what keeps `TINIO_PG_DSN` an
+    /// address and not a selector: an exported dsn changes nothing a filesystem run answers.
+    pub(crate) fn is_pg(&self) -> bool {
+        self.config.backend() == storage::Backend::Pg
+            || is_pg_root(&self.root, self.pg_root.as_deref())
     }
 
     /// The credential policy this resolution's bind falls under (audit run-2, P2).
@@ -217,6 +242,7 @@ impl Resolution {
     /// use tinio_config::Config;
     ///
     /// let resolution = Resolution {
+    ///     pg_root: None,
     ///     root: PathBuf::from("/srv/data"),
     ///     config: Config::parse("version = 1\n[server]\nhost = \"0.0.0.0\"\n").expect("config"),
     ///     config_text: String::new(),
@@ -442,6 +468,7 @@ fn spell_authority(authority: &str, default_port: u16) -> Result<String, Error> 
 /// use tinio_config::Config;
 ///
 /// let resolution = Resolution {
+///     pg_root: None,
 ///     root: PathBuf::from("/srv/data"),
 ///     config: Config::default(),
 ///     config_text: String::new(),
@@ -511,6 +538,7 @@ pub fn log_file(resolution: &Resolution, args: &start::Args) -> Result<PathBuf, 
 ///     config: None,
 ///     read_only: false,
 ///     state_dir: None,
+///     pg_dsn: None,
 /// };
 /// let located = locate(discovery, &Provenance::default())?;
 /// let args = Args {
@@ -560,6 +588,7 @@ pub fn server(
 ///     config: None,
 ///     read_only: false,
 ///     state_dir: None,
+///     pg_dsn: None,
 /// };
 /// let located = locate(discovery, &Provenance::default())?;
 /// let args = Args {
@@ -624,6 +653,7 @@ fn server_with(
 ///     config: None,
 ///     read_only: false,
 ///     state_dir: None,
+///     pg_dsn: None,
 /// };
 /// let located = locate(discovery, &Provenance::default())?;
 /// let args = DirArgs {
@@ -688,8 +718,14 @@ fn resume(located: Located, chain: Chain, adopted: Option<&str>) -> Result<Resol
         root,
         read_only,
         state_dir,
+        // The arm that produced this `Located`, carried onto the [`Resolution`] below so the pg
+        // decision ([`Resolution::is_pg`]) is read off the value a caller holds.
+        pg_root,
         config: explicit,
         state_dir_override,
+        // The document the mode was resolved from, read once by `locate` (`--config`, or the
+        // root-side file): folded into the load below rather than read a second time.
+        config_doc,
     } = located;
     // **The path is derived, not validated, when the document is already in hand** (design
     // decision 18): an adopted child's `--config` may name a file outside every exposure, and the
@@ -707,9 +743,18 @@ fn resume(located: Located, chain: Chain, adopted: Option<&str>) -> Result<Resol
     // payload carries the text and never the path (decision 18): `sandbox::launch::prepare` read
     // the file a third time for it — this chain's own read is the second — and the text it found
     // there could differ from the one this resolution is built on.
-    let (loaded, text) = match (adopted, chain) {
-        // The payload's text **is** the document: no path is read and nothing is created.
-        (Some(text), _) => (Config::parse(text), text.to_owned()),
+    let (loaded, text) = match (adopted, chain, config_doc) {
+        // The payload's text **is** the document (design decision 18): the launcher forwards the
+        // configuration bytes unparsed and the confinement exposes no path to read, so this is a
+        // text parse and cannot become a `Config::load`. Nothing is created.
+        (Some(text), _, _) => (Config::parse(text), text.to_owned()),
+        // **The document the mode was read from is already parsed** ([`Located::config_doc`]): its
+        // `Config` and the text it was read from are reused, so a start reads and parses its
+        // configuration once rather than twice — whether `--config` named it or it is the
+        // root-side file. The load outcome is the same one that read produced (`document` is this
+        // chain's own parse), and a document that did not parse never reached here: the mode's read
+        // answers `None` for it.
+        (None, _, Some((config, text))) => (Ok(config), text),
         // The serving chain **creates** the file it did not find (`contracts/cli.md:45`: it is
         // generated "on first start"), and the text of a document that call created is the text
         // that call wrote — `to_toml`'s own bytes, from the value it serialized them from. The
@@ -717,7 +762,7 @@ fn resume(located: Located, chain: Chain, adopted: Option<&str>) -> Result<Resol
         //
         // **The loaded arm is reachable**: the guard above is this arm's own `is_file` test, and
         // another process can create the file between it and the call.
-        (None, Chain::Serving) if !path.is_file() => {
+        (None, Chain::Serving, None) if !path.is_file() => {
             let (config, outcome) = discover::load_or_create(&root, &path, read_only)?;
             let text = match outcome {
                 discover::Outcome::Created(text) => text,
@@ -729,9 +774,9 @@ fn resume(located: Located, chain: Chain, adopted: Option<&str>) -> Result<Resol
         // it (decisions 14 and 26): an absent file contributes nothing, and nothing is written.
         // The empty text is that absence spelled out, and no launcher ever reads it — the chain
         // that launches is [`Chain::Serving`], whose absent-file arm above creates the document.
-        (None, Chain::Reading) if !path.is_file() => (Ok(Config::default()), String::new()),
+        (None, Chain::Reading, None) if !path.is_file() => (Ok(Config::default()), String::new()),
         // Every other run reads the document **once** and keeps both answers.
-        (None, _) => match document(&path) {
+        (None, _, None) => match document(&path) {
             Ok((config, text)) => (Ok(config), text),
             Err(err) => (Err(err), String::new()),
         },
@@ -752,6 +797,7 @@ fn resume(located: Located, chain: Chain, adopted: Option<&str>) -> Result<Resol
         config_text: text,
         config_path: path,
         read_only,
+        pg_root,
         state_dir,
         state_dir_override,
         config_error,
@@ -796,35 +842,26 @@ fn fold_credentials(env: &EnvArgs, config: &mut Config) -> Result<(), Error> {
     }
 }
 
-/// The document `path` holds: **the text**, and the configuration parsed from it — one read for
-/// both answers.
+/// The document `path` holds: **the configuration**, through the loader, and **the text** the
+/// launch payload carries (design decision 18).
 ///
-/// [`Config::load`] answers only the second of them, and the text has to survive the call: it is
-/// what the launch payload carries (design decision 18), because the file may sit outside every
-/// exposure the launcher's confinement grants. `sandbox::launch::prepare` re-read the path for it
-/// until this function existed, which was the **third** read of one start — `resolve::mode_config`
-/// is the first, this is the second — and a second answer to what the document says: a file edited
-/// between the resolution and the launch would have served a configuration the resolution never
-/// saw. What this reads is the file as it is, and the parse is the one `Config::load` runs, so the
-/// two answers cannot drift.
+/// **The configuration is [`Config::load`]'s** — the only parse production uses — so a refusal
+/// names the file the loader read.
 ///
-/// **A refusal still names the file.** `Config::parse` labels the document it is handed `(inline)`
-/// — the payload's case, where no file is behind the text — and this one came off a disk, so the
-/// parse's own message is re-spelled with the path it came from rather than with a spelling that
-/// would leave the operator hunting for which file is broken.
-fn document(path: &Path) -> Result<(Config, String), _config::Error> {
-    let text = fs::read_to_string(path).map_err(|source| _config::Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    match Config::parse(&text) {
-        Ok(config) => Ok((config, text)),
-        Err(_config::Error::Parse { message, .. }) => Err(_config::Error::Parse {
-            path: path.to_path_buf(),
-            message,
-        }),
-        Err(err) => Err(err),
-    }
+/// **The text is a rendering of the resolved configuration** ([`Config::to_toml`]), not a second
+/// read of the file. Decision 18's requirement is that the child's answers cannot diverge from
+/// this resolution's, and a rendering of the configuration the run actually serves cannot
+/// diverge from it, while a re-read of a file the operator may have edited in between can. That
+/// divergence is the one thing the payload exists to prevent, so the rendering is the honest
+/// source; `to_toml` is a serialization, so the loader stays production's only parse.
+///
+/// **`locate`'s anchoring read is the other caller**: the document `--config` named is parsed
+/// once for the pg selector, and the same pair travels on [`Located::config_doc`] so this chain
+/// and the mode's file level reuse it rather than reading the file again.
+pub(super) fn document(path: &Path) -> Result<(Config, String), _config::Error> {
+    let config = Config::load(path)?;
+    let text = config.to_toml()?;
+    Ok((config, text))
 }
 
 /// The config the **mode** is resolved from, before the state dir is known.
@@ -842,22 +879,49 @@ fn document(path: &Path) -> Result<(Config, String), _config::Error> {
 /// confined `--config`-outside-the-root run before it could serve. Without `--config` the
 /// root-side pair above is inside the served root and therefore readable, so that shape is
 /// unchanged.
+///
+/// **`anchor` is the document `--config` named, already parsed** ([`locate::anchor_config`]): the
+/// mode's file level for that run *is* that document, and `config_path` would resolve the very file
+/// the anchoring read opened — so it is reused rather than read a second time. A document that
+/// named no `--config`, or named an absent path, leaves `anchor` `None` and the path branch below
+/// answers as it always did; one that named a broken file never reaches this function at all,
+/// because [`locate::anchor_config`] fails the run on it.
+///
+/// **The pair is the document the later legs reuse**, for the root-side file as much as for an
+/// anchoring `--config`: [`super::document`] is production's only parse, and the configuration
+/// beside the text it rendered to is exactly what [`super::resume`] would have read from the same
+/// path — the chain's own load is then skipped, and the file is parsed once for the whole start.
+/// A file that does not parse answers `None` here, so the chain's read is what reports it.
 fn mode_config(
     root: &Path,
     root_state_dir: &Path,
     explicit: Option<&Path>,
     adopted: Option<&str>,
-) -> Result<Option<Config>, Error> {
+    anchor: Option<&locate::Anchor>,
+) -> Result<Option<(Config, String)>, Error> {
     if let Some(text) = adopted
         && explicit.is_some()
     {
-        return Ok(Config::parse(text).ok());
+        // Exempt text parse: the launcher forwarded this document's bytes unparsed and the
+        // confinement exposes no path to read (design decision 18), so there is nothing for
+        // `Config::load` to open here — this text came from outside the process, not from code.
+        return Ok(Config::parse(text)
+            .ok()
+            .map(|config| (config, text.to_owned())));
+    }
+    if let Some(anchor) = anchor {
+        return Ok(match anchor {
+            locate::Anchor::Reusable { config, text } => Some((config.clone(), text.clone())),
+            // The payload anchor is the adopted case above, which has already answered: it holds
+            // no reusable text (the two later legs parse the payload themselves).
+            locate::Anchor::Payload(_) => None,
+        });
     }
     let path = config_path(root, root_state_dir, explicit)?;
     if !path.is_file() {
         return Ok(None);
     }
-    Ok(Config::load(&path).ok())
+    Ok(document(&path).ok())
 }
 
 /// Folds the flags clap cannot hand a config into the resolved config (design §4): a flag and
@@ -954,6 +1018,7 @@ fn fold_flags(
 /// use tinio_config::Config;
 ///
 /// let resolution = Resolution {
+///     pg_root: None,
 ///     root: PathBuf::from("/srv/data"),
 ///     config: Config::default(),
 ///     config_text: String::new(),

@@ -22,11 +22,10 @@ mod sweep;
 // **The contract double rides the `testing` feature, so it compiles as production code** and
 // clippy's in-tests keys do not reach it (design 2026-10-09 D7); the exemption is stated here
 // rather than cleaned, the same shape `tinio-util`'s `testing` module carries.
-#[allow(
-    clippy::unwrap_used,
+#[expect(
     clippy::expect_used,
     clippy::panic,
-    reason = "test support: behind `testing` (docs/style.md §Panics)"
+    reason = "test support: behind `testing`, the double's helpers state their invariants with `expect` and `panic` (docs/style.md §Panics)"
 )]
 #[cfg(feature = "testing")]
 pub mod testing;

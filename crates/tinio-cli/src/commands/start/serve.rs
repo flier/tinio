@@ -6,10 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::{fmt::Display, net::SocketAddr, process::ExitCode, time::Duration};
 
-use futures::{
-    StreamExt,
-    future::{Either, select},
-};
+use futures::future::{Either, select};
 use tokio::{
     net::TcpListener,
     sync::watch,
@@ -17,20 +14,24 @@ use tokio::{
     time::{error::Elapsed, timeout},
 };
 
-use super::Ready;
+#[cfg(all(test, feature = "pg"))]
+use super::serving::pg_pass;
+#[cfg(test)]
+use super::serving::{fs_cleanup, multipart_grace_for};
+use super::{
+    Args, Prepared, Ready, Served,
+    serving::{ServingBackend, sweep_options_for},
+};
+#[cfg(feature = "versioning")]
+use crate::_fs::FsStorage;
+#[cfg(test)]
+use crate::_fs::sweep;
 #[cfg(unix)]
 use crate::notify;
 use crate::{
     _config,
-    _core::{
-        cleanup::{Cleanup, CleanupOptions, RepairKind},
-        mode::AccessMode,
-    },
-    _fs::{
-        FsCleanup, FsStorage, Scanner, ScannerOptions,
-        sweep::{self, Sweeper},
-    },
-    _sandbox::platform_facts,
+    _core::{mode::AccessMode, storage::Storage},
+    _sandbox::{Adopted, platform_facts},
     _server::{
         Capabilities, DataPlane, Identity, PlaneConfig,
         identity::{self, IdentityFromConfig},
@@ -38,9 +39,11 @@ use crate::{
     Error,
     commands::EnvArgs,
     events,
-    resolve::Resolution,
-    sandbox,
+    resolve::{Pipelines, Resolution},
+    sandbox, signal,
 };
+#[cfg(feature = "pg")]
+use crate::{_core::storage::Error as StorageError, _pg::PgStorage};
 
 /// The drain bound `contracts/cli.md:43` promises: "cease accepting, drain ≤ 10 s, remove `state`
 /// and the socket, exit 0".
@@ -58,7 +61,7 @@ const DRAIN_BOUND: Duration = Duration::from_secs(10);
 /// inside `contracts/cli.md:43`'s window instead of following that pacing: a pass abandoned here
 /// is idempotent work that resumes on the next start, so waiting longer buys nothing the next run
 /// does not do anyway.
-const BACKGROUND_BOUND: Duration = Duration::from_secs(2);
+pub(super) const BACKGROUND_BOUND: Duration = Duration::from_secs(2);
 
 /// How long the toggle-off warning's count may run before its message degrades to the count-free
 /// spelling ([`bounded_versioning_warning`]).
@@ -102,52 +105,199 @@ const WARNING_BOUND: Duration = Duration::from_secs(2);
 /// # Ok(())
 /// # }
 /// ```
+/// The resolution and process state §1's serving half runs on, bundled so [`serve_backend`]
+/// takes one value beside the constructed backend.
+struct Serving {
+    resolution: Resolution,
+    args: Args,
+    adopted: Option<Adopted>,
+    handles: signal::Handles,
+    pipelines: Pipelines,
+    on_ready: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Ready {
+    /// The constructed backend and the serving state, split apart — **the field
+    /// list `serve` used to destructure and rebuild by hand, written once**.
+    /// `Ready`'s fields are private to the `start` module, so this lives beside
+    /// [`Serving`], which carries the same six from the same move.
+    fn split(self) -> (Served, Serving) {
+        let Ready {
+            resolution,
+            args,
+            adopted,
+            handles,
+            backend,
+            pipelines,
+            on_ready,
+        } = self;
+        (
+            backend,
+            Serving {
+                resolution,
+                args,
+                adopted,
+                handles,
+                pipelines,
+                on_ready,
+            },
+        )
+    }
+}
+
 pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
-    // One pattern, with the plane's field gated the same way the struct declares it.
-    let Ready {
+    let (backend, serving) = ready.split();
+    match backend {
+        Served::Fs(prepared) => serve_backend(*prepared, serving).await,
+        #[cfg(feature = "pg")]
+        Served::Pg { config, access } => {
+            // **The pg arm's whole startup is framed here, at one site** (decision 19). `serve` is
+            // reached as `on_runtime(start::serve(*ready))`, so it never passes through the
+            // framing arm that frames `start::run`'s error; a pg startup refusal raised below would
+            // otherwise exit with no stdout frame, and a client waiting on a readiness frame would
+            // time out instead of learning why. **Framing the call rather than each step** is what
+            // makes it regression-proof: [`prepare_pg`] owns every fallible step of the pg startup
+            // (the construction, the management-plane bind, and anything added later), so a new
+            // step inherits this frame instead of having to remember it.
+            let (prepared, serving) = prepare_pg(config, access, serving)
+                .await
+                .inspect_err(frame_startup)?;
+            serve_backend(prepared, serving).await
+        }
+    }
+}
+
+/// Emit the stdout error frame a **pre-readiness serving failure** owes (decision 19), and hand
+/// the error on unchanged.
+///
+/// **Why one function.** `serve` (and so `serve_backend`) is reached from `on_runtime`, not
+/// through the arm that frames `start::run`'s error, so a fallible step that runs before `state`
+/// is published would otherwise exit with only the `tinio: …` stderr line and a client waiting on
+/// a readiness frame would time out instead of learning why. **Every pre-readiness `?` in [`serve`]
+/// and [`serve_backend`] frames through this** — the pg construction's `inspect_err` on
+/// [`prepare_pg`] included — so the wording has one writer, and the two halves' refusals read alike.
+fn frame_startup<E: Display>(err: &E) {
+    events::emit_error(&err.to_string());
+}
+
+/// The data-plane listener: the resolved bind address, the listener (a launcher's inherited one,
+/// or a fresh bind), and its local address — **the pre-readiness fallible steps in one function**
+/// so [`serve_backend`] frames them at one site ([`frame_startup`]), and a step added inside here
+/// inherits that frame.
+async fn bind_served_listener(
+    resolution: &Resolution,
+    adopted: Option<&Adopted>,
+) -> Result<(TcpListener, SocketAddr), Error> {
+    let bind = resolution.address()?;
+    let listener = match adopted {
+        // The listener a launcher handed this child over the inherited descriptor (Task 9).
+        Some(adopted) => sandbox::adopted_listener(adopted)?,
+        None => TcpListener::bind(bind).await?,
+    };
+    let address = listener.local_addr()?;
+    Ok((listener, address))
+}
+
+/// Construct the pg backend and bind its management plane — **the pg arm's whole startup**, in one
+/// function so its refusals are framed once by [`serve`]'s caller (decision 19).
+///
+/// Order is the ruling, and it is `run()`'s for a filesystem run: `PgStorage::connect` is the
+/// single-instance gate (its ownership lock, PG12) and it runs first; the management plane's bind
+/// follows, still before the repair `serve_backend` runs.
+///
+/// **`serving` is taken and returned by value** so the returned future holds no borrow of it across
+/// the `connect` await — a `Serving` owns a `Box<dyn FnOnce() + Send>` (the readiness hook) and is
+/// therefore `Send` but not `Sync`, so a `&Serving` held across an await would make [`serve`]'s
+/// future non-`Send` and break the `tokio::spawn` that drives it.
+#[cfg(feature = "pg")]
+async fn prepare_pg(
+    config: _pg::Config,
+    access: _pg::Access,
+    serving: Serving,
+) -> Result<(Prepared<PgStorage>, Serving), Error> {
+    let storage = PgStorage::connect(&config, access)
+        .await
+        .map_err(StorageError::from)?;
+    #[cfg(feature = "api")]
+    let plane = super::run::open_management_plane(
+        &storage,
+        &serving.resolution,
+        &serving.args,
+        serving.adopted.as_ref(),
+        &serving.handles,
+        &serving.pipelines,
+    )?;
+    #[cfg(feature = "api")]
+    let prepared = Prepared { storage, plane };
+    #[cfg(not(feature = "api"))]
+    let prepared = Prepared { storage };
+    Ok((prepared, serving))
+}
+
+/// §1's serving half over a constructed backend — **the one body, generic across backends**.
+///
+/// The backend-specific operation the serving half owes — the startup repair — travels through
+/// [`ServingBackend`], which also carries the filesystem-only background passes; everything else —
+/// the listener, the two planes, `state`, readiness, the drain and the shutdown — is the
+/// contract's and is written once. A filesystem backend and a pg backend therefore run the **same**
+/// serving code, which is the point of the seam.
+///
+/// The repair is deliberately the first thing here, and the plane's single-instance gate has
+/// already happened: in the pre-runtime half for the filesystem backend (its bound control
+/// channel), and in the pg constructor for a pg backend (its ownership lock, PG12). Decision 12's
+/// order is single-instance bind → repair → data plane bound → api plane bound → `state` →
+/// readiness.
+///
+/// # Errors
+///
+/// A bind failure (the port is taken, or the inherited listener cannot be adopted), a
+/// management transport that cannot be bound, a plane that stopped while the process was
+/// still serving, and the plane's drain at the end of the run. A shutdown the `stop` channel
+/// drove — the ordinary signal or `POST /stop` path — returns `ExitCode::SUCCESS`: every arm
+/// ends cleanly on that channel, and a drain is not a failure.
+async fn serve_backend<S>(prepared: Prepared<S>, serving: Serving) -> Result<ExitCode, Error>
+where
+    S: ServingBackend,
+{
+    let storage = prepared.storage;
+    #[cfg(feature = "api")]
+    let plane = prepared.plane;
+    let Serving {
         resolution,
         args,
         adopted,
         handles,
-        storage,
         pipelines,
-        #[cfg(feature = "api")]
-        plane,
         on_ready,
-    } = ready;
+    } = serving;
 
     // The startup repair, post-bind (decision 12): the fast, deterministic items only, and
     // best-effort — a failed stage is warned and readiness proceeds, because the scanner
-    // covers the residue.
-    let repaired = repair(&storage, &resolution).await;
+    // covers the residue. The backend decides what "repair" means.
+    //
+    // **The repair runs in every build; only the `versioning` feature reads its answer** (it arms
+    // the optional post-repair block verify below), so the *binding* — not the call — is gated.
+    #[cfg(feature = "versioning")]
+    let repaired = storage.repair(&resolution).await;
+    #[cfg(not(feature = "versioning"))]
+    let _ = storage.repair(&resolution).await;
+    // **The run's access mode, bound once** and read by the `versioning` block below and by the
+    // data plane and the background pass further down — so it is unconditional (a `versioning`-off
+    // or `api`-off build still reads it), and the earlier placement is what lets those readers
+    // share one value instead of recomputing `resolution.read_only`.
+    let access = AccessMode::from(resolution.read_only);
 
     // Crash evidence arms the design's optional post-unclean-shutdown verify (2026-10-06
     // review): when the repair actually cleared residue, every versioned bucket's stored
     // blocks are re-read and re-hashed in the background — report-only, the corrupt count on
     // `tinio_storage_blocks_corrupt_total`. Serving is not delayed: the trust-the-store read
-    // path is compensated, never gated.
+    // path is compensated, never gated. The backend decides what "verify" means (the filesystem
+    // backend re-hashes its blocks; a backend whose read path verifies does nothing).
     #[cfg(feature = "versioning")]
     if repaired {
         let storage = storage.clone();
-        let access = AccessMode::from(resolution.read_only);
         tokio::spawn(async move {
-            let cleanup = FsCleanup::new(
-                &storage,
-                CleanupOptions {
-                    access,
-                    ..Default::default()
-                },
-            );
-            match cleanup.verify_all_blocks().await {
-                Ok((checked, corrupt)) => tracing::info!(
-                    blocks_checked = checked,
-                    blocks_corrupt = corrupt,
-                    "post-repair block verification finished"
-                ),
-                Err(err) => {
-                    tracing::warn!(error = %err, "post-repair block verification failed")
-                }
-            }
+            storage.verify_blocks(access).await;
         });
     }
 
@@ -172,9 +322,9 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
         let stopper = handles.stopper.clone();
         sandbox::on_stop(move || {
             let _ = stopper.send(true);
-        })?;
+        })
+        .inspect_err(frame_startup)?;
     }
-    let bind = resolution.address()?;
     // **The built-in pair is a loopback-only development credential** (audit run-2, P2): a config
     // with no `[auth]` section serves `identity::root_auth_pair`'s documented fallback, which is
     // not a credential at all. **The refusal for a bind another host can reach is `run`'s static
@@ -187,18 +337,19 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     if let Some(message) = resolution.credential_policy()?.warning() {
         warn(&message);
     }
-    // **Borrowed, not taken**: the arm below asks whether this process is a launched child, which
-    // is what decides who publishes `state`. A `match adopted` binding its inner value would move
-    // it here and leave that question unanswerable at the publish site.
-    let listener = match adopted.as_ref() {
-        // The listener a launcher handed this child over the inherited descriptor (Task 9).
-        Some(adopted) => sandbox::adopted_listener(adopted)?,
-        None => TcpListener::bind(bind).await?,
-    };
-    let address = listener.local_addr()?;
+    // **The pre-readiness fallible steps are framed at their own sites** (decision 19): a client
+    // waiting on a readiness frame must learn why none came, and `serve` is reached from
+    // `on_runtime` rather than through the arm that frames `start::run`'s error — so without this
+    // a port already in use exits 1 with only the `tinio: …` stderr line. `bind_served_listener`
+    // gathers the resolved address, the bind and the local address, so a step added inside it
+    // inherits the frame; [`frame_startup`] is the one wording. The filesystem path's **ordinary**
+    // cases are unchanged: a successful bind emits nothing, and the management plane's refusal in
+    // `start::run` is still framed by `run.rs` (this only adds a frame where there was none).
+    let (listener, address) = bind_served_listener(&resolution, adopted.as_ref())
+        .await
+        .inspect_err(frame_startup)?;
     warn_if_non_loopback(address);
     let caps = capabilities_for(&resolution);
-    let access = AccessMode::from(resolution.read_only);
     // The fail-open defense's startup half (spec 2026-10-03): the feature is compiled in but
     // `[s3] versioning` is off, so a root that still holds version data keeps serving its current
     // versions while every version operation is refused. The run starts either way — refusing to
@@ -221,7 +372,7 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     let versioning_warning = tokio::spawn({
         let storage = storage.clone();
         async move {
-            let scan = versioning_disabled_warning(&storage, &caps);
+            let scan = storage.versioning_warning(&caps);
             if let Some(message) = bounded_versioning_warning(WARNING_BOUND, scan).await {
                 warn(&message);
             }
@@ -257,12 +408,8 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
         async move { plane.serve(stop).await }
     });
     let data = tokio::spawn(data.serve(listener, stop.clone()));
-    let background = tokio::spawn(scanner_and_sweeper(
-        storage.clone(),
-        stop.clone(),
-        access,
-        sweep_options_for(&resolution),
-    ));
+    let background =
+        tokio::spawn(storage.background(stop.clone(), access, sweep_options_for(&resolution)));
 
     #[cfg(feature = "api")]
     // **A launched child never writes `state`.** Its launcher does, and the two launcher
@@ -279,7 +426,7 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     // process that owns its own `state`, which is every unconfined run and every in-place
     // platform.
     if adopted.is_none() {
-        plane.publish(address.port())?; // `state` is written here
+        plane.publish(address.port()).inspect_err(frame_startup)?; // `state` is written here
     }
     events::ready(address); // the readiness event, on stdout (§8; decision 19)
     // The operational summary, on stderr: endpoint, root and credentials status — the event
@@ -455,7 +602,10 @@ fn warn(message: &str) {
 /// awaits the count without one, so a wedged read would stay pending here forever — the timeout
 /// the task applies is what keeps it from holding the shutdown join.
 #[cfg(feature = "versioning")]
-async fn versioning_disabled_warning(storage: &FsStorage, caps: &Capabilities) -> Option<String> {
+pub(super) async fn versioning_disabled_warning(
+    storage: &FsStorage,
+    caps: &Capabilities,
+) -> Option<String> {
     if caps.versioning {
         return None;
     }
@@ -537,141 +687,6 @@ fn background_arm(name: &str, outcome: Result<(), JoinError>) -> Result<(), Erro
     outcome.map_err(|err| Error::Operational(format!("{name} did not finish: {err}")))
 }
 
-/// The restart repair: the `Cleanup` contract's startup kind, run before either plane serves.
-///
-/// Best-effort by contract (`failure-handling.md` §3): every stage is warned rather than
-/// propagated, because the scanner covers whatever residue a failed stage leaves behind, and a
-/// server that refuses to start over a full `tmp/` would be a worse failure than the residue.
-async fn repair(storage: &FsStorage, resolution: &Resolution) -> bool {
-    let cleanup = repair_cleanup(storage, resolution);
-    // Whether any stage actually cleared something: the startup repair runs
-    // with `dry_run` off, so an `Ok` action is executed repair — residue a
-    // crash left (2026-10-06 review). That is the unclean-shutdown signal
-    // the optional post-repair block verification arms on.
-    let mut repaired = false;
-    match cleanup.repair(RepairKind::Startup).await {
-        Ok(mut actions) => {
-            while let Some(action) = actions.next().await {
-                match action {
-                    Ok(_) => repaired = true,
-                    Err(err) => tracing::warn!(
-                        error = %err,
-                        "startup repair step failed; the scanner covers the residue"
-                    ),
-                }
-            }
-        }
-        Err(err) => tracing::warn!(
-            error = %err,
-            "startup repair failed; the scanner covers the residue"
-        ),
-    }
-    repaired
-}
-
-/// The `FsCleanup` the startup repair runs: the access mode plus the pipeline's orphan-upload
-/// grace — the resolved `[s3] multipart_expire_days` ([`multipart_grace_for`]), so the repair
-/// judges an abandoned upload by the same configured clock the sweeper does instead of the
-/// hardcoded sweep default.
-///
-/// **A function of its own so the wiring is testable rather than only readable**: a test over
-/// [`multipart_grace_for`] pins the value but not whether [`repair`] chains it onto the cleanup
-/// it builds, and this is the one construction both `repair` and that test drive.
-fn repair_cleanup(storage: &FsStorage, resolution: &Resolution) -> FsCleanup {
-    FsCleanup::new(
-        storage,
-        CleanupOptions {
-            access: AccessMode::from(resolution.read_only),
-            ..Default::default()
-        },
-    )
-    .with_multipart_grace(multipart_grace_for(resolution))
-}
-
-/// The two background passes, on the serving half's one shutdown channel.
-///
-/// Both loops exit when `stop` flips, and this future completes only when **both** have — which
-/// is what makes awaiting it the guarantee the shutdown sequence needs: no pass is mid-flight
-/// when the pipelines are shut down, so a pass cannot keep enqueueing after them and hit
-/// `Err(ShutDown)` on enqueue (a spurious "scanner pass failed" warning at stop).
-///
-/// **That guarantee belongs to the awaits that run to completion, and the serving half bounds
-/// its own** (`BACKGROUND_BOUND`): both loops re-check the channel only *between* chunks — the
-/// scanner's pacing sleeps in `max_wait` steps (`tinio_util::pacing::sleep_checked`) — so a
-/// chunk up to 15 s long is what the bound is there to interrupt, and it does so on an ordinary
-/// graceful stop. A pass abandoned that way which then enqueues into a shut-down pipeline hits
-/// the same `Err(ShutDown)` and its loop logs it ("scanner pass failed"/"sweep pass failed") and
-/// drops it. Nothing is lost: the work a pass does is idempotent and resumes on the next start.
-///
-/// **A read-only run builds neither pass.** The scanner's gate is `enabled: false` there — its
-/// purpose is to pre-warm ETags by *writing* rows, and a read-only run reads the rows instead
-/// (the read paths recompute what they cannot hit without writing it back, FR-023 amended) — and
-/// the sweeper is not built at all: its pass removes `<state-dir>/tmp` and `multipart/` residue
-/// and writes the retention/compaction rows, and in this mode the state dir is the **root's own**
-/// `.tinio/`, so running it would write the very tree the mode promises to leave alone. The
-/// existing `Cleanup` access gate stays what covers the startup repair
-/// ([`repair`] above), which is a different pass.
-///
-/// The scanner's `TINIO_SCANNER=0`/`1` toggle is read inside `Scanner::new`, so the strict
-/// `0`/`1` parsing lives with the gate it flips rather than here.
-async fn scanner_and_sweeper(
-    storage: FsStorage,
-    stop: watch::Receiver<bool>,
-    access: AccessMode,
-    sweep_options: sweep::Options,
-) {
-    if access.is_read_only() {
-        // Read-only mode builds neither pass (see the doc above): the scanner
-        // would only repeat what listings recompute on demand, and the
-        // sweeper's passes would write the state dir the mode serves from.
-        return;
-    }
-    let scanner = Scanner::new(
-        storage.clone(),
-        ScannerOptions {
-            // The `[scanner]` section's own gate is Task 9's/its own wiring; what this task
-            // lifts is the shape, and `TINIO_SCANNER=0` still switches the scanner off here.
-            enabled: true,
-            delay: Duration::from_secs(10),
-            max_wait: Duration::from_secs(15),
-            cycle: Duration::from_secs(24 * 3600),
-            access,
-        },
-    );
-    let sweeper = Sweeper::new(storage, sweep_options);
-    let (_, _) = tokio::join!(scanner.run(stop.clone()), sweeper.run(stop));
-}
-
-/// The background sweep's options from the resolved `[s3]` section (R2): the two TTLs —
-/// `temp_ttl_hours` and `multipart_expire_days` (hours and days in the config, a `Duration` at
-/// the sweeper) — the three versioning keys — `noncurrent_keep`, `noncurrent_expire_days` and
-/// `block_grace_minutes` (minutes in the config, a `Duration` at the sweeper; the key's floor of
-/// 1 is the parser's) — and `block_bytes_warn` (bytes; 0 = off), the block store's size warning
-/// threshold. Without an `[s3]` section every default applies, which is what an absent section
-/// means everywhere else.
-fn sweep_options_for(resolution: &Resolution) -> sweep::Options {
-    match resolution.config.s3.as_ref() {
-        Some(s3) => sweep::Options {
-            temp_ttl: Duration::from_secs(s3.temp_ttl_hours.saturating_mul(3600)),
-            multipart_ttl: Duration::from_secs(s3.multipart_expire_days.saturating_mul(24 * 3600)),
-            noncurrent_keep: s3.noncurrent_keep,
-            noncurrent_expire_days: s3.noncurrent_expire_days,
-            block_grace: Duration::from_secs(s3.block_grace_minutes.saturating_mul(60)),
-            block_bytes_warn: s3.block_bytes_warn,
-        },
-        None => sweep::Options::default(),
-    }
-}
-
-/// The startup repair's orphan-upload idle grace: the resolved `[s3] multipart_expire_days` in
-/// seconds — **the sweep's own `multipart_ttl`** ([`sweep_options_for`]), because the repair and
-/// the sweeper judge the same abandoned upload and one configured clock must decide both.
-/// Without an `[s3]` section the sweeper's default (7 days) applies, which is exactly what
-/// [`FsCleanup::new`] would have used on its own.
-fn multipart_grace_for(resolution: &Resolution) -> Duration {
-    sweep_options_for(resolution).multipart_ttl
-}
-
 /// The `[s3]` capability toggles and page-size caps from the resolved config (FR-021); without
 /// an `[s3]` section the defaults apply.
 ///
@@ -697,7 +712,7 @@ fn capabilities_for(resolution: &Resolution) -> Capabilities {
 /// the shipped binary while `caps.acl` still defaulted to `true`. A config's `acl = false`
 /// therefore reaches [`DataPlane::new_with_auth`] at runtime, and a build always has both
 /// constructors to choose from.
-fn plane_for(storage: FsStorage, plane: PlaneConfig, resolution: &Resolution) -> DataPlane {
+fn plane_for<S: Storage>(storage: S, plane: PlaneConfig, resolution: &Resolution) -> DataPlane {
     if plane.caps.acl {
         // The identity is the single `Identity::from_config` assembly (`tinio-server`'s
         // `identity::IdentityFromConfig`), which is also what the root credential pair inside
@@ -746,250 +761,5 @@ fn credential_origin(env: &EnvArgs, config: &_config::Config) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    #[cfg(feature = "versioning")]
-    use std::future::pending;
-    use std::{path::PathBuf, time::Duration};
-
-    use tokio::{
-        sync::watch,
-        time::{sleep, timeout},
-    };
-
-    use super::{
-        Resolution, multipart_grace_for, repair_cleanup, stopping, sweep, sweep_options_for,
-    };
-    #[cfg(feature = "versioning")]
-    use super::{bounded_versioning_warning, versioning_disabled_warning};
-    #[cfg(feature = "versioning")]
-    use crate::_core::{
-        acl::Acl,
-        bucket,
-        storage::{BucketOps, VersionOps},
-        version::State,
-    };
-    #[cfg(feature = "versioning")]
-    use crate::_server::Capabilities;
-    use crate::{
-        _config::Config,
-        _fs::{FsStorage, testing},
-    };
-
-    /// **The drain bound is armed by a stop, never by the clock**, and this leg is the defect in
-    /// the form a unit test can hold: with the channel still `false`, [`stopping`] must not
-    /// resolve. `serve` used to arm `DRAIN_BOUND` at exactly this point, so an idle server walked
-    /// the drain path ~12 s after readiness, removed `state` and exited.
-    #[tokio::test]
-    async fn an_unstopped_server_never_reaches_its_drain() {
-        let (_sender, mut stop) = watch::channel(false);
-        assert!(
-            timeout(Duration::from_millis(50), stopping(&mut stop))
-                .await
-                .is_err(),
-            "nothing asked for a stop, so the drain must not begin"
-        );
-    }
-
-    /// **The two orders a stop can arrive in are equivalent, and the second is why the current
-    /// value is read before `changed()` is awaited**: a receiver that already saw the flip would
-    /// otherwise wait for the *next* change, which never comes.
-    #[tokio::test]
-    async fn a_stop_starts_the_drain_in_either_order() {
-        // The flip lands during the wait.
-        let (sender, mut stop) = watch::channel(false);
-        let flip = tokio::spawn(async move {
-            sleep(Duration::from_millis(10)).await;
-            let _ = sender.send(true);
-        });
-        assert!(
-            timeout(Duration::from_secs(5), stopping(&mut stop))
-                .await
-                .is_ok(),
-            "a stop that arrived during the wait must start the drain"
-        );
-        flip.await.expect("the flip task");
-
-        // The flip landed before the wait.
-        let (sender, mut stop) = watch::channel(false);
-        sender.send(true).expect("flip before the wait");
-        assert!(
-            timeout(Duration::from_millis(50), stopping(&mut stop))
-                .await
-                .is_ok(),
-            "a stop that arrived before the wait must start the drain"
-        );
-    }
-
-    /// The toggle-off startup warning: with versioning compiled in, a root that holds version
-    /// data is named by count when `[s3] versioning` is off — and the warning is silent when the
-    /// toggle is on or the root holds no version data (spec 2026-10-03).
-    #[cfg(feature = "versioning")]
-    #[tokio::test]
-    async fn the_versioning_disabled_warning_names_the_buckets_that_hold_version_data() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(dir.path(), testing::fs_options()).unwrap();
-        let off = Capabilities {
-            versioning: false,
-            ..Default::default()
-        };
-        // A root with no version data is silent, whatever the toggle says.
-        assert!(versioning_disabled_warning(&storage, &off).await.is_none());
-        // One versioned bucket: the message's verb agrees with its count.
-        let alpha = bucket::name("alpha").unwrap();
-        storage
-            .create_bucket(&alpha, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        storage
-            .set_bucket_versioning(&alpha, State::Enabled)
-            .await
-            .unwrap();
-        assert_eq!(
-            versioning_disabled_warning(&storage, &off).await.as_deref(),
-            Some(
-                "[s3] versioning is off but 1 bucket holds version data; current versions keep serving and every version operation is refused"
-            ),
-        );
-        // Two: the plural spelling, unchanged.
-        let beta = bucket::name("beta").unwrap();
-        storage
-            .create_bucket(&beta, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        storage
-            .set_bucket_versioning(&beta, State::Enabled)
-            .await
-            .unwrap();
-        assert_eq!(
-            versioning_disabled_warning(&storage, &off).await.as_deref(),
-            Some(
-                "[s3] versioning is off but 2 buckets hold version data; current versions keep serving and every version operation is refused"
-            ),
-        );
-        // The toggle on is silent on the very same root.
-        let on = Capabilities {
-            versioning: true,
-            ..Default::default()
-        };
-        assert!(versioning_disabled_warning(&storage, &on).await.is_none());
-    }
-
-    /// The bounded warning's timed-out arm — the arm whose absence kept the shutdown join one
-    /// wedged scan away from hanging the process. A scan that never answers must still produce a
-    /// warning that names the condition, and it must not pretend a count. [`pending`] stands in
-    /// for the wedged read so the arm is driven deterministically; a real [`FsStorage`]'s scan has
-    /// no seam a test can hold open, which is why the bound is the wrapper's parameter.
-    #[cfg(feature = "versioning")]
-    #[tokio::test]
-    async fn a_timed_out_versioning_warning_names_the_condition_without_a_count() {
-        assert_eq!(
-            bounded_versioning_warning(Duration::from_millis(10), pending::<Option<String>>())
-                .await
-                .as_deref(),
-            Some(
-                "[s3] versioning is off and this root may hold version data, but the count timed out; current versions keep serving and every version operation is refused"
-            ),
-        );
-        // A scan that answers inside the bound passes through untouched: the bound is a
-        // degradation path, never a rewrite of what the scan said.
-        assert_eq!(
-            bounded_versioning_warning(Duration::from_secs(5), async {
-                Some("the scan's own answer".to_owned())
-            })
-            .await
-            .as_deref(),
-            Some("the scan's own answer"),
-        );
-    }
-
-    /// A resolved-config fixture for the `[s3]`-section legs below: they pin key names, their units
-    /// and the sweeper's conversions, so a **parsed** config — not a hand-built struct — is the
-    /// input, and every leg reads the same fixture.
-    fn resolution(config: &str) -> Resolution {
-        Resolution {
-            root: PathBuf::from("/srv/data"),
-            config: Config::parse(config).expect("the config parses"),
-            config_text: config.to_owned(),
-            config_path: PathBuf::from("/srv/data/.tinio/.tinio.toml"),
-            read_only: false,
-            state_dir: PathBuf::from("/srv/data/.tinio"),
-            state_dir_override: None,
-            config_error: None,
-        }
-    }
-
-    /// R2: the `[s3]` TTL and retention keys reach the sweep pass — built from a **parsed** config,
-    /// so the key names, their units and the hours/days/minutes-to-seconds conversions are what is
-    /// pinned, and the same resolved section the neighbouring `capabilities_for` reads is what
-    /// feeds it.
-    #[test]
-    fn the_sweep_options_carry_the_resolved_ttl_and_retention_keys() {
-        let options = sweep_options_for(&resolution(
-            "version = 1\n[s3]\ntemp_ttl_hours = 6\nmultipart_expire_days = 2\nnoncurrent_keep = 3\nnoncurrent_expire_days = 30\nblock_grace_minutes = 45",
-        ));
-        assert_eq!(
-            options.temp_ttl,
-            Duration::from_secs(6 * 3600),
-            "the config's hours are the sweeper's seconds"
-        );
-        assert_eq!(
-            options.multipart_ttl,
-            Duration::from_secs(2 * 24 * 3600),
-            "the config's days are the sweeper's seconds"
-        );
-        assert_eq!(options.noncurrent_keep, 3);
-        assert_eq!(options.noncurrent_expire_days, 30);
-        assert_eq!(
-            options.block_grace,
-            Duration::from_secs(45 * 60),
-            "the config's minutes are the sweeper's seconds"
-        );
-
-        // Without an `[s3]` section every default applies, and the versioning keys' defaults are
-        // the safe reading: keep every noncurrent version, never expire by age, ten minutes'
-        // grace — beside the sweeper's 24 h temp and 7 d multipart TTLs.
-        assert_eq!(
-            sweep_options_for(&resolution("version = 1")),
-            sweep::Options::default()
-        );
-    }
-
-    /// The startup repair hands the cleanup the resolved `[s3] multipart_expire_days` as its
-    /// orphan-upload grace: the very value the sweeper's `multipart_ttl` carries, so the repair
-    /// can no longer judge orphans by the hardcoded 7-day default while the sweeper honours the
-    /// configured clock.
-    ///
-    /// **The built cleanup is asserted, not only the value.** `repair` runs whatever
-    /// [`repair_cleanup`] returns; a test over [`multipart_grace_for`] alone pins the converted
-    /// value but not whether it is chained onto that cleanup at all, which is the half a
-    /// reviewer could only read-verify.
-    #[test]
-    fn the_startup_repair_grace_is_the_resolved_multipart_expiry() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FsStorage::new(dir.path(), testing::fs_options()).unwrap();
-
-        let configured = resolution("version = 1\n[s3]\nmultipart_expire_days = 2");
-        assert_eq!(
-            multipart_grace_for(&configured),
-            Duration::from_secs(2 * 24 * 3600),
-            "the config's days are the cleanup's seconds"
-        );
-        assert_eq!(
-            repair_cleanup(&storage, &configured).multipart_grace(),
-            Duration::from_secs(2 * 24 * 3600),
-            "the cleanup the repair runs carries the configured grace"
-        );
-
-        let absent = resolution("version = 1");
-        assert_eq!(
-            multipart_grace_for(&absent),
-            Duration::from_secs(7 * 24 * 3600),
-            "without an [s3] section the sweeper's own default applies"
-        );
-        assert_eq!(
-            repair_cleanup(&storage, &absent).multipart_grace(),
-            Duration::from_secs(7 * 24 * 3600),
-            "and the cleanup the repair runs falls back to that same default"
-        );
-    }
-}
+#[path = "serve_tests.rs"]
+mod tests;

@@ -6,11 +6,20 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+#[cfg(feature = "pg")]
+use std::path::PathBuf;
 
 // Reached directly rather than through the module's `pub use`: the row is `pub(crate)` and
 // re-exporting it would put a foreign `_sandbox::Error` in this crate's public API.
 use super::checks::{HOST_CONFINEMENT, HOST_CONFINEMENT_OK, host_confinement_finding};
 use super::*;
+#[cfg(feature = "pg")]
+use crate::{
+    _config::Config,
+    _util::secret::{Secret, SecretKey},
+    cli::{Discovery, Provenance},
+    resolve::{locate_from, pg},
+};
 use crate::{
     _sandbox,
     _util::testing::assert_send_sync,
@@ -391,7 +400,7 @@ fn free_space_reports_the_amount_and_its_percentage() {
     // The probe itself, on whatever filesystem the test runs from: this asserts the
     // shape of the answer — both numbers are in the detail — and never a byte count.
     let dir = tempfile::TempDir::new().expect("temp");
-    let finding = free_space(dir.path());
+    let finding = free_space(&resolution(dir.path(), "version = 1\n"));
     assert_eq!(finding.check, "free space");
     assert!(
         finding.detail.contains('%'),
@@ -784,6 +793,7 @@ fn the_repaired_integrity_arm_is_a_warning() {
 fn resolution(root: &Path, config: &str) -> Resolution {
     let state_dir = root.join(".tinio");
     Resolution {
+        pg_root: None,
         root: root.to_path_buf(),
         config: crate::_config::Config::parse(config).expect("config"),
         config_text: config.to_owned(),
@@ -1008,5 +1018,323 @@ fn the_symlink_row_renders_its_tail_and_an_empty_sample() {
     assert_eq!(
         empty.detail,
         "4 link entr(ies) present while `follow_symlinks` is disabled"
+    );
+}
+
+/// A `Resolution` for a hand-written configuration, as `doctor`'s pg leg reads one: the fields
+/// the leg touches are the config and the mode; the paths are fictional because nothing on the
+/// filesystem is read for a pg diagnosis.
+#[cfg(feature = "pg")]
+fn pg_resolution(config_text: &str, read_only: bool) -> crate::resolve::Resolution {
+    crate::resolve::Resolution {
+        pg_root: None,
+        root: PathBuf::from("/srv/pg"),
+        config: Config::parse(config_text).expect("the fixture configuration parses"),
+        config_text: config_text.to_owned(),
+        config_path: PathBuf::from("/srv/pg/.tinio/.tinio.toml"),
+        read_only,
+        state_dir: PathBuf::from("/srv/pg/.tinio"),
+        state_dir_override: None,
+        config_error: None,
+    }
+}
+
+/// A `Secret` from a fixture string — the shape `EnvArgs::pg_dsn` holds.
+#[cfg(feature = "pg")]
+fn pg_secret(raw: &str) -> Secret {
+    Secret::from(SecretKey::from(raw.to_owned()))
+}
+
+/// **R8's negative half**: a filesystem run carries no pg key and no addressed dsn, so the pg
+/// leg adds no rows at all — the report is exactly the filesystem report it has always been.
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn the_pg_leg_stays_silent_for_a_filesystem_run() {
+    let resolution = pg_resolution("version = 1\n[server]\nport = 9000\n", false);
+    assert!(
+        super::checks::pg_findings(&resolution, None)
+            .await
+            .is_empty()
+    );
+}
+
+/// A configuration that selects pg but names no dsn is the one shape reported rather than
+/// skipped: the run says pg and nothing can be diagnosed, which is the operator's one fix.
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn a_pg_configuration_without_a_dsn_is_reported_with_the_remedy() {
+    let resolution = pg_resolution("version = 1\n[storage]\ntype = \"pg\"\n", false);
+    let rows = super::checks::pg_findings(&resolution, None).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].severity, Severity::Error, "{rows:?}");
+    assert!(
+        rows[0].detail.contains("TINIO_PG_DSN"),
+        "the remedy names the addressing channel: {}",
+        rows[0].detail
+    );
+}
+
+/// **R8's positive half**: with `TINIO_PG_DSN` addressed, a dsn nothing answers for is a
+/// connection row at `error` whose remedy names `TINIO_PG_DSN` (and `[storage.pg] dsn`) — the
+/// channels that decide which instance the run is diagnosing. The port is closed on any host,
+/// so the refusal is immediate and the leg needs no server.
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn a_refused_pg_instance_names_the_channel_that_addresses_it() {
+    let resolution = pg_resolution("version = 1\n[storage]\ntype = \"pg\"\n", false);
+    let dsn = pg_secret("postgres://tinio:tinio@127.0.0.1:1/tinio?sslmode=disable");
+    let rows = super::checks::pg_findings(&resolution, Some(&dsn)).await;
+
+    let connection = rows
+        .iter()
+        .find(|row| row.check == "postgres connection")
+        .expect("the connection row is reported");
+    assert_eq!(connection.severity, Severity::Error, "{rows:?}");
+    assert!(
+        connection.detail.contains("TINIO_PG_DSN"),
+        "{}",
+        connection.detail
+    );
+    assert!(
+        connection.detail.contains("storage.pg"),
+        "{}",
+        connection.detail
+    );
+    // The other legs still report: a server that cannot be reached does not silence the TLS row
+    // (which is the dsn's own resolution) or the encoding row's "not inspected" reason.
+    assert!(
+        rows.iter().any(|row| row.check == "postgres tls"),
+        "{rows:?}"
+    );
+    // PG5: no row may carry the dsn's text (which holds the password).
+    let raw = "postgres://tinio:tinio@127.0.0.1:1/tinio?sslmode=disable";
+    assert!(
+        rows.iter().all(|row| !row.detail.contains(raw)),
+        "a row rendered the dsn: {rows:?}"
+    );
+}
+
+/// The live leg, skipping without `TINIO_PG_DSN` (PG8): the dsn the environment carries becomes
+/// the diagnosis's subject, and the addressable channels (TINIO_PG_DSN) are what R8 settled on.
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn the_pg_leg_diagnoses_the_addressed_instance() {
+    let Some(dsn) = std::env::var("TINIO_PG_DSN")
+        .ok()
+        .filter(|dsn| !dsn.trim().is_empty())
+    else {
+        return;
+    };
+    let resolution = pg_resolution("version = 1\n[storage]\ntype = \"pg\"\n", true);
+    let rows = super::checks::pg_findings(&resolution, Some(&pg_secret(&dsn))).await;
+    let row = |name: &str| rows.iter().find(|row| row.check == name);
+
+    for name in [
+        "postgres connection",
+        "postgres pool",
+        "postgres encoding",
+        "postgres tls",
+        "postgres schema",
+        "postgres access",
+        "postgres ownership",
+    ] {
+        assert!(row(name).is_some(), "the {name} row is missing: {rows:?}");
+    }
+    // The fixture server is up and its database is UTF-8.
+    assert_eq!(
+        row("postgres connection").map(|row| row.severity),
+        Some(Severity::Ok),
+        "{rows:?}"
+    );
+    assert_eq!(
+        row("postgres encoding").map(|row| row.severity),
+        Some(Severity::Ok),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().all(|row| !row.detail.contains(&dsn)),
+        "a row rendered the dsn: {rows:?}"
+    );
+}
+
+/// **R8's remaining half**: a pg run has no `DIR` — its root is the dsn-derived synthetic root
+/// (`contracts/config.md`'s `[storage.pg]` bullet) — so `TINIO_PG_DSN=… tinio doctor` with no
+/// `DIR` and no `.tinio` above must resolve that root rather than answer the usage error. The
+/// walk-up starts at a scratch directory (the `locate_from` seam), so the leg never depends on
+/// the process's working directory.
+#[cfg(feature = "pg")]
+#[test]
+fn a_pg_dsn_with_no_dir_resolves_the_synthetic_root() {
+    let scratch = tempfile::TempDir::new().expect("temp");
+    let dsn = pg_secret("postgres://tinio:tinio@127.0.0.1:55432/tinio?sslmode=disable");
+    let located = locate_from(
+        Discovery {
+            dir: None,
+            config: None,
+            read_only: false,
+            state_dir: None,
+            pg_dsn: Some(dsn.clone()),
+        },
+        &Provenance::default(),
+        scratch.path(),
+    )
+    .expect("the dsn derives the root");
+
+    let root = pg::resolve_root(&dsn, None).expect("the synthetic root");
+    assert_eq!(located.root, root);
+    assert_eq!(located.state_dir, root.join(".tinio"));
+    // The override names the **root**, which is the value a pg run's override always is (the
+    // operator's `TINIO_STATE_DIR` reaches `pg::resolve_root` as the root): the client pair reads
+    // it in place of the home-derived second candidate, whose derivation would canonicalize a
+    // leaf the serving half has not created yet — and §6 says a pg run never relocates. It is
+    // also what lets a consumer re-derive this root and compare, which is how the serving half
+    // refuses such a run and the check list skips its served-root legs.
+    assert_eq!(
+        located.state_dir_override.as_deref(),
+        Some(located.root.as_path())
+    );
+}
+
+/// The other arm, unchanged: with no dsn and no `DIR` the usage error still fires, so the
+/// fallback is the dsn's and not "any run with no root".
+#[cfg(feature = "pg")]
+#[test]
+fn no_dsn_and_no_dir_still_answers_the_root_usage_error() {
+    let scratch = tempfile::TempDir::new().expect("temp");
+    let err = locate_from(
+        Discovery {
+            dir: None,
+            config: None,
+            read_only: false,
+            state_dir: None,
+            pg_dsn: None,
+        },
+        &Provenance::default(),
+        scratch.path(),
+    )
+    .expect_err("no root and no dsn");
+    assert!(matches!(err, Error::Usage(_)), "{err}");
+    assert!(err.to_string().contains("no storage root"), "{err}");
+}
+
+/// **A pg run's report is green on a healthy database** (ruling R8). The served-root legs answer
+/// `ok` and say why instead of failing on a directory the serving half has not created — without
+/// the skip this leg reports `error storage root: … could not be read` and exits 1 on an instance
+/// that is perfectly well, which is a doctor no script can trust.
+///
+/// The root is a scratch leaf that is **never created**, which is exactly the state a pg
+/// deployment is in before its first serving start: the row set is asserted too, so a script that
+/// reads check names sees the same ones on either backend.
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn a_pg_run_skips_the_served_root_legs_and_is_green() {
+    let scratch = tempfile::TempDir::new().expect("temp");
+    let root = scratch.path().join("pg-root");
+    let state_dir = root.join(".tinio");
+    let resolution = Resolution {
+        // The record `locate`'s dsn-only arm writes: this run took it, so its root is synthetic.
+        pg_root: Some(root.clone()),
+        root: root.clone(),
+        config: Config::default(),
+        config_text: String::new(),
+        config_path: state_dir.join(".tinio.toml"),
+        read_only: false,
+        state_dir: state_dir.clone(),
+        // The shape `locate`'s dsn-only fallback produces: the override names the derived root.
+        state_dir_override: Some(root.clone()),
+        config_error: None,
+    };
+    let state = StateDir {
+        dir: state_dir,
+        resolved: true,
+        liveness: Liveness::NoStateFile,
+        control_name: None,
+        channel_answers: false,
+    };
+
+    let report = checks(
+        &Run {
+            resolution: &resolution,
+            state: &state,
+        },
+        Proposals::Informational,
+    )
+    .await;
+
+    assert!(problems(&report).is_empty(), "{:?}", report.findings());
+    for name in [
+        "storage root",
+        "storage root writable",
+        "free space",
+        "meta.redb",
+    ] {
+        let row = report
+            .findings()
+            .iter()
+            .find(|finding| finding.check == name)
+            .expect("the row is kept for a pg run");
+        assert!(row.detail.starts_with("skipped"), "{row:?}");
+    }
+    assert!(
+        report
+            .findings()
+            .iter()
+            .any(|finding| finding.check == "configuration"
+                && finding.detail.contains("TINIO_PG_DSN")),
+        "the configuration row names the addressing channel: {:?}",
+        report.findings()
+    );
+    assert!(!root.exists(), "the diagnosis created its root: {root:?}");
+}
+
+/// **F1's shape**: a served root that is also the operator's `TINIO_STATE_DIR`, with a pg dsn
+/// exported, is a **filesystem** run. The check list decides on `Located::pg_root` — the arm's own
+/// record, carried in here as `None` — and never on the environment, so the served-root legs run
+/// as they always did. (Before the fix the decision re-derived the synthetic root from
+/// `state_dir_override`, which *is* `TINIO_STATE_DIR` on a filesystem run: the leg below answered
+/// `skipped` and the report described a database that does not exist.)
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn a_root_that_is_also_the_state_dir_override_still_runs_the_root_legs() {
+    let scratch = tempfile::TempDir::new().expect("temp");
+    let root = scratch.path().to_path_buf();
+    let resolution = Resolution {
+        pg_root: None,
+        root: root.clone(),
+        config: Config::default(),
+        config_text: String::new(),
+        config_path: root.join(".tinio").join(".tinio.toml"),
+        read_only: false,
+        state_dir: root.join(".tinio"),
+        // `TINIO_STATE_DIR` == the served root, the shape that used to read as pg.
+        state_dir_override: Some(root.clone()),
+        config_error: None,
+    };
+    let state = StateDir {
+        dir: root.join(".tinio"),
+        resolved: true,
+        liveness: Liveness::NoStateFile,
+        control_name: None,
+        channel_answers: false,
+    };
+
+    let report = checks(
+        &Run {
+            resolution: &resolution,
+            state: &state,
+        },
+        Proposals::Informational,
+    )
+    .await;
+
+    let row = report
+        .findings()
+        .iter()
+        .find(|finding| finding.check == "storage root")
+        .expect("the row is reported");
+    assert_eq!(row.severity, Severity::Ok, "{:?}", report.findings());
+    assert!(
+        !row.detail.starts_with("skipped"),
+        "a filesystem run runs its root legs: {row:?}"
     );
 }

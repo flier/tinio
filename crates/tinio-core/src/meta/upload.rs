@@ -384,7 +384,6 @@ pub trait UploadMeta: Send + Sync + 'static {
     /// The completion-time join: one record per requested part number, in the
     /// input's order, `None` for a number with no stored part. The outer
     /// `None` is an upload whose key does not match.
-    #[allow(clippy::type_complexity)]
     async fn part_records(
         &self,
         bucket: &bucket::Name,
@@ -411,7 +410,6 @@ pub trait UploadMeta: Send + Sync + 'static {
     /// as truncated, or the client's resume arithmetic would advance the
     /// marker past uploads it never received. A truncated page always carries
     /// its resume marker — the last entry of the page, exclusive-after.
-    #[allow(clippy::type_complexity)]
     async fn list_uploads_page(
         &self,
         bucket: &bucket::Name,

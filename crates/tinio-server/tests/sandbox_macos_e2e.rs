@@ -26,6 +26,18 @@
 
 #![cfg(target_os = "macos")]
 #![cfg(feature = "sandbox")]
+// **A stated exemption because clippy's test keys do not reach it**
+// (docs/style.md §Panics, design 2026-10-09 D7): `allow-*-in-tests` covers
+// `#[test]` functions and `#[cfg(test)]` modules, while this target's failure
+// helper (`fail`) is a plain `fn` outside one — and it is deliberately the one
+// panicking shape here: it panics only after it has swept the confined grandchild
+// and reaped the launcher, because a panic is what cannot run that sweep first.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test support: a test target's harness helpers (docs/style.md §Panics)"
+)]
 
 mod common;
 
@@ -39,12 +51,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{frame_line, stdout_lines, tinio_bin, wait_for_listening_in, wait_timeout};
+use common::{stdout_lines, tinio_bin, wait_for_listening_in, wait_timeout};
 use tinio_api::state::State;
 use tinio_sandbox::Event;
 use tinio_util::{
     job,
-    testing::{kill_and_reap, poll_exit, wait_for_path},
+    testing::{frame_line, kill_and_reap, poll_exit, wait_for_path},
 };
 
 /// How often the leg looks for a file the product writes: the waits below are
@@ -413,7 +425,10 @@ fn a_confined_run_publishes_its_state_and_reports_the_mechanism_it_chose() {
     let mut frame = String::new();
     for line in lines.iter() {
         if line.trim_end().is_empty() {
-            if matches!(frame_line(&mut frame, &line), Some(Event::Listening { .. })) {
+            if matches!(
+                frame_line(&mut frame, &line, Event::decode),
+                Some(Event::Listening { .. })
+            ) {
                 events += 1;
             }
             continue;
@@ -422,7 +437,7 @@ fn a_confined_run_publishes_its_state_and_reports_the_mechanism_it_chose() {
             line.starts_with("event: ") || line.starts_with("data: "),
             "a non-frame line reached the consumer: {line:?}"
         );
-        frame_line(&mut frame, &line);
+        frame_line(&mut frame, &line, Event::decode);
     }
     // A frame is an `event:` line, a `data:` line and a blank line — so a
     // *second* legitimate frame's `event:` line is part of the protocol, and

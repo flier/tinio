@@ -277,10 +277,13 @@ fn the_grant_phase_warns_only_past_a_share_of_the_readiness_budget() {
 /// `warn!` or an `info!` slipped into that path still fails.
 #[test]
 // `Grants::new` takes an `Arc<PackageSid>` over a type that owns a raw `PSID` and
-// is deliberately neither `Send` nor `Sync` — the same allow, for the same
+// is deliberately neither `Send` nor `Sync` — the same `expect`, for the same
 // reason, as `src/acl.rs`'s tests module: this is shared ownership inside one
 // thread, which is what the code under test is given.
-#[allow(clippy::arc_with_non_send_sync)]
+#[expect(
+    clippy::arc_with_non_send_sync,
+    reason = "test context: `Grants::new` takes an `Arc<PackageSid>` over a type that owns a raw `PSID` and is deliberately neither `Send` nor `Sync`; this is shared ownership inside one thread, which is what the code under test is given"
+)]
 fn a_standing_grant_is_not_an_info_event() {
     let _recorder = recorder();
     let dir = tempdir().expect("temp dir");

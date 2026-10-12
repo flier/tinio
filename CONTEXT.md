@@ -11,10 +11,10 @@ Domain glossary for the tinio workspace. English only. This file is a glossary �
 - **World** — the per-scenario shared state: the server under test and the last response.
 - **Spec scenario** — a scenario that carries a spec ID (`@FR-xxx` / `@SC-xxx` / `@Txxx`) and documents a contract behavior.
 - **Spec traceability tags** — the `@FR-xxx`/`@SC-xxx`/`@Txxx` tags linking a scenario to the spec; feature-level (inherited by tag filters, invisible to the hooks).
-- **Scenario-level tags** — the tags the `#[before]` hook reads (`config_from_tags`, one mapping shared by the in-process server and the `@external` spawn): backend (`@fs`/`@mem`), `@nested-root`, `@checksum-on`, `@minimal-caps`, `@cold-listing`, `@max-buckets-3`, and the external-client tags `@interop`/`@boto3`/`@mc`; `@aws`/`@rclone` are declarative markers of which client an `@interop` scenario drives (not read by the hook).
+- **Scenario-level tags** — the tags the `#[before]` hook reads (`config_from_tags`, one mapping shared by the in-process server and the `@external` spawn): backend (`@fs`/`@mem`/`@pg`), `@nested-root`, `@checksum-on`, `@minimal-caps`, `@cold-listing`, `@max-buckets-3`, and the external-client tags `@interop`/`@boto3`/`@mc`; `@aws`/`@rclone` are declarative markers of which client an `@interop` scenario drives (not read by the hook).
 - **Backend-neutral scenario** — no backend tag; runs on the default backend and in every backend pass.
-- **Backend-tagged scenario** — carries `@fs` or `@mem`; runs only on that backend. An explicit backend tag wins over the environment.
-- **Backend pass** — a full run of the backend-neutral suite on one backend; CI runs the fs pass (default) and the mem pass (`TINIO_E2E_BACKEND=mem`, excluding `@fs`-only scenarios).
+- **Backend-tagged scenario** — carries `@fs`, `@mem` or `@pg`; runs only on that backend. An explicit backend tag wins over the environment, which (`TINIO_E2E_BACKEND`) wins over the fs default.
+- **Backend pass** — a full run of the backend-neutral suite on one backend; CI runs the fs pass (default), the mem pass (`TINIO_E2E_BACKEND=mem`, excluding `@fs`-only scenarios) and the pg pass (`TINIO_E2E_BACKEND=pg`, serialized, in the PostgreSQL job).
 - **@external umbrella** — the union of `@interop` ∪ `@boto3` ∪ `@mc`; scenarios that need external client binaries and are excluded from default runs.
 - **fail_on_skipped** — the runner's always-on mode: undefined or otherwise skipped steps fail the run, so a feature that drifts out of sync with its step definitions never passes silently.
 - **Traceability check** — `cargo test -p tinio-e2e --test traceability`: cross-references the spec corpus and the feature tags both ways (with the documented `NOT_COVERED_BY_CUCUMBER` allow-list).
@@ -30,6 +30,7 @@ Domain glossary for the tinio workspace. English only. This file is a glossary �
 ## Storage & server
 
 - **Served root** — the directory a server instance serves; the fs backend keeps its state and buckets inside it, and never writes outside it.
+- **Synthetic root** — the pg run's stand-in for a served root: `~/.tinio/pg/<hash of the dsn>/`, or `TINIO_STATE_DIR` when set, so config discovery, the state dir and the CLI surface work unchanged though a pg run serves no directory; a positional `DIR` under `[storage] type = "pg"` is a usage error.
 - **State dir** — the fs backend's metadata database and temp areas: `.tinio/` inside the served root in normal mode; in read-only mode it stays the root's own `<root>/.tinio/`, opened read-only (its `meta.redb` is the storage's metadata source), while only the run's **tool state** relocates to the home state dir (see Read-only mode).
 - **Scanner** — the fs backend's background sweeper (temp cleanup, interrupted-upload cleanup); "cold listing" exercises listing before the scanner has caught up.
 - **Capability toggle** — a server configuration switch that enables/disables an S3 operation or feature (multipart, copy, list v1/v2, delete-objects, checksum validation).

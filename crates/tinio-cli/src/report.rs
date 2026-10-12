@@ -5,30 +5,19 @@
 
 use std::fmt::Write;
 
-use parse_display::Display;
 use serde::Serialize;
 
-use crate::{
-    _core::cleanup::{RepairAction, RepairActionLevel},
-    Error,
-};
-
-/// The severity a finding carries, mapped from the engine's four levels.
+/// The severity a finding carries — the shared vocabulary, re-exported here so this module's two
+/// renderings and a backend's doctor rows cannot spell the same three levels twice.
 ///
 /// `Display` and the JSON spelling are the **same** derivation — the variant's name, lowercased —
 /// rather than a hand-written word table beside `serde`'s: one place spells the variants, and
 /// `every_severity_has_one_word_in_both_renderings` pins the two renderings to it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Display)]
-#[serde(rename_all = "lowercase")]
-#[display(style = "lowercase")]
-pub enum Severity {
-    /// Nothing to do.
-    Ok,
-    /// Something the operator should look at, repaired or not.
-    Warn,
-    /// Something that could not be repaired.
+pub use crate::_core::severity::Severity;
+use crate::{
+    _core::cleanup::{RepairAction, RepairActionLevel},
     Error,
-}
+};
 
 /// The name of the private-state check, whose rows the cleanup stream produces here and the store
 /// legs produce in the check list: one name, so the leg reads the same in either rendering

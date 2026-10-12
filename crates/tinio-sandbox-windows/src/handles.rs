@@ -140,7 +140,10 @@ pub fn system_directory() -> PathBuf {
 // proven by the caller. Making this an `unsafe fn` would put an `unsafe` block
 // in every module that marks a handle inheritable, which is what design decision
 // 14 confines to this one.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "the lint's premise does not hold: `HANDLE` is windows-sys's public handle type, named by later tasks' own signatures, and the caller proves the contract — an `unsafe fn` would put an `unsafe` block in every module that marks a handle inheritable, which design decision 14 confines to this one"
+)]
 pub fn mark_inheritable(handle: HANDLE) -> io::Result<()> {
     // SAFETY: `handle` is a live handle the caller owns for the duration of the
     // call, and SetHandleInformation with HANDLE_FLAG_INHERIT only sets the
@@ -425,9 +428,12 @@ pub fn parent_end(handle: HANDLE) -> File {
 /// pipe.close_read();
 /// assert!(pipe.read().is_none());
 /// ```
-// The allow is [`mark_inheritable`]'s, for the same reason and with the same
+// The `expect` is [`mark_inheritable`]'s, for the same reason and with the same
 // contract: the caller owns the handle and gives it up exactly once, here.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "the one `mark_inheritable` carries, for the same reason and with the same contract: the caller owns the handle and gives it up exactly once, here"
+)]
 pub fn close(handle: HANDLE) {
     // SAFETY: `handle` is a live handle this process owns and is giving up; it
     // is closed exactly once, here, and nothing else holds a copy of it.

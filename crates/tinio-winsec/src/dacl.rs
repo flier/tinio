@@ -255,7 +255,10 @@ pub fn acl_is_current_user_only(path: &Path) -> io::Result<bool> {
 
 /// The current process's user: the SID points into a `TOKEN_USER` buffer this value owns, so it
 /// cannot outlive it, and the token handle is closed with it.
-#[allow(non_snake_case)] // the field is Win32's own name for it
+#[expect(
+    non_snake_case,
+    reason = "`Sid` is Win32's own name for the field, and the struct mirrors the API's `TOKEN_USER` shape"
+)]
 struct CurrentUser {
     /// The current user's SID, inside `buffer`.
     Sid: PSID,

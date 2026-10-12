@@ -4,8 +4,8 @@
 //! Shared by the cucumber binary (`tests/cucumber.rs` writes
 //! `CUCUMBER_FILTER_TAGS` from [`default_filter`]) and the `traceability`
 //! target, which `#[path]`-includes this file so the composition's unit tests
-//! ride its libtest — the same arrangement `steps/sigv4.rs` uses, because the
-//! cucumber binary is `harness = false` and carries no test harness.
+//! ride its libtest, because the cucumber binary is `harness = false` and
+//! carries no test harness.
 //!
 //! **The rule** (`plans/2026-09-29-sandbox-bdd-e2e.md` §3): a scenario
 //! carrying platform tags runs on a host whose target matches **at least one**
@@ -103,17 +103,21 @@ fn platform_clause(target_os: &str) -> String {
 /// nothing is excluded (the caller then leaves `CUCUMBER_FILTER_TAGS` unset,
 /// which is cucumber's own default).
 ///
-/// Four independent axes, in composition order: `@parquet` unless the parquet
+/// Five independent axes, in composition order: `@parquet` unless the parquet
 /// cargo feature is on; the platform axis ([`platform_clause`]); the
 /// `@external` umbrella (`@interop`/`@boto3`/`@mc`) unless the external opt-in
-/// is set; and `@confinement`, which follows the [`Confinement`] state — the
+/// is set; `@confinement`, which follows the [`Confinement`] state — the
 /// target's own default (excluded off macOS) when the variable is unset, and
-/// the explicit states forcing it in or out on every target.
+/// the explicit states forcing it in or out on every target; and `@pg`, always
+/// excluded from the default run (PG17) — the `@pg` pass is its own run, driven
+/// by an explicit `--tags` (which is also what sets `TINIO_E2E_BACKEND=pg`),
+/// and no other pass wants the DB-backed scenarios.
 ///
 /// The target, the two opt-in flags and the confinement state are parameters
 /// rather than `cfg!`/env reads, so one function composes every host's filter
 /// and the composition is assertable without a host of each kind
-/// (`tests/traceability.rs` includes this file for exactly that).
+/// (`tests/traceability.rs` includes this file for exactly that). `@pg` is not
+/// a parameter: it is excluded from every default run, whatever the host.
 pub fn default_filter(
     target_os: &str,
     parquet: bool,
@@ -136,6 +140,7 @@ pub fn default_filter(
     if confinement_excluded {
         excluded.push("not @confinement".to_owned());
     }
+    excluded.push("not @pg".to_owned());
     excluded.join(" and ")
 }
 
@@ -149,7 +154,11 @@ mod tests {
     // `parse_confinement` is reached only by the refusal test, which the
     // cucumber binary compiles but never runs (harness disabled — the same
     // reason `selected` carries its dead-code allow below).
-    #[allow(unused_imports)]
+    #[allow(
+        unused_imports,
+        clippy::allow_attributes,
+        reason = "test support: `parse_confinement` is reached only by the refusal test, which the traceability binary runs but the cucumber binary compiles without running (harness disabled) — one attribute cannot be `expect` in both"
+    )]
     use super::{Confinement, default_filter, parse_confinement};
 
     /// The filter a target composes when only the platform axis can exclude
@@ -160,7 +169,11 @@ mod tests {
     /// `allow(dead_code)`: the tests module also compiles into the cucumber
     /// test binary (harness disabled — never runs there), where no `#[test]`
     /// reaches this helper.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        clippy::allow_attributes,
+        reason = "test support: no `#[test]` reaches this helper in the cucumber binary (harness disabled — never runs there), while the traceability binary's tests do — one attribute cannot be `expect` in both"
+    )]
     fn selected(target_os: &str, tags: &[&str]) -> bool {
         let filter: TagOperation = default_filter(target_os, true, true, Confinement::Include)
             .parse()
@@ -176,15 +189,15 @@ mod tests {
         for (target, expected) in [
             (
                 "linux",
-                "not ((@linux or @macos or @windows or @unix) and not (@linux or @unix))",
+                "not ((@linux or @macos or @windows or @unix) and not (@linux or @unix)) and not @pg",
             ),
             (
                 "macos",
-                "not ((@linux or @macos or @windows or @unix) and not (@macos or @unix))",
+                "not ((@linux or @macos or @windows or @unix) and not (@macos or @unix)) and not @pg",
             ),
             (
                 "windows",
-                "not ((@linux or @macos or @windows or @unix) and not @windows)",
+                "not ((@linux or @macos or @windows or @unix) and not @windows) and not @pg",
             ),
         ] {
             assert_eq!(
@@ -268,18 +281,18 @@ mod tests {
     fn the_other_axes_follow_their_inputs() {
         assert_eq!(
             default_filter("linux", false, false, Confinement::Platform),
-            "not @parquet and not ((@linux or @macos or @windows or @unix) and not (@linux or @unix)) and not @interop and not @boto3 and not @mc and not @confinement"
+            "not @parquet and not ((@linux or @macos or @windows or @unix) and not (@linux or @unix)) and not @interop and not @boto3 and not @mc and not @confinement and not @pg"
         );
         // `@confinement` follows the state, not the host alone: on macOS the
         // platform default emits nothing for the family, and the `0` state
         // emits the exclusion — the two composed strings, whole.
         assert_eq!(
             default_filter("macos", true, true, Confinement::Platform),
-            "not ((@linux or @macos or @windows or @unix) and not (@macos or @unix))"
+            "not ((@linux or @macos or @windows or @unix) and not (@macos or @unix)) and not @pg"
         );
         assert_eq!(
             default_filter("macos", true, true, Confinement::Exclude),
-            "not ((@linux or @macos or @windows or @unix) and not (@macos or @unix)) and not @confinement"
+            "not ((@linux or @macos or @windows or @unix) and not (@macos or @unix)) and not @confinement and not @pg"
         );
         assert!(
             !default_filter("macos", true, true, Confinement::Include).contains("@confinement")
@@ -317,6 +330,27 @@ mod tests {
             assert!(
                 excluded(target, Confinement::Exclude),
                 "forced out on {target}"
+            );
+        }
+    }
+
+    /// The `@pg` axis is the fifth, and unlike the other four it follows no input: it is excluded
+    /// from every default run, whatever the host and whatever the opt-ins say, because the DB-backed
+    /// pass is its own explicit-`--tags` run (PG17). `selected` composes with parquet on and both
+    /// opt-ins set, so only this axis can drop a `@pg` scenario.
+    #[test]
+    fn the_pg_axis_is_excluded_from_every_default_run() {
+        for target in ["linux", "macos", "windows"] {
+            let filter = default_filter(target, true, true, Confinement::Include);
+            assert!(
+                filter.ends_with("not @pg"),
+                "the composed filter for {target}: {filter}"
+            );
+            assert!(!selected(target, &["@pg"]), "a @pg scenario on {target}");
+            // The axis drops only `@pg`: a backend-neutral scenario stays selected.
+            assert!(
+                selected(target, &["@fs", "@cli"]),
+                "a neutral scenario on {target}"
             );
         }
     }

@@ -174,7 +174,10 @@ impl MemoryStorage {
     /// transaction ([Self::write_object_recording_versions]); every other
     /// bucket takes the engine's commit path ([Self::write_object_plain]) —
     /// bytes first through the accounting decorator, then the guarded row.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the write's own field set — bucket, key, body, tags, checksum, owner and ACL — kept positional because it is forwarded unchanged to both write paths below"
+    )]
     async fn write_object(
         &self,
         bucket: &Name,
@@ -232,7 +235,10 @@ impl MemoryStorage {
     /// newer writer's — byte-identical or not. An object that was never
     /// recorded is therefore billed for nothing, exactly as when mem ran the
     /// compensation itself.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the plain write path's field set — bucket, key, body, tags, checksum, owner and ACL — kept positional because it is forwarded to the contract's `commit_object`"
+    )]
     async fn write_object_plain(
         &self,
         bucket: &Name,
@@ -314,7 +320,10 @@ impl MemoryStorage {
     /// with the row, and the object and history bytes are one admission
     /// decision (version.rs's the_version_history_counts_against_the_total_limit).
     #[cfg(feature = "versioning")]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the versioned write's field set — bucket, key, body, tags, checksum, owner and ACL — kept positional because the one raw transaction needs them all at once"
+    )]
     async fn write_object_recording_versions(
         &self,
         bucket: &Name,
@@ -336,7 +345,7 @@ impl MemoryStorage {
         // it: the adjustment below runs inside the write, and the decorator's
         // lock is not reentrant — the closure may only use the `*_unlocked`
         // entry points.
-        let guard = self.lock_accounting().await;
+        let guard = self.content().lock_accounting().await;
         let (now, version_id, records_versions) =
             self.db
                 .write(|txn| -> Result<(u64, Option<version::Id>, bool), Error> {
@@ -394,7 +403,8 @@ impl MemoryStorage {
                     // untouched. The accounting lock is already held (the caller
                     // took it before opening the transaction), so this is the
                     // unlocked variant.
-                    self.adjust_total_unlocked(delta + history_bytes)?;
+                    self.content()
+                        .adjust_total_unlocked(delta + history_bytes)?;
                     Ok((now, stored.version_id.clone(), records_versions))
                 })?;
         // The versioned write published bytes through its own transaction:
@@ -479,6 +489,7 @@ impl MemoryStorage {
         // no check. The adjustment lands after the transaction, so it takes the
         // accounting lock itself rather than riding a guard.
         if let Err(error) = self
+            .content()
             .adjust_total_locked(history_bytes - old_len as i64)
             .await
         {
@@ -494,7 +505,7 @@ impl MemoryStorage {
         // The key's bytes left (or a marker now stands where they were):
         // forget its publish identity, so no stale compensation claims them.
         {
-            let _section = self.lock_accounting().await;
+            let _section = self.content().lock_accounting().await;
             self.content()
                 .forget_publish_tag(bucket, &ContentKey::Object(key.clone()));
         }

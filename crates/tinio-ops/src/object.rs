@@ -425,7 +425,10 @@ where
 
     /// The write's shared tail: publish the staged bytes at `key` and record
     /// the row the content now describes.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the write's shared tail takes the operation's whole field set — bucket, key, staged body, tags, owner, ACL and the version bit — because both write paths forward it unchanged"
+    )]
     async fn publish_and_record(
         &self,
         bucket: &bucket::Name,

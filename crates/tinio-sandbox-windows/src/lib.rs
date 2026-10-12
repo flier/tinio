@@ -94,11 +94,10 @@ pub(crate) mod sweep;
 // It pulls `tinio-util`'s `testing` feature with it, which is the other half of the
 // same rule: the shared device is not compiled into the launcher the CLI starts.
 #[cfg(feature = "testing")]
-#[allow(
-    clippy::unwrap_used,
+#[expect(
     clippy::expect_used,
     clippy::panic,
-    reason = "test support: behind `testing` (docs/style.md §Panics, design 2026-10-09 D7)"
+    reason = "test support: behind `testing`, the harness states its invariants with `expect` and `panic` (docs/style.md §Panics, design 2026-10-09 D7)"
 )]
 pub mod testing;
 
@@ -194,18 +193,21 @@ pub fn confine(sandbox: &Sandbox, plan: &LaunchPlan) -> Result<Confinement> {
 ///
 /// **One of the crate root's two unsafe sites, and the reason each exception
 /// sits on its own function rather than on the file**: the manifest denies
-/// `unsafe_code`, a crate-level allow would lift that for every line of this
+/// `unsafe_code`, a crate-level `expect` would lift that for every line of this
 /// module — including the modules it declares and every item added later — and
 /// the constitution asks for the smallest scope in which the exception is
 /// expressible (design decision 14). **Two, and a reader counting them should
 /// count both**, because that is what the lint sees: this function and
-/// [`from_wide`] below, each with its own `allow`.
+/// [`from_wide`] below, each with its own `expect`.
 ///
 /// # Safety
 ///
 /// `text` must point at a NUL-terminated UTF-16 buffer that stays valid for the
 /// call.
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "one of this module's two `unsafe_code` sites — the raw-pointer reads it exists for, with design decision 14 confining the exemption to these two functions and the safety contract stated on each"
+)]
 pub(crate) unsafe fn from_wide_units<'a>(text: *const u16) -> &'a [u16] {
     // SAFETY: the pointer is NUL-terminated by the caller's contract, so the
     // scan stops inside the buffer and yields the length below it.
@@ -230,7 +232,10 @@ pub(crate) unsafe fn from_wide_units<'a>(text: *const u16) -> &'a [u16] {
 ///
 /// `text` must point at a NUL-terminated UTF-16 buffer that stays valid for the
 /// call.
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "the second of this module's two `unsafe_code` sites — the raw-pointer read it exists for, forwarded to `from_wide_units` with the same caller contract"
+)]
 pub(crate) unsafe fn from_wide(text: *const u16) -> String {
     // SAFETY: the caller's contract is this function's, forwarded unchanged.
     String::from_utf16_lossy(unsafe { from_wide_units(text) })

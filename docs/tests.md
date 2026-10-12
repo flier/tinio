@@ -12,9 +12,10 @@
 
 - Shared harness = lib behind a test feature; shared include = file-scope.
 - Integration for crate boundary / foreign oracle / bench-shared / public-API properties.
-- One-module property suite inline with its subject; spawn sites outside the guard's scan: record at the guard.
+- One-module property suite inline with its subject; a harness spawns via `job::spawn` only; an outside-guard site: record the reason.
 - Drop a duplicate only when the survivor covers the same rule; fold missing asserts first.
 - State-dir layout: closed set the fs backend tests pin — `meta.redb`, `tmp/`, `multipart/`, `blobs/`, tool-state files.
+- State-dir classes: fs reserved dir, read-only home leaf, pg synthetic root — owner `contracts/config.md` (`[storage.pg]`).
 
 ## Standard acceptance (pre-push gate)
 
@@ -42,8 +43,8 @@
 
 - Layout / tags / env: e2e README; features ↔ S3 surface contract.
 - `Given`/`When`=act, `Then`=assert; 1st-person; one behavior/scenario.
-- Default filter owns platform / external / confinement (`TINIO_E2E_CONFINEMENT`); replacing it restates every exclusion.
-- Gate: fs, mem, parquet, spec-ID traceability; no spec ID → Rust; keep the shared util harness.
+- Default filter owns platform / external / confinement (`TINIO_E2E_CONFINEMENT`) / pg; replacing it restates every exclusion.
+- Gate: fs, mem, pg (live postgres), parquet, spec-ID traceability; no spec ID → Rust; keep the shared util harness.
 - Clean target dir: build the binary first, else a large slice of scenarios fails spuriously.
 
 ## Product surfaces

@@ -73,13 +73,12 @@ pub struct Handles {
     pub shutdown: watch::Receiver<bool>,
     /// The plane's `/stop` sender.
     ///
-    /// `allow(dead_code)` **in the api-off build only**, and for a reason that is not a
-    /// formality: nothing sends on this channel there (there is no plane), but the value must
-    /// still be held — the serving halves wait on `shutdown`, and a `watch` receiver whose
-    /// every sender has dropped wakes at once, so a `Handles` that did not keep its sender
-    /// would shut the server down at start-up. Held is not read, and the allow is the honest
-    /// spelling of that rather than a pretend read.
-    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    /// Nothing sends on this channel in an `api`-off build (there is no plane), and the value
+    /// must still be held there: the serving halves wait on `shutdown`, and a `watch` receiver
+    /// whose every sender has dropped wakes at once, so a `Handles` that did not keep its sender
+    /// would shut the server down at start-up. Held is not read — and as a `pub` field of a
+    /// `pub` struct it draws no `dead_code` warning, so the exemption this used to carry is gone
+    /// rather than restated.
     pub stopper: watch::Sender<bool>,
 }
 
@@ -200,7 +199,7 @@ pub fn install() -> Result<Handles, Error> {
 /// with the error dropped is exactly what the library's own wake did (`MSG_DONTWAIT`), and what
 /// this handler's contract needs. Only the *writer* end: the drain wants its blocking read.
 ///
-/// **A function of its own because it is one of this crate's enumerated `#[allow(unsafe_code)]`
+/// **A function of its own because it is one of this crate's enumerated `#[expect(unsafe_code)]`
 /// sites**, and the shape every other site here takes: one item that holds the exception together
 /// with the argument making it sound, rather than an allow spread over the call site (the list's
 /// home is [`install_console_handler`]'s doc). It is unsafe at all because `signal-hook`'s
@@ -222,7 +221,10 @@ pub fn install() -> Result<Handles, Error> {
 /// confinement refused cannot unwind out of a handler — and the thread draining that socket is
 /// where everything else (the count, the logging, the channel) happens.
 #[cfg(unix)]
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "one of this crate's enumerated `unsafe_code` sites: a single async-signal-safe `write(2)` on a descriptor this process owns, captured before registration — allocation-free, lock-free and non-blocking"
+)]
 fn register_wakes(writer: &Arc<UnixStream>) -> Result<(), Error> {
     use rustix::io::write;
 
@@ -298,7 +300,7 @@ const CLOSE_DRAIN: Duration = Duration::from_secs(3);
 
 /// Declares the Windows console handler and registers it.
 ///
-/// **One of this crate's four enumerated `#[allow(unsafe_code)]` sites** — the others are
+/// **One of this crate's four enumerated `#[expect(unsafe_code)]` sites** — the others are
 /// `daemon.rs`'s `set_launch_env`, `doctor.rs`'s `space` (the `GetDiskFreeSpaceExW` disk-space
 /// probe) and [`register_wakes`], the unix registration: `signal-hook`'s registration is `unsafe`
 /// because the action it takes runs inside a signal handler, and that function's doc is where the
@@ -325,7 +327,10 @@ const CLOSE_DRAIN: Duration = Duration::from_secs(3);
 /// already gone when the system sends them, so the honest answer is `FALSE` — the next
 /// handler's business, not ours.
 #[cfg(windows)]
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "the crate's console-handler site, and the head of its enumerated list: Windows runs the handler on a thread of its own, so it must be `unsafe extern \"system\"`, and it only increments a counter and answers `TRUE`/`FALSE` — it never unwinds"
+)]
 fn install_console_handler(stopper: watch::Sender<bool>) -> Result<(), Error> {
     /// The handler Windows runs, on a thread of its own, for every console control event.
     unsafe extern "system" fn on_console_event(event: u32) -> BOOL {

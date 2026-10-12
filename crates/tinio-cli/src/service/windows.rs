@@ -116,7 +116,7 @@ pub(crate) fn try_run_as_service() -> bool {
 // `define_windows_service!` builds the `extern "system" fn(u32, *mut *mut u16)` the
 // dispatcher's signature takes, parses the SCM's wide-character argument vector and calls
 // `service_main` with it. The macro is the crate's, so the one `unsafe` inside it (that raw
-// vector) stays in `windows-service` rather than becoming an `#[allow(unsafe_code)]` site of
+// vector) stays in `windows-service` rather than becoming an `#[expect(unsafe_code)]` site of
 // ours — and the comment is not a doc comment because rustdoc generates no documentation for
 // a macro invocation, which is a `-D warnings` failure.
 #[cfg(windows)]

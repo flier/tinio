@@ -39,7 +39,7 @@ use crate::{
         meta::{
             VersionMeta,
             object::Row as CallerRow,
-            version::{Current, Kind as ContractKind, Stored},
+            version::{Current, Kind as ContractKind, Stored, slot_move_rewinds},
         },
         object, storage, to_nanos,
         version::{self as contract, Id, State},
@@ -272,28 +272,11 @@ impl VersionMeta for RedbMetadata {
                 // the sequence holds no row at all.
                 let moved_off = recorded.as_ref().map(|row| row.version_seq);
                 let mut row = recorded.unwrap_or_else(empty_object_row);
-                // The monotonic guard (2026-10-07 review; identity-scoped by the
-                // 2026-10-10 ruling): a slot never moves backwards **within one
-                // identity**. The write transaction serialises commits but does
-                // not order them by sequence, so a lower-sequence advance of a
-                // real version committing after a higher-sequence one would
-                // leave the slot below the newest version it already named — the
-                // very state the slot exists to prevent (`current_slot` would
-                // then resolve the marker bit off the stale row). A move to the
-                // **same** sequence is the crash window's own re-run and is
-                // allowed; a lower one that keeps a real identity is refused,
-                // exactly as `put_version` refuses a row another version already
-                // occupies.
-                //
-                // The null identity is not a rewind of that numbering: the null
-                // version's `seq = 0` is its own space, so a suspended bucket's
-                // in-place write to the null slot — the plan's `(Null, 0)` over a
-                // real current version — lands. It must: that advance runs after
-                // the supersede, the publish and the object-row write have
-                // committed, so refusing it leaves a write that took effect and
-                // then errored. Only a **real** incoming identity is measured
-                // against the recorded sequence.
-                if id.is_some() && seq < row.version_seq {
+                // The slot never moves backwards within one identity (see
+                // `slot_move_rewinds`): a lower-sequence advance of a real
+                // version is refused exactly as `put_version` refuses a row
+                // another version already occupies.
+                if slot_move_rewinds(id.as_ref(), seq, row.version_seq) {
                     tracing::warn!(
                         bucket = %bucket,
                         key = %key,

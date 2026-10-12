@@ -22,7 +22,7 @@ use sqlx::migrate::{Migration, Migrator};
 /// A literal rather than a walk over [`MIGRATOR`], so it stays usable in a
 /// `const`; `the_schema_version_is_the_newest_embedded_migration` pins it to
 /// the embedded set.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 1;
 
 /// Every migration, embedded at compile time, in version order.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./sql/migrations");
@@ -80,10 +80,17 @@ mod tests {
         }
     }
 
+    /// A database at the binary's version, or ahead of it, pends nothing; the
+    /// forward path from an empty one is the whole embedded set, contiguous and
+    /// capped at [`SCHEMA_VERSION`] however many files the history holds.
     #[test]
-    fn only_a_newer_database_pends_nothing() {
+    fn a_newer_database_pends_nothing_and_the_forward_path_is_contiguous() {
         assert_eq!(pending(SCHEMA_VERSION).count(), 0);
-        assert_eq!(pending(0).count(), MIGRATOR.iter().count());
         assert_eq!(pending(SCHEMA_VERSION + 1).count(), 0);
+        // The forward path from an empty database is exactly the embedded set,
+        // one step per version: with a one-file history that is the single step
+        // to 1, and the property holds unchanged however many files there are.
+        let from_empty: Vec<i64> = pending(0).map(|migration| migration.version).collect();
+        assert_eq!(from_empty, (1..=SCHEMA_VERSION).collect::<Vec<i64>>());
     }
 }

@@ -2,7 +2,7 @@
 //! `tests/features/`; step definitions live in `tests/steps/`.
 //!
 //! Default tag filter: scenarios that cannot pass in this build are excluded
-//! unless the user passes an explicit `--tags` on the CLI. The four exclusion
+//! unless the user passes an explicit `--tags` on the CLI. The five exclusion
 //! axes are independent (`steps/tag_filter.rs` owns the composition): `@parquet`
 //! drops out unless the binary was compiled `--features parquet` (the parquet
 //! input reader lives behind `tinio-server/select-parquet`, off by default);
@@ -22,7 +22,9 @@
 //! rather than picking a side (`steps/tag_filter.rs` owns the grammar): a
 //! Windows target pays the launcher's ACL grant, and no budget here covers what
 //! `docs/tests.md`'s "Grant cost" measures (see that section's owner rule; the
-//! platform scripts are the real gate).
+//! platform scripts are the real gate); and the database-backed scenarios
+//! (`@pg`) always drop out — the `@pg` pass is its own explicit `--tags` run
+//! against a live database (PG17), never the default run.
 //!
 //! `TINIO_E2E_REPORT=<path>` additionally writes a Cucumber-JSON report
 //! to the given file (CI uses this for the PR test report).
@@ -51,6 +53,9 @@ pub extern crate tinio_core as _core;
 pub extern crate tinio_fs as _fs;
 #[doc(hidden)]
 pub extern crate tinio_mem as _mem;
+#[cfg(feature = "pg")]
+#[doc(hidden)]
+pub extern crate tinio_pg as _pg;
 #[doc(hidden)]
 pub extern crate tinio_server as _server;
 #[doc(hidden)]

@@ -118,7 +118,7 @@ pub struct BucketOps<M, C, H> {
 /// use tinio_version::Versions;
 ///
 /// let plane = VersionPlane {
-///     versions: Arc::new(Versions::new(rows.clone(), content.clone(), Store::new(LocalBlocks::new(dir)))),
+///     versions: Arc::new(Versions::rows_as_gate(rows.clone(), content.clone(), Store::new(LocalBlocks::new(dir)))),
 ///     version_rows: Arc::clone(&rows),
 ///     blobs: Store::new(LocalBlocks::new(dir)),
 /// };

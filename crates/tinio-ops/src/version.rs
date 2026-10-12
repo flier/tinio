@@ -1,28 +1,32 @@
 //! The `version` group of the ops engine: the versioning-state pair, the
-//! version-addressed reads and the per-version tag/ACL pairs.
+//! version-addressed reads and deletes and the per-version tag/ACL pairs.
 //!
-//! The group's inventory is nine operations (E14); this module writes
-//! **eight** of them — the two state operations, the version-addressed `get`
-//! and `head`, and the four per-version tag/ACL bodies. The ninth, the
-//! version-addressed delete, has no engine body yet — but the blocker it was
-//! filed with is gone. Its current-version arm restores whatever version
-//! becomes current again, which **moves the slot backwards to a real identity**
-//! — the one move `advance_slot` refuses by its absolute guard — and that move
-//! now has a contract call: [`VersionMeta::restore_slot`] commits it in one
-//! transaction together with the successor's content elements, the current
-//! slot, the dropped version row, its index entry and the cleared retained
-//! part list (fs's `restore` is its only caller so far). The body is therefore
-//! expressible, and authoring it is the version group's next wave (the
-//! design's §8.3), whose items are the successor scan over `list_versions`
-//! plus `Stored::is_history(Slot::At(removed_seq))` — a decode cost where fs's
-//! adapter scan reads two raw rows —, the content removal through
-//! `ObjectContent::remove`, and the no-successor arm's `ObjectMeta::remove`.
-//! `list_object_versions` is the
-//! backend's own (E14), because it needs the backend's "what is the current
-//! object" truth beside the F01/F04 gate — and so are the two methods the
-//! trait keeps outside the group: `current_version` (the bounded per-key probe
-//! behind the plain read's marker disclosure) and `ensure_rename_allowed` (the
-//! rename guard the trait's own default body answers).
+//! The group's inventory is nine operations (E14); this module writes all
+//! nine — the two state operations, the version-addressed `get`, `head` and
+//! `delete`, and the four per-version tag/ACL bodies. The delete's
+//! current-version arm restores whatever version becomes current again, which
+//! **moves the slot backwards to a real identity** — the one move
+//! `advance_slot` refuses by its absolute guard — and that move is
+//! [`VersionMeta::restore_slot`]'s: its one transaction commits the successor's
+//! content elements, the slot, the dropped version row, its index entry and the
+//! cleared retained part list. The successor itself is the key's newest
+//! remaining row ([`VersionMeta::latest`] — the one-row read, never a walk of
+//! the history), the removed version's bytes go through
+//! `ObjectContent::remove` and the no-successor arm's object row through
+//! `ObjectMeta::remove`. The **marker-creating** delete a versioned `DELETE`
+//! takes is [`ObjectOps::create_delete_marker`], a body beside the nine: its
+//! ordering (supersede, remove the bytes and the row, write the marker's slot,
+//! materialize the marker's object row) is shared here, while the slot write
+//! itself is the backend's [`MarkerWrite`] port — a marker is a recorded slot
+//! with **no version row**, a state no contract write expresses, and the
+//! null-identity marker a suspended delete makes must not displace the null
+//! version the same delete leaves in history.
+//! `list_object_versions` is the backend's own (E14), because it needs the
+//! backend's "what is the current object" truth beside the F01/F04 gate — and
+//! so are the two methods the trait keeps outside the group: `current_version`
+//! (the bounded per-key probe behind the plain read's marker disclosure) and
+//! `ensure_rename_allowed` (the rename guard the trait's own default body
+//! answers).
 //!
 //! # The handles
 //!
@@ -91,7 +95,7 @@ use std::time::SystemTime;
 
 use crate::{
     _core::{
-        ByteRange, GetObjectResult,
+        ByteRange, ETag, GetObjectResult,
         acl::{self, Acl},
         blob::BlockStore,
         bucket,
@@ -103,10 +107,11 @@ use crate::{
         },
         object,
         storage::{self, Error, marker_has_no_metadata},
-        version::{self, HeadResult, Id, ReadResult, State, wire_of},
+        version::{self, HeadResult, Id, Marker, ReadResult, State, wire_of},
     },
     _version::{
-        Current, CurrentRows, Identity as WriteIdentity, Intent, Seqs, Versions, plan_write,
+        Current, CurrentRows, Identity as WriteIdentity, Intent, MarkerWrite, Seqs, Versions,
+        plan_write,
     },
     ObjectOps, StagedBody,
     ops::{VersionPlane, projected},
@@ -114,7 +119,10 @@ use crate::{
 
 /// The version plane this group's bodies take: the state engine over the
 /// backend's ports, the version rows beside it and the block plane.
-type Plane<R, C, B> = VersionPlane<Versions<R, C, B>, R, B>;
+///
+/// `G` defaults to `R` for a backend whose rows are also the gate. pg passes
+/// the store as the rows and a separate gate.
+type Plane<R, C, B, G = R> = VersionPlane<Versions<R, C, B, G>, R, B>;
 
 /// What the plane resolved the addressed version to.
 enum Found {
@@ -168,15 +176,16 @@ where
     /// recorded identity its content no longer matches is **not** the current
     /// version, so a request that names it resolves nothing (`NoSuchVersion`)
     /// instead of serving the drift under a stale identifier.
-    async fn resolve<R, B>(
+    async fn resolve<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
     ) -> Result<Found, Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         let current = plane
@@ -223,15 +232,16 @@ where
 
     /// The stamp a version-addressed read of the current delete marker
     /// answers, read where the model records it (see the module doc).
-    async fn marker_stamp<R, B>(
+    async fn marker_stamp<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         seq: u64,
     ) -> Result<SystemTime, Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         if let Some(row) = VersionMeta::get_version(&*plane.version_rows, bucket, key, seq)
@@ -299,13 +309,14 @@ where
     ///
     /// The state engine's failures; the backend's own bucket checks stay with
     /// its trait implementation.
-    pub async fn bucket_versioning<R, B>(
+    pub async fn bucket_versioning<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
     ) -> Result<State, Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         plane.versions.state(bucket).await.map_err(projected)
@@ -320,14 +331,15 @@ where
     /// # Errors
     ///
     /// The state engine's failures.
-    pub async fn set_bucket_versioning<R, B>(
+    pub async fn set_bucket_versioning<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         state: State,
     ) -> Result<(), Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         plane
@@ -338,15 +350,16 @@ where
     }
 
     /// Resolve one addressed version into the three answers get and head share.
-    async fn address<R, B>(
+    async fn address<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
     ) -> Result<Addressed, Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         let records_versions = plane
@@ -375,15 +388,16 @@ where
     }
 
     /// Project [`Found`] onto the row a tag or ACL body writes. Markers refuse.
-    async fn version_home<R, B>(
+    async fn version_home<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
     ) -> Result<VersionHome, Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         match self.resolve(plane, bucket, key, version).await? {
@@ -404,16 +418,17 @@ where
     /// `NoSuchVersion` for a well-formed identity naming no version,
     /// `NoSuchKey` when the addressed current version's content is gone, and
     /// the planes' own failures.
-    pub async fn get_object_version<R, B>(
+    pub async fn get_object_version<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
         range: Option<ByteRange>,
     ) -> Result<ReadResult, Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         match self.address(plane, bucket, key, version).await? {
@@ -463,15 +478,16 @@ where
     ///
     /// As the version-addressed read: `NoSuchVersion`, `NoSuchKey` and the
     /// planes' failures.
-    pub async fn head_object_version<R, B>(
+    pub async fn head_object_version<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
     ) -> Result<HeadResult, Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         match self.address(plane, bucket, key, version).await? {
@@ -499,6 +515,288 @@ where
         }
     }
 
+    /// Permanently remove one version — S3 `DeleteObject` with a `versionId`.
+    ///
+    /// Two shapes, decided by the key's gated current:
+    ///
+    /// - **the addressed identity is the current version** — it leaves and the newest
+    ///   remaining version becomes current again (its bytes stream back onto the key path,
+    ///   and `restore_slot` commits the row, the slot and the consumption of its own row in
+    ///   one transaction). The current version's row leaves first when it has one (a marker
+    ///   does; a content version holds no row of its own), so the removed marker cannot be
+    ///   mistaken for its own successor. With no version left the key disappears: its bytes
+    ///   and its object row go, and its slot with them — a row-less key is a key no version
+    ///   was ever recorded for, so a later write plans from zero rather than being refused
+    ///   by a sequence nothing records any more;
+    /// - **a noncurrent version** — its row and its index entry leave in one transaction
+    ///   ([`VersionMeta::expire`]). Its blocks stay: liveness is derived from the rows, and
+    ///   `Cleanup`'s sweep drops what no row names.
+    ///
+    /// The successor scan is [`VersionMeta::latest`]'s one row, never a walk of the history,
+    /// and a row that is the current version's own — the sequence the slot records — is
+    /// consumed before the scan so the scan cannot name it.
+    ///
+    /// # Errors
+    ///
+    /// `NoSuchVersion` (the contract's not-found class, naming the wire the caller asked
+    /// for) when the identity names no version of the key.
+    pub async fn delete_object_version<R, B, G>(
+        &self,
+        plane: &Plane<R, C, B, G>,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<Marker, Error>
+    where
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
+        B: BlockStore,
+    {
+        let current = plane
+            .versions
+            .current(bucket, key)
+            .await
+            .map_err(projected)?;
+        if current.exists && current.version.as_ref() == version {
+            let removed = Marker {
+                id: version.cloned(),
+                is_delete_marker: current.is_delete_marker,
+            };
+            // The current version's own row: a marker's sits at the slot's sequence, a
+            // content version has none. `expire` is idempotent, so the content arm's call
+            // is the one that finds nothing.
+            VersionMeta::expire(&*plane.version_rows, bucket, key, current.seq)
+                .await
+                .map_err(projected)?;
+            match VersionMeta::latest(&*plane.version_rows, bucket, key)
+                .await
+                .map_err(projected)?
+            {
+                Some((seq, row)) => self.restore_version(plane, bucket, key, seq, row).await?,
+                None => {
+                    self.content
+                        .remove(bucket, &ContentKey::Object(key.clone()))
+                        .await
+                        .map_err(projected)?;
+                    let _ = ObjectMeta::remove(&*self.meta, bucket, key)
+                        .await
+                        .map_err(projected)?;
+                }
+            }
+            return Ok(removed);
+        }
+        let wire = wire_of(version);
+        let Some(seq) = VersionMeta::version_seq_of(&*plane.version_rows, bucket, key, version)
+            .await
+            .map_err(projected)?
+        else {
+            return Err(storage::no_such_version(wire));
+        };
+        let Some(row) = VersionMeta::get_version(&*plane.version_rows, bucket, key, seq)
+            .await
+            .map_err(projected)?
+        else {
+            return Err(storage::no_such_version(wire));
+        };
+        VersionMeta::expire(&*plane.version_rows, bucket, key, seq)
+            .await
+            .map_err(projected)?;
+        Ok(Marker {
+            id: row.id.clone(),
+            is_delete_marker: row.kind == Kind::Marker,
+        })
+    }
+
+    /// Make one version current again: its content back onto the key path, then
+    /// `restore_slot`'s one transaction.
+    ///
+    /// The order is the restore's contract — the bytes first, so a crash between the two
+    /// leaves the version's row, and so its content, recoverable — and the row this call
+    /// writes is the version's own recorded elements (a marker's is the empty row
+    /// `advance_slot` materializes, with the marker's own creation stamp).
+    async fn restore_version<R, B, G>(
+        &self,
+        plane: &Plane<R, C, B, G>,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seq: u64,
+        row: Stored,
+    ) -> Result<(), Error>
+    where
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
+        B: BlockStore,
+    {
+        let acl = Acl {
+            owner: row.owner.clone(),
+            grants: row.acl.grants.clone(),
+        };
+        let elements = if row.kind == Kind::Marker {
+            Row {
+                etag: ETag::EMPTY,
+                size: 0,
+                mtime: row.created,
+                identity: 0,
+                tags: row.tags.clone(),
+                checksum: None,
+                owner: row.owner.clone(),
+                acl,
+            }
+        } else {
+            // The version's bytes stream back onto the key path (the restore's content
+            // half), and the entry that publish left carries the length and the identity the
+            // row records.
+            let published = plane
+                .versions
+                .materialize(bucket, key, &row)
+                .await
+                .map_err(projected)?;
+            let entry = self.content.stat(bucket, key).await.map_err(projected)?;
+            Row {
+                etag: row.etag.clone(),
+                size: published.as_ref().map_or(row.size, |body| body.size),
+                mtime: entry
+                    .as_ref()
+                    .and_then(|entry| entry.mtime)
+                    .unwrap_or(row.created),
+                identity: entry.as_ref().map_or(0, |entry| entry.identity),
+                tags: row.tags.clone(),
+                checksum: row.checksum.clone(),
+                owner: row.owner.clone(),
+                acl,
+            }
+        };
+        VersionMeta::restore_slot(
+            &*plane.version_rows,
+            bucket,
+            key,
+            &elements,
+            row.id.clone(),
+            seq,
+        )
+        .await
+        .map_err(projected)
+    }
+
+    /// Create the delete marker a versioned `DELETE` makes current.
+    ///
+    /// The ordering is the engine's, and it is the engine's own test scaffold
+    /// (`plant_delete_marker`) in production order, over the contracts:
+    ///
+    /// 1. the plan ([`plan_write`] with [`Intent::Delete`]): whether the
+    ///    outgoing version turns noncurrent, the marker's identity and its
+    ///    sequence — the suspended shapes included, where the null version is
+    ///    **removed** rather than moved and the marker takes the key's next
+    ///    free sequence instead of the history row's;
+    /// 2. the supersede, before the content goes (the outgoing version's bytes
+    ///    are still the key's);
+    /// 3. the key's bytes and its object row leave — a marker holds no
+    ///    content, and leaving the row would leave the deleted object's
+    ///    elements for the listing to read;
+    /// 4. the marker becomes current **without a version row**, through the
+    ///    backend's [`MarkerWrite`] port: the port records the marker bit,
+    ///    materializes the key's (empty) object row and stamps the version the
+    ///    slot moves off, and a current marker's own row, if an earlier shape
+    ///    left one, expires first so repeated suspended deletes cannot grow a
+    ///    phantom history.
+    ///
+    /// A bucket that records no versions takes the version-free delete instead
+    /// ([`delete_object`](Self::delete_object)): the state can flip between the
+    /// caller's read and this body's, and the plan's own `marker` bit is the
+    /// answer.
+    ///
+    /// # Errors
+    ///
+    /// The version engine's failures (a supersede race included), the row
+    /// plane's, the content plane's and the marker port's.
+    pub async fn create_delete_marker<R, B, G, W>(
+        &self,
+        plane: &Plane<R, C, B, G>,
+        markers: &W,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<Marker, Error>
+    where
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
+        B: BlockStore,
+        W: MarkerWrite,
+    {
+        let state = plane.versions.state(bucket).await.map_err(projected)?;
+        let current = plane
+            .versions
+            .current(bucket, key)
+            .await
+            .map_err(projected)?;
+        let seqs = Seqs {
+            latest: VersionMeta::latest(&*plane.version_rows, bucket, key)
+                .await
+                .map_err(projected)?
+                .map(|(seq, _)| seq)
+                .unwrap_or(0),
+            null_at_zero: VersionMeta::version_seq_of(&*plane.version_rows, bucket, key, None)
+                .await
+                .map_err(projected)?
+                == Some(0),
+        };
+        let plan = plan_write(Intent::Delete, state, &current, &seqs);
+        if !plan.marker {
+            // The state is not recording versions, so the version-free delete
+            // is the answer.
+            return self.delete_object(bucket, key).await;
+        }
+        if plan.supersede {
+            plane
+                .versions
+                .supersede_with(bucket, key, &current)
+                .await
+                .map_err(projected)?;
+        }
+        let id = match plan.identity {
+            WriteIdentity::Fresh => Some(version::mint()),
+            WriteIdentity::Null | WriteIdentity::Unversioned => None,
+        };
+        self.content
+            .remove(bucket, &ContentKey::Object(key.clone()))
+            .await
+            .map_err(projected)?;
+        let _ = ObjectMeta::remove(&*self.meta, bucket, key)
+            .await
+            .map_err(projected)?;
+        // A **current marker's** own row, if an earlier shape left one, expires
+        // before the new slot names the new one: repeated suspended deletes
+        // must not grow a phantom history, and the sequence this body is about
+        // to leave would otherwise read as the slot's own record. The branch is
+        // the marker bit's — a content version's sequence holds no row of its
+        // own, and the one the supersede has just written there is the history
+        // the successor scan must find.
+        if current.is_delete_marker {
+            VersionMeta::expire(&*plane.version_rows, bucket, key, current.seq)
+                .await
+                .map_err(projected)?;
+        }
+        markers
+            .mark_current_marker(
+                bucket,
+                key,
+                id.clone(),
+                plan.seq,
+                // The row the marker's slot moves off: the version the supersede
+                // above committed into history, stamped noncurrent in the
+                // marker's own transaction (RG5 — the rule `advance_slot` and
+                // `restore_slot` apply). Available only when a real version was
+                // superseded: when `current` is a marker, the row at its
+                // sequence is expired just above, so there is nothing to stamp.
+                plan.supersede.then_some(current.seq),
+            )
+            .await
+            .map_err(projected)?;
+        Ok(Marker {
+            id,
+            is_delete_marker: true,
+        })
+    }
+
     /// The tags of one version (S3 GetObjectTagging with a `versionId`).
     ///
     /// A delete marker holds no metadata: the refusal is the contract's
@@ -508,15 +806,16 @@ where
     ///
     /// `NoSuchVersion` for an unknown identity or a marker address, and the
     /// planes' own failures.
-    pub async fn version_tags<R, B>(
+    pub async fn version_tags<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
     ) -> Result<object::Tags, Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         match self.version_home(plane, bucket, key, version).await? {
@@ -534,16 +833,17 @@ where
     ///
     /// `NoSuchVersion` for an unknown identity or a marker address, and the
     /// planes' own failures.
-    pub async fn set_version_tags<R, B>(
+    pub async fn set_version_tags<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
         tags: object::Tags,
     ) -> Result<(), Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         match self.version_home(plane, bucket, key, version).await? {
@@ -572,15 +872,16 @@ where
     ///
     /// `NoSuchVersion` for an unknown identity or a marker address, and the
     /// planes' own failures.
-    pub async fn version_acl<R, B>(
+    pub async fn version_acl<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
     ) -> Result<Acl, Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         match self.version_home(plane, bucket, key, version).await? {
@@ -604,16 +905,17 @@ where
     ///
     /// `NoSuchVersion` for an unknown identity or a marker address, and the
     /// planes' own failures.
-    pub async fn set_version_acl<R, B>(
+    pub async fn set_version_acl<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
         acl: &Acl,
     ) -> Result<(), Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         match self.version_home(plane, bucket, key, version).await? {
@@ -645,16 +947,17 @@ where
     /// is dropped, so the version stays current. A first write has no outgoing
     /// version: the published bytes stay, and a read that finds no row serves
     /// them as the null version.
-    async fn undo_versioned_put<R, B>(
+    pub async fn undo_versioned_put<R, B, G>(
         &self,
-        plane: &Plane<R, C, B>,
+        plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         before: Option<&Row>,
         history_seq: Option<u64>,
     ) -> Result<(), Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         let content_key = ContentKey::Object(key.clone());
@@ -749,10 +1052,13 @@ where
     ///
     /// The version engine's failures (a supersede race included), the row
     /// plane's, and the content plane's.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn put_object_versioned<R, B>(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the versioned put's field set — plane, bucket, key, staged body, tags, owner and ACL — is the operation's own, forwarded once into the version engine"
+    )]
+    pub async fn put_object_versioned<R, B, G>(
         &self,
-        plane: &VersionPlane<Versions<R, C, B>, R, B>,
+        plane: &VersionPlane<Versions<R, C, B, G>, R, B>,
         bucket: &bucket::Name,
         key: &object::Key,
         staged: StagedBody<C::Staged>,
@@ -761,7 +1067,8 @@ where
         acl: &Acl,
     ) -> Result<object::Info, Error>
     where
-        R: Metadata + VersionMeta + CurrentRows,
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
         B: BlockStore,
     {
         let state = plane.versions.state(bucket).await.map_err(projected)?;

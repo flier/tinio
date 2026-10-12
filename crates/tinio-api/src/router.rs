@@ -476,13 +476,16 @@ async fn status(AxumState(shared): AxumState<Shared>) -> Json<StatusBody> {
 }
 
 // Never called: `#[utoipa::path]` needs an item of its own, and it sits beside the handler it
-// mirrors so the two cannot drift apart — hence the deliberate `dead_code` allow. The `///` line
+// mirrors so the two cannot drift apart — hence the deliberate `dead_code` `expect`. The `///` line
 // below is the operation's `summary` in the document, which is why it describes the endpoint
 // rather than this stub.
 
 /// The running server's state: pid, host, storage root, port, start time and version.
 #[cfg(feature = "openapi")]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the stub exists only so `#[utoipa::path]` has an item to attach to; it sits beside the handler it mirrors so the two cannot drift apart and is deliberately never called"
+)]
 #[utoipa::path(
     get,
     path = "/status",
@@ -511,7 +514,10 @@ async fn stop(AxumState(shared): AxumState<Shared>) -> (StatusCode, Json<StopBod
 
 /// Cease accepting, drain in-flight requests for up to 10 s, then exit.
 #[cfg(feature = "openapi")]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "same shape as `status_doc`: a `#[utoipa::path]` stub, deliberately never called"
+)]
 #[utoipa::path(
     post,
     path = "/stop",
@@ -565,7 +571,10 @@ async fn metrics(AxumState(shared): AxumState<Shared>) -> Response {
 ///
 /// `404` when the plane carries no gauge source: the absence is served, not an empty `200`.
 #[cfg(feature = "openapi")]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "same shape as `status_doc`: a `#[utoipa::path]` stub, deliberately never called"
+)]
 #[utoipa::path(
     get,
     path = "/metrics",
@@ -596,7 +605,10 @@ async fn openapi_json() -> Json<&'static OpenApiSchema> {
 
 /// This OpenAPI document, as `application/json`.
 #[cfg(feature = "openapi")]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "same shape as `status_doc`: a `#[utoipa::path]` stub, deliberately never called"
+)]
 #[utoipa::path(
     get,
     path = "/openapi.json",

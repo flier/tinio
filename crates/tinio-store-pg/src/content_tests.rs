@@ -1,4 +1,4 @@
-use std::{io, iter};
+use std::{io, iter, time::Duration};
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -11,6 +11,7 @@ use crate::{
         object,
         storage::{BodyStream, ByteRange},
     },
+    _sqlx::query,
     Error, PgStore,
     tests::fixtures::scratch,
 };
@@ -388,11 +389,12 @@ async fn a_zero_length_object_is_live_and_refuses_a_range() {
     db.drop_db().await;
 }
 
-/// A stage another allocation superseded cannot flip the head: its rows stay
-/// residue, the key answers `MissingContent` until the live allocation
-/// publishes, and the raced publish answers `PublishRaced`.
+/// A publish whose generation a later allocation superseded does not error: it
+/// re-homes its generation onto the head's next free sequence and flips that,
+/// so its bytes become live (last-writer-wins) and no 5xx escapes. The later
+/// allocation then re-homes in turn and wins as the last writer.
 #[tokio::test]
-async fn a_publish_another_allocation_superseded_races() {
+async fn a_superseded_publish_re_homes_and_flips_instead_of_erroring() {
     let Some((db, store)) = scratch().await else {
         return;
     };
@@ -417,30 +419,282 @@ async fn a_publish_another_allocation_superseded_races() {
         .await
         .expect("the bytes stage");
 
-    let err = store
+    // `first` lost the allocation race (the head's `next_seq` moved on to
+    // `second`): it re-homes and lands, so the concurrent write resolves to one
+    // of the two bodies rather than a 500.
+    store
         .publish(&bucket, first, &content)
         .await
-        .expect_err("a superseded generation cannot flip the head");
-    assert!(matches!(err, Error::PublishRaced), "{err}");
-    assert_eq!(
-        err.to_string(),
-        "a concurrent publish moved the live generation"
-    );
+        .expect("a superseded publish converges, it never errors");
+    assert_eq!(read(&store, &bucket, &content, None).await, b"first");
     assert!(
-        store.open(&bucket, &content, None).await.is_err(),
-        "the raced rows are residue, not content"
+        !store.is_empty(&bucket).await.expect("the probe runs"),
+        "the re-homed generation is live content"
     );
-    assert!(store.is_empty(&bucket).await.expect("the probe runs"));
 
+    // The later allocation publishes next and wins, as the last writer.
     store
         .publish(&bucket, second, &content)
         .await
-        .expect("the live allocation flips the head");
+        .expect("the later allocation re-homes and flips the head");
     assert_eq!(read(&store, &bucket, &content, None).await, b"second");
+    assert!(
+        !store.is_empty(&bucket).await.expect("the probe runs"),
+        "the last writer is live content"
+    );
+
     store
         .remove(&bucket, &content)
         .await
         .expect("the removal lands");
+    store
+        .remove_bucket(&bucket)
+        .await
+        .expect("the bucket drains");
+    db.drop_db().await;
+}
+
+/// A same-key race never tears the object: whichever generation is live, a full
+/// read returns one whole body's bytes, never a mix of the two. The interleaving
+/// is forced — two staged handles published in sequence — so the leg does not
+/// depend on wall-clock luck.
+#[tokio::test]
+async fn a_same_key_race_never_tears_the_object() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = bucket::name("conf-content-no-tear").expect("a valid bucket name");
+    let key = object::key("raced.bin").expect("a valid object key");
+    let content = ContentKey::Object(key.clone());
+
+    let a = vec![b'a'; 3 * MIB + 17];
+    let mut b = vec![b'b'; 3 * MIB + 17];
+    b[0] = b'A'; // distinct content, same length
+
+    let mut first = store
+        .stage(&bucket, &content)
+        .await
+        .expect("the first stage opens");
+    first
+        .write(Bytes::from(a.clone()))
+        .await
+        .expect("the bytes stage");
+    let mut second = store
+        .stage(&bucket, &content)
+        .await
+        .expect("the second stage opens");
+    second
+        .write(Bytes::from(b.clone()))
+        .await
+        .expect("the bytes stage");
+
+    store
+        .publish(&bucket, first, &content)
+        .await
+        .expect("the superseded publish converges");
+    assert_eq!(
+        read(&store, &bucket, &content, None).await,
+        a,
+        "the loser's body is whole, not a mixture"
+    );
+    store
+        .publish(&bucket, second, &content)
+        .await
+        .expect("the later publish lands");
+    assert_eq!(
+        read(&store, &bucket, &content, None).await,
+        b,
+        "the winner's body is whole, not a mixture"
+    );
+
+    store
+        .remove(&bucket, &content)
+        .await
+        .expect("the removal lands");
+    store
+        .remove_bucket(&bucket)
+        .await
+        .expect("the bucket drains");
+    db.drop_db().await;
+}
+
+/// The generation a later allocation superseded must survive the whole window
+/// between that allocation and its own publish — not merely the length of the
+/// re-home transaction. Driven explicitly: `first` streams a batch that commits
+/// (a body past the 4 MiB publish batch, so its chunk rows reach the table
+/// before any publish), the `second` allocation then supersedes it, an orphan
+/// sweep runs in that window, and only then does the loser publish. The per-row
+/// write stamp must keep the fresh superseded rows out of the sweep, so nothing
+/// is reclaimed and the re-home flips a body whole.
+#[tokio::test]
+async fn a_superseded_generation_survives_a_sweep_in_its_window() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = bucket::name("conf-content-race-sweep").expect("a valid bucket name");
+    let key = object::key("raced.bin").expect("a valid object key");
+    let content = ContentKey::Object(key.clone());
+
+    // Five 1 MiB chunks: `write` flushes the first batch of four, so four rows
+    // are committed under `first`'s sequence before the publish.
+    let first_body = vec![b'a'; 5 * MIB];
+    let mut first = store
+        .stage(&bucket, &content)
+        .await
+        .expect("the first stage opens");
+    first
+        .write(Bytes::from(first_body.clone()))
+        .await
+        .expect("the bytes stage");
+    let mut second = store
+        .stage(&bucket, &content)
+        .await
+        .expect("the second stage opens");
+    second
+        .write(Bytes::from_static(b"second body"))
+        .await
+        .expect("the bytes stage");
+
+    // The second allocation committed, so `first`'s already-committed rows are
+    // superseded: neither live nor the head's `next_seq`. A sweep runs now, in
+    // that window. The generation is only moments old, so its rows are inside
+    // the grace and the per-row stamp keeps them.
+    let orphans = store
+        .orphan_chunks(Duration::from_secs(3600))
+        .await
+        .expect("the scan runs");
+    let reclaimed = store
+        .reclaim_orphan_chunks(&orphans)
+        .await
+        .expect("the sweep runs");
+    assert_eq!(reclaimed, 0, "a fresh superseded generation is not residue");
+
+    // `first` re-homes and flips a complete body. A reclaimed row would make the
+    // move short (the row-count check rolls back) or the read answer `Corrupt`.
+    store
+        .publish(&bucket, first, &content)
+        .await
+        .expect("the superseded publish converges whole");
+    assert_eq!(read(&store, &bucket, &content, None).await, first_body);
+
+    store
+        .publish(&bucket, second, &content)
+        .await
+        .expect("the later publish lands");
+    assert_eq!(read(&store, &bucket, &content, None).await, b"second body");
+
+    store
+        .remove(&bucket, &content)
+        .await
+        .expect("the removal lands");
+    store
+        .remove_bucket(&bucket)
+        .await
+        .expect("the bucket drains");
+    db.drop_db().await;
+}
+
+/// A staged generation whose allocation has aged stays whole while any of its
+/// chunks was written inside the grace window. Aging every chunk then makes
+/// the generation residue. A generation missing a chunk does not flip.
+#[tokio::test]
+async fn an_in_flight_generation_survives_while_a_chunk_is_fresh() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = bucket::name("conf-content-inflight").expect("a valid bucket name");
+    let key = object::key("inflight.bin").expect("a valid object key");
+    let content = ContentKey::Object(key);
+
+    let body = vec![b'a'; 5 * MIB];
+    let mut staged = store
+        .stage(&bucket, &content)
+        .await
+        .expect("the stage opens");
+    staged
+        .write(Bytes::from(body))
+        .await
+        .expect("the bytes stage");
+
+    let pool = store.pool();
+    query(
+        "UPDATE content_heads SET allocated_at = now() - interval '2 hours' \
+         WHERE bucket = $1 AND ckey = $2",
+    )
+    .bind(&staged.bucket)
+    .bind(&staged.ckey)
+    .execute(&**pool)
+    .await
+    .expect("the allocation ages");
+    query(
+        "UPDATE content SET published = now() - interval '2 hours' \
+         WHERE bucket = $1 AND ckey = $2 AND chunk_no <> 0",
+    )
+    .bind(&staged.bucket)
+    .bind(&staged.ckey)
+    .execute(&**pool)
+    .await
+    .expect("the earlier chunks age");
+
+    let orphans = store
+        .orphan_chunks(Duration::from_secs(600))
+        .await
+        .expect("the scan runs");
+    let reclaimed = store
+        .reclaim_orphan_chunks(&orphans)
+        .await
+        .expect("the sweep runs");
+    assert_eq!(
+        reclaimed, 0,
+        "one fresh chunk protects the whole staged generation"
+    );
+
+    query(
+        "UPDATE content SET published = now() - interval '2 hours' \
+         WHERE bucket = $1 AND ckey = $2",
+    )
+    .bind(&staged.bucket)
+    .bind(&staged.ckey)
+    .execute(&**pool)
+    .await
+    .expect("the last chunk ages");
+    let orphans = store
+        .orphan_chunks(Duration::from_secs(600))
+        .await
+        .expect("the scan runs");
+    let reclaimed = store
+        .reclaim_orphan_chunks(&orphans)
+        .await
+        .expect("the sweep runs");
+    assert!(
+        reclaimed > 0,
+        "a staged generation whose every chunk has aged is residue"
+    );
+
+    let mut again = store
+        .stage(&bucket, &content)
+        .await
+        .expect("a second stage opens");
+    again
+        .write(Bytes::from(vec![b'b'; 5 * MIB]))
+        .await
+        .expect("the bytes stage");
+    query("DELETE FROM content WHERE bucket = $1 AND ckey = $2 AND seq = $3 AND chunk_no = 0")
+        .bind(&again.bucket)
+        .bind(&again.ckey)
+        .bind(again.seq)
+        .execute(&**pool)
+        .await
+        .expect("one chunk leaves");
+    let err = store
+        .publish(&bucket, again, &content)
+        .await
+        .expect_err("a short generation does not flip");
+    assert!(
+        matches!(err, Error::PublishRaced),
+        "the refusal is the publish race, got {err}"
+    );
+
     store
         .remove_bucket(&bucket)
         .await

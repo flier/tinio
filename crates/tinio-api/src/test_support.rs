@@ -48,7 +48,13 @@ use crate::{
 ///
 /// The `dead_code` allowance is only for a build without `tls`: with the feature off its one
 /// caller, `https_get` below, does not exist either.
-#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "tls"),
+    expect(
+        dead_code,
+        reason = "the fixture pair's one caller, `https_get`, is behind the same feature, so in a build without `tls` this function is deliberately unreachable"
+    )
+)]
 pub(crate) fn fixture_pair() -> (PathBuf, PathBuf) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     (dir.join("cert.pem"), dir.join("key.pem"))

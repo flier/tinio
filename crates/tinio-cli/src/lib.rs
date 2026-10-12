@@ -24,10 +24,16 @@ pub extern crate tinio_fs as _fs;
 #[cfg(feature = "mem")]
 #[doc(hidden)]
 pub extern crate tinio_mem as _mem;
+#[cfg(feature = "pg")]
+#[doc(hidden)]
+pub extern crate tinio_pg as _pg;
 #[doc(hidden)]
 pub extern crate tinio_sandbox as _sandbox;
 #[doc(hidden)]
 pub extern crate tinio_server as _server;
+#[cfg(all(test, feature = "pg"))]
+#[doc(hidden)]
+pub extern crate tinio_store_pg as _store_pg;
 /// Not `#[cfg(test)]`, unlike its first life: the confinement's exposure rule asks
 /// `path_contains` whether a state directory is inside the served root, and that question is
 /// asked by the running server rather than only by a test.

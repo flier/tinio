@@ -205,7 +205,7 @@ pub(crate) enum Content {
     /// a missing file to report: every plain read resolves the file it
     /// serves and reports `NoSuchKey` when there is none, so a stripped build
     /// never constructs this arm.
-    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
+    #[cfg(feature = "versioning")]
     Missing,
 }
 
@@ -255,7 +255,9 @@ pub(crate) fn gate(stored: &object_meta::Stored, content: Content) -> Verdict {
                 Verdict::Degraded
             }
         }
+        #[cfg(feature = "versioning")]
         Content::Missing if stored.is_delete_marker => Verdict::Live,
+        #[cfg(feature = "versioning")]
         Content::Missing => Verdict::Degraded,
     }
 }
@@ -496,7 +498,10 @@ impl Store {
     /// the `ensure_row` row's etag: the stored entry when it
     /// still matches, else the content MD5 recomputed streaming. Returns
     /// the ETag and whether it was (re)computed.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per element the ensured row is keyed by — bucket, key, path, size, mtime, identity and the symlink policy — the same set `ensure_row` takes"
+    )]
     pub async fn ensure_etag(
         &self,
         bucket: &bucket::Name,
@@ -545,7 +550,10 @@ impl Store {
     /// still name a version the content no longer is (see
     /// [`Self::rewrite_preserving`]). Callers with no gate verdict pass
     /// `None` — the identity then rides the row exactly as it always has.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per element the staleness gate judges — bucket, key, path, size, mtime, identity, the symlink policy and the gate's `stale` verdict"
+    )]
     pub(crate) async fn ensure_row(
         &self,
         bucket: &bucket::Name,
@@ -656,7 +664,10 @@ impl Store {
     /// The ETag of an object file at `path`: the stored entry when it still
     /// matches (`size` + `mtime` + `identity` — F01), else the content
     /// MD5 recomputed streaming and the entry rewritten (FR-022).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per element the file's identity is judged by — bucket, key, path, size, mtime, identity and the symlink policy — forwarded whole to `ensure_etag`"
+    )]
     pub async fn etag_for_file(
         &self,
         bucket: &bucket::Name,
@@ -717,7 +728,10 @@ impl Store {
     /// same transaction, so a concurrent write that installed its own
     /// live version is never cleared by a reader that judged the previous
     /// content.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the write transaction's own field set — bucket, key, etag, size, mtime, identity and the stale identity the gate judged invalid — one transaction rewrites them together"
+    )]
     async fn rewrite_preserving(
         &self,
         bucket: &bucket::Name,
@@ -2177,7 +2191,9 @@ mod tests {
         // Missing: the file is gone. A row still describing content is an
         // out-of-band removal (degraded); a recorded marker holds no content
         // to drift from, so its identity stays live.
+        #[cfg(feature = "versioning")]
         assert_eq!(gate(&row, Content::Missing), Verdict::Degraded);
+        #[cfg(feature = "versioning")]
         assert_eq!(
             gate(&stored_row(0, 1_000, 0, true), Content::Missing),
             Verdict::Live,

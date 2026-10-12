@@ -201,7 +201,10 @@ impl JobObject {
     // own signatures, and the contract — a live handle the caller owns — is proven by the caller.
     // An `unsafe fn` would put an `unsafe` block at every call site, which is what design decision
     // 14 confines to this module.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    #[expect(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "the lint's premise does not hold: `HANDLE` is windows-sys's public handle type, named by both callers' own signatures, and the caller proves the contract — an `unsafe fn` would put an `unsafe` block at every call site, which design decision 14 confines to this module"
+    )]
     pub fn assign(&self, process: HANDLE) -> io::Result<()> {
         // SAFETY: both handles are live and owned by the caller for the duration of the call; the
         // job takes no ownership of the process handle.

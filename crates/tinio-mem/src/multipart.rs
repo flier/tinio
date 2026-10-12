@@ -140,7 +140,8 @@ impl MemoryStorage {
                 version::check_bucket_write(txn, bucket)?;
                 let (version_id, version_seq, history_bytes, records_versions) =
                     version::prepare_publish(txn, bucket, key, now)?;
-                self.adjust_total_with_credit_unlocked(history_bytes, 0)?;
+                self.content()
+                    .adjust_total_with_credit_unlocked(history_bytes, 0)?;
                 Ok((version_id, version_seq, records_versions))
             })?;
         drop(guard);
@@ -536,7 +537,7 @@ impl MultipartOps for MemoryStorage {
                 // The assembled body is written raw by the core, so the
                 // single-object cap is checked here (never the total: the core's
                 // meter owns that, with the credit above).
-                self.check_object_bytes_unlocked(size)?;
+                self.content().check_object_bytes_unlocked(size)?;
                 let done = self.db.write(|txn| {
                     version::complete_versioned(
                         self, txn, bucket, key, now, &data, &row, &retained, credit,

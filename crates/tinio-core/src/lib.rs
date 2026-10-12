@@ -31,6 +31,7 @@ pub mod multipart;
 pub mod object;
 pub mod percent;
 pub mod pipeline;
+pub mod severity;
 pub mod storage;
 pub mod version;
 

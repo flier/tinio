@@ -26,10 +26,9 @@
 //!   use for it. A job object on Windows (`GuardJob`, `guard`), the
 //!   parent-death signal on Linux, nothing on macOS; reachable without the
 //!   `testing` feature, so that its own tests run in the default graph;
-//!   `testing` re-exports the module. **The gate `tests/spawn_guard.rs`
-//!   holds that spelling up**: it fails on a raw `Command::spawn` under
-//!   `crates/*/tests/**` that its allowlist does not name with a reason,
-//!   and a `#[cfg(test)]` module inside `src/` is outside that scan.
+//!   `testing` re-exports the module. **Every harness spawn site takes it**
+//!   (docs/tests.md §Harness & guards): a raw `Command::spawn` is a review
+//!   finding — recorded with its reason, not left unremarked.
 //! - `job_object` — the Win32 job-object call sequence itself (create with
 //!   its limits already set, assign, terminate, close on `Drop`), the one
 //!   primitive `job`'s guard and `tinio-sandbox-windows`'s per-launch `Job`
@@ -68,7 +67,7 @@ pub extern crate tinio_core as _core;
 // production dependency of several crates — bench-only code must not compile
 // into a default build (the `expect`s below are fixture assertions on paths
 // the bench itself named, `docs/style.md` §Panics).
-#[allow(
+#[expect(
     clippy::expect_used,
     reason = "test support: behind `bench` (docs/style.md §Panics)"
 )]
@@ -92,10 +91,9 @@ pub mod switch;
 // tinio-util`, which is what each platform's leg runs) rather than only for a caller who asked for
 // a feature. `testing` re-exports the module, so a harness still spells it `tinio_util::testing::job`.
 #[allow(
-    clippy::unwrap_used,
     clippy::expect_used,
-    clippy::panic,
-    reason = "test support: behind `testing` (docs/style.md §Panics)"
+    clippy::allow_attributes,
+    reason = "test support: the module's `expect`s sit in its `#[cfg(all(test, windows))]` tests — live in this crate's test build, cfg'd away when a dependent compiles it non-test — so one attribute cannot be `expect` in both"
 )]
 #[cfg(any(test, feature = "testing"))]
 pub mod job;
@@ -110,7 +108,7 @@ pub mod job;
 #[cfg(windows)]
 pub mod job_object;
 
-#[allow(
+#[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,

@@ -28,7 +28,7 @@ use crate::{
         MIGRATION_LOCK_KEY, MIGRATION_TABLE, OWNERSHIP_LOCK_KEY, SCHEMA_VERSION, VERSION_TABLE_SQL,
         pending,
     },
-    pool::{DEFAULT_POOL_SIZE, Dsn, Pool, SslMode},
+    pool::{DEFAULT_POOL_SIZE, Pool, SslMode},
 };
 
 /// How a store instance serves (PG12): one writable instance owns a database,
@@ -230,19 +230,7 @@ impl PgStore {
     /// # }
     /// ```
     pub async fn connect_with_pool(pool: Pool, access: Access) -> Result<Self, Error> {
-        verify_encoding(&pool).await?;
-        let applied = read_schema_version(&pool).await?;
-        if access.is_writable() {
-            refuse_a_newer_schema(applied)?;
-            if applied < SCHEMA_VERSION {
-                migrate(&pool).await?;
-            }
-        } else if applied != SCHEMA_VERSION {
-            return Err(Error::SchemaMismatch {
-                found: applied,
-                supported: SCHEMA_VERSION,
-            });
-        }
+        schema_gate(&pool, access, SchemaGate::BringForward).await?;
         Ok(Self {
             pool,
             access,
@@ -251,16 +239,19 @@ impl PgStore {
     }
 
     /// Open a store that never migrates: it reads the schema version and
-    /// answers it. This is the path `doctor` uses (PG11) — a diagnostic must
-    /// not change the database it inspects.
+    /// answers it. This is the pool-opening half of the path `doctor` uses
+    /// (PG11) — a diagnostic must not change the database it inspects.
     ///
-    /// The mode is the one the inspecting session is opened in and the one
-    /// [`PgStore::access`] reports, whatever the schema; it never migrates and
-    /// never takes the ownership lock. A **writable** inspection is a writable
-    /// store, so it passes the same schema gate [`PgStore::connect`] applies —
-    /// and because this path never migrates, a database behind the binary is
-    /// refused ([`Error::SchemaBehind`]) instead of migrated. A read-only
-    /// inspection only reports, which is what `doctor` needs.
+    /// The mode is the one the inspecting session is opened in — the pool is
+    /// opened read-only for [`Access::ReadOnly`], so the session's own layer of
+    /// the read-only mode (PG6) is present on the diagnostic path too, not just
+    /// the reported flag — and the one [`PgStore::access`] reports, whatever
+    /// the schema; it never migrates and never takes the ownership lock. A
+    /// **writable** inspection is a writable store, so it passes the same
+    /// schema gate [`PgStore::connect`] applies — and because this path never
+    /// migrates, a database behind the binary is refused
+    /// ([`Error::SchemaBehind`]) instead of migrated. A read-only inspection
+    /// only reports, which is what `doctor` needs.
     ///
     /// # Examples
     ///
@@ -281,18 +272,32 @@ impl PgStore {
     /// # }
     /// ```
     pub async fn inspect(dsn: &str, pool: u32, access: Access) -> Result<Self, Error> {
-        let pool = Pool::open(dsn, pool)?;
-        verify_encoding(&pool).await?;
-        let applied = read_schema_version(&pool).await?;
-        if access.is_writable() {
-            refuse_a_newer_schema(applied)?;
-            if applied < SCHEMA_VERSION {
-                return Err(Error::SchemaBehind {
-                    found: applied,
-                    supported: SCHEMA_VERSION,
-                });
-            }
-        }
+        // The session is opened in the asked-for mode: a read-only inspection
+        // connects read-only, so a diagnostic run cannot write by accident
+        // through the pool it inspects with (PG6).
+        let pool = Pool::open_for(dsn, pool, access)?;
+        Self::inspect_with_pool(pool, access).await
+    }
+
+    /// Inspect over an already-built pool, the non-migrating path [`Self::inspect`] takes over
+    /// the pool it opens — the shape [`Self::connect_with_pool`] has. A caller that already
+    /// holds the pool a diagnosis runs through hands it here rather than opening a second one.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tinio_store_pg::{Access, PgStore, pool::Pool};
+    ///
+    /// # async fn example() -> Result<(), tinio_store_pg::Error> {
+    /// let pool = Pool::open("postgres://user:password@db.example:5432/tinio", 8)?;
+    /// // The store inspects through the caller's own pool and never migrates it.
+    /// let store = PgStore::inspect_with_pool(pool, Access::ReadOnly).await?;
+    /// println!("applied {:?}", store.schema());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn inspect_with_pool(pool: Pool, access: Access) -> Result<Self, Error> {
+        let applied = schema_gate(&pool, access, SchemaGate::ReportOnly).await?;
         Ok(Self {
             pool,
             access,
@@ -655,6 +660,49 @@ async fn read_schema_version(pool: &Pool) -> Result<i64, Error> {
     Ok(version as i64)
 }
 
+/// Which open path passes the schema gate — the one thing that decides what a
+/// database which does not match this binary means.
+#[derive(Debug, Clone, Copy)]
+enum SchemaGate {
+    /// [`PgStore::connect_with_pool`]: a writable open brings a database behind
+    /// this binary forward, and a read-only one refuses anything but an exact
+    /// match.
+    BringForward,
+    /// [`PgStore::inspect_with_pool`]: never migrates — a writable open refuses a
+    /// database behind this binary instead ([`Error::SchemaBehind`]), and a
+    /// read-only one reports whatever it finds (PG11).
+    ReportOnly,
+}
+
+/// The encoding-and-schema gate both open paths pass: verify the encoding, read
+/// the applied version, and — on the writable path — refuse a database newer
+/// than this binary. What a database *behind* this binary means is the gate's
+/// own argument, so the sequence has one text.
+async fn schema_gate(pool: &Pool, access: Access, gate: SchemaGate) -> Result<i64, Error> {
+    verify_encoding(pool).await?;
+    let applied = read_schema_version(pool).await?;
+    if access.is_writable() {
+        refuse_a_newer_schema(applied)?;
+        if applied < SCHEMA_VERSION {
+            match gate {
+                SchemaGate::BringForward => migrate(pool).await?,
+                SchemaGate::ReportOnly => {
+                    return Err(Error::SchemaBehind {
+                        found: applied,
+                        supported: SCHEMA_VERSION,
+                    });
+                }
+            }
+        }
+    } else if matches!(gate, SchemaGate::BringForward) && applied != SCHEMA_VERSION {
+        return Err(Error::SchemaMismatch {
+            found: applied,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    Ok(applied)
+}
+
 /// Apply every pending migration, each in its own transaction, under an
 /// advisory lock held on a dedicated out-of-pool connection.
 async fn migrate(pool: &Pool) -> Result<(), Error> {
@@ -665,11 +713,24 @@ async fn migrate(pool: &Pool) -> Result<(), Error> {
 /// database-backed test can pin the refusal with a wait it can afford.
 /// Open the dedicated out-of-pool connection a lock lives on, with the dsn's
 /// password stripped from the error.
+///
+/// The connection is opened **through the pool's own options**
+/// ([`Pool::dedicated_options`]), not by re-parsing a mode-less dsn: a
+/// dedicated connection therefore carries the pool's session, the read-only
+/// startup option included (PG6), and cannot open with more privilege than the
+/// pool that asked for it. Re-parsing the raw dsn here was the one way that
+/// could happen.
 async fn connect_dedicated(pool: &Pool) -> Result<PgConnection, Error> {
-    let dsn = Dsn::parse(pool.dsn_text())?;
-    PgConnection::connect_with(&dsn.options())
+    PgConnection::connect_with(&pool.dedicated_options())
         .await
-        .map_err(|err| Error::connect(dsn.host(), dsn.database(), &err.to_string(), dsn.redacted()))
+        .map_err(|err| {
+            Error::connect(
+                pool.host(),
+                pool.database(),
+                &err.to_string(),
+                pool.redacted(),
+            )
+        })
 }
 
 async fn migrate_with_lock_wait(pool: &Pool, wait: Duration) -> Result<(), Error> {
@@ -752,6 +813,9 @@ const MIGRATION_LOCK_POLL: Duration = Duration::from_millis(100);
 mod tests;
 
 #[cfg(test)]
-#[allow(clippy::absolute_paths)]
+#[expect(
+    clippy::absolute_paths,
+    reason = "the module proves the crate's public path — its imports spell `tinio_store_pg::…` on purpose, and a shortened path would not prove the public one"
+)]
 #[path = "store_db_tests.rs"]
 mod db_tests;

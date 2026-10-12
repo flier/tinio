@@ -58,6 +58,7 @@ const TEMPLATE: &str = include_str!("status.hbs");
 ///     config: None,
 ///     read_only: false,
 ///     state_dir: None,
+///     pg_dsn: None,
 /// };
 /// let located = locate(discovery, &Provenance::default())?;
 /// let args = Args {
@@ -178,6 +179,7 @@ mod tests {
     /// A resolution with nothing in it but what these legs read.
     fn resolution(root: &str) -> Resolution {
         Resolution {
+            pg_root: None,
             root: PathBuf::from(root),
             config: Config::default(),
             config_text: String::new(),

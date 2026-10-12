@@ -237,6 +237,7 @@ pub fn resolve_flag(source: ValueSource, requested: bool, file: bool) -> bool {
 ///     config: None,
 ///     read_only: false,
 ///     state_dir: None,
+///     pg_dsn: None,
 /// };
 /// let located = locate(discovery, &Provenance::default())?;
 /// let args = Args {

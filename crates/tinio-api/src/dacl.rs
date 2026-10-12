@@ -1,6 +1,6 @@
 //! The crate's one raw-Windows module: named-pipe DACL creation, adoption, and the pipe
 //! read-back. File DACLs live in [`tinio_winsec`]; nothing here is reachable off Windows, and the
-//! single `#[allow(unsafe_code)]` below is the crate's only `unsafe` site (design decision 20's
+//! single `#[expect(unsafe_code)]` below is the crate's only `unsafe` site (design decision 20's
 //! pattern, `docs/cargo.md`): every caller sees a safe wrapper whose checks are exhaustive and
 //! whose failures are `Error`s, never panics, because the invariant is the one Windows imposes
 //! rather than one this crate chooses.
@@ -145,7 +145,10 @@ pub(crate) fn adopt_pipe(handle: OwnedHandle) -> io::Result<NamedPipeServer> {
 // kernel's handle table is what the value is later resolved against. Marking it `unsafe` would
 // move the launcher's handoff proof out of the doc above and into the signature of every
 // caller, `Plane::adopt` included, which is a safe operation for exactly the same reason.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "the lint's premise does not hold: this function stores the caller's handle through `from_raw_handle` and dereferences nothing, so marking it `unsafe` would move the launcher's handoff proof into every caller's signature"
+)]
 pub fn adopted_pipe(raw: RawHandle) -> io::Result<OwnedHandle> {
     if raw.is_null() {
         return Err(io::Error::new(

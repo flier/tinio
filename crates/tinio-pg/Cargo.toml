@@ -1,0 +1,49 @@
+[package]
+name = "tinio-pg"
+version.workspace = true
+edition.workspace = true
+description = "PostgreSQL backend for tinio: the servable pg backend over the shared ops engine and tinio-store-pg"
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+derive_more = { workspace = true, features = ["debug"] }
+futures.workspace = true
+secrecy.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "time",
+] }
+
+tinio-blob.workspace = true
+tinio-core.workspace = true
+tinio-ops.workspace = true
+tinio-store-pg.workspace = true
+tinio-util.workspace = true
+tinio-version = { workspace = true, optional = true }
+
+[dev-dependencies]
+tinio-pg = { path = ".", features = ["versioning"] }
+tinio-store-pg = { workspace = true, features = ["testing"] }
+tinio-util = { workspace = true, features = ["testing"] }
+
+[features]
+default = []
+versioning = ["dep:tinio-version"]
+testing = ["tinio-store-pg/testing"]
+
+[lints.clippy]
+absolute_paths = "warn"
+allow_attributes = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_used = "warn"
+
+[lints.rust]
+unsafe_code = "forbid"

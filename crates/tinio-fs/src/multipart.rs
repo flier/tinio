@@ -424,7 +424,10 @@ impl Store {
     /// Unix-only: the backend's `copy_part` uses the contract's stream
     /// default elsewhere.
     #[cfg(unix)]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the copy's own field set — bucket, key, upload id, part number, the staged source, offset and length — the fast path's inputs exactly as the caller holds them"
+    )]
     pub(crate) async fn put_part_copy(
         &self,
         bucket: &bucket::Name,
@@ -453,7 +456,10 @@ impl Store {
     /// interleave as rename(A), rename(B), txn(B), txn(A), which would
     /// wedge the upload). A failed record removes the renamed part and
     /// the (empty) directory.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the rename-and-record section's field set — bucket, key, upload id, part number, the staged temp, etag and the tee slot — both callers forward them unchanged"
+    )]
     async fn publish_part(
         &self,
         bucket: &bucket::Name,

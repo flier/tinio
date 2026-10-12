@@ -775,7 +775,7 @@ pub fn supervise(child: &mut Child, teardown: impl FnOnce()) -> Result<ExitStatu
 // crate's new rows would otherwise fail the gate on. Scoped to the module rather than the
 // file, so the production code above keeps the lint.
 #[cfg(test)]
-#[allow(
+#[expect(
     clippy::unreachable,
     reason = "test context: `unreachable!` in the fixtures' never-run `wait` closures (docs/style.md §Panics, design 2026-10-09 D7)"
 )]

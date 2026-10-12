@@ -17,7 +17,7 @@
 //! `GenerateConsoleCtrlEvent` is an `unsafe extern` call, the child has to be spawned
 //! `CREATE_NEW_PROCESS_GROUP` to be addressable by it at all, and the leg is a `#[cfg(windows)]`
 //! arm inside the cucumber suite's step table. It is the second of the workspace's two
-//! **console-related** `#[allow(unsafe_code)]` sites — `tinio-cli`'s `signal.rs` console handler is
+//! **console-related** `#[expect(unsafe_code)]` sites — `tinio-cli`'s `signal.rs` console handler is
 //! the other — and the workspace's exception sites are **enumerated one by one rather than
 //! counted** (design decision 20): `tinio-cli`'s four — the console handler, the unix registration
 //! beside it (`register_wakes`), `daemon.rs`'s `set_launch_env` and `doctor`'s `space` — are named
@@ -98,7 +98,10 @@ impl Drop for Serving {
 /// control event through its own process group, and terminates on one. The drain is the default
 /// build's evidence — the graph the product ships.
 #[cfg(windows)]
-#[allow(unsafe_code)] // the one call below is `GenerateConsoleCtrlEvent`; see the assertion
+#[expect(
+    unsafe_code,
+    reason = "test context: the one call below is `GenerateConsoleCtrlEvent`, and the assertion it feeds is the evidence the leg reports"
+)]
 #[test]
 fn the_console_handler_reaches_the_shutdown_path() {
     use std::{

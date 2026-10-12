@@ -115,7 +115,10 @@ mod tests {
     /// instantiation is deferred with it. There is deliberately **no** `dyn`
     /// probe: the category methods' `where Self: Metadata` clause makes
     /// `Metadata` dyn-incompatible (round 40), and a dyn form never resolves.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "a compile-time shape probe: the point is that the biased `where` clause resolves against type variables, so it is deliberately never called"
+    )]
     fn shape_probe<M, C>(store: &M, content: &C)
     where
         M: Metadata + version::VersionMeta,
@@ -126,7 +129,10 @@ mod tests {
 
     /// The deferred ops-engine instantiation: this is the call the plan's Step 2
     /// names, kept here so the future `Ops` probe has one obvious home.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "the deferred ops-engine instantiation the plan's Step 2 names, kept so the future `Ops` probe has one obvious home — deliberately never called"
+    )]
     fn ops_probe<M, C>(store: &M, content: &C)
     where
         M: Metadata + version::VersionMeta,

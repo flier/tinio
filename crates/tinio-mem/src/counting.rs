@@ -388,6 +388,7 @@ where
     }
 
     /// [`Self::adjust_total_unlocked`] behind the accounting lock.
+    #[cfg(feature = "versioning")]
     pub(crate) async fn adjust_total_locked(&self, delta: i64) -> Result<(), Error> {
         let _section = self.accounting.lock().await;
         self.adjust_total_unlocked(delta)
@@ -865,13 +866,17 @@ where
         }
         let _section = self.lock_accounting().await;
         let mut held = Vec::with_capacity(keys.len());
-        for (index, key) in keys.iter().enumerate() {
+        let mut seen = HashSet::with_capacity(keys.len());
+        for key in keys {
             // The inner plane removes each key once, so a key the batch
-            // names again holds nothing by then.
-            let len = if keys[..index].contains(key) {
-                0
-            } else {
+            // names again holds nothing by then. Membership is asked of a
+            // set: the scan this replaced was quadratic inside the
+            // accounting lock, so a large drained bucket serialized every
+            // concurrent publish.
+            let len = if seen.insert(key) {
                 self.stored_len(bucket, key).await?
+            } else {
+                0
             };
             held.push(len);
         }

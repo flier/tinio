@@ -2,7 +2,7 @@
 //!
 //! These are the process-level legs `crates/tinio/tests/lifecycle.rs` used to hold. What stayed
 //! there is the console-handler leg, which needs `GenerateConsoleCtrlEvent` under
-//! `#[cfg(windows)]` and one of the workspace's two console-related `#[allow(unsafe_code)]` sites
+//! `#[cfg(windows)]` and one of the workspace's two console-related `#[expect(unsafe_code)]` sites
 //! (the workspace enumerates its exception sites one by one rather than counting them — design
 //! decision 20); its module doc says so, and `docs/tests.md`'s "CLI (tinio)" section carries the
 //! leg-by-leg mapping.
@@ -37,7 +37,7 @@ use std::{
     ffi::OsString,
     fs,
     io::ErrorKind,
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::OnceLock,
@@ -53,14 +53,14 @@ use rustix::process::{Pid, Signal, kill_process};
 use secrecy::ExposeSecret as _;
 use tempfile::TempDir;
 use tinio_api::{
-    client::{Call, RawResponse, get_http, get_local},
+    client::{Call, RawResponse, dialable, get_http, get_local},
     router::Auth,
     state::{STATE_FILE, State},
 };
 use tinio_sandbox::Event;
 #[cfg(target_os = "windows")]
 use tinio_sandbox::windows::testing;
-use tinio_util::testing::{job, kill_and_reap, poll_exit, wait_for_path};
+use tinio_util::testing::{frame_line, job, kill_and_reap, poll_exit, wait_for_path};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::ClientOptions;
 #[cfg(windows)]
@@ -69,15 +69,16 @@ use tokio::time::sleep;
 
 #[cfg(target_os = "macos")]
 use super::common::sweep_confined_grandchild;
-use super::{
-    World,
-    common::{ACL_ROOT, frame_line},
-};
+use super::{World, common::ACL_ROOT};
+#[cfg(feature = "pg")]
+use crate::_pg::_store_pg::test_support::TestDb;
 // The configuration document's own schema and the file name discovery looks for
 // (`steps/clients.rs` reaches the same pair through `crate::_server::_config`): the config-channel
 // fixture is written through the types the run reads it back with, so a renamed key is a compile
 // error here rather than a section a run silently takes as unset.
 use crate::_server::_config::{Config, discover, server};
+#[cfg(feature = "pg")]
+use crate::_server::_config::{auth, storage};
 
 /// How long a run may go without exiting and without reporting readiness before the harness
 /// calls it hung.
@@ -267,6 +268,16 @@ pub struct Cli {
     /// scenario closes it).
     #[cfg(windows)]
     pub(super) held: Vec<fs::File>,
+    /// The scratch PostgreSQL database a `@pg` scenario created — the handle
+    /// [`Cli::drop_pg_scratch`] needs to remove it again.
+    ///
+    /// **One per scenario, dropped on every path out**: the `#[after]` hook calls
+    /// [`Cli::drop_pg_scratch`] after [`Cli::teardown`] has ended the servers, so a failing
+    /// assertion cannot leave a database holding PG12's process-lifetime ownership lock (which
+    /// would starve the next scenario's connect, and the shared `tinio` fixture belongs to every
+    /// other leg). `None` for every scenario that created none.
+    #[cfg(feature = "pg")]
+    pg_scratch: Option<TestDb>,
 }
 
 /// One run of the binary, as the operator would have seen it: the exit status (absent while it
@@ -358,6 +369,8 @@ impl Cli {
             notify: None,
             #[cfg(windows)]
             held: Vec::new(),
+            #[cfg(feature = "pg")]
+            pg_scratch: None,
         }
     }
 
@@ -799,14 +812,12 @@ impl Cli {
     /// stderr in this two-pass CLI, so the phrase searched for is the *error's*, not the help's.
     ///
     /// **The probe spawns through the job guard like every other site in this harness.** It used
-    /// to reach the binary through `Command::output()`, which is the same spawn-and-wait without
-    /// the guard — and it is the shape the spawn guard (`crates/tinio-util/tests/spawn_guard.rs`)
-    /// now reads as a site of its own, where the `.spawn()`-only text scan it replaced could not
-    /// see it: `output()` spawns as surely as `spawn()` does, and a suite that reaches the binary
-    /// through it never holds the handle the job membership is about. `job::output` is the guard's
-    /// own spelling of that recipe, so the child is a member of the test process's job and the
-    /// three stdio modes are the helper's rather than three lines written here (a `--help` probe
-    /// exits on its own, so what the guard buys here is the property rather than the reaping).
+    /// to reach the binary through `Command::output()`, the same spawn-and-wait without the guard:
+    /// `output()` spawns as surely as `spawn()` does, and a suite that reaches the binary through
+    /// it never holds the handle the job membership is about. `job::output` is the guard's own
+    /// spelling of that recipe, so the child is a member of the test process's job and the three
+    /// stdio modes are the helper's rather than three lines written here (a `--help` probe exits
+    /// on its own, so what the guard buys here is the property rather than the reaping).
     fn knows_flag(&self, flag: &str) -> bool {
         let mut cmd = self.command();
         cmd.arg("server")
@@ -833,6 +844,27 @@ impl Cli {
         // it still refuses entries (see [`Cli::unwritable`]).
         #[cfg(unix)]
         self.restore_modes();
+    }
+
+    /// Drop the scratch PostgreSQL database this scenario created — the `#[after]` hook's second
+    /// teardown step, after [`Cli::teardown`] has ended the servers that held it.
+    ///
+    /// **A scratch database, never the shared `tinio` one** (PG8/PG12): PG12's writable-ownership
+    /// lock is process-lifetime, so a run that took it against the shared fixture would starve
+    /// every other leg of the pass — and the pass's own backend-neutral scenarios reset that
+    /// fixture for themselves. The store harness terminates lingering sessions and then drops;
+    /// the servers are already gone ([`Cli::teardown`] runs first).
+    ///
+    /// **Best-effort by design**: a scenario that failed before it created the database has
+    /// nothing to take, and a drop that cannot reach the server is not a finding this suite
+    /// reports — the name is unique per process and nanosecond, so a leak cannot collide with
+    /// anything.
+    #[cfg(feature = "pg")]
+    pub(super) async fn drop_pg_scratch(&mut self) {
+        let Some(scratch) = self.pg_scratch.take() else {
+            return;
+        };
+        scratch.drop_db().await;
     }
 
     /// Asks a daemon the scenario detached to stop, and waits for the artifact that says it is
@@ -998,7 +1030,7 @@ fn frames(text: &str) -> Vec<Event> {
     let mut frames = Vec::new();
     let mut frame = String::new();
     for line in text.lines() {
-        if let Some(event) = frame_line(&mut frame, line) {
+        if let Some(event) = frame_line(&mut frame, line, Event::decode) {
             frames.push(event);
         }
     }
@@ -1388,20 +1420,6 @@ fn metrics_token<'a>(control: &str, state: &'a State) -> Option<&'a str> {
         .then(|| state.token.expose_secret().as_str())
 }
 
-/// The address to dial for a **recorded** control address.
-///
-/// A wildcard bind records the wildcard — `0.0.0.0:9001` is what it bound — and that is not a
-/// *connect* address on any platform (`tinio_api::client`'s own `dialable` makes the same
-/// substitution for `tinio status`, where it is private to that module). The recorded name stays
-/// what the bind wrote; this changes only where the connection goes.
-fn dialable(addr: SocketAddr) -> SocketAddr {
-    if addr.ip().is_unspecified() {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
-    } else {
-        addr
-    }
-}
-
 /// One management request over the control channel `control` names, as the three shapes the
 /// contract lists: a Windows named pipe (the full `\\.\pipe\…` form the bind normalises), a TCP
 /// address, or a unix socket path.
@@ -1599,6 +1617,73 @@ async fn an_earlier_probe_left_its_profile_behind(_world: &mut World) {
     spawn_blocking(testing::leave_probe_residue)
         .await
         .unwrap_or_else(|join| panic!("the residue fixture panicked: {join}"));
+}
+
+/// `TINIO_STATE_DIR` **is** the served root — the one input that makes a pg run's synthetic root
+/// coincide with the scenario's scratch root.
+///
+/// A pg run has no served directory, so `resolve::pg::resolve_root`'s override arm takes the
+/// variable verbatim as the **root**, not the state directory (`an_explicit_state_dir_moves_the_synthetic_root`
+/// pins the rule): the state directory is then that root's own `.tinio`, so the `state` file, the
+/// access log and the control channel land under it exactly as a filesystem run's do. Every other
+/// `@cli` scenario's children get the harness's *other* state directory (a candidate beside the
+/// root); this is the one step that points the variable at the root itself.
+#[given("the child's state directory override is the served root")]
+async fn state_dir_override_is_the_root(world: &mut World) {
+    let cli = cli(world);
+    cli.vars.push((
+        "TINIO_STATE_DIR".to_owned(),
+        cli.root().display().to_string(),
+    ));
+}
+
+/// **The fixture every `@pg` scenario owns: a scratch PostgreSQL database and the
+/// `[storage] type = "pg"` configuration that names it.**
+///
+/// **A scratch database, never the shared `tinio` one** (PG8/PG12): the writable-ownership lock is
+/// process-lifetime, so a run that took it against the shared fixture would starve every other leg
+/// of the pass — and the pass's own backend-neutral scenarios reset that fixture for themselves.
+/// The name is the harness's, unique per process, and [`Cli::drop_pg_scratch`] removes the
+/// database when the scenario ends.
+///
+/// **The configuration is written where the run reads it** — `<root>/pg.toml`, named on the
+/// command line with `--config` (the one document a pg run reads without a root, PG13) — and
+/// carries the `[auth]` pair this suite signs with ([`ACL_ROOT`]), so the journey's requests
+/// authenticate against the run's own configuration chain rather than a harness-side switch. The
+/// run opens the scratch dsn, never the base one, so no other leg's database is touched.
+#[cfg(feature = "pg")]
+#[given("a scratch pg database and a pg configuration")]
+async fn scratch_pg_database(world: &mut World) {
+    let db = TestDb::create()
+        .await
+        .expect("the @pg pass needs TINIO_PG_DSN (the compose fixture's dsn, never spelled here)");
+    let dsn = db.dsn.clone();
+
+    let cli = cli(world);
+    // Through the schema, never as text (the same rule `config_asks_for_the_confinement`
+    // follows): the section, the key and its value are `tinio-config`'s own types, so a
+    // renamed key is a compile error here rather than a document the run silently reads as
+    // an unset default.
+    let config = Config {
+        storage: Some(storage::Config {
+            backend: storage::Backend::Pg,
+            pg: Some(storage::pg::Config {
+                dsn: Some(auth::Secret::from(auth::SecretKey::from(dsn))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        auth: Some(auth::Config {
+            access_key: ACL_ROOT.0.to_owned(),
+            secret_key: auth::Secret::from(auth::SecretKey::from(ACL_ROOT.1.to_owned())),
+        }),
+        ..Default::default()
+    };
+    let text = toml::to_string(&config).expect("the pg configuration schema serializes");
+    let path = cli.root().join("pg.toml");
+    fs::write(&path, text)
+        .unwrap_or_else(|err| panic!("the pg configuration `{}`: {err}", path.display()));
+    cli.pg_scratch = Some(db);
 }
 
 // --- When ---------------------------------------------------------------

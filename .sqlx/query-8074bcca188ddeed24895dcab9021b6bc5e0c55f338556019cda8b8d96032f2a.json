@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO current_slots (bucket, key, version_id, seq, is_delete_marker)\nVALUES (\n    $1, $2, $3, $4,\n    coalesce(\n        (\n            SELECT kind = 'marker' FROM version_rows\n            WHERE bucket = $1 AND key = $2 AND seq = $4\n        ),\n        FALSE\n    )\n)\nON CONFLICT (bucket, key) DO UPDATE SET\n    version_id = excluded.version_id,\n    seq = excluded.seq,\n    is_delete_marker = excluded.is_delete_marker\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8074bcca188ddeed24895dcab9021b6bc5e0c55f338556019cda8b8d96032f2a"
+}

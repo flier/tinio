@@ -11,11 +11,12 @@
 //! the state machine, the crash-safety order and the supersede race are
 //! inherited unchanged.
 //!
-//! [`CurrentRows`] is the one port that stays: the metadata contract's point
-//! read deliberately does not gate, while the engine must only ever see the
+//! Two ports stay. [`CurrentRows`]: the metadata contract's point read
+//! deliberately does not gate, while the engine must only ever see the
 //! backend's **gated** current (the F01/F04 staleness rule a read applies).
-//! The block plane needs no port at all, because the engine holds
-//! [`Store`](tinio_blob::Store) directly.
+//! [`MarkerWrite`]: a version-creating delete leaves a slot with no version
+//! row, which no contract write expresses. The block plane needs no port at
+//! all, because the engine holds [`Store`](tinio_blob::Store) directly.
 //!
 //! The write path's **decision** is a pure function, not a port:
 //! [`plan_write`] answers whether to supersede, which identity and sequence
@@ -49,5 +50,5 @@ pub use self::{
     engine::Versions,
     error::Error,
     plan::{Identity, Intent, Plan, Seqs, converges_null, plan_write},
-    ports::{Current, CurrentRows, PublishedBody},
+    ports::{Current, CurrentRows, MarkerWrite, PublishedBody},
 };

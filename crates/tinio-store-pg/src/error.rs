@@ -161,7 +161,8 @@ pub enum Error {
         size: u64,
     },
     /// Another publish moved the key's live generation between this publish's
-    /// allocation and its visibility flip.
+    /// allocation and its visibility flip, or the generation's chunk run is
+    /// short of the body that was staged.
     #[error("a concurrent publish moved the live generation")]
     PublishRaced,
     /// A version row already stored at the row's sequence names a different

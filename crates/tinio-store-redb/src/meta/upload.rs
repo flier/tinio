@@ -317,7 +317,6 @@ impl UploadMeta for RedbMetadata {
         })
     }
 
-    #[allow(clippy::type_complexity)]
     async fn part_records(
         &self,
         bucket: &bucket::Name,
@@ -368,7 +367,6 @@ impl UploadMeta for RedbMetadata {
         Ok(uploads)
     }
 
-    #[allow(clippy::type_complexity)]
     async fn list_uploads_page(
         &self,
         bucket: &bucket::Name,

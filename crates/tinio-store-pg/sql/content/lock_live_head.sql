@@ -1,7 +1,7 @@
 SELECT
-    live_seq AS "live_seq!",
-    live_len AS "live_len!",
-    publish_id AS "publish_id?"
+    live_seq AS "seq!",
+    live_len AS "len!",
+    publish_id
 FROM content_heads
 WHERE
     bucket = $1

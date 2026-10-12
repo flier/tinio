@@ -86,8 +86,10 @@ pub(crate) struct Judged {
 #[derive(Debug, Clone)]
 pub(crate) struct Rows {
     /// The backend this adapter serves (its state-database handle, its meta
-    /// store and its path mapping).
-    storage: FsStorage,
+    /// store and its path mapping) — held as the shared `Arc` every
+    /// version-plane handle is built from, so cloning the adapter is a
+    /// pointer bump rather than a copy of the backend's paths and owner map.
+    storage: Arc<FsStorage>,
     /// The contract implementation over the same state database: every
     /// forwarded call runs through it, so the two-table transactions and the
     /// version-index rules have exactly one home.
@@ -96,7 +98,7 @@ pub(crate) struct Rows {
 
 impl Rows {
     /// Serve a backend's rows.
-    pub(crate) fn new(storage: FsStorage) -> Self {
+    pub(crate) fn new(storage: Arc<FsStorage>) -> Self {
         // The contract implementation the storage's meta facade already holds
         // over this same driver, cloned rather than rebuilt: a per-call
         // `Rows` shares one engine handle instead of allocating a second.
@@ -1184,7 +1186,7 @@ mod tests {
         // A guard that compared identity and kind only would overwrite the
         // committed row and drop its blob out of the live set.
         let (_root, storage, bucket, key) = fixture().await;
-        let rows = Rows::new(storage.clone());
+        let rows = Rows::new(Arc::new(storage.clone()));
         let committed = BlobRef::single(BlockHash::of(b"first"), 5);
         rows.put_version(
             &bucket,
@@ -1456,7 +1458,7 @@ mod tests {
         plant(&storage, &bucket, &key, b"first", Some("v1"), 1).await;
         let versions = storage.versions(&bucket);
         versions.supersede(&bucket, &key).await.unwrap();
-        let rows = Rows::new(storage.clone());
+        let rows = Rows::new(Arc::new(storage.clone()));
 
         let indexed = |storage: &FsStorage| {
             let bucket = bucket.clone();
@@ -1494,7 +1496,7 @@ mod tests {
         // always names the one null-id row and no older row is stranded
         // unaddressable once the pointed-at row expires.
         let (_root, storage, bucket, key) = fixture().await;
-        let rows = Rows::new(storage.clone());
+        let rows = Rows::new(Arc::new(storage.clone()));
         rows.put_version(
             &bucket,
             &key,

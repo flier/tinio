@@ -6,6 +6,12 @@ description = "BDD acceptance suite: cucumber scenarios over the in-process tini
 publish = false
 
 [dependencies]
+sqlx = { workspace = true, optional = true, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls-ring-native-roots",
+] }
+tinio-pg = { path = "../tinio-pg", optional = true }
 tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",
@@ -21,15 +27,11 @@ bzip2 = { workspace = true }
 cucumber = { workspace = true, features = ["output-json", "tracing"] }
 flate2 = { workspace = true }
 futures = { workspace = true }
-hmac = { workspace = true }
 http = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 md-5 = { workspace = true }
 percent-encoding = { workspace = true }
-proc-macro2 = { workspace = true, features = ["span-locations"] }
 secrecy = { workspace = true }
-sha2 = { workspace = true }
-syn = { workspace = true, features = ["full", "visit"] }
 tempfile = { workspace = true }
 toml = { workspace = true }
 
@@ -47,18 +49,18 @@ rustix = { workspace = true, features = ["process"] }
 
 [features]
 parquet = ["tinio-server/select-parquet"]
+pg = ["dep:tinio-pg", "dep:sqlx", "tinio-pg/versioning", "tinio-pg/testing"]
 
 [[test]]
 name = "cucumber"
 harness = false
 
-# Spec↔tag traceability cross-check: a plain default-harness test target
-# (no cucumber involvement), so `cargo test` runs it normally.
 [[test]]
 name = "traceability"
 
 [lints.clippy]
 absolute_paths = "warn"
+allow_attributes = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"

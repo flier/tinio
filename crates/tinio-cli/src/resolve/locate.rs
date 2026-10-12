@@ -7,8 +7,9 @@ use std::{
 
 use clap::parser::ValueSource;
 
+use super::pg;
 use crate::{
-    _config::{Config, discover, sources, state},
+    _config::{Config, discover, sources, state, storage},
     _core::object::RESERVED_SEGMENT,
     Error,
     cli::{Discovery, Provenance},
@@ -75,19 +76,24 @@ pub(crate) fn current_dir() -> Result<PathBuf, Error> {
 pub fn resolve_root(explicit: Option<&Path>, from: &Path) -> Result<PathBuf, Error> {
     let candidate = match explicit {
         Some(dir) => dir.to_path_buf(),
-        None => match from
-            .ancestors()
-            .find(|dir| dir.join(RESERVED_SEGMENT).is_dir())
-        {
-            Some(dir) => dir.to_path_buf(),
-            None => {
-                return Err(Error::Usage(format!(
-                    "no storage root: pass DIR, or run from a directory inside one — walked up from `{}` looking for a `{RESERVED_SEGMENT}` directory",
-                    from.display()
-                )));
-            }
-        },
+        None => nearest_root(from).ok_or_else(|| no_root(from))?,
     };
+    canonical_root(&candidate)
+}
+
+/// The nearest ancestor of `from` that holds a `{RESERVED_SEGMENT}` directory, or `None` — the
+/// walk-up itself, split out of [`resolve_root`] so [`locate`] can tell "there is no root" (where
+/// a pg dsn answers with the synthetic root it derives, ruling R8) from "a root that cannot be
+/// used" (which stays an error whatever else the run carries).
+fn nearest_root(from: &Path) -> Option<PathBuf> {
+    from.ancestors()
+        .find(|dir| dir.join(RESERVED_SEGMENT).is_dir())
+        .map(Path::to_path_buf)
+}
+
+/// A root as its own identity: canonical, because that is what the home-state-dir hash and the
+/// socket name are derived from — `./data` and `/abs/data` are one root and not two (FR-020).
+fn canonical_root(candidate: &Path) -> Result<PathBuf, Error> {
     candidate.canonicalize().map_err(|err| {
         Error::Usage(format!(
             "the storage root `{}` is not usable: {err} — pass an existing DIR",
@@ -96,33 +102,57 @@ pub fn resolve_root(explicit: Option<&Path>, from: &Path) -> Result<PathBuf, Err
     })
 }
 
-/// [`resolve_root`] with its walk-up starting point read **only when there is a walk-up**.
+/// The usage error a run that named no `DIR` and found no `{RESERVED_SEGMENT}` above it answers —
+/// the one message both [`resolve_root`] and [`rooted`] produce it with.
+fn no_root(from: &Path) -> Error {
+    Error::Usage(format!(
+        "no storage root: pass DIR, or run from a directory inside one — walked up from `{}` looking for a `{RESERVED_SEGMENT}` directory",
+        from.display()
+    ))
+}
+
+/// The root a run resolves, or `None` when there is none **and** a pg dsn is addressed — the one
+/// case [`locate_in`] answers with the synthetic root rather than an error (ruling R8).
 ///
-/// [`resolve_root`]'s `from` is consulted in one branch and one only — the explicit `DIR` answer
-/// returns `candidate.canonicalize()` without ever looking at it — so computing `current_dir()`
-/// eagerly at the call site paid for a lookup most runs never use. **On macOS that lookup is a
-/// grant rather than a microsecond**, which is what makes this a correctness fix and not a tidy-up:
-/// `env::current_dir()` is `getcwd()`, `getcwd()` there is `fcntl(F_GETPATH)`, and Seatbelt refuses
-/// it for a working directory under a directory the profile does not grant — so a confined child
-/// **died** with `tinio: I/O error: Operation not permitted (os error 1)` at this call, before it
-/// emitted an event, whenever the launcher's working directory sat inside the operator's home
-/// (measured on macOS 15.8, 2026-09-25, with `tinio server /tmp/<root> --port 0 --sandbox` run from
-/// `~/…` and no home rule in the profile). The launcher platforms' profile has to name every path
-/// its confined child touches, and a directory the child never reads should not be one of them.
+/// **`current_dir()` is consulted here and nowhere else.** An explicit `DIR` never reads it, and
+/// neither does a caller that supplied the walk-up's starting point; **on macOS that lookup is a
+/// grant rather than a microsecond**, which is what makes this a correctness rule and not a
+/// tidy-up: `env::current_dir()` is `getcwd()`, `getcwd()` there is `fcntl(F_GETPATH)`, and
+/// Seatbelt refuses it for a working directory under a directory the profile does not grant — so a
+/// confined child **died** with `tinio: I/O error: Operation not permitted (os error 1)` at this
+/// call, before it emitted an event, whenever the launcher's working directory sat inside the
+/// operator's home (measured on macOS 15.8, 2026-09-25, with `tinio server /tmp/<root> --port 0
+/// --sandbox` run from `~/…` and no home rule in the profile). The walk-up shape keeps the lookup,
+/// and it does not need a grant of its own: the root the walk finds is an ancestor of the working
+/// directory, so the directory is inside the served root's own exposure.
 ///
-/// The walk-up shape keeps the lookup, and it does not need a grant of its own: when no `DIR` was
-/// given, the root the walk finds is an ancestor of the working directory, so the directory is
-/// inside the served root's own exposure.
+/// **The pg arm is the R8 fallback.** With no `DIR` and no `.tinio` above, a run that carries a pg
+/// dsn (or the `--pg-dsn` flag, its other channel) is a pg run — and a pg run has no served root to
+/// walk up to, its state dir being the dsn-derived synthetic root — so `Ok(None)` says "let the
+/// caller resolve that root" instead of the usage error. Without a dsn the error stands exactly as
+/// it did, so an ordinary run with neither root nor dsn is unchanged.
 ///
 /// # Errors
 ///
 /// Whatever [`resolve_root`] refuses, plus the working directory's own I/O error.
-fn rooted(explicit: Option<&Path>) -> Result<PathBuf, Error> {
-    match explicit {
-        // `from` is deliberately the same path: `resolve_root` never reads it on this branch, and
-        // passing the working directory here would be the lookup this function exists to avoid.
-        Some(dir) => resolve_root(Some(dir), dir),
-        None => resolve_root(None, &current_dir()?),
+fn rooted(
+    explicit: Option<&Path>,
+    from: Option<&Path>,
+    pg_dsn: bool,
+) -> Result<Option<PathBuf>, Error> {
+    if let Some(dir) = explicit {
+        // `from` is deliberately unused on this branch: `resolve_root` never reads it, and passing
+        // the working directory here would be the lookup this function exists to avoid.
+        return Ok(Some(resolve_root(Some(dir), dir)?));
+    }
+    let from = match from {
+        Some(from) => from.to_path_buf(),
+        None => current_dir()?,
+    };
+    match nearest_root(&from) {
+        Some(candidate) => Ok(Some(canonical_root(&candidate)?)),
+        None if pg_dsn => Ok(None),
+        None => Err(no_root(&from)),
     }
 }
 
@@ -318,6 +348,7 @@ pub fn state_dir_candidates(
 ///     config: None,
 ///     read_only: false,
 ///     state_dir: None,
+///     pg_dsn: None,
 /// };
 /// let located: Located = locate(discovery, &Provenance::default()).expect("a root");
 /// assert!(located.state_dir.ends_with(".tinio"));
@@ -356,6 +387,7 @@ pub fn locate(discovery: Discovery, provenance: &Provenance) -> Result<Located, 
 ///     config: None,
 ///     read_only: false,
 ///     state_dir: None,
+///     pg_dsn: None,
 /// };
 /// let located =
 ///     locate_confined(discovery, &Provenance::default(), "version = 1\n").expect("a root");
@@ -371,25 +403,109 @@ pub fn locate_confined(
 
 /// [`locate`] and [`locate_confined`]'s one body: the mode's file level is the only thing the
 /// payload changes.
+///
+/// **The pg arm runs before the root is resolved** (PG5/PG13): a run whose configuration selects
+/// `[storage] type = "pg"` has no served root, so its root is synthesized from the dsn and a
+/// positional `DIR` — or a discovered `.tinio/` root — is refused rather than ignored. That is
+/// why the selector is read from the document the **operator named** (`--config`, or the
+/// confined child's payload text) before [`rooted`] runs: it is the one document a pg run can
+/// read without a root, and a pg run has none to walk up to.
 fn locate_with(
     discovery: Discovery,
     provenance: &Provenance,
     adopted: Option<&str>,
 ) -> Result<Located, Error> {
-    let root = rooted(discovery.dir.as_deref())?;
+    locate_in(discovery, provenance, adopted, None)
+}
+
+/// [`locate`] with the walk-up's **starting directory named** — the `#[cfg(test)]` entry below,
+/// and nothing else: the public pair passes `None`, which is what keeps `current_dir()` lazy
+/// ([`rooted`]'s doc is the macOS correctness reason for that laziness).
+///
+/// It exists because one arm of the resolution — a `.tinio/` root **discovered** by the walk-up
+/// — is otherwise reachable only by mutating the process's working directory, which no test may
+/// do (it races every other test in the binary), and that arm is where PG13's second refusal and
+/// the root-side selector both live.
+fn locate_in(
+    discovery: Discovery,
+    provenance: &Provenance,
+    adopted: Option<&str>,
+    from: Option<&Path>,
+) -> Result<Located, Error> {
+    // The document the operator named, read and parsed **once**: it answers the pg selector here,
+    // it is the mode's file level below, and it travels on [`Located`] so the chain that builds
+    // the [`super::Resolution`] reuses it rather than reading the file a second and third time. A
+    // document that is absent answers `None`; one that is present but does not parse fails the run
+    // here ([`anchor_config`]'s reason), before the root is resolved.
+    let anchor = anchor_config(&discovery, adopted)?;
+    if let Some(config) = anchor.as_ref().map(Anchor::config)
+        && config.backend() == storage::Backend::Pg
+    {
+        let mut located = pg_located(discovery, provenance, config)?;
+        located.config_doc = anchor.and_then(Anchor::reusable);
+        return Ok(located);
+    }
+    // The root, or — when the walk-up finds nothing and a pg dsn is addressed — the synthetic root
+    // a pg run lives under (ruling R8): `TINIO_PG_DSN=… tinio doctor` with no `DIR` must diagnose
+    // the database, and a pg run has no served root for the walk-up to find. `rooted` returns
+    // `None` for exactly that arm and nothing else; with no dsn it returns the usage error, so the
+    // no-root-with-no-dsn case is unchanged.
+    let root = match rooted(discovery.dir.as_deref(), from, discovery.pg_dsn.is_some())? {
+        Some(root) => root,
+        None => {
+            let mut located = pg_located(discovery, provenance, &Config::default())?;
+            // **A pg run has exactly one state directory**, so the client pair collapses onto it.
+            // §6's read-only rule is "there is no served root and no relocation", which is why the
+            // pair's other candidate — `<home>/.tinio/roots/<sha256(canonical root)>/`, a
+            // *home-derived* leaf — is a directory this run can never use; and deriving it
+            // canonicalizes the root, which a run that just resolved the dsn's synthetic leaf may
+            // be the first thing to name (the leaf is created by the serving half, and by nothing
+            // the resolution does). The override is what `state_dir_candidates` reads in place of
+            // that derivation, so naming one here is what makes a bare `tinio doctor` resolve at
+            // all.
+            //
+            // **It names the root and not the state directory**, which is the value a pg run's
+            // override always is: `pg_located` hands `TINIO_STATE_DIR` to `pg::resolve_root` as
+            // the root, so an operator-named override already *is* the root here. What this field
+            // is **not** is a signal — `Located::pg_root` is the record of which arm ran, and it
+            // exists precisely because this one is also the operator's `TINIO_STATE_DIR` on a
+            // filesystem run: reading it as "this run is pg" refused a service that had nothing to
+            // do with PostgreSQL.
+            located.state_dir_override = Some(located.root.clone());
+            located.config_doc = anchor.and_then(Anchor::reusable);
+            return Ok(located);
+        }
+    };
     // The config the **mode** is read from, before the state dir is known: `<root>/.tinio`'s own
     // pair, which is readable whatever the mode turns out to be (the root-side file is the one
     // FR-023 keeps readable in read-only mode too). A confined child holding the payload's text
     // is the one caller whose file level is that text rather than a path — `mode_config` states
-    // the two shapes and why neither of them reads `--config` for such a process.
+    // the two shapes and why neither of them reads `--config` for such a process. The anchoring
+    // document, when there is one, is its file level instead of a second read of the same file;
+    // the pair it answers with is also the document the chain that builds the [`super::Resolution`]
+    // reuses, so the file is parsed once for the whole start.
     let file_mode = super::mode_config(
         &root,
         &root.join(RESERVED_SEGMENT),
         discovery.config.as_deref(),
         adopted,
+        anchor.as_ref(),
     )?;
+    // The same selector through the other door (PG13): a root did resolve — positionally or by
+    // the walk-up — and the document under it says pg. The run is refused **here**, where the
+    // type is known and the root is in hand, because `resolve_root` cannot know either.
+    if let Some((config, _)) = file_mode.as_ref()
+        && config.backend() == storage::Backend::Pg
+    {
+        return Err(match discovery.dir.as_deref() {
+            Some(dir) => pg::refuse_positional_dir(dir),
+            None => pg::refuse_discovered_root(&root),
+        });
+    }
     let read_only = resolve_mode(
-        file_mode.as_ref().unwrap_or(&Config::default()),
+        file_mode
+            .as_ref()
+            .map_or(&Config::default(), |(config, _)| config),
         provenance.read_only,
         discovery.read_only,
     );
@@ -398,8 +514,143 @@ fn locate_with(
         root,
         read_only,
         state_dir,
+        // The filesystem arm ran, so this is not a pg run whatever else the run carries.
+        pg_root: None,
         config: discovery.config,
         state_dir_override: discovery.state_dir,
+        config_doc: file_mode,
+    })
+}
+
+/// [`locate`] for a test: the walk-up starts at `from` instead of the process's working
+/// directory.
+///
+/// **Test support, and it is `#[cfg(test)]` for a reason**: the discovered-root arm
+/// (`<root>/.tinio/…`) has no other deterministic entry — the production path reads
+/// `env::current_dir()`, and a test that changed it would race every other test in this binary —
+/// so the seam names the one input instead. Nothing about the resolution differs: the body is
+/// [`locate_in`]'s, and only the walk-up's starting point is supplied.
+///
+/// # Errors
+///
+/// Whatever [`locate`] refuses, including PG13's refusal for a discovered root under
+/// `[storage] type = "pg"`.
+#[cfg(test)]
+pub(crate) fn locate_from(
+    discovery: Discovery,
+    provenance: &Provenance,
+    from: &Path,
+) -> Result<Located, Error> {
+    locate_in(discovery, provenance, None, Some(from))
+}
+
+/// The configuration an operator **named** — `--config`, or the payload text a confinement
+/// launched this process with — parsed for the one question that must be answerable before the
+/// root exists: does this run select the pg backend?
+///
+/// A document that is **absent** answers `None`: it can name no backend, and its absence is
+/// [`config_path`]'s usage error to report where the root is in hand. A document that is present
+/// but **unreadable or unparseable propagates the error** rather than being read as "no backend":
+/// swallowing it here made `tinio server --config <broken>` — with no `DIR` and no `.tinio` above
+/// the working directory — answer [`rooted`]'s storage-root usage error first, so the operator was
+/// sent to look for a root when the configuration was what they had to fix. The error is
+/// [`super::document`]'s own, so it is the same one the load chain would have raised later, at the
+/// same message; a `--config` that parses still answers `Some`, exactly as before.
+///
+/// **The document is read once** ([`super::document`], production's only parse): the same pair
+/// `mode_config` and the chain that builds the [`super::Resolution`] would have read again travels
+/// on [`Located`].
+fn anchor_config(discovery: &Discovery, adopted: Option<&str>) -> Result<Option<Anchor>, Error> {
+    let Some(path) = discovery.config.as_deref() else {
+        return Ok(None);
+    };
+    match adopted {
+        // Exempt text parse: the launcher forwarded this document's bytes unparsed and the
+        // confinement exposes no path to read (design decision 18), so there is nothing for
+        // `Config::load` to open here — this text came from outside the process, not from code.
+        // `mode_config` and `resume` each parse the payload's own text, which is the document
+        // (nothing is read twice, and each exemption stands), so the anchor is the parsed
+        // configuration alone.
+        Some(text) => Ok(Config::parse(text).ok().map(Anchor::Payload)),
+        None if path.is_file() => {
+            let (config, text) = super::document(path)?;
+            Ok(Some(Anchor::Reusable { config, text }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// The document an operator **named**, with its own reusable text when it has one.
+///
+/// The two shapes are the parser's, not this module's: a file was loaded by [`super::document`]
+/// (production's only parse), so the text it was parsed from is the one the later legs reuse, while
+/// a launcher's payload text (design decision 18) is parsed again by those legs themselves and has
+/// no second representation to carry.
+pub(super) enum Anchor {
+    /// A file's document: the configuration, and the text it was loaded from.
+    Reusable { config: Config, text: String },
+    /// A launcher's payload text: the configuration it parsed to, and no text of its own.
+    Payload(Config),
+}
+
+impl Anchor {
+    /// The configuration the anchor parsed, whichever shape it came in.
+    fn config(&self) -> &Config {
+        match self {
+            Self::Reusable { config, .. } | Self::Payload(config) => config,
+        }
+    }
+
+    /// The reusable document [`Located::config_doc`] carries, when this anchor has one.
+    fn reusable(self) -> Option<(Config, String)> {
+        match self {
+            Self::Reusable { config, text } => Some((config, text)),
+            Self::Payload(_) => None,
+        }
+    }
+}
+
+/// The [`Located`] a pg run resolves to (PG5/PG13): the synthetic root, the mode, and the state
+/// directory under that root.
+///
+/// **The mode's file level is the anchoring document** ([`anchor_config`]) when there is one,
+/// which is the run's own configuration — the pg arm exists because that document said `pg`.
+/// [`rooted`]'s R8 fallback is the other caller and has no document at all (there is no root to
+/// find one under), so it passes `Config::default()`: the mode is then the flag and the
+/// environment alone, which is exactly what a run with no configuration file has. Nothing is lost
+/// either way — the document, when there is one, is loaded later by the chain that builds the
+/// [`super::Resolution`] from this value, which is where the pool size and the section's own dsn
+/// are read.
+///
+/// **The state directory never relocates for pg**, whatever the mode: §6's read-only rule is
+/// "there is no served root and no relocation", because the thing the fs relocation protects —
+/// the served root's private state — does not exist here. The root this run resolves is tool
+/// state by construction, so `<root>/.tinio` is the answer in both modes and the read-only
+/// machine's home-derived (`<home>/.tinio/roots/<sha256(root)16>/`) branch is deliberately not
+/// reached (it would also have to canonicalize a root the first run has not created yet).
+fn pg_located(
+    discovery: Discovery,
+    provenance: &Provenance,
+    config: &Config,
+) -> Result<Located, Error> {
+    if let Some(dir) = discovery.dir.as_deref() {
+        return Err(pg::refuse_positional_dir(dir));
+    }
+    let dsn = pg::resolve_dsn(config.pg_section(), discovery.pg_dsn.as_ref())?;
+    let root = pg::resolve_root(&dsn, discovery.state_dir.as_deref())?;
+    let read_only = resolve_mode(config, provenance.read_only, discovery.read_only);
+    let state_dir = resolve_state_dir(&root, false, discovery.state_dir.as_deref())?;
+    Ok(Located {
+        root: root.clone(),
+        read_only,
+        state_dir,
+        // This is the arm that ran, so the root it derived is recorded as the pg run's own.
+        pg_root: Some(root),
+        config: discovery.config,
+        state_dir_override: discovery.state_dir,
+        // The caller threads the anchoring document onto the value it returns (`locate_in`), so the
+        // chain that builds the `Resolution` reuses the one read rather than a second.
+        config_doc: None,
     })
 }
 
@@ -411,7 +662,8 @@ fn locate_with(
 /// [`super::for_doctor()`].
 #[derive(Debug)]
 pub struct Located {
-    /// The served storage root, canonical (FR-020's walk-up included).
+    /// The served storage root, canonical (FR-020's walk-up included) — or, for a pg run, the
+    /// **synthetic** root its configuration and tool state live under ([`super::pg::resolve_root`]).
     pub root: PathBuf,
     /// The resolved mode (decision 4), from the discovery parse's two channels and the root-side
     /// config file.
@@ -420,6 +672,18 @@ pub struct Located {
     pub state_dir: PathBuf,
     /// The explicit `--config`, which must name an existing file (`server`'s alone).
     pub config: Option<PathBuf>,
+    /// The synthetic root the **pg arm** derived, when that is the arm this resolution took
+    /// (PG5/PG13): `Some(root)` for a pg run, `None` for every filesystem one — `TINIO_PG_DSN`
+    /// exported included, which is the whole point of recording it here rather than re-deriving
+    /// it downstream.
+    ///
+    /// **It exists so "this run is a pg one" is a fact rather than an inference.** Every other
+    /// field a consumer could test is ambiguous: `state_dir_override`, for instance, is the
+    /// operator's `TINIO_STATE_DIR` on a filesystem run and the derived root on the dsn-only one,
+    /// so a run that set the variable to its own root would read as pg. The commands that have to
+    /// tell the two apart — the serving half's refusal and the doctor's check list, both through
+    /// `commands::is_pg_root` — read this field.
+    pub pg_root: Option<PathBuf>,
     /// `TINIO_STATE_DIR` as the discovery parse read it, kept for the **candidate pair** a client
     /// probes: it replaces the home-derived candidate in either mode
     /// ([`state_dir_candidates`]), and that answer must be the same one `.env`'s own location
@@ -429,6 +693,17 @@ pub struct Located {
     /// confinement's read-only macOS rule (which reads whether it is there) and
     /// [`super::state_dir_candidates`]'s caller.
     pub state_dir_override: Option<PathBuf>,
+    /// The document the mode was resolved from — the operator's `--config`, or `<root>/.tinio`'s
+    /// own file — **read and parsed once**, as its `Config` beside the text it was parsed from.
+    /// The chain that builds the [`super::Resolution`] reuses the pair instead of reading the file
+    /// again, so a start parses its configuration once rather than twice, whether `--config` named
+    /// it or not.
+    ///
+    /// It is `None` when no document was read at all — no `--config` and no root-side file (which
+    /// the chain's read or auto-create answers), a file that does not parse (the chain's read
+    /// reports the error), and a launcher's payload text: the two legs that read that text parse
+    /// it themselves (design decision 18), so nothing about their exempt `Config::parse` changes.
+    pub config_doc: Option<(Config, String)>,
 }
 
 /// Loads `<state dir>/.env` (FR-016's level 3, design §1 step e).

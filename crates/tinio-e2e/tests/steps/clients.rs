@@ -40,11 +40,11 @@ use std::{
 use assert_cmd::{Command as AssertCmd, cargo::cargo_bin};
 use cucumber::{given, then, when};
 use tinio_sandbox::Event;
-use tinio_util::testing::{job, kill_and_reap};
+use tinio_util::testing::{frame_line, job, kill_and_reap};
 
 use super::{
     FsKind, World,
-    common::{contains_ignore_case, deterministic_bytes, frame_line},
+    common::{contains_ignore_case, deterministic_bytes},
     has_tag,
 };
 use crate::_server::{
@@ -358,9 +358,9 @@ impl Drop for SpawnedServer {
 ///
 /// The child speaks the sandbox's event stream (design decision 19): one SSE frame per event —
 /// an `event:` line, a `data:` line, closed by a blank line. **A frame is not a line**, and the
-/// accumulation this reads with is [`frame_line`]'s — the one home in this crate for the rule
-/// (`steps/common.rs`), which `steps/cli.rs`'s whole-stream reader is written on too. Text that
-/// is not a frame — a log a dependency wrote before the subscriber was installed — does not
+/// accumulation this reads with is [`frame_line`]'s — the one home for the rule
+/// (`tinio_util::testing`), which `steps/cli.rs`'s whole-stream reader is written on too. Text
+/// that is not a frame — a log a dependency wrote before the subscriber was installed — does not
 /// decode and is skipped rather than fatal, which is the property the framing buys. A reader
 /// thread keeps the pipe drained so the child never blocks on a full buffer; the thread exits
 /// when the child dies.
@@ -375,7 +375,7 @@ fn wait_for_ready(stdout: impl Read + Send + 'static, budget: Duration) -> Optio
         let mut line = String::new();
         let mut frame = String::new();
         while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
-            if let Some(event) = frame_line(&mut frame, &line) {
+            if let Some(event) = frame_line(&mut frame, &line, Event::decode) {
                 let _ = tx.send(event);
                 return;
             }

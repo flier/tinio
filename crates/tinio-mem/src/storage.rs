@@ -27,7 +27,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::lock::MutexGuard as AsyncMutexGuard;
 use redb::ReadableTable;
 
 #[cfg(test)]
@@ -244,70 +243,6 @@ impl MemoryStorage {
     /// a test inspects transaction counts through.
     pub fn driver(&self) -> Arc<Driver> {
         self.metadata.driver()
-    }
-
-    /// Take mem's accounting lock: the critical section a counted mutation
-    /// reads and writes in. The versioned single-transaction paths hold this
-    /// guard across their own transaction and meter their raw writes with
-    /// the `*_unlocked` entry points. The lock is **not** reentrant: a
-    /// caller holding it must never call a `*_locked` method.
-    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
-    pub(crate) async fn lock_accounting(&self) -> AsyncMutexGuard<'_, ()> {
-        self.content.lock_accounting().await
-    }
-
-    /// Apply a signed byte delta to the tracked total and enforce
-    /// `max_total_bytes`
-    /// ([`CountingContent::adjust_total_unlocked`]). Call with the
-    /// accounting lock held, inside the write transaction before the commit;
-    /// a failing limit leaves the total unchanged. No-op when no total limit
-    /// is configured.
-    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
-    pub(crate) fn adjust_total_unlocked(&self, delta: i64) -> Result<(), Error> {
-        self.content.adjust_total_unlocked(delta)
-    }
-
-    /// [`Self::adjust_total_unlocked`] with a `credit` the caller is about
-    /// to release: the `max_total_bytes` check forgives those bytes while
-    /// the reservation stays the exact delta, so the total never drifts
-    /// ([[`CountingContent::adjust_total_with_credit_unlocked`]]).
-    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
-    pub(crate) fn adjust_total_with_credit_unlocked(
-        &self,
-        delta: i64,
-        credit: u64,
-    ) -> Result<(), Error> {
-        self.content
-            .adjust_total_with_credit_unlocked(delta, credit)
-    }
-
-    /// Apply a signed byte delta to the tracked total **without** the
-    /// `max_total_bytes` check. The paths that only move or drop bytes the
-    /// backend already holds — a compensation after a failed publish, a
-    /// version delete (whose materialize can re-publish content onto the key
-    /// path), a bucket teardown — must never fail for capacity: the limit
-    /// governs what a client write may **add**, and a backend that refused a
-    /// delete for space would be unusable. The delta is clamped at zero, so a
-    /// compensation that would otherwise fail still lands; a delta that grows
-    /// the total can leave it above the limit, which the next write's check
-    /// then sees (the limit is best-effort, exactly as the type doc says).
-    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
-    pub(crate) fn release_total_unlocked(&self, delta: i64) {
-        self.content.release_total_unlocked(delta);
-    }
-
-    /// [`Self::adjust_total_unlocked`] behind the accounting lock.
-    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
-    pub(crate) async fn adjust_total_locked(&self, delta: i64) -> Result<(), Error> {
-        self.content.adjust_total_locked(delta).await
-    }
-
-    /// The single-object cap check (`max_object_bytes`) without the
-    /// accounting lock — for a caller that already holds it. Never touches
-    /// the total.
-    #[cfg_attr(not(feature = "versioning"), allow(dead_code))]
-    pub(crate) fn check_object_bytes_unlocked(&self, len: u64) -> Result<(), Error> {
-        self.content.check_object_bytes_unlocked(len)
     }
 
     /// The currently tracked total bytes (objects and parts). Meaningful only
@@ -755,12 +690,12 @@ mod tests {
             max_total_bytes: Some(8),
         })
         .unwrap();
-        storage.adjust_total_locked(4).await.unwrap();
+        storage.content().adjust_total_locked(4).await.unwrap();
         assert_eq!(storage.total_bytes(), 4);
         // A rollback subtracts what it reserved, landing exactly on zero.
-        storage.release_total_unlocked(-2);
+        storage.content().release_total_unlocked(-2);
         assert_eq!(storage.total_bytes(), 2);
-        storage.release_total_unlocked(-2);
+        storage.content().release_total_unlocked(-2);
         assert_eq!(storage.total_bytes(), 0);
     }
 
@@ -775,10 +710,10 @@ mod tests {
             max_total_bytes: Some(8),
         })
         .unwrap();
-        storage.adjust_total_unlocked(4).unwrap();
+        storage.content().adjust_total_unlocked(4).unwrap();
         assert_eq!(storage.total_bytes(), 4);
         let underflow = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            storage.adjust_total_unlocked(-5).ok();
+            storage.content().adjust_total_unlocked(-5).ok();
         }));
         assert_eq!(storage.total_bytes(), 0, "the clamp still lands");
         if cfg!(debug_assertions) {
@@ -803,11 +738,11 @@ mod tests {
         {
             // The single-transaction posture: hold the lock, meter with the
             // unlocked pair.
-            let _section = storage.lock_accounting().await;
-            storage.adjust_total_unlocked(6).unwrap();
+            let _section = storage.content().lock_accounting().await;
+            storage.content().adjust_total_unlocked(6).unwrap();
             assert_eq!(storage.total_bytes(), 6);
             // Six more bytes cross the cap without a credit...
-            let err = storage.adjust_total_unlocked(6).unwrap_err();
+            let err = storage.content().adjust_total_unlocked(6).unwrap_err();
             assert!(matches!(
                 err,
                 Error::Storage(storage::Error::EntityTooLarge {
@@ -817,18 +752,24 @@ mod tests {
             ));
             assert_eq!(storage.total_bytes(), 6, "a refusal moves nothing");
             // ... and land with the six bytes the caller is about to release.
-            storage.adjust_total_with_credit_unlocked(6, 6).unwrap();
+            storage
+                .content()
+                .adjust_total_with_credit_unlocked(6, 6)
+                .unwrap();
             assert_eq!(
                 storage.total_bytes(),
                 12,
                 "the credit widens the check, never the reservation"
             );
-            storage.release_total_unlocked(-6);
+            storage.content().release_total_unlocked(-6);
             assert_eq!(storage.total_bytes(), 6);
             // The object cap is checked without the total moving.
-            storage.check_object_bytes_unlocked(6).unwrap();
+            storage.content().check_object_bytes_unlocked(6).unwrap();
             assert!(matches!(
-                storage.check_object_bytes_unlocked(7).unwrap_err(),
+                storage
+                    .content()
+                    .check_object_bytes_unlocked(7)
+                    .unwrap_err(),
                 Error::Storage(storage::Error::EntityTooLarge { size: 7, limit: 6 })
             ));
             assert_eq!(storage.total_bytes(), 6);
@@ -845,8 +786,8 @@ mod tests {
             max_total_bytes: Some(8),
         })
         .unwrap();
-        storage.adjust_total_locked(4).await.unwrap();
-        let err = storage.adjust_total_locked(10).await.unwrap_err();
+        storage.content().adjust_total_locked(4).await.unwrap();
+        let err = storage.content().adjust_total_locked(10).await.unwrap_err();
         let Error::Storage(storage::Error::EntityTooLarge { size, limit }) = err else {
             panic!("expected EntityTooLarge, got {err:?}");
         };

@@ -36,10 +36,10 @@ use tinio_config::{
     state::STATE_DIR_VAR,
 };
 use tinio_sandbox::Event;
-use tinio_util::testing::PipedChild;
+use tinio_util::testing::{PipedChild, frame_line};
 use tokio::time::sleep;
 
-use super::common::{frame_line, signed, tinio_bin, wait_timeout};
+use super::common::{signed, tinio_bin, wait_timeout};
 
 /// A spawned `serve` child with both pipes drained. Killed and reaped when
 /// it drops (see the module doc for the ordering rationale).
@@ -160,7 +160,7 @@ impl Serve {
         let mut frame = String::new();
         self.stdout_lines()
             .iter()
-            .find_map(|line| frame_line(&mut frame, line))
+            .find_map(|line| frame_line(&mut frame, line, Event::decode))
     }
 }
 

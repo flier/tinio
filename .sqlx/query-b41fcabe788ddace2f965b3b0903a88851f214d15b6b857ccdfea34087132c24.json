@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    s.ssl AS \"enabled!\",\n    s.version AS \"version\",\n    s.cipher AS \"cipher\",\n    s.bits AS \"bits\"\nFROM pg_stat_ssl AS s\nWHERE s.pid = pg_backend_pid()\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "enabled!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "pg_stat_ssl",
+            "name": "ssl"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pg_stat_ssl",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "cipher",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pg_stat_ssl",
+            "name": "cipher"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "bits",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "pg_stat_ssl",
+            "name": "bits"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "b41fcabe788ddace2f965b3b0903a88851f214d15b6b857ccdfea34087132c24"
+}

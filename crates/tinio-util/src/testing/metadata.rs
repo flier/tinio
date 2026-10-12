@@ -671,7 +671,181 @@ where
         "a second drain of a bucket with no rows is a no-op"
     );
 
+    advance_stamp_leg(store, Kind::Object).await;
+    advance_stamp_leg(store, Kind::Marker).await;
     restore_leg(store).await;
+}
+
+/// The seed [`advance_stamp_leg`] runs over: the bucket row, the current object
+/// version's row at seq 1, and the slot that records it — the state a supersede
+/// leaves before it moves the slot off the outgoing version. The leg adds only
+/// the rows it actually pins.
+async fn seed_current_object<V>(
+    store: &V,
+    bucket: &bucket::Name,
+    key: &object::Key,
+    v1: &version::Id,
+) where
+    V: Metadata + VersionMeta,
+{
+    BucketMeta::create(store, bucket, &bucket_at(t0()))
+        .await
+        .unwrap();
+    store
+        .put_version(bucket, key, &version_row(1, Some(v1.clone()), Kind::Object))
+        .await
+        .unwrap();
+    store
+        .advance_slot(bucket, key, Some(v1.clone()), 1)
+        .await
+        .unwrap();
+}
+
+/// The forward slot move's stamp ([`VersionMeta::advance_slot`]) over its own
+/// bucket: the row the slot moves off says it stopped being current, in the
+/// same commit that records the incoming version's row — the S5/RG5 rule whose
+/// one contract home is [`VersionMeta::restore_slot`]'s doc bullet ("The row
+/// the slot moves off is stamped [`Stored::became_noncurrent`]"), and which the
+/// [`VersionMeta::advance_slot`] trait doc now states too. It is pinned here
+/// for the forward writer [`restore_leg`] does not cover.
+///
+/// A leg for the **advance** stamp was the suite's gap: the restore stamp sat
+/// here and the forward one did not, so a backend could stop stamping the row
+/// its slot moves off and the suite stayed green (pg did, on the two writers
+/// this leg reaches). The two rows are committed the way a supersede commits
+/// them — the outgoing current version and the incoming one, both with
+/// `became_noncurrent == 0` (the crash window's adopted row is not history yet)
+/// — and the advance that moves the slot off the outgoing row must stamp it.
+/// The contract's two exemptions are pinned too: a move at the same sequence
+/// moves off nothing, and a sequence holding no row has nothing to stamp — the
+/// latter exercised at the end, where the slot is moved **off** a sequence that
+/// holds no row.
+///
+/// **The leg is parameterized over the incoming row's kind**, because the same
+/// move serves both writers the delete shape needs: an **object** successor
+/// (the supersede) and a **delete marker** — the versioned delete, reached here
+/// through the same [`VersionMeta::advance_slot`] call because the store's own
+/// delete writer is not a [`VersionMeta`] method (fs discharges the obligation
+/// on `delete_versioned` → `stamp_superseded`, pg on `mark_current_marker`).
+/// The marker arm adds the one assertion the object arm cannot make — the bit
+/// [`VersionMeta::current_slot`] answers from the row's kind — and shares the
+/// rest, so a leg over the object shape alone cannot leave the marker's state
+/// unconstructed.
+async fn advance_stamp_leg<V>(store: &V, kind: Kind)
+where
+    V: Metadata + VersionMeta,
+{
+    let (bucket, key) = match kind {
+        Kind::Object => (bucket_name("conf-version-advance"), key("advance.txt")),
+        Kind::Marker => (
+            bucket_name("conf-version-marker-stamp"),
+            key("marker-stamp.txt"),
+        ),
+    };
+    let v1 = version::Id::new("v1").expect("a valid version id");
+    let v2 = version::Id::new(if kind == Kind::Marker { "m1" } else { "v2" })
+        .expect("a valid version id");
+    let v3 = version::Id::new("v3").expect("a valid version id");
+
+    // The seed: the outgoing current version's row at seq 1, with the slot that
+    // records it — not history yet.
+    seed_current_object(store, &bucket, &key, &v1).await;
+    assert_eq!(
+        store
+            .get_version(&bucket, &key, 1)
+            .await
+            .unwrap()
+            .expect("the current version's own row")
+            .became_noncurrent,
+        0,
+        "the row the slot records is the current version's: not history yet"
+    );
+    // The incoming version's row, committed beside the outgoing one as a
+    // supersede commits them, both unstamped.
+    store
+        .put_version(&bucket, &key, &version_row(2, Some(v2.clone()), kind))
+        .await
+        .unwrap();
+
+    // The advance moves the slot off seq 1: that row stopped being current in
+    // this commit, so it carries the stamp. The incoming version's own row at
+    // seq 2 does not.
+    store
+        .advance_slot(&bucket, &key, Some(v2.clone()), 2)
+        .await
+        .unwrap();
+    assert_ne!(
+        store
+            .get_version(&bucket, &key, 1)
+            .await
+            .unwrap()
+            .expect("the moved-off row stays")
+            .became_noncurrent,
+        0,
+        "the advance stamps the row it moves off (S5/RG5)"
+    );
+    assert_eq!(
+        store
+            .get_version(&bucket, &key, 2)
+            .await
+            .unwrap()
+            .expect("the incoming version's row")
+            .became_noncurrent,
+        0,
+        "the incoming version's own row is not history"
+    );
+    if kind == Kind::Marker {
+        let slot = store
+            .current_slot(&bucket, &key)
+            .await
+            .unwrap()
+            .expect("a delete marker is a legitimate current");
+        assert!(
+            slot.is_delete_marker,
+            "the current row's kind, not the slot, decides a marker"
+        );
+    }
+
+    // The same-sequence re-run is the crash window's own commit: it moves off
+    // nothing, so the current version's row stays unstamped.
+    store
+        .advance_slot(&bucket, &key, Some(v2), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_version(&bucket, &key, 2)
+            .await
+            .unwrap()
+            .expect("the current version's row")
+            .became_noncurrent,
+        0,
+        "a same-sequence re-run does not stamp the current version's row"
+    );
+
+    // A move onto a sequence holding no version row is legal — the slot is the
+    // recorded fact — and writes no version row.
+    store
+        .advance_slot(&bucket, &key, Some(v3.clone()), 7)
+        .await
+        .unwrap();
+    assert!(
+        store.get_version(&bucket, &key, 7).await.unwrap().is_none(),
+        "an advance onto a free sequence writes no version row"
+    );
+
+    // The row-less exemption is about the sequence being **left**: the slot now
+    // records seq 7, which holds no version row, so advancing away from it
+    // moves off a sequence with nothing to stamp — the call succeeds and the
+    // missing row is neither errored on nor fabricated.
+    store
+        .advance_slot(&bucket, &key, Some(v3), 8)
+        .await
+        .unwrap();
+    assert!(
+        store.get_version(&bucket, &key, 7).await.unwrap().is_none(),
+        "an advance off a row-less sequence stamps nothing and fabricates nothing"
+    );
 }
 
 /// The restore's commit ([`VersionMeta::restore_slot`]) over its own bucket, so

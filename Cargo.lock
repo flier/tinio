@@ -4766,6 +4766,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "daemonize",
+ "dirs 7.0.0",
  "either",
  "futures",
  "handlebars",
@@ -4773,6 +4774,7 @@ dependencies = [
  "parse-display",
  "rustix 1.1.4",
  "sd-notify",
+ "secrecy",
  "serde",
  "serde_json",
  "service-manager",
@@ -4786,8 +4788,10 @@ dependencies = [
  "tinio-core",
  "tinio-fs",
  "tinio-mem",
+ "tinio-pg",
  "tinio-sandbox",
  "tinio-server",
+ "tinio-store-pg",
  "tinio-util",
  "tokio",
  "tracing",
@@ -4835,6 +4839,7 @@ dependencies = [
  "parse-display",
  "percent-encoding",
  "proptest",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
@@ -4855,21 +4860,19 @@ dependencies = [
  "cucumber",
  "flate2",
  "futures",
- "hmac",
  "http",
  "hyper-util",
  "md-5",
  "percent-encoding",
- "proc-macro2",
  "rustix 1.1.4",
  "secrecy",
- "sha2 0.11.0",
- "syn 3.0.5",
+ "sqlx",
  "tempfile",
  "tinio-api",
  "tinio-core",
  "tinio-fs",
  "tinio-mem",
+ "tinio-pg",
  "tinio-sandbox",
  "tinio-sandbox-windows",
  "tinio-server",
@@ -4950,10 +4953,30 @@ dependencies = [
  "tinio-blob",
  "tinio-core",
  "tinio-store-redb",
+ "tinio-util",
  "tinio-version",
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "tinio-pg"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "derive_more",
+ "futures",
+ "secrecy",
+ "thiserror 2.0.20",
+ "tinio-blob",
+ "tinio-core",
+ "tinio-ops",
+ "tinio-pg",
+ "tinio-store-pg",
+ "tinio-util",
+ "tinio-version",
+ "tokio",
 ]
 
 [[package]]
@@ -5160,17 +5183,18 @@ dependencies = [
 name = "tinio-util"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "derive_more",
  "futures",
  "handlebars",
+ "hmac",
  "papaya",
- "proc-macro2",
  "rustix 1.1.4",
  "secrecy",
  "serde",
  "serde_json",
- "syn 3.0.5",
+ "sha2 0.11.0",
  "tempfile",
  "tinio-core",
  "tokio",
@@ -5191,6 +5215,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tinio-blob",
  "tinio-core",
+ "tinio-util",
  "tokio",
 ]
 

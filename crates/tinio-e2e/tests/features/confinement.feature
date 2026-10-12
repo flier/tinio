@@ -495,7 +495,7 @@ Feature: Confinement
     When I run "tinio server {root} --port 0 --sandbox"
     Then the readiness line reports a bound port
     And the root publishes a state file only when the run is serving
-    And its stderr contains "the confinement cuts the outbound path the OTLP exporter is the only user of"
+    And its stderr contains "the confinement cuts the outbound path only the OTLP exporter uses"
     And its stderr contains "channel=`--sandbox`"
     And its stderr contains "endpoint=http://127.0.0.1:4317"
 

@@ -1359,7 +1359,10 @@ mod tests {
         /// (S3-specific: `x-amz-content-sha256` is required and computes
         /// over the payload). Mirrors the canonicalization s3s verifies
         /// in `ops/signature.rs`.
-        #[allow(clippy::too_many_arguments)]
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "the SigV4 canonical request's inputs — access key, secret, method, path, host, the two dates and the payload hash — taken positionally because the test helper mirrors `ops/signature.rs`'s canonicalization"
+        )]
         fn authorization(
             access_key: &str,
             secret: &str,

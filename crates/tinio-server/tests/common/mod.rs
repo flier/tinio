@@ -74,7 +74,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tinio_core::acl::DEFAULT_ROOT_ACCESS_KEY;
 use tinio_sandbox::Event;
-use tinio_util::testing::wait_timeout_secs;
+use tinio_util::testing::{frame_line, wait_timeout_secs};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -156,16 +156,9 @@ pub fn dechunk(mut rest: &[u8]) -> Vec<u8> {
 }
 
 /// The text between the first `open`/`close` pair — empty when either is
-/// absent, so a missing tag never yields a garbage slice.
-pub fn extract(text: &str, open: &str, close: &str) -> String {
-    let Some(start) = text.find(open).map(|i| i + open.len()) else {
-        return String::new();
-    };
-    let Some(end) = text[start..].find(close).map(|i| start + i) else {
-        return String::new();
-    };
-    text[start..end].to_string()
-}
+/// absent, so a missing tag never yields a garbage slice. The rule is
+/// [`tinio_util::testing::extract`]'s, re-exported rather than copied.
+pub use tinio_util::testing::extract;
 
 /// Whether a connect failure is the Windows loopback accept race (a
 /// connection aborted in the accept queue) — the e2e harness retries these
@@ -240,7 +233,10 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 /// `host;x-amz-content-sha256;x-amz-date` — the canonicalization s3s verifies
 /// in `ops/signature.rs`, mirrored from `data.rs`'s acl test
 /// (`x-amz-content-sha256` is S3-specific and covers the payload).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the SigV4 canonical request's inputs — access key, secret, method, path, host, the two dates and the payload hash — taken positionally because the helper mirrors `data.rs`'s acl test signing"
+)]
 fn authorization(
     access_key: &str,
     secret: &str,
@@ -386,30 +382,6 @@ pub fn wait_timeout() -> Duration {
     Duration::from_secs(wait_timeout_secs())
 }
 
-/// Feed one line of a child's event stream into `frame`, returning the event
-/// when the line closes a frame, and clearing `frame` either way.
-///
-/// **A frame is not a line.** [`Event::encode`] writes an `event:` line, a
-/// `data:` line and the blank line that closes them, so a decoder fed one line
-/// at a time sees an event name with no payload and drops it; accumulating to
-/// the blank line is what makes that line the frame's end rather than a line to
-/// skip. Text that is not one of our frames is dropped rather than fatal, which
-/// is what makes a stray write to stdout harmless (design §12).
-///
-/// The line's own terminator is not significant: it is trimmed and re-emitted
-/// as `\n`, so a reader holding a pipe's raw CRLF and one holding an already
-/// trimmed line build the same frame text, which `sse-core` dispatches alike.
-pub fn frame_line(frame: &mut String, line: &str) -> Option<Event> {
-    if line.trim_end().is_empty() {
-        let event = Event::decode(frame);
-        frame.clear();
-        return event;
-    }
-    frame.push_str(line.trim_end());
-    frame.push('\n');
-    None
-}
-
 /// Read a spawned child's event stream until `listening` arrives, and hand back
 /// the endpoint it bound — or the message the caller's own `fail` renders.
 ///
@@ -473,7 +445,7 @@ pub fn wait_for_listening_in(lines: &mpsc::Receiver<String>) -> Result<SocketAdd
         let left = deadline.saturating_duration_since(Instant::now());
         match lines.recv_timeout(left) {
             Ok(line) => {
-                if let Some(event) = frame_line(&mut frame, &line) {
+                if let Some(event) = frame_line(&mut frame, &line, Event::decode) {
                     return match event {
                         Event::Listening { addr } => Ok(addr),
                         Event::Error { message } => {
@@ -601,5 +573,9 @@ pub fn answer(addr: SocketAddr) -> Result<String, String> {
 // "none of them uses everything" fact the module-wide `dead_code` allow above records,
 // which a lint reading one target at a time cannot see.
 #[cfg(target_os = "macos")]
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    clippy::allow_attributes,
+    reason = "test support: every target that declares `mod common;` compiles this re-export and only `sandbox_macos_e2e.rs` calls it, so a lint reading one target at a time cannot see the use — an `expect` here is unfulfilled in the targets that do call it"
+)]
 pub use tinio_util::testing::sweep_confined_grandchild;

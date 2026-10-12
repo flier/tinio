@@ -30,10 +30,9 @@
 //! of `crates/tinio-cli/src/events.rs` and `contracts/cli.md:59`), read off the child's stdout
 //! **file**, and only then asserts the child is still alive.
 //!
-//! **Every spawn goes through `job::spawn`** — the one spelling a harness's spawn sites use, held
-//! up by `crates/tinio-util/tests/spawn_guard.rs`'s scan of `crates/*/tests/**` — and every path
-//! out kills and reaps the child, so a failing assertion never leaves a server holding the root's
-//! state database.
+//! **Every spawn goes through `job::spawn`** — the one spelling a harness's spawn sites use
+//! (docs/tests.md §Harness & guards) — and every path out kills and reaps the child, so a failing
+//! assertion never leaves a server holding the root's state database.
 
 // **A test-support root (docs/style.md §Panics), and a stated one because clippy's test keys do
 // not reach it** (design 2026-10-09 D7): `allow-*-in-tests` covers `#[test]` functions and
@@ -97,7 +96,20 @@ fn bin() -> Command {
 }
 
 /// A scratch directory, a served root inside it, and a config path beside that root.
+///
+/// **On macOS the scratch directory lives under `/tmp`, and that is `sun_path`'s doing
+/// rather than tidiness.** A start's control socket is `<root>/.tinio/tinio-<16 hex>.sock`,
+/// `sun_path` is **104 bytes** on this platform, and `$TMPDIR` there is
+/// `/private/var/folders/<xx>/<hash>/T/` — 57 bytes before `tempfile` adds its ten — so a
+/// temp-rooted socket passes the limit and the server refuses to start instead of serving.
+/// `/tmp` is the platform's short scratch area (canonical `/private/tmp`, 12 bytes), the
+/// same reason `sandbox_macos_e2e.rs`, `injection.rs` and the e2e harness's `scratch_dir`
+/// reach for it; every other platform's `$TMPDIR` is already short, so its default stands
+/// and this target's behaviour there is unchanged.
 fn temp_root() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    #[cfg(target_os = "macos")]
+    let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
+    #[cfg(not(target_os = "macos"))]
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("root");
     fs::create_dir_all(&root).expect("root");

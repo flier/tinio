@@ -32,6 +32,7 @@ tinio-util = { workspace = true, features = ["testing"] }
 
 [lints.clippy]
 absolute_paths = "warn"
+allow_attributes = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"

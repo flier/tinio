@@ -61,6 +61,7 @@ const POLL: Duration = Duration::from_millis(100);
 ///     config: None,
 ///     read_only: false,
 ///     state_dir: None,
+///     pg_dsn: None,
 /// };
 /// let located = locate(discovery, &Provenance::default())?;
 /// let args = Args {

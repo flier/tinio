@@ -118,8 +118,10 @@ impl StoredKeyed {
 
 /// Decode one object row from the stored columns: the four derived elements
 /// and the checksum are the wire/instant values, the tags and ACL arrive as
-/// the contract types.
-fn object_row(
+/// the contract types. Shared with the bucket-wide version listing, whose
+/// join reads the same seven columns: one definer for the decode keeps a
+/// listing's elements and a walk's row the same row.
+pub(crate) fn object_row(
     etag: &str,
     size: i64,
     mtime: OffsetDateTime,
@@ -166,6 +168,52 @@ pub(crate) async fn upsert_object(
     Ok(())
 }
 
+/// Write one object row and its retained parts together: the row itself —
+/// upserted from `row`, or deleted when it is `None` — then the part list that
+/// replaces whatever the object held before, because an overwrite is a fresh
+/// object. Answers whether the row write touched a row, so a caller reporting
+/// an idempotent removal reads the delete's own count rather than re-spelling
+/// the statement.
+async fn write_object_row(
+    tx: &mut PgTx,
+    bucket: &bucket::Name,
+    key: &object::Key,
+    row: Option<&ObjectRow>,
+    parts: &[PartRow],
+) -> Result<bool, Error> {
+    let written = match row {
+        Some(row) => {
+            upsert_object(tx, bucket, key, row).await?;
+            true
+        }
+        None => {
+            sqlx::query_file!("sql/meta/object/delete_object_row.sql", bucket, key)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected()
+                > 0
+        }
+    };
+    sqlx::query_file!("sql/meta/object/clear_object_parts.sql", bucket, key)
+        .execute(&mut **tx)
+        .await?;
+    if !parts.is_empty() {
+        let (numbers, sizes, algorithms, values) = part_arrays(parts);
+        sqlx::query_file!(
+            "sql/meta/object/put_with_parts.sql",
+            bucket,
+            key,
+            &numbers,
+            &sizes,
+            &algorithms,
+            &values
+        )
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(written)
+}
+
 /// The retained part list's element vectors, in the order the relation stores
 /// them, so a list is written with one unnest statement.
 fn part_arrays(parts: &[PartRow]) -> (Vec<i64>, Vec<i64>, Vec<String>, Vec<String>) {
@@ -203,12 +251,7 @@ impl ObjectMeta for PgStore {
         row: &ObjectRow,
     ) -> Result<(), Error> {
         let mut tx = begin(self.pool()).await?;
-        upsert_object(&mut tx, bucket, key, row).await?;
-        // An overwrite is a fresh object: the parts of the object it replaces
-        // must not survive it, and they retire in the same transaction.
-        sqlx::query_file!("sql/meta/object/clear_object_parts.sql", bucket, key)
-            .execute(&mut *tx)
-            .await?;
+        write_object_row(&mut tx, bucket, key, Some(row), &[]).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -221,14 +264,9 @@ impl ObjectMeta for PgStore {
     ) -> Result<(), Error> {
         // The bucket row stays locked across the upsert, so a concurrent
         // remove_if_empty cannot commit an empty-bucket delete underneath it.
-        // The column list is upsert_object's: the guard is the lock, not a
-        // second copy of the write.
         let mut tx = begin(self.pool()).await?;
         assert_bucket_row(&mut tx, bucket).await?;
-        upsert_object(&mut tx, bucket, key, row).await?;
-        sqlx::query_file!("sql/meta/object/clear_object_parts.sql", bucket, key)
-            .execute(&mut *tx)
-            .await?;
+        write_object_row(&mut tx, bucket, key, Some(row), &[]).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -242,24 +280,7 @@ impl ObjectMeta for PgStore {
     ) -> Result<(), Error> {
         let mut tx = begin(self.pool()).await?;
         assert_bucket_row(&mut tx, bucket).await?;
-        upsert_object(&mut tx, bucket, key, row).await?;
-        sqlx::query_file!("sql/meta/object/clear_object_parts.sql", bucket, key)
-            .execute(&mut *tx)
-            .await?;
-        if !parts.is_empty() {
-            let (numbers, sizes, algorithms, values) = part_arrays(parts);
-            sqlx::query_file!(
-                "sql/meta/object/put_with_parts.sql",
-                bucket,
-                key,
-                &numbers,
-                &sizes,
-                &algorithms,
-                &values
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
+        write_object_row(&mut tx, bucket, key, Some(row), parts).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -460,10 +481,49 @@ impl ObjectMeta for PgStore {
     ) -> Result<(), Error> {
         let mut tx = begin(self.pool()).await?;
         let mut wires = Vec::with_capacity(rows.len());
-        for (key, row) in rows {
-            upsert_object(&mut tx, bucket, key, row).await?;
-            wires.push(key.to_string());
+        let mut etags = Vec::with_capacity(rows.len());
+        let mut sizes = Vec::with_capacity(rows.len());
+        let mut mtimes = Vec::with_capacity(rows.len());
+        let mut identities = Vec::with_capacity(rows.len());
+        let mut tags = Vec::with_capacity(rows.len());
+        let mut checksums = Vec::with_capacity(rows.len());
+        let mut acls = Vec::with_capacity(rows.len());
+        // One statement cannot touch a key twice, so a key that appears twice in
+        // the batch is written once — from its last row, which is the write the
+        // per-row loop would have left standing.
+        let mut last: HashMap<&object::Key, usize> = HashMap::with_capacity(rows.len());
+        for (index, (key, _row)) in rows.iter().enumerate() {
+            last.insert(key, index);
         }
+        for (index, (key, row)) in rows.iter().enumerate() {
+            if last.get(key) != Some(&index) {
+                continue;
+            }
+            wires.push(key.to_string());
+            etags.push(row.etag.as_str().to_owned());
+            sizes.push(row.size as i64);
+            mtimes.push(to_timestamp(row.mtime));
+            identities.push(row.identity as i64);
+            tags.push(row.tags.clone());
+            checksums.push(checksum_wire(row));
+            acls.push(acl_composite(row.owner.as_ref(), &row.acl.grants));
+        }
+        // One statement for the whole batch, the unnest shape the parts path
+        // writes with: the rows land together instead of one statement apiece.
+        sqlx::query_file!(
+            "sql/meta/object/put_batch.sql",
+            bucket,
+            &wires,
+            &etags,
+            &sizes,
+            &mtimes,
+            &identities,
+            &tags as _,
+            &checksums,
+            &acls as _
+        )
+        .execute(&mut *tx)
+        .await?;
         sqlx::query!(
             "DELETE FROM object_parts WHERE bucket = $1 AND key = ANY($2)",
             bucket,
@@ -477,14 +537,24 @@ impl ObjectMeta for PgStore {
 
     async fn remove(&self, bucket: &bucket::Name, key: &object::Key) -> Result<bool, Error> {
         let mut tx = begin(self.pool()).await?;
-        let removed = sqlx::query_file!("sql/meta/object/delete_object_row.sql", bucket, key)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query_file!("sql/meta/object/clear_object_parts.sql", bucket, key)
-            .execute(&mut *tx)
-            .await?;
+        let removed = write_object_row(&mut tx, bucket, key, None, &[]).await?;
+        // The key's version slot leaves with the row it belongs to: a slot IS
+        // object-row state (a delete marker is exactly a recorded slot whose
+        // row carries no bytes), so a row-less slot would be a fact the model
+        // has no state for — and a writer that later took that key would be
+        // refused by `advance_slot`'s monotonic guard for a sequence nothing
+        // records any more. Removing the last version of a key therefore
+        // removes the slot, and the key is a key no version was ever recorded
+        // for.
+        sqlx::query!(
+            "DELETE FROM current_slots WHERE bucket = $1 AND key = $2",
+            bucket,
+            key
+        )
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
-        Ok(removed.rows_affected() > 0)
+        Ok(removed)
     }
 
     async fn remove_many(&self, bucket: &bucket::Name, keys: &[object::Key]) -> Result<(), Error> {
@@ -499,6 +569,19 @@ impl ObjectMeta for PgStore {
         .await?;
         sqlx::query!(
             "DELETE FROM object_parts WHERE bucket = $1 AND key = ANY($2)",
+            bucket,
+            &wires
+        )
+        .execute(&mut *tx)
+        .await?;
+        // Every key's version slot leaves with its row, exactly as `remove` clears
+        // it: the slot IS object-row state (the contract's own rule), so a batch
+        // removal must not leave a row-less slot behind. This is the path
+        // `Cleanup` uses to retire many versioned keys at once, and a stale slot
+        // would make the next advance from below its sequence a rewind. One
+        // statement for the batch, `remove`'s per-key text widened to the wires.
+        sqlx::query!(
+            "DELETE FROM current_slots WHERE bucket = $1 AND key = ANY($2)",
             bucket,
             &wires
         )

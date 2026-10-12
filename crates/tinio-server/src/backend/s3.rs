@@ -1,312 +1,55 @@
+//! The s3s `S3` dispatch over [`S3Backend`] — **generated from the ops table**
+//! ([`tinio_s3_ops`]), so an operation is declared in exactly one place.
+//!
+//! Each row of `backend/ops.rs` names its s3s trait method (the row's own
+//! name), its dto pair, and — through `#[handler(...)]` — the inherent method
+//! on `S3Backend` that answers it. This module expands the table into the
+//! forwarding `impl`: one arm per row, under the row's own `#[cfg]`, calling
+//! `self.<handler>(req)`. The body of every arm is the same three lines, so
+//! there is nothing here to keep in step with the table by hand.
+//!
+//! **What the compiler holds.** The arm's name comes from the row and the
+//! trait's own signature fixes its dto pair, so a row that names a handler
+//! that does not exist (`E0599`), or one whose dtos do not match (`E0308`),
+//! keeps the crate from building — the "operation no dispatch arm answers, a
+//! 501 waiting to happen" failure the source-parsing cross-check used to
+//! catch. A dispatch arm the table does not describe cannot be written at
+//! all: the whole `impl` is generated, and a hand-added second `impl S3 for
+//! S3Backend` would be a conflicting implementation (`E0119`).
+//!
+//! The handlers themselves live beside their operation groups —
+//! `buckets.rs`, `objects.rs`, `listing.rs`, `multipart.rs`, `cors.rs`,
+//! `select.rs`, `versioning.rs` — as `pub(crate) async fn op_<name>`.
+
 use async_trait::async_trait;
 use s3s::{S3, S3Request, S3Response, S3Result, dto};
 
-use super::S3Backend;
+use super::{S3Backend, ops::tinio_s3_ops};
 use crate::_core::storage::Storage;
 
-#[async_trait]
-impl<S: Storage> S3 for S3Backend<S> {
-    // --- buckets (T047) ---
-    async fn create_bucket(
-        &self,
-        req: S3Request<dto::CreateBucketInput>,
-    ) -> S3Result<S3Response<dto::CreateBucketOutput>> {
-        self.op_create_bucket(req).await
-    }
-
-    async fn delete_bucket(
-        &self,
-        req: S3Request<dto::DeleteBucketInput>,
-    ) -> S3Result<S3Response<dto::DeleteBucketOutput>> {
-        self.op_delete_bucket(req).await
-    }
-
-    async fn head_bucket(
-        &self,
-        req: S3Request<dto::HeadBucketInput>,
-    ) -> S3Result<S3Response<dto::HeadBucketOutput>> {
-        self.op_head_bucket(req).await
-    }
-
-    async fn list_buckets(
-        &self,
-        req: S3Request<dto::ListBucketsInput>,
-    ) -> S3Result<S3Response<dto::ListBucketsOutput>> {
-        self.op_list_buckets(req).await
-    }
-
-    async fn get_bucket_location(
-        &self,
-        req: S3Request<dto::GetBucketLocationInput>,
-    ) -> S3Result<S3Response<dto::GetBucketLocationOutput>> {
-        self.op_get_bucket_location(req).await
-    }
-
-    // --- bucket tagging (spec 2026-08-31) ---
-    async fn get_bucket_tagging(
-        &self,
-        req: S3Request<dto::GetBucketTaggingInput>,
-    ) -> S3Result<S3Response<dto::GetBucketTaggingOutput>> {
-        self.op_get_bucket_tagging(req).await
-    }
-
-    async fn put_bucket_tagging(
-        &self,
-        req: S3Request<dto::PutBucketTaggingInput>,
-    ) -> S3Result<S3Response<dto::PutBucketTaggingOutput>> {
-        self.op_put_bucket_tagging(req).await
-    }
-
-    async fn delete_bucket_tagging(
-        &self,
-        req: S3Request<dto::DeleteBucketTaggingInput>,
-    ) -> S3Result<S3Response<dto::DeleteBucketTaggingOutput>> {
-        self.op_delete_bucket_tagging(req).await
-    }
-
-    // --- bucket CORS (spec 2026-09-05) ---
-    #[cfg(feature = "cors")]
-    async fn get_bucket_cors(
-        &self,
-        req: S3Request<dto::GetBucketCorsInput>,
-    ) -> S3Result<S3Response<dto::GetBucketCorsOutput>> {
-        self.op_get_bucket_cors(req).await
-    }
-
-    #[cfg(feature = "cors")]
-    async fn put_bucket_cors(
-        &self,
-        req: S3Request<dto::PutBucketCorsInput>,
-    ) -> S3Result<S3Response<dto::PutBucketCorsOutput>> {
-        self.op_put_bucket_cors(req).await
-    }
-
-    #[cfg(feature = "cors")]
-    async fn delete_bucket_cors(
-        &self,
-        req: S3Request<dto::DeleteBucketCorsInput>,
-    ) -> S3Result<S3Response<dto::DeleteBucketCorsOutput>> {
-        self.op_delete_bucket_cors(req).await
-    }
-
-    // --- bucket/object ACL (spec 2026-09-05) ---
-    #[cfg(feature = "acl")]
-    async fn get_bucket_acl(
-        &self,
-        req: S3Request<dto::GetBucketAclInput>,
-    ) -> S3Result<S3Response<dto::GetBucketAclOutput>> {
-        self.op_get_bucket_acl(req).await
-    }
-
-    #[cfg(feature = "acl")]
-    async fn put_bucket_acl(
-        &self,
-        req: S3Request<dto::PutBucketAclInput>,
-    ) -> S3Result<S3Response<dto::PutBucketAclOutput>> {
-        self.op_put_bucket_acl(req).await
-    }
-
-    #[cfg(feature = "acl")]
-    async fn get_object_acl(
-        &self,
-        req: S3Request<dto::GetObjectAclInput>,
-    ) -> S3Result<S3Response<dto::GetObjectAclOutput>> {
-        self.op_get_object_acl(req).await
-    }
-
-    #[cfg(feature = "acl")]
-    async fn put_object_acl(
-        &self,
-        req: S3Request<dto::PutObjectAclInput>,
-    ) -> S3Result<S3Response<dto::PutObjectAclOutput>> {
-        self.op_put_object_acl(req).await
-    }
-
-    // --- objects + copy (T048) ---
-    async fn put_object(
-        &self,
-        req: S3Request<dto::PutObjectInput>,
-    ) -> S3Result<S3Response<dto::PutObjectOutput>> {
-        self.op_put_object(req).await
-    }
-
-    async fn get_object(
-        &self,
-        req: S3Request<dto::GetObjectInput>,
-    ) -> S3Result<S3Response<dto::GetObjectOutput>> {
-        self.op_get_object(req).await
-    }
-
-    async fn head_object(
-        &self,
-        req: S3Request<dto::HeadObjectInput>,
-    ) -> S3Result<S3Response<dto::HeadObjectOutput>> {
-        self.op_head_object(req).await
-    }
-
-    async fn get_object_attributes(
-        &self,
-        req: S3Request<dto::GetObjectAttributesInput>,
-    ) -> S3Result<S3Response<dto::GetObjectAttributesOutput>> {
-        self.op_get_object_attributes(req).await
-    }
-
-    async fn delete_object(
-        &self,
-        req: S3Request<dto::DeleteObjectInput>,
-    ) -> S3Result<S3Response<dto::DeleteObjectOutput>> {
-        self.op_delete_object(req).await
-    }
-
-    async fn delete_objects(
-        &self,
-        req: S3Request<dto::DeleteObjectsInput>,
-    ) -> S3Result<S3Response<dto::DeleteObjectsOutput>> {
-        self.op_delete_objects(req).await
-    }
-
-    async fn get_object_tagging(
-        &self,
-        req: S3Request<dto::GetObjectTaggingInput>,
-    ) -> S3Result<S3Response<dto::GetObjectTaggingOutput>> {
-        self.op_get_object_tagging(req).await
-    }
-
-    async fn put_object_tagging(
-        &self,
-        req: S3Request<dto::PutObjectTaggingInput>,
-    ) -> S3Result<S3Response<dto::PutObjectTaggingOutput>> {
-        self.op_put_object_tagging(req).await
-    }
-
-    async fn delete_object_tagging(
-        &self,
-        req: S3Request<dto::DeleteObjectTaggingInput>,
-    ) -> S3Result<S3Response<dto::DeleteObjectTaggingOutput>> {
-        self.op_delete_object_tagging(req).await
-    }
-
-    #[cfg(feature = "copy")]
-    async fn copy_object(
-        &self,
-        req: S3Request<dto::CopyObjectInput>,
-    ) -> S3Result<S3Response<dto::CopyObjectOutput>> {
-        self.op_copy_object(req).await
-    }
-
-    #[cfg(feature = "copy")]
-    async fn rename_object(
-        &self,
-        req: S3Request<dto::RenameObjectInput>,
-    ) -> S3Result<S3Response<dto::RenameObjectOutput>> {
-        self.op_rename_object(req).await
-    }
-
-    // --- listing (T049) ---
-    #[cfg(feature = "list-v1")]
-    async fn list_objects(
-        &self,
-        req: S3Request<dto::ListObjectsInput>,
-    ) -> S3Result<S3Response<dto::ListObjectsOutput>> {
-        self.op_list_objects(req).await
-    }
-
-    #[cfg(feature = "list-v2")]
-    async fn list_objects_v2(
-        &self,
-        req: S3Request<dto::ListObjectsV2Input>,
-    ) -> S3Result<S3Response<dto::ListObjectsV2Output>> {
-        self.op_list_objects_v2(req).await
-    }
-
-    // --- multipart (T050) ---
-    #[cfg(feature = "multipart")]
-    async fn create_multipart_upload(
-        &self,
-        req: S3Request<dto::CreateMultipartUploadInput>,
-    ) -> S3Result<S3Response<dto::CreateMultipartUploadOutput>> {
-        self.op_create_multipart_upload(req).await
-    }
-
-    #[cfg(feature = "multipart")]
-    async fn upload_part(
-        &self,
-        req: S3Request<dto::UploadPartInput>,
-    ) -> S3Result<S3Response<dto::UploadPartOutput>> {
-        self.op_upload_part(req).await
-    }
-
-    #[cfg(all(feature = "multipart", feature = "copy"))]
-    async fn upload_part_copy(
-        &self,
-        req: S3Request<dto::UploadPartCopyInput>,
-    ) -> S3Result<S3Response<dto::UploadPartCopyOutput>> {
-        self.op_upload_part_copy(req).await
-    }
-
-    #[cfg(feature = "multipart")]
-    async fn complete_multipart_upload(
-        &self,
-        req: S3Request<dto::CompleteMultipartUploadInput>,
-    ) -> S3Result<S3Response<dto::CompleteMultipartUploadOutput>> {
-        self.op_complete_multipart_upload(req).await
-    }
-
-    #[cfg(feature = "multipart")]
-    async fn abort_multipart_upload(
-        &self,
-        req: S3Request<dto::AbortMultipartUploadInput>,
-    ) -> S3Result<S3Response<dto::AbortMultipartUploadOutput>> {
-        self.op_abort_multipart_upload(req).await
-    }
-
-    #[cfg(feature = "multipart")]
-    async fn list_parts(
-        &self,
-        req: S3Request<dto::ListPartsInput>,
-    ) -> S3Result<S3Response<dto::ListPartsOutput>> {
-        self.op_list_parts(req).await
-    }
-
-    #[cfg(feature = "multipart")]
-    async fn list_multipart_uploads(
-        &self,
-        req: S3Request<dto::ListMultipartUploadsInput>,
-    ) -> S3Result<S3Response<dto::ListMultipartUploadsOutput>> {
-        self.op_list_multipart_uploads(req).await
-    }
-
-    // --- select (spec 2026-09-04) ---
-    #[cfg(feature = "select")]
-    async fn select_object_content(
-        &self,
-        req: S3Request<dto::SelectObjectContentInput>,
-    ) -> S3Result<S3Response<dto::SelectObjectContentOutput>> {
-        self.op_select_object_content(req).await
-    }
-
-    // --- versioning (spec 2026-10-03) ---
-    #[cfg(feature = "versioning")]
-    async fn get_bucket_versioning(
-        &self,
-        req: S3Request<dto::GetBucketVersioningInput>,
-    ) -> S3Result<S3Response<dto::GetBucketVersioningOutput>> {
-        self.op_get_bucket_versioning(req).await
-    }
-
-    #[cfg(feature = "versioning")]
-    async fn put_bucket_versioning(
-        &self,
-        req: S3Request<dto::PutBucketVersioningInput>,
-    ) -> S3Result<S3Response<dto::PutBucketVersioningOutput>> {
-        self.op_put_bucket_versioning(req).await
-    }
-
-    #[cfg(feature = "versioning")]
-    async fn list_object_versions(
-        &self,
-        req: S3Request<dto::ListObjectVersionsInput>,
-    ) -> S3Result<S3Response<dto::ListObjectVersionsOutput>> {
-        self.op_list_object_versions(req).await
-    }
+/// The base dispatch, expanded from [`tinio_s3_ops`]. See this module's doc
+/// for what the compiler holds.
+macro_rules! s3_dispatch_impl {
+    (
+        read { $(#[handler($rh:ident)] $(#[gated($($rg:ident $(: $rf:literal)?),+)])? $(#[on_ok($rok:expr)])? fn $r:ident ( $ri:ident ) -> $ro:ident; )* }
+        write { $(#[handler($wh:ident)] $(#[gated($($wg:ident $(: $wf:literal)?),+)])? $(#[on_ok($wok:expr)])? fn $w:ident ( $wi:ident ) -> $wo:ident; )* }
+    ) => {
+        #[async_trait]
+        impl<S: Storage> S3 for S3Backend<S> {
+            $(
+                $( $( $(#[cfg(feature = $rf)])? )+ )?
+                async fn $r(&self, req: S3Request<dto::$ri>) -> S3Result<S3Response<dto::$ro>> {
+                    self.$rh(req).await
+                }
+            )*
+            $(
+                $( $( $(#[cfg(feature = $wf)])? )+ )?
+                async fn $w(&self, req: S3Request<dto::$wi>) -> S3Result<S3Response<dto::$wo>> {
+                    self.$wh(req).await
+                }
+            )*
+        }
+    };
 }
+
+tinio_s3_ops!(s3_dispatch_impl);

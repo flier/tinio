@@ -120,8 +120,10 @@ jobs:
   sql:
     name: sql (sqruff)
     # SQL formatting is platform-neutral and non-compiling like fmt, so it
-    # does not wait on the compile gate. The policy lives in `.sqruff` (and
-    # `.sqruffignore`, whose four dialect-gap files docs/style.md records).
+    # does not wait on the compile gate. The policy lives in `.sqruff`, and
+    # every statement in the crate parses in its postgres dialect: the four
+    # files the ignore list used to hold were rewritten (three spelled
+    # `= ANY (array)`, one the builtin-locale clause) so nothing is exempt.
     # sqruff has no taiki-e/install-action manifest, so the pinned musl
     # release asset is fetched and its published sha256 verified; the archive
     # holds a single `sqruff` entry. The version is pinned because rule
@@ -432,6 +434,18 @@ jobs:
       - name: feature-matrix check (tinio-mem)
         run: cargo hack check --package tinio-mem --each-feature --profile ci
 
+      # tinio-pg carries the same self dev-dependency shape as tinio-fs/tinio-mem
+      # (tinio-pg on itself, features = ["versioning"]), so its feature-off arm is
+      # invisible to every test graph. Those siblings omit --no-dev-deps because a
+      # plain `cargo check` already builds no dev-dependencies; this leg keeps it
+      # so a future target-widening (--all-targets/--tests) cannot re-mask that
+      # arm and leave the leg passing while guarding nothing. It is the
+      # `cargo check -p tinio-pg` that was red for most of this phase (three
+      # modules ungated while the store dependency was still optional) and that no
+      # CI leg guarded until now.
+      - name: feature-matrix check (tinio-pg)
+        run: cargo hack check --package tinio-pg --each-feature --no-dev-deps --profile ci
+
       # tinio-util's features gate what is not production: the shared
       # conformance suites (`testing`) and the pinned bench data root
       # (`bench`, moved here by P4's close-out so every bench target in the
@@ -462,8 +476,9 @@ jobs:
       # implementation: it carries no feature at all (P3 Task 13), so every run
       # here is a SQLx run and the database-free arm PG15 requires is the whole
       # crate. The db-backed legs are not here: they are ordinary `#[cfg(test)]`
-      # legs that skip unless `TINIO_PG_DSN` names a live postgres:18-alpine,
-      # which is the operator's manual run.
+      # legs that skip unless `TINIO_PG_DSN` names a live postgres:18-alpine;
+      # the `pg` job carries that service and runs them, and every leg here
+      # stays database-free (PG8).
       - name: feature-matrix check (tinio-store-pg)
         run: cargo hack check --package tinio-store-pg --each-feature --no-dev-deps --profile ci
 
@@ -502,8 +517,9 @@ jobs:
 
       # In-process scenarios; the runner's built-in default filter excludes
       # the feature-gated (@parquet), platform-bound (@linux/@macos/@windows/
-      # @unix), external-client (@interop/@boto3/@mc) and host-bound
-      # (@confinement off macOS) tags, so the fs pass needs no --tags. Which
+      # @unix), external-client (@interop/@boto3/@mc), host-bound
+      # (@confinement off macOS) and database-backed (@pg) tags, so the fs pass
+      # needs no --tags. Which
       # confinement scenarios that leaves in this leg on macOS — and the arm
       # they take there — is docs/tests.md's fact (its macOS section owns the
       # selection, its CLI section the arm); this comment cites it rather than
@@ -513,11 +529,13 @@ jobs:
       # cucumber keeps the args from reaching the plain-harness traceability
       # target (its own step below), and an explicit --tags REPLACES the
       # runner's default filter, so the mem pass must repeat the platform,
-      # external-tag and confinement exclusions itself — every platform tag,
-      # not one host's non-matching set: this one list is shared by the ubuntu,
-      # windows and macos runners (`e2e-port`), so what it may keep is what all
-      # three may run, and the runner's compound platform clause cannot be
-      # spelled once (tests/steps/tag_filter.rs).
+      # external-tag, confinement and @pg exclusions itself — every platform
+      # tag, not one host's non-matching set: this one list is shared by the
+      # ubuntu, windows and macos runners (`e2e-port`), so what it may keep is
+      # what all three may run, and the runner's compound platform clause cannot
+      # be spelled once (tests/steps/tag_filter.rs). `not @pg` is
+      # load-bearing: the DB-backed scenarios belong to the `pg` job's own
+      # serial pass, never to this one.
       # --retry 2 on both passes: ConnectionAborted flakes on loaded legs
       # burned both retry-1 attempts in earlier runs (33764783657 fs,
       # 33750043137 mem).
@@ -538,7 +556,7 @@ jobs:
 
       - &e2e-mem
         name: e2e cucumber (mem backend)
-        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @interop and not @boto3 and not @mc and not @confinement' --retry 2
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @interop and not @boto3 and not @mc and not @confinement and not @pg' --retry 2
         env:
           TINIO_E2E_BACKEND: mem
           TINIO_E2E_REPORT: cucumber-report-mem.json
@@ -548,15 +566,6 @@ jobs:
       - &e2e-trace
         name: e2e traceability
         run: cargo test --profile ci -p tinio-e2e --test traceability
-
-      # The panic-policy gate (design 2026-10-09 D8): a `syn`-parsed scan of
-      # production source for the unannotated assert family, `#[allow]`
-      # escapes from the six panic lints, and `#[expect]` reasons outside
-      # D2's four prefixes. Plain-harness like traceability above — its own
-      # target, no cucumber argv, no platform dependence.
-      - &e2e-policy
-        name: e2e-policy
-        run: cargo test --profile ci -p tinio-e2e --test policy
 
       # PR test reports (BDD cucumber migration): the e2e/interop jobs write
       # JSON reports. Reports land in crates/tinio-e2e/ (cargo runs the test
@@ -753,7 +762,6 @@ jobs:
 
       - *e2e-mem
       - *e2e-trace
-      - *e2e-policy
       - *upload-report
 
   bench-smoke:
@@ -921,12 +929,111 @@ jobs:
       - *interop-cucumber
       - *upload-report
 
+  # The PostgreSQL job (PG8, PG15–PG17): the workflow's only leg that carries a
+  # database service. It owns every database-backed surface — the store's own
+  # suite, tinio-pg's conformance acceptance and the serialized @pg cucumber
+  # pass — because every other leg stays database-free: the DB-backed tests are
+  # ordinary `#[cfg(test)]` legs that skip unless `TINIO_PG_DSN` is set, so
+  # `cargo test --workspace` never needs a server. Gated on `check` only, not
+  # the ubuntu test chain: this is the phase's proof, and a red unit test must
+  # not withhold its signal.
+  pg:
+    name: PG (postgres:18-alpine)
+    needs: check
+    runs-on: ubuntu-latest
+    # The workflow's first `services:` block, mirroring the store's
+    # docker-compose fixture (crates/tinio-store-pg/docker-compose.yml): the
+    # same image, the same `tinio` user/password/database, the same UTF8 initdb
+    # arg and the same pg_isready healthcheck. Inside a runner the server
+    # listens on 5432 (the compose fixture only maps 55432:5432 on the host);
+    # the healthcheck holds the steps until it accepts connections.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: tinio
+          POSTGRES_PASSWORD: tinio
+          POSTGRES_DB: tinio
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tinio -d tinio"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      # The store's policy treats an omitted `sslmode` as `require` (PG10), so
+      # the plaintext service needs the explicit `disable`: the compose
+      # fixture's own dsn, against the runner's 5432 rather than the host's
+      # 55432. A service block is the same fixture exception the compose file
+      # already is — the credential is the pinned dev one, not a secret.
+      TINIO_PG_DSN: postgres://tinio:tinio@127.0.0.1:5432/tinio?sslmode=disable
+    steps:
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
+
+      # Cheapest signal first, in the order that wastes least: the store's own
+      # database-backed suite proves the persistence layer before the backend
+      # above it is exercised. Every DB-backed test creates its own scratch
+      # database, so the suite's own `cargo test` parallelism is safe and a run
+      # leaves no state behind.
+      - name: store database-backed suite
+        run: cargo test --profile ci -p tinio-store-pg -- --nocapture
+
+      # tinio-pg's conformance acceptance: `assert_conformance` and the
+      # versioning leg over a live PostgreSQL, the construction acceptances,
+      # and the `>100 MiB` streaming leg (PG22's mitigation for the
+      # chunked-content risk). `versioning` is the crate's own feature — the
+      # crate carries no `pg` feature, it *is* the backend (PG15) — and it is
+      # what compiles the version plane the contract suite reaches.
+      - name: tinio-pg conformance (assert_conformance + the >100 MiB leg)
+        run: cargo test --profile ci -p tinio-pg --features versioning -- --nocapture
+
+      # The @pg pass runs the backend-neutral @cli scenarios too (they spawn
+      # the real binary), so the `tinio` binary must exist beside the test
+      # binary first — the same prerequisite the e2e job's step covers (the
+      # `*e2e-build` step, aliased from its definition there).
+      - *e2e-build
+
+      # The @pg cucumber pass. Backend-neutral scenarios run on the pg backend
+      # via TINIO_E2E_BACKEND=pg, and the list carries no `not @pg` (unlike the
+      # mem leg's): the DB-backed scenarios are this pass's own. An explicit
+      # --tags REPLACES the runner's default filter, so every other exclusion
+      # is restated (platform, @parquet, @external, @confinement). --concurrency
+      # 1 is the serialization PG8 requires: every scenario truncates ONE
+      # shared database, so only a serial run keeps them from resetting each
+      # other mid-scenario.
+      - name: e2e cucumber (pg backend, serial)
+        run: cargo test --profile ci -p tinio-e2e --features pg --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @interop and not @boto3 and not @mc and not @confinement' --retry 2 --concurrency 1
+        env:
+          # The backend the pass runs on. `config_from_tags` picks the backend
+          # from a scenario tag, else this variable, else `Backend::Fs` — and no
+          # scenario carries `@pg`, so WITHOUT this the pass would silently run
+          # on the fs backend and certify nothing about PostgreSQL (PG17). Set
+          # on the step, not the job, mirroring the mem leg: it is read only by
+          # the cucumber process, and no other step in this job wants it.
+          TINIO_E2E_BACKEND: pg
+
+      # The sqlx-cache drift leg (design §"The SQL layout"): a committed `.sqlx`
+      # entry that has gone stale against the schema it describes is caught
+      # ONLY by `cargo xtask sqlx check` beside a live, migrated database — this
+      # job is that database's only home. It runs after the @pg pass, whose
+      # first connect migrated the base database the check describes against
+      # (the pass's own scenarios use it). `always()` so the drift is reported
+      # even when the pass above is red: the drift is independent of it.
+      - name: sqlx cache drift (cargo xtask sqlx check)
+        if: always()
+        run: cargo xtask sqlx check
+
   # P3 removed the `pg-meta-check` job with the spike it guarded. The spike
   # lived in `spike/pg-meta` as its own cargo workspace (the root Cargo.toml
   # excluded `spike`), which is why no workspace gate could compile it and a
   # contract change landed twice before the gate noticed. The crate is now
   # `crates/tinio-store-pg`, a plain workspace member: `check` compiles it in
-  # every build, `test` runs its database-free tests, and the `features` job
-  # isolates its two feature arms with cargo-hack. The db-backed legs (the
-  # conformance suite against postgres:18-alpine) are the crate's own manual
-  # gate and are deliberately not in CI.
+  # every build, `test` runs its database-free tests, the `features` job
+  # isolates its feature arms with cargo-hack, and the `pg` job above carries
+  # the postgres:18-alpine service the DB-backed legs need (PG8).

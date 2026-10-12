@@ -29,7 +29,10 @@ use crate::_api::{
 // The crate-wide facade alias, imported rather than spelled `crate::_sandbox::...`: a
 // three-segment expression path is what this crate's `absolute_paths` lint refuses.
 use crate::_sandbox;
-#[cfg(all(feature = "api", unix))]
+// The pg leg's inputs, likewise imported rather than spelled: `crate::_pg::doctor::CONNECTION`
+// is the four-segment shape the same lint refuses. `start` is read by the api leg's
+// `api_options` and by the pg leg's shared `(Config, Access)` builder.
+#[cfg(any(all(feature = "api", unix), feature = "pg"))]
 use crate::commands::start;
 use crate::{
     _core::cleanup::{self, Cleanup},
@@ -39,9 +42,34 @@ use crate::{
     },
     _server::identity,
     Error,
+    cli::PG_DSN_VAR,
     report::{Finding, PRIVATE_STATE, Report, Severity},
     resolve::{self, Resolution},
 };
+// The pg leg's inputs, gated with the leg itself: `Secret` is the addressed dsn, which only the
+// `pg` build has anything to do with — the check list's own pg/fs decision is `pg_root`, a value
+// both builds carry.
+#[cfg(feature = "pg")]
+use crate::{_pg::doctor, _util::secret::Secret};
+
+/// The one sentence every skipped served-root row carries for a pg run (ruling R8): a pg run has
+/// no served root — the database is the store — and the row keeps the filesystem path's name, `ok`
+/// and marked skipped, so a script reads the same check names on either backend.
+pub(crate) const PG_NO_ROOT: &str =
+    "skipped: a pg run has no served root — the database is the store";
+
+/// The served root's readability row's name, owned here so the real leg and a pg run's skip row
+/// cannot spell it differently.
+const STORAGE_ROOT: &str = "storage root";
+
+/// The served root's writability row's name, owned here for the same reason.
+const STORAGE_ROOT_WRITABLE: &str = "storage root writable";
+
+/// The free-space row's name, owned here rather than repeated between the real leg and the skip.
+const FREE_SPACE: &str = "free space";
+
+/// The private state store's inspect row's name, owned here for the skip row and the store legs.
+const META_STORE: &str = "meta.redb";
 
 /// Which pass is asking for the store — the one thing that decides whether it may be created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +118,7 @@ pub enum Store {
 /// lock.` — after it is dropped, both succeed. Hence the probe and the single open, whose
 /// `Open` this returns whole so its `db` and its two values reach both legs.
 pub fn open_store(dir: &Path, pass: Pass) -> Result<Store, Error> {
-    let present = fs::symlink_metadata(dir.join("meta.redb")).is_ok();
+    let present = fs::symlink_metadata(dir.join(META_STORE)).is_ok();
     if !present && pass == Pass::Diagnostics {
         return Ok(Store::Absent);
     }
@@ -317,13 +345,18 @@ pub fn below_floor(free: u64, total: u64) -> bool {
     free < DEFAULT_FLOOR_BYTES.max(total / 20)
 }
 
-/// The free-space check: probe `root`'s filesystem, then report the amount, its percentage of
-/// the volume and the floor rule's verdict.
-pub fn free_space(root: &Path) -> Finding {
+/// The free-space check: probe the resolved root's filesystem, then report the amount, its
+/// percentage of the volume and the floor rule's verdict. A pg run has no served root, so its row
+/// is the skip.
+pub fn free_space(resolution: &Resolution) -> Finding {
+    let root = resolution.root.as_path();
+    if resolution.is_pg() {
+        return Finding::check(FREE_SPACE, Severity::Ok, PG_NO_ROOT);
+    }
     match space(root) {
         Some((free, total)) => free_space_finding(root, free, total),
         None => Finding::check(
-            "free space",
+            FREE_SPACE,
             Severity::Warn,
             format!("not inspected: {} could not be probed", root.display()),
         ),
@@ -343,7 +376,7 @@ fn free_space_finding(root: &Path, free: u64, total: u64) -> Finding {
         root.display()
     );
     Finding::check(
-        "free space",
+        FREE_SPACE,
         if below_floor(free, total) {
             Severity::Warn
         } else {
@@ -435,14 +468,17 @@ fn space(root: &Path) -> Option<(u64, u64)> {
 /// `(free, total)` bytes on `root`'s filesystem: `lpFreeBytesAvailableToCaller` and
 /// `lpTotalNumberOfBytes` of `GetDiskFreeSpaceExW`.
 ///
-/// **One of this crate's enumerated `#[allow(unsafe_code)]` sites**: the enumeration and its
+/// **One of this crate's enumerated `#[expect(unsafe_code)]` sites**: the enumeration and its
 /// reason live with `signal.rs`'s console handler, which owns the list — this file is one of
 /// its entries, and repeating the others here would be the second copy the one-definer rule
 /// forbids. The invariant is Windows's: the call writes the two `u64` out
 /// parameters **only on success**, and the path reaches it as a NUL-terminated wide string —
 /// the encoding `GetDiskFreeSpaceExW` requires.
 #[cfg(windows)]
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "one of this crate's enumerated `unsafe_code` sites (the list lives with `signal.rs`'s console handler): Windows's `GetDiskFreeSpaceExW` writes its two out parameters only on success, and the path reaches it as a NUL-terminated wide string, the encoding the call requires"
+)]
 fn space(root: &Path) -> Option<(u64, u64)> {
     let mut path: Vec<u16> = root.as_os_str().encode_wide().collect();
     if path.contains(&0) {
@@ -468,67 +504,87 @@ pub async fn checks(run: &Run<'_>, proposals: Proposals) -> Report {
     let Run { resolution, state } = *run;
     let mut report = Report::default();
     report.push(state_dir_finding(state));
-    report.extend(storage_root_findings(
-        &resolution.root,
-        resolution.read_only,
-    ));
-    report.push(config_finding(resolution));
 
-    // The one `FsOptions` this run builds, and the one read of the configuration behind it:
-    // the walk's follow policy, the fragmentation threshold and the cleanup's write policy
-    // are read from the very struct the storage is built from, never from a second read that
-    // could disagree with it.
-    let options = fs_options(run);
-    let threshold = options.compact_threshold_percent;
-    let follow_symlinks = options.follow_symlinks;
-
-    match open_store(&state.dir, Pass::Diagnostics) {
-        Ok(Store::Absent) => {
-            report.push(Finding::check(
-                PRIVATE_STATE,
-                Severity::Ok,
-                "there is no store; nothing to clear",
-            ));
-            report.push(Finding::check(
-                "meta.redb",
-                Severity::Ok,
-                "not present; nothing to check",
-            ));
-        }
-        Ok(Store::Opened { open, integrity }) => {
-            // `Stats` is `Copy` and the marker is a `bool`, so both are read **before**
-            // `open` — which owns the `db` — moves into the cleanup helper: one open, one
-            // owner, and the fragmentation leg still reads the values that open carried.
-            let stats = open.stats;
-            let compact_needed = open.compact_needed;
-            report.extend(cleanup_findings(run, open, options, proposals).await);
-            report.extend(store_findings(integrity, &stats, compact_needed, threshold));
-        }
-        Err(err) if store_is_held(&err) => {
-            let detail = format!("not inspected: {err}");
-            report.push(Finding::check(
-                PRIVATE_STATE,
-                Severity::Warn,
-                detail.clone(),
-            ));
-            report.push(Finding::check("meta.redb", Severity::Warn, detail));
-        }
-        Err(err) => {
-            report.push(Finding::check(
-                PRIVATE_STATE,
-                Severity::Error,
-                err.to_string(),
-            ));
-            report.push(Finding::check(
-                "meta.redb",
-                Severity::Error,
-                err.to_string(),
-            ));
-        }
+    // **A pg run has no served root** (PG5/PG13; ruling R8): when the resolution took `locate`'s pg
+    // arm — the arm's own record is [`Resolution::pg_root`] — or its configuration selects pg, the
+    // subject is a database and not a directory. **The decision is the resolution's**
+    // ([`Resolution::is_pg`], the one definition both the serving half's refusal and this check
+    // list read), so the two cannot drift; this leg only asks it.
+    // The synthetic leaf is created by a serving start, so the legs below would report a root that
+    // "could not be read" on a perfectly healthy instance. Each of them keeps its row, `ok` and
+    // marked skipped, the shape the read-only arm of the writability check already uses, so a
+    // script reads the same check names on either backend.
+    let pg_run = resolution.is_pg();
+    // The storage-root rows lead both arms and are the same rows either way, so the one call sits
+    // above the fork; `free_space` does **not** move with it, because the contract's list puts it
+    // after the walk on a filesystem run and here on a pg one.
+    report.extend(storage_root_findings(resolution));
+    if pg_run {
+        // **Each served-root leg answers its own skipped row, from its own name** (ruling R8): the
+        // leg and the row name are one source, so a rename cannot desync the pg skip-set.
+        report.extend(walk_findings(resolution, false).await);
+        report.push(free_space(resolution));
+        report.extend(store_skipped_findings());
+        report.push(pg_configuration_finding(resolution));
+    } else {
+        report.push(config_finding(resolution));
     }
 
-    report.extend(walk_findings(&resolution.root, follow_symlinks).await);
-    report.push(free_space(&resolution.root));
+    // The served-root legs: skipped whole for a pg run (the block above), and otherwise the
+    // **one** `FsOptions` this run builds — the one read of the configuration behind it, because
+    // the walk's follow policy, the fragmentation threshold and the cleanup's write policy are
+    // read from the very struct the storage is built from, never from a second read that could
+    // disagree with it.
+    if !pg_run {
+        let options = fs_options(run);
+        let threshold = options.compact_threshold_percent;
+        let follow_symlinks = options.follow_symlinks;
+
+        match open_store(&state.dir, Pass::Diagnostics) {
+            Ok(Store::Absent) => {
+                report.push(Finding::check(
+                    PRIVATE_STATE,
+                    Severity::Ok,
+                    "there is no store; nothing to clear",
+                ));
+                report.push(Finding::check(
+                    META_STORE,
+                    Severity::Ok,
+                    "not present; nothing to check",
+                ));
+            }
+            Ok(Store::Opened { open, integrity }) => {
+                // `Stats` is `Copy` and the marker is a `bool`, so both are read **before**
+                // `open` — which owns the `db` — moves into the cleanup helper: one open, one
+                // owner, and the fragmentation leg still reads the values that open carried.
+                let stats = open.stats;
+                let compact_needed = open.compact_needed;
+                report.extend(cleanup_findings(run, open, options, proposals).await);
+                report.extend(store_findings(integrity, &stats, compact_needed, threshold));
+            }
+            Err(err) if store_is_held(&err) => {
+                let detail = format!("not inspected: {err}");
+                report.push(Finding::check(
+                    PRIVATE_STATE,
+                    Severity::Warn,
+                    detail.clone(),
+                ));
+                report.push(Finding::check(META_STORE, Severity::Warn, detail));
+            }
+            Err(err) => {
+                report.push(Finding::check(
+                    PRIVATE_STATE,
+                    Severity::Error,
+                    err.to_string(),
+                ));
+                report.push(Finding::check(META_STORE, Severity::Error, err.to_string()));
+            }
+        }
+
+        report.extend(walk_findings(resolution, follow_symlinks).await);
+        report.push(free_space(resolution));
+    }
+
     // The push sits exactly after `free_space`'s because the predicate is the host's own
     // answer, not the root's, and the row is the last thing about the machine the checks
     // speak for. It is not free: Windows' probe creates and deletes an AppContainer profile
@@ -538,8 +594,55 @@ pub async fn checks(run: &Run<'_>, proposals: Proposals) -> Report {
     #[cfg(feature = "api")]
     report.push(state_findings(run));
     #[cfg(all(feature = "api", unix))]
-    report.extend(socket_findings(run));
+    report.extend(socket_findings(run, pg_run));
+    // **A build without the backend cannot diagnose what the run addressed**, and the served-root
+    // legs above are skipped for a pg run either way — so the report has to say so rather than
+    // answering green over a database nothing read. (With the feature on, the pg leg's rows are
+    // what the run appends.)
+    #[cfg(not(feature = "pg"))]
+    if pg_run {
+        report.push(Finding::check(
+            "postgres instance",
+            Severity::Warn,
+            "not inspected: this build carries no pg backend (the `pg` feature is off)",
+        ));
+    }
     report
+}
+
+/// The private-state store's two rows for a pg run, each answered `ok` with the reason (ruling
+/// R8): a pg run has no `meta.redb`, so these rows name the store's checks — the names the
+/// filesystem path's own store legs emit — and say why they did not run.
+fn store_skipped_findings() -> Vec<Finding> {
+    [PRIVATE_STATE, META_STORE]
+        .into_iter()
+        .map(|name| Finding::check(name, Severity::Ok, PG_NO_ROOT))
+        .collect()
+}
+
+/// The configuration row of a pg run.
+///
+/// A load failure is a real defect whatever the backend, so it keeps the error. A document that
+/// **is** there keeps [`config_finding`]'s own arms, the credential-policy warn included — the run
+/// read it, and the policy governs the API whatever stores the bytes. The absent-document arm is
+/// the one that changes: "a first start would auto-create it" describes a filesystem root, while a
+/// pg run that was addressed by dsn resolved no document at all, so the row names the channel that
+/// addressed the instance instead.
+fn pg_configuration_finding(resolution: &Resolution) -> Finding {
+    if let Some(err) = &resolution.config_error {
+        return Finding::check("configuration", Severity::Error, err.clone());
+    }
+    if resolution.config_path.is_file() {
+        return config_finding(resolution);
+    }
+    Finding::check(
+        "configuration",
+        Severity::Ok,
+        format!(
+            "a pg run: the database is the store ([storage] type = \"pg\"); this instance is \
+             addressed by {PG_DSN_VAR} (or `--pg-dsn`), else by `[storage.pg] dsn`"
+        ),
+    )
 }
 
 /// The run's frame: the state directory every state-dependent leg read, and which of decision
@@ -573,10 +676,10 @@ fn store_is_held(err: &Error) -> bool {
 /// on the ok summary.
 pub(super) fn store_open_finding(err: &Error) -> Finding {
     if store_is_held(err) {
-        Finding::check("meta.redb", Severity::Warn, format!("not inspected: {err}"))
+        Finding::check(META_STORE, Severity::Warn, format!("not inspected: {err}"))
     } else {
         Finding::check(
-            "meta.redb",
+            META_STORE,
             Severity::Error,
             format!("the state store could not be opened: {err}"),
         )
@@ -585,12 +688,19 @@ pub(super) fn store_open_finding(err: &Error) -> Finding {
 
 /// The storage root's two rows: it exists and is a readable directory, and — unless the run is
 /// read-only, where a read-only root is valid (the doctor section's `--read-only` paragraph) — it is writable.
-fn storage_root_findings(root: &Path, read_only: bool) -> Vec<Finding> {
+fn storage_root_findings(resolution: &Resolution) -> Vec<Finding> {
+    let root = resolution.root.as_path();
+    if resolution.is_pg() {
+        return vec![
+            Finding::check(STORAGE_ROOT, Severity::Ok, PG_NO_ROOT),
+            Finding::check(STORAGE_ROOT_WRITABLE, Severity::Ok, PG_NO_ROOT),
+        ];
+    }
     let mut out = Vec::with_capacity(2);
     out.push(readability(root));
-    if read_only {
+    if resolution.read_only {
         out.push(Finding::check(
-            "storage root writable",
+            STORAGE_ROOT_WRITABLE,
             Severity::Ok,
             "skipped: read-only mode accepts a read-only root",
         ));
@@ -630,7 +740,7 @@ fn readability(root: &Path) -> Finding {
             ),
         },
     };
-    Finding::check("storage root", severity, detail)
+    Finding::check(STORAGE_ROOT, severity, detail)
 }
 
 /// The writability probe: one probe file, created and removed, so the answer is the
@@ -662,7 +772,7 @@ fn writability(root: &Path) -> Finding {
         .open(&probe)
     {
         return Finding::check(
-            "storage root writable",
+            STORAGE_ROOT_WRITABLE,
             Severity::Error,
             format!("{}: {err}", root.display()),
         );
@@ -678,12 +788,12 @@ fn writability(root: &Path) -> Finding {
     };
     match removed {
         Ok(()) => Finding::check(
-            "storage root writable",
+            STORAGE_ROOT_WRITABLE,
             Severity::Ok,
             "a probe file was created and removed",
         ),
         Err(err) => Finding::check(
-            "storage root writable",
+            STORAGE_ROOT_WRITABLE,
             Severity::Warn,
             format!(
                 "{} is writable; the probe file {} could not be removed: {err}",
@@ -835,14 +945,14 @@ fn store_findings(
 /// test can seed, so the unit fixture drives the mapping itself.
 pub(crate) fn integrity_finding(integrity: Integrity) -> Finding {
     match integrity {
-        Integrity::Healthy => Finding::check("meta.redb", Severity::Ok, "integrity check passed"),
+        Integrity::Healthy => Finding::check(META_STORE, Severity::Ok, "integrity check passed"),
         Integrity::Repaired => Finding::check(
-            "meta.redb",
+            META_STORE,
             Severity::Warn,
             "the integrity check failed and was repaired automatically",
         ),
         Integrity::Corrupted(err) => Finding::check(
-            "meta.redb",
+            META_STORE,
             Severity::Error,
             format!(
                 "corrupted ({err}); the metadata is derivable — delete the file and let the \
@@ -924,11 +1034,20 @@ fn state_findings(run: &Run<'_>) -> Finding {
 /// The gate is the pair and not the feature alone: the check calls `tinio_api`, which is an
 /// optional dependency, and on Windows the local channel is a named pipe — a pipe cannot
 /// outlive its process, so there is no file to probe and no residue to reclaim.
+///
+/// **A pg run whose root is absent answers its own `skipped` row** (ruling R8): the derived name
+/// is `sha1` of the *canonical* root, so a synthetic root the serving half has not created yet
+/// makes the derivation fail with "no such file or directory" — the same not-yet-created shape
+/// the sibling served-root legs already answer `ok` for. Every other failed derivation stays the
+/// warn it was: a root that exists but cannot be canonicalized is a real problem.
 #[cfg(all(feature = "api", unix))]
-fn socket_findings(run: &Run<'_>) -> Vec<Finding> {
+fn socket_findings(run: &Run<'_>, pg_run: bool) -> Vec<Finding> {
     let Run { resolution, state } = *run;
     let path = match socket_path_of(run) {
         Ok(path) => path,
+        Err(_) if pg_run && fs::symlink_metadata(&resolution.root).is_err() => {
+            return vec![Finding::check("control socket", Severity::Ok, PG_NO_ROOT)];
+        }
         Err(err) => {
             return vec![Finding::check(
                 "control socket",
@@ -988,6 +1107,55 @@ fn socket_findings(run: &Run<'_>) -> Vec<Finding> {
         ),
     });
     out
+}
+
+/// The pg leg's rows, appended to the report when this run addresses a PostgreSQL instance
+/// (`#[cfg(feature = "pg")]`).
+///
+/// **Ruling R8's addressing decision**: a pg run has no served root — its state dir is the
+/// dsn-derived synthetic root (`contracts/config.md`'s `[storage.pg]` bullet) — and neither
+/// `doctor`'s arm nor `status`/`stop` carries `--config`, so the instance is addressed through
+/// **`TINIO_PG_DSN`** (the hidden `--pg-dsn` flag is its other channel), else through
+/// `[storage.pg] dsn` in the configuration this run resolved. The remedy text of a failed
+/// connection names that channel, because the operator who hit it is the one who has to set it.
+///
+/// The leg runs when the configuration selects `[storage] type = "pg"` **or** a dsn is
+/// addressed, and its rows are **appended** to the report rather than replacing the filesystem
+/// legs: the run that reaches here resolved some directory, and removing the rows about it
+/// would silently stop reporting on it. A pg deployment is expected to pass any existing
+/// directory (the run has no root of its own to name).
+///
+/// A pg configuration with **no** dsn at all is the one shape that is reported rather than
+/// skipped: the run names pg and cannot be diagnosed, which is exactly what the operator has to
+/// fix.
+///
+/// Nothing here mutates the database: `tinio_pg::doctor::diagnose` reads every store fact
+/// through `PgStore::inspect`, the non-migrating path (PG11). The dsn travels as a `Secret` and
+/// is never rendered.
+#[cfg(feature = "pg")]
+pub(crate) async fn pg_findings(resolution: &Resolution, pg_dsn: Option<&Secret>) -> Vec<Finding> {
+    // **The serving half's own builder** (`start::pg_backend_config`): `resolve::pg::resolve_dsn`
+    // is where the dsn precedence lives (`TINIO_PG_DSN` over `[storage.pg] dsn`; PG5), so the
+    // database a run opens and the one it diagnoses cannot resolve differently.
+    let Ok((config, access)) = start::pg_backend_config(resolution, pg_dsn) else {
+        // A pg run that names no dsn is the one shape reported rather than skipped: the run says
+        // pg and nothing can be diagnosed, which is the operator's one fix. The decision is the
+        // resolution's ([`Resolution::is_pg`]), the same one the check list's skip-set reads.
+        if resolution.is_pg() {
+            return vec![Finding::check(
+                doctor::CONNECTION,
+                Severity::Error,
+                "a pg run names no dsn: set TINIO_PG_DSN (or `--pg-dsn`), or `[storage.pg] dsn` \
+                 in the configuration",
+            )];
+        }
+        return Vec::new();
+    };
+    doctor::diagnose(&config, access)
+        .await
+        .into_iter()
+        .map(|check| Finding::check(check.name, check.severity, check.detail))
+        .collect()
 }
 
 /// The offline [`FsOptions`] this run's storage is built from: **plan B's one mapping**

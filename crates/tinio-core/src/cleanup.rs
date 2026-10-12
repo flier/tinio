@@ -25,12 +25,15 @@
 //! `buckets.json` entries, stale `state`/socket, meta orphans, and stale
 //! home root-state dirs — and never touches user data.
 
-use std::error::Error;
+use std::{
+    error::Error,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
-use crate::{mode::AccessMode, storage};
+use crate::{from_nanos, mode::AccessMode, storage};
 
 /// A pinned, `Send` stream of cleanup actions (progress reporting).
 ///
@@ -231,6 +234,46 @@ pub trait Cleanup: Send + Sync + 'static {
     async fn reclaim_meta_orphans(&self) -> Result<ActionStream<Self::Error>, Self::Error>;
 }
 
+/// Whether either retention key is set at all — **both unset means nothing
+/// retires**, so a caller that would scan history, or walk it for the live
+/// block set, can skip the pass instead of asking [`retires`] for an answer it
+/// already knows.
+pub fn retention_enabled(keep: u64, expire: Duration) -> bool {
+    keep > 0 || !expire.is_zero()
+}
+
+/// Whether the history row at `index` (0 = newest) is past a retention
+/// threshold — the **one** home of the rule both backends' retention passes
+/// apply over the same `[s3]` keys (`noncurrent_keep` and
+/// `noncurrent_expire_days`), so a change to how a noncurrent version retires
+/// reaches every backend at once.
+///
+/// The age runs from the moment the version stopped being current: the row's
+/// own stamp where a supersede landed one, and its creation where it never did
+/// (a publish that aborted before its state transaction, or a removal out of
+/// band). The row's write is the earliest moment it can have stopped being
+/// current, so the age is never under-counted and an unstamped row is never
+/// aged from the epoch. Both `became` and `created` are nanoseconds.
+pub fn retires(
+    index: usize,
+    became: u64,
+    created: u64,
+    keep: u64,
+    expire: Duration,
+    now: SystemTime,
+) -> bool {
+    if keep > 0 && index as u64 >= keep {
+        return true;
+    }
+    if expire.is_zero() {
+        return false;
+    }
+    let became = if became != 0 { became } else { created };
+    now.duration_since(from_nanos(became))
+        .map(|age| age >= expire)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use futures::{StreamExt, stream};
@@ -269,6 +312,35 @@ mod tests {
         // The other default: a plane that never opted into read-only mode
         // may repair the root, which is what the repair stages assume.
         assert_eq!(options.access, AccessMode::ReadWrite);
+    }
+
+    /// The retention rule's pure arithmetic: the keep budget, the day window,
+    /// and the unstamped row that ages from its creation. Both backends call
+    /// this one rule, so it is pinned once.
+    #[test]
+    fn the_retention_rule_retires_by_budget_and_by_age() {
+        let day = Duration::from_secs(86_400);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let now_nanos = 1_000_000_000_000_000_000u64;
+        let day_nanos = 86_400 * 1_000_000_000u64;
+        // The keep budget retires by index, whatever the age.
+        assert!(retires(1, 0, 0, 1, Duration::ZERO, now));
+        assert!(!retires(0, 0, 0, 1, Duration::ZERO, now));
+        // Both keys unset is the safe reading: nothing retires.
+        assert!(!retires(9, 0, 0, 0, Duration::ZERO, now));
+        // The day window retires an aged row and spares a fresh one.
+        assert!(retires(0, now_nanos - 2 * day_nanos, 0, 0, day, now));
+        assert!(!retires(
+            0,
+            now_nanos - 3_600 * 1_000_000_000,
+            0,
+            0,
+            day,
+            now
+        ));
+        // A row no supersede stamped ages from its creation, never from the epoch.
+        assert!(retires(0, 0, now_nanos - 2 * day_nanos, 0, day, now));
+        assert!(!retires(0, 0, now_nanos, 0, day, now));
     }
 
     #[test]

@@ -258,7 +258,10 @@ const PROBE_STEPS: ProbeSteps = ProbeSteps {
 /// let available = userns_available().unwrap();
 /// let _ = available;
 /// ```
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "an `unsafe` site of its own: the probe forks with `kernel_fork`, and the child exits having done nothing else of ours"
+)]
 pub fn userns_available() -> Result<bool> {
     // A child that reaches the unshare and a parent that never does: the answer
     // travels as one byte, and the child always exits without running anything
@@ -370,7 +373,10 @@ pub fn userns_available() -> Result<bool> {
 /// half is the precondition [`userns_available`] documents and does not
 /// enforce — it forks inside a libtest worker in this crate's own test — and
 /// that function's doc says so rather than restating it here.
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "an `unsafe` site of its own: `unshare_unsafe` runs with the caller's namespace flags, and `enter` has already refused a process with more than one task"
+)]
 pub(crate) fn unshare(flags: UnshareFlags, step_name: &'static str) -> Result<()> {
     // SAFETY: the flags are the caller's, and every caller in this crate passes
     // a namespace flag — never `CLONE_FILES` (see above).

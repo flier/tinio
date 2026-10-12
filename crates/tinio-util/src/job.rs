@@ -115,14 +115,13 @@
 //! reach for `Command::output()` and lose the guard in the same line. [`output`] is that recipe
 //! once, on the same guard, and neither half of the pair is a caller's to remember.
 //!
-//! **The one spelling is a gate, not a convention.** "Every harness spawns through [`spawn`]" is a
-//! sentence anything can quietly falsify, so a check holds it up: `tests/spawn_guard.rs` scans the
-//! test sources — every `*.rs` under `crates/*/tests/`, which is every workspace member's
-//! integration suites, `support/`, `steps/` and harness modules — and fails on a `.spawn()` that is
-//! not this function's, unless the gate's allowlist names the file with its reason. **The coverage
-//! is the test sources and nothing else**: a `#[cfg(test)]` module inside `src/` is outside the
-//! scan, and this module's own tests are the case that has to be — they spawn raw to prove the
-//! adoption, which a child of [`spawn`] could not distinguish from an assignment after the fact.
+//! **The one spelling is a rule held by review, not a gate.** "Every harness spawns through
+//! [`spawn`]" is a convention the test sources are read for (docs/tests.md §Harness & guards): a
+//! `.spawn()` that is not this function's, or an `.output()`/`.status()` that reaches around it, is
+//! a review finding — recorded with its reason. **The rule covers the test sources**: a
+//! `#[cfg(test)]` module inside `src/` is in scope, and this module's own tests are the case that
+//! must spawn plainly — they prove the adoption, which a child of [`spawn`] could not distinguish
+//! from an assignment after the fact.
 
 #![allow(unsafe_code)]
 
@@ -133,10 +132,11 @@ use std::{
 
 /// Spawn `command` guarded — the one spelling a harness's spawn sites use.
 ///
-/// **The one spelling, and the gate that makes it one**: a raw `.spawn()` under
-/// `crates/*/tests/**` fails `tests/spawn_guard.rs` unless that gate's allowlist names the file
-/// with its reason, which is the check this sentence is held up by rather than an assurance the
-/// module doc asks a reader to take on faith.
+/// **The one spelling, and the rule that makes it one**: a raw `.spawn()` — or an
+/// `.output()`/`.status()` that reaches around it — under `crates/*/tests/**` or a
+/// test-gated `src/` item is a review finding recorded with its reason
+/// (docs/tests.md §Harness & guards), not an assurance the module doc asks a reader
+/// to take on faith.
 ///
 /// **On Windows the child is created inside the guard's job**, because the guard put *this*
 /// process in that job before the first child was spawned; see the module doc for the mechanism,

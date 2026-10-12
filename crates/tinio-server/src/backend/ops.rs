@@ -1,19 +1,31 @@
 //! The S3 operation inventory.
 //!
 //! One row per operation tinio implements, grouped by whether it mutates.
-//! The rows are facts about the operation — its s3s dto pair, its mutating
-//! kind, the cargo feature that strips it, the `[s3]` capability that
-//! refuses it, and any post-success side effect — and five consumers read
-//! them: the three decorators (`MetricS3` in `metrics.rs`, `CapabilityS3`
+//! The rows are facts about the operation — its s3s dto pair, its inherent
+//! handler, its mutating kind, the cargo feature that strips it, the `[s3]`
+//! capability that refuses it, and any post-success side effect — and six
+//! consumers read them: the four generated `impl S3` blocks (`S3Backend`'s
+//! dispatch in `backend/s3.rs`, `MetricS3` in `metrics.rs`, `CapabilityS3`
 //! in `capability.rs`, `S3ReadonlyBackend` in `readonly.rs`), this
-//! module's own `op_names` (the `include_str!` cross-check against
-//! `backend/s3.rs`, the read/write group pins, and the group lists
+//! module's own `op_names` (the read/write group pins, and the group lists
 //! `readonly.rs`'s table-driven tests drive), and `readonly.rs`'s
 //! test-only `readonly_probe`.
+//!
+//! The base dispatch — `impl S3 for S3Backend` — is generated here too, so
+//! the table is the single place an operation is declared: a row's name
+//! answers its s3s trait method, and its `#[handler(...)]` names the
+//! inherent method that does the work. A row whose handler does not exist,
+//! whose dto pair does not match that handler, or whose stripping features
+//! disagree with the handler's own `#[cfg]` is a **compile error** in the
+//! generated dispatch — a name no dispatch arm answers (a 501 waiting to
+//! happen) cannot be written down.
 //!
 //! # Row grammar
 //!
 //! ```text
+//! #[handler(<ident>)]                    the inherent method on `S3Backend`
+//!     that answers this s3s operation; the
+//!     generated dispatch calls `self.<ident>`
 //! $(#[gated(<field>[: "<feature>"], …)] )?   every listed `Capabilities`
 //!     field must be on (the list is a conjunction), and each entry's cargo
 //!     feature — when given — strips the row from builds without it.
@@ -21,9 +33,16 @@
 //! fn <method> (<InputIdent>) -> <OutputIdent>;
 //! ```
 //!
+//! The handler name is captured as an `ident` because `macro_rules!` cannot
+//! mint `op_<method>` from the row name, so the spelling that the dispatch
+//! calls must be written out. It is not free to diverge: the generated arm
+//! is `self.<handler>(req)`, and the handler's signature is the row's dto
+//! pair, so a handler that is missing (`E0599`) or that answers a different
+//! operation's dtos (`E0308`) fails to compile.
+//!
 //! The compile-time strip and the runtime refusal are one fact at two layers,
 //! and the strip is a function of the capability — verified across all 39
-//! operations against `backend/s3.rs`'s 22 `#[cfg]` attributes. So the row
+//! operations against the handlers' own `#[cfg]` attributes. So the row
 //! states the feature once, and the consumers derive the attribute. A
 //! capability with no cargo feature (`tagging`, `delete_objects`) is written
 //! bare: `#[gated(tagging)]`.
@@ -37,90 +56,129 @@
 //!
 //! Two more constraints, each verified by compiling the alternative:
 //!
-//! - **A consumer cannot use `$(#[$m:meta])*`.** `#[gated(...)]` and
-//!   `#[on_ok(...)]` are themselves `meta`: a catch-all beside a named clause
-//!   is a local ambiguity the parser refuses (design §4).
+//! - **A consumer cannot use `$(#[$m:meta])*`.** `#[handler(...)]`,
+//!   `#[gated(...)]` and `#[on_ok(...)]` are themselves `meta`: a catch-all
+//!   beside a named clause is a local ambiguity the parser refuses (design §4).
 //! - **The dto pair is captured as `ident`, not `ty`.** A `ty` fragment
 //!   cannot be used as a path segment (`dto::$in`), and `stringify!` of a
 //!   multi-token path would break the derived wire name.
 //!
-//! Every consumer must spell out both clauses in order — `macro_rules!` has
-//! no partial matching — so adding a clause here edits five matchers.
+//! Every consumer must spell out all three clauses in order — `macro_rules!`
+//! has no partial matching — so adding a clause here edits six matchers.
 
 macro_rules! tinio_s3_ops {
     ($consumer:ident) => {
         $consumer! {
             read {
+                #[handler(op_head_bucket)]
                 fn head_bucket (HeadBucketInput) -> HeadBucketOutput;
+                #[handler(op_list_buckets)]
                 fn list_buckets (ListBucketsInput) -> ListBucketsOutput;
+                #[handler(op_get_bucket_location)]
                 fn get_bucket_location (GetBucketLocationInput) -> GetBucketLocationOutput;
+                #[handler(op_get_bucket_tagging)]
                 #[gated(tagging)]
                 fn get_bucket_tagging (GetBucketTaggingInput) -> GetBucketTaggingOutput;
+                #[handler(op_get_bucket_cors)]
                 #[gated(cors: "cors")]
                 fn get_bucket_cors (GetBucketCorsInput) -> GetBucketCorsOutput;
+                #[handler(op_get_bucket_acl)]
                 #[gated(acl: "acl")]
                 fn get_bucket_acl (GetBucketAclInput) -> GetBucketAclOutput;
+                #[handler(op_get_object)]
                 fn get_object (GetObjectInput) -> GetObjectOutput;
+                #[handler(op_head_object)]
                 fn head_object (HeadObjectInput) -> HeadObjectOutput;
+                #[handler(op_get_object_attributes)]
                 fn get_object_attributes (GetObjectAttributesInput) -> GetObjectAttributesOutput;
+                #[handler(op_get_bucket_versioning)]
                 #[gated(versioning: "versioning")]
                 fn get_bucket_versioning (GetBucketVersioningInput) -> GetBucketVersioningOutput;
+                #[handler(op_list_object_versions)]
                 #[gated(versioning: "versioning")]
                 fn list_object_versions (ListObjectVersionsInput) -> ListObjectVersionsOutput;
+                #[handler(op_get_object_tagging)]
                 #[gated(tagging)]
                 fn get_object_tagging (GetObjectTaggingInput) -> GetObjectTaggingOutput;
+                #[handler(op_get_object_acl)]
                 #[gated(acl: "acl")]
                 fn get_object_acl (GetObjectAclInput) -> GetObjectAclOutput;
+                #[handler(op_list_objects)]
                 #[gated(list_objects_v1: "list-v1")]
                 fn list_objects (ListObjectsInput) -> ListObjectsOutput;
+                #[handler(op_list_objects_v2)]
                 #[gated(list_objects_v2: "list-v2")]
                 fn list_objects_v2 (ListObjectsV2Input) -> ListObjectsV2Output;
+                #[handler(op_list_parts)]
                 #[gated(multipart: "multipart")]
                 fn list_parts (ListPartsInput) -> ListPartsOutput;
+                #[handler(op_list_multipart_uploads)]
                 #[gated(multipart: "multipart")]
                 fn list_multipart_uploads (ListMultipartUploadsInput) -> ListMultipartUploadsOutput;
+                #[handler(op_select_object_content)]
                 #[gated(select: "select")]
                 fn select_object_content (SelectObjectContentInput) -> SelectObjectContentOutput;
             }
             write {
+                #[handler(op_create_bucket)]
                 fn create_bucket (CreateBucketInput) -> CreateBucketOutput;
+                #[handler(op_delete_bucket)]
                 fn delete_bucket (DeleteBucketInput) -> DeleteBucketOutput;
+                #[handler(op_put_bucket_tagging)]
                 #[gated(tagging)]
                 fn put_bucket_tagging (PutBucketTaggingInput) -> PutBucketTaggingOutput;
+                #[handler(op_delete_bucket_tagging)]
                 #[gated(tagging)]
                 fn delete_bucket_tagging (DeleteBucketTaggingInput) -> DeleteBucketTaggingOutput;
+                #[handler(op_put_bucket_cors)]
                 #[gated(cors: "cors")]
                 fn put_bucket_cors (PutBucketCorsInput) -> PutBucketCorsOutput;
+                #[handler(op_delete_bucket_cors)]
                 #[gated(cors: "cors")]
                 fn delete_bucket_cors (DeleteBucketCorsInput) -> DeleteBucketCorsOutput;
+                #[handler(op_put_bucket_acl)]
                 #[gated(acl: "acl")]
                 fn put_bucket_acl (PutBucketAclInput) -> PutBucketAclOutput;
+                #[handler(op_put_object_acl)]
                 #[gated(acl: "acl")]
                 fn put_object_acl (PutObjectAclInput) -> PutObjectAclOutput;
+                #[handler(op_put_object)]
                 fn put_object (PutObjectInput) -> PutObjectOutput;
+                #[handler(op_delete_object)]
                 fn delete_object (DeleteObjectInput) -> DeleteObjectOutput;
+                #[handler(op_delete_objects)]
                 #[gated(delete_objects)]
                 fn delete_objects (DeleteObjectsInput) -> DeleteObjectsOutput;
+                #[handler(op_put_bucket_versioning)]
                 #[gated(versioning: "versioning")]
                 fn put_bucket_versioning (PutBucketVersioningInput) -> PutBucketVersioningOutput;
+                #[handler(op_put_object_tagging)]
                 #[gated(tagging)]
                 fn put_object_tagging (PutObjectTaggingInput) -> PutObjectTaggingOutput;
+                #[handler(op_delete_object_tagging)]
                 #[gated(tagging)]
                 fn delete_object_tagging (DeleteObjectTaggingInput) -> DeleteObjectTaggingOutput;
+                #[handler(op_copy_object)]
                 #[gated(copy_object: "copy")]
                 fn copy_object (CopyObjectInput) -> CopyObjectOutput;
+                #[handler(op_rename_object)]
                 #[gated(copy_object: "copy")]
                 fn rename_object (RenameObjectInput) -> RenameObjectOutput;
+                #[handler(op_create_multipart_upload)]
                 #[gated(multipart: "multipart")]
                 #[on_ok(crate::metrics::multipart_in_progress_inc())]
                 fn create_multipart_upload (CreateMultipartUploadInput) -> CreateMultipartUploadOutput;
+                #[handler(op_upload_part)]
                 #[gated(multipart: "multipart")]
                 fn upload_part (UploadPartInput) -> UploadPartOutput;
+                #[handler(op_upload_part_copy)]
                 #[gated(multipart: "multipart", copy_object: "copy")]
                 fn upload_part_copy (UploadPartCopyInput) -> UploadPartCopyOutput;
+                #[handler(op_complete_multipart_upload)]
                 #[gated(multipart: "multipart")]
                 #[on_ok(crate::metrics::multipart_in_progress_dec())]
                 fn complete_multipart_upload (CompleteMultipartUploadInput) -> CompleteMultipartUploadOutput;
+                #[handler(op_abort_multipart_upload)]
                 #[gated(multipart: "multipart")]
                 #[on_ok(crate::metrics::multipart_in_progress_dec())]
                 fn abort_multipart_upload (AbortMultipartUploadInput) -> AbortMultipartUploadOutput;
@@ -130,91 +188,81 @@ macro_rules! tinio_s3_ops {
 }
 pub(crate) use tinio_s3_ops;
 
-/// The table read as data, for the cross-check test.
+/// The table read as data, for the group pins.
 ///
 /// Two properties, deliberately built two ways:
 ///
-/// - [`table_features`] pushes **unconditionally**. It is the table's facts —
-///   name plus stripping features — and must be comparable with `s3.rs`'s raw
-///   text, which `include_str!` never filters by feature;
 /// - [`table_ops`] carries the derived `#[cfg]`, so it is what *this* build
 ///   compiles (measured on this table: 39 names under `--all-features`, 23
 ///   under `--no-default-features --features multipart`, 17 under
 ///   `--no-default-features`). It is a subset check against the table, never
-///   an equality with the file.
-/// - [`read_ops`] and [`write_ops`] push unconditionally too, one group each:
-///   the grouping pin has to hold in every build, not only an all-features
+///   an equality with a file.
+/// - [`read_ops`] and [`write_ops`] carry their group unconditionally, one group
+///   each: the grouping pin has to hold in every build, not only an all-features
 ///   one, so neither may carry the derived `#[cfg]`.
 ///
-/// The `allow`s cover this shape, not its content: a `Vec::new()` followed by
-/// `push` trips `clippy::vec_init_then_push`, and a row without `#[gated]`
-/// never pushes into `feats`, which makes that `mut` unused. Clippy **does**
-/// lint local `macro_rules!` output (measured), and the repo gates on
-/// `-D warnings`.
+/// **The four are `vec![…]` literals rather than `Vec::new()` followed by `push`,
+/// and the reason is that clippy reads this expansion**: `clippy::vec_init_then_push`
+/// fires on the accumulate shape, and whether it does depends on the toolchain —
+/// the shape was observed to redden one toolchain's `-D warnings` while every run
+/// on this host stayed green, so the shape is not worth keeping. A literal with the
+/// `#[cfg]` on each element builds the same table and gives the lint no shape to
+/// read, on any toolchain. The element-level `#[cfg]` is long stable (measured on
+/// 1.75), so the fix trusts nothing newer than the workspace already builds with.
 macro_rules! op_names {
     (
-        read { $( $(#[gated($($rg:ident $(: $rf:literal)?),+)])? $(#[on_ok($rh:expr)])? fn $r:ident ( $ri:ident ) -> $ro:ident; )* }
-        write { $( $(#[gated($($wg:ident $(: $wf:literal)?),+)])? $(#[on_ok($wh:expr)])? fn $w:ident ( $wi:ident ) -> $wo:ident; )* }
+        read { $( $(#[handler($rh:ident)])? $(#[gated($($rg:ident $(: $rf:literal)?),+)])? $(#[on_ok($rhh:expr)])? fn $r:ident ( $ri:ident ) -> $ro:ident; )* }
+        write { $( $(#[handler($wh:ident)])? $(#[gated($($wg:ident $(: $wf:literal)?),+)])? $(#[on_ok($whh:expr)])? fn $w:ident ( $wi:ident ) -> $wo:ident; )* }
     ) => {
         /// Every row this feature set compiles.
         #[cfg(test)]
-        #[allow(clippy::vec_init_then_push)]
         pub(crate) fn table_ops() -> Vec<&'static str> {
-            let mut ops = Vec::new();
-            $(
-                $( $( $(#[cfg(feature = $rf)])? )+ )?
-                ops.push(stringify!($r));
-            )*
-            $(
-                $( $( $(#[cfg(feature = $wf)])? )+ )?
-                ops.push(stringify!($w));
-            )*
-            ops
+            vec![
+                $(
+                    $( $( $(#[cfg(feature = $rf)])? )+ )?
+                    stringify!($r),
+                )*
+                $(
+                    $( $( $(#[cfg(feature = $wf)])? )+ )?
+                    stringify!($w),
+                )*
+            ]
         }
 
-        /// Every row with the cargo features that strip it — not filtered by
-        /// the build, so it can be compared with `s3.rs`'s text.
+        /// Every row, unfiltered by the build — the independent side of the
+        /// read/write partition pin, which has to hold in every build.
         #[cfg(test)]
-        #[allow(clippy::vec_init_then_push)]
-        pub(crate) fn table_features() -> Vec<(&'static str, Vec<&'static str>)> {
-            let mut rows = Vec::new();
-            $(
-                #[allow(unused_mut)]
-                let mut feats: Vec<&'static str> = Vec::new();
-                $( $( $( feats.push($rf); )? )+ )?
-                rows.push((stringify!($r), feats));
-            )*
-            $(
-                #[allow(unused_mut)]
-                let mut feats: Vec<&'static str> = Vec::new();
-                $( $( $( feats.push($wf); )? )+ )?
-                rows.push((stringify!($w), feats));
-            )*
-            rows
+        pub(crate) fn table_rows() -> Vec<&'static str> {
+            vec![
+                $(
+                    stringify!($r),
+                )*
+                $(
+                    stringify!($w),
+                )*
+            ]
         }
 
         /// The read group alone, unfiltered by the build: the decorators
         /// forward these.
         #[cfg(test)]
-        #[allow(clippy::vec_init_then_push)]
         pub(crate) fn read_ops() -> Vec<&'static str> {
-            let mut ops = Vec::new();
-            $(
-                ops.push(stringify!($r));
-            )*
-            ops
+            vec![
+                $(
+                    stringify!($r),
+                )*
+            ]
         }
 
         /// The write group alone, unfiltered by the build: these are the
         /// operations the read-only decorator refuses.
         #[cfg(test)]
-        #[allow(clippy::vec_init_then_push)]
         pub(crate) fn write_ops() -> Vec<&'static str> {
-            let mut ops = Vec::new();
-            $(
-                ops.push(stringify!($w));
-            )*
-            ops
+            vec![
+                $(
+                    stringify!($w),
+                )*
+            ]
         }
     };
 }
@@ -223,97 +271,7 @@ tinio_s3_ops!(op_names);
 
 #[cfg(test)]
 mod tests {
-    use std::mem::take;
-
     use super::*;
-
-    /// `(async fn name, cfg features)` for each method of `S3Backend`'s
-    /// dispatch, in file order.
-    ///
-    /// The scan starts at the `impl … S3 for S3Backend` header and runs to
-    /// the first `#[cfg(test)]` line or the end of the file. There is no
-    /// brace matching, so those two bounds coincide with the impl block only
-    /// because the impl is `s3.rs`'s last item and the file has no test
-    /// module — a later test module, or any `async fn` after the block, is
-    /// what the `#[cfg(test)]` stop is there to catch. Comment lines are
-    /// skipped without clearing the pending features: a comment between an
-    /// operation's `#[cfg]` and its `fn` must not be mistaken for another
-    /// operation or silently drop the features.
-    fn dispatch_rows(source: &str) -> Vec<(String, Vec<String>)> {
-        let mut rows: Vec<(String, Vec<String>)> = Vec::new();
-        let mut pending: Vec<String> = Vec::new();
-        let mut in_impl = false;
-        for line in source.lines() {
-            let trimmed = line.trim();
-            if !in_impl {
-                in_impl = trimmed.starts_with("impl<") && trimmed.contains("S3 for S3Backend");
-                continue;
-            }
-            if trimmed.starts_with("#[cfg(test)]") {
-                break;
-            }
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            if trimmed.starts_with("#[cfg(") {
-                // A `not(...)` would read as a plain feature and silently
-                // invert the set instead of failing, so refuse it loudly.
-                assert!(
-                    !trimmed.contains("not("),
-                    "unsupported `not(...)` in a dispatch cfg: {trimmed}"
-                );
-                // Every other cfg in the dispatch is either one
-                // `feature = "x"` or an `all(...)` of them.
-                pending.extend(
-                    trimmed
-                        .split("feature = \"")
-                        .skip(1)
-                        .filter_map(|rest| rest.split('"').next())
-                        .map(String::from),
-                );
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("async fn ") {
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                let mut features = take(&mut pending);
-                features.sort();
-                rows.push((name, features));
-                continue;
-            }
-            if !trimmed.is_empty() {
-                pending.clear();
-            }
-        }
-        rows
-    }
-
-    #[test]
-    fn table_matches_the_s3_dispatch() {
-        // The file side is raw text, so it is feature-independent: all 36
-        // methods with their `#[cfg]` attributes, in file order.
-        let mut expected = dispatch_rows(include_str!("s3.rs"));
-        // The table side must not be filtered either — hence
-        // `table_features`, which pushes unconditionally. Comparing the
-        // `#[cfg]`-filtered `table_ops()` against the file could only ever
-        // hold in an all-features build.
-        let mut actual: Vec<(String, Vec<String>)> = table_features()
-            .into_iter()
-            .map(|(name, feats)| {
-                let mut feats: Vec<String> = feats.into_iter().map(String::from).collect();
-                feats.sort();
-                (name.to_string(), feats)
-            })
-            .collect();
-        expected.sort();
-        actual.sort();
-        // Names AND the cargo features that strip them, sorted on both
-        // sides: the table's row order is free (reads first, then writes)
-        // and is not `s3.rs`'s order.
-        assert_eq!(actual, expected);
-    }
 
     /// The twenty-one mutating operations, written out from the design's
     /// `Kind` column and the plan's table, in sorted order so it compares
@@ -346,14 +304,14 @@ mod tests {
 
     /// The table's read/write split, pinned against [`WRITE_OPS`].
     ///
-    /// [`table_matches_the_s3_dispatch`] sorts both sides and compares names
-    /// and stripping features, so a row moved between the two groups is
-    /// invisible to it — and the read-only decorator forwards the `read`
-    /// group while refusing the `write` group, so a mutating operation
-    /// misplaced into `read` would be *forwarded* in read-only mode with
-    /// every other test still green. `s3.rs` is the independent side for the
-    /// names and the features; the duplicated list above is the independent
-    /// side for the classification.
+    /// The generated dispatch sorts nothing: a row moved between the two
+    /// groups is invisible to it (both groups generate the same forwarding
+    /// arm), and the read-only decorator forwards the `read` group while
+    /// refusing the `write` group — so a mutating operation misplaced into
+    /// `read` would be *forwarded* in read-only mode with every other test
+    /// still green. The table rows are the independent side for the names;
+    /// the duplicated list above is the independent side for the
+    /// classification.
     #[test]
     fn table_groups_operations_by_whether_they_mutate() {
         let mut writes = write_ops();
@@ -369,7 +327,9 @@ mod tests {
         let mut union = read.clone();
         union.extend(writes);
         union.sort();
-        let mut all: Vec<&str> = table_features().into_iter().map(|(name, _)| name).collect();
+        // Unfiltered on both sides, so the partition holds in every build —
+        // not only an all-features one.
+        let mut all = table_rows();
         all.sort();
         assert_eq!(union, all);
     }
@@ -378,7 +338,7 @@ mod tests {
     /// operation set, checked under every feature combination.
     #[test]
     fn compiled_ops_come_from_the_table() {
-        let names: Vec<&str> = table_features().into_iter().map(|(name, _)| name).collect();
+        let names = table_rows();
         for op in table_ops() {
             assert!(names.contains(&op), "{op} is not a table row");
         }

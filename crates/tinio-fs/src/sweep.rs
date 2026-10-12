@@ -31,7 +31,8 @@ use crate::{
     _core::{
         blob::{BlobRef, BlockHash},
         bucket::Name,
-        from_nanos, object,
+        cleanup::{retention_enabled, retires},
+        object,
     },
     _store_redb::{object_meta, version as rows},
     error::projected,
@@ -249,39 +250,6 @@ struct RetentionScan {
     retire: Vec<Retirement>,
 }
 
-/// Whether the history row at `index` (0 = newest) is past a retention
-/// threshold — the pure rule behind [`Options`]' two retention keys. Every
-/// row the walk hands over is history by the predicate that walk applied
-/// (`Row::is_history` against the key's recorded slot), so nothing here
-/// re-asks it.
-///
-/// The age runs from the moment the version stopped being current: the
-/// row's own stamp where the transaction that moved the slot off it landed
-/// one, and its creation where it never did (a publish that aborted before
-/// its state transaction, or a removal out of band). The row's write is the
-/// earliest moment it can have stopped being current, so the age is never
-/// under-counted and an unstamped row is never aged from the epoch.
-#[cfg(feature = "versioning")]
-fn retires(
-    index: usize,
-    became: u64,
-    created: u64,
-    keep: u64,
-    expire: Duration,
-    now: SystemTime,
-) -> bool {
-    if keep > 0 && index as u64 >= keep {
-        return true;
-    }
-    if expire.is_zero() {
-        return false;
-    }
-    let became = if became != 0 { became } else { created };
-    now.duration_since(from_nanos(became))
-        .map(|age| age >= expire)
-        .unwrap_or(false)
-}
-
 /// Turn one key's history (oldest first) into its retirement decision —
 /// the sequences the retention keys retire, indexed newest-first as
 /// [`retires`] defines it — and fold the decision into the scan: a row the
@@ -303,7 +271,7 @@ fn flush_retirement(
     };
     // Only a valid object key can be addressed by an expiry.
     let key = object::key(&key).ok();
-    let can_retire = key.is_some() && (keep > 0 || !expire.is_zero());
+    let can_retire = key.is_some() && retention_enabled(keep, expire);
     let mut seqs = Vec::new();
     for (index, (seq, became, created, blob)) in history.iter().rev().enumerate() {
         if can_retire && retires(index, *became, *created, keep, expire, now) {

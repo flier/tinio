@@ -86,26 +86,13 @@
 //! fails a test which reads it. None of them names a domain type or a platform,
 //! which is what lets them live in the shared module at all.
 //!
-//! One more is the structural reader: [`function_body`], the one boundary rule four tests used to
-//! hand-roll their own delimiters for — the parse finds the declaration and the line its body
-//! closes on, so no site's slice can run past the function it names, and a mention of a signature
-//! that is not a declaration cannot be mistaken for one.
-//!
-//! And two are the attribute predicates every parsed source gate is written on:
-//! [`is_test_gated`] — the one test-context rule — and [`item_attrs`], the
-//! attribute accessor that rule is asked about. The repo policy test
-//! (`crates/tinio-e2e/tests/policy.rs`) and the spawn guard
-//! (`tests/spawn_guard.rs`) take their rules from here, so neither spells a
-//! second copy of one.
-//!
-//! Three more are how those gates reach the files at all: [`workspace_root()`] and
+//! And two are how the remaining readers reach the files at all: [`workspace_root()`] and
 //! its macro twin [`workspace_root!`] — the root, in the two spellings a caller
 //! needs, because the `env!("CARGO_MANIFEST_DIR")` half is a fact of the
-//! *calling* crate and only a macro expands there — plus [`repo_rel`], the name,
-//! and [`walk_files`], the walk. Three parsed gates used to carry a copy of the
-//! walk each; what stays with the gate is the *scope* it walks — which roots,
-//! which extension — because no two of them agree on that and it is the gate's
-//! own policy.
+//! *calling* crate and only a macro expands there — plus [`walk_files`], the walk.
+//! Parsed readers used to carry a copy of the walk each; what stays with the reader is the
+//! *scope* it walks — which roots, which extension — because no two of them agree on
+//! that and it is the reader's own policy.
 //!
 //! Four fixtures are the same idea one step down: [`conform_owner`],
 //! [`conform_other_owner`], [`conform_group_read_grant`] and [`checksum_tee`]
@@ -131,12 +118,6 @@ use std::{
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use syn::{
-    Attribute, Item,
-    meta::ParseNestedMeta,
-    spanned::Spanned,
-    visit::{self, Visit},
-};
 // `Instant` is std's here, because the module now carries a sync poll
 // (`wait_for_exit`) beside the async one; tokio's timer-aware instant is named
 // for its crate so the two cannot be swapped by a `use` nobody looked at.
@@ -144,7 +125,10 @@ use tokio::time::{Instant as TokioInstant, sleep};
 use tracing::{Level, callsite::rebuild_interest_cache};
 use tracing_subscriber::fmt::MakeWriter;
 
+pub mod blocks;
+pub mod http;
 pub mod metadata;
+pub mod sigv4;
 
 use crate::_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListBucketsParams, ListObjectsParams,
@@ -199,6 +183,30 @@ pub fn json_keys(value: &serde_json::Value) -> Vec<String> {
 /// Build a validated [`ETag`] from a wire-format hex string (harness helper).
 pub fn etag(hex: &str) -> ETag {
     ETag::new(hex).expect("valid etag")
+}
+
+/// The lowercase hex of `bytes` — the wire form a digest, a signature or a
+/// derived key is written in. One home for the harnesses and the signer, which
+/// had a copy of the loop each.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The text between the first `open`/`close` pair — empty when either is
+/// absent, so a missing tag never yields a garbage slice.
+///
+/// Both wire-XML readers need it and neither `tests/` tree can import from the
+/// other's: `tinio-e2e`'s steps read an ETag, a continuation token and an S3
+/// error code out of a response body with it, and `tinio-server`'s common
+/// module reads the same fields.
+pub fn extract(text: &str, open: &str, close: &str) -> String {
+    let Some(start) = text.find(open).map(|i| i + open.len()) else {
+        return String::new();
+    };
+    let Some(end) = text[start..].find(close).map(|i| start + i) else {
+        return String::new();
+    };
+    text[start..end].to_string()
 }
 
 /// The harness's fixed canonical owner id (64 lowercase hex) — the
@@ -3790,72 +3798,6 @@ mod tests {
         let hex = "d41d8cd98f00b204e9800998ecf8427e";
         assert_eq!(etag(hex).as_str(), hex);
     }
-
-    /// The boundary rule on the two shapes its callers have: a free function at column zero whose
-    /// body holds a block closing deeper, and an `impl` method at four spaces — plus the mention
-    /// above `outer`, which the parse keeps out of that declaration's own span.
-    #[test]
-    fn a_function_slice_ends_at_the_declarations_own_closing_brace() {
-        let source = "\
-// fn outer is mentioned here
-fn outer() {
-    if x {
-        inner();
-    }
-}
-
-    fn method() {
-        if y {
-            deeper();
-        }
-    }
-";
-        let outer = function_body(source, "fn outer");
-        assert!(outer.starts_with("fn outer()"), "{outer}");
-        assert!(outer.contains("inner();"), "{outer}");
-        assert_eq!(outer.lines().last(), Some("}"), "{outer}");
-        let method = function_body(source, "fn method");
-        assert!(method.contains("deeper();"), "{method}");
-        assert!(!method.contains("fn outer"), "{method}");
-        assert_eq!(method.lines().last(), Some("    }"), "{method}");
-
-        // The shape the text rule refused for its indentation: a body whose close is spelled at
-        // column zero under a declaration indented four. It parses, so the parse ends the slice
-        // on its brace and the whole function comes back — the boundary is the tree's, and
-        // indentation is not a rule any more.
-        let flat = "    fn method() {\n}\n";
-        assert_eq!(function_body(flat, "fn method"), flat);
-    }
-
-    /// The property the text rule hand-patched: a signature the source only *mentions* cannot be
-    /// mistaken for a declaration. The mention is `fn b`'s attribute — outside its own signature
-    /// span and outside every declaration's — so the answer is the `fn a` that follows, never the
-    /// `fn b` body the mention precedes. Both directions are pinned: a rule that read the mention
-    /// as a declaration would find `fn b`'s body instead, which both assertions reject.
-    #[test]
-    fn a_doc_mention_is_not_a_declaration() {
-        let src = "/// fn a does things\nfn b() { b(); }\nfn a() { a(); }\n";
-        assert!(function_body(src, "fn a").contains("a();"));
-        assert!(!function_body(src, "fn a").contains("b();"));
-    }
-
-    /// One of the two panics: a parse in which no declaration carries the signature. The parse
-    /// itself succeeded, so this is the "no such declaration" arm and not the other one.
-    #[test]
-    #[should_panic(expected = "no function declaration of this source carries")]
-    fn a_source_with_no_such_declaration_is_the_shared_guard() {
-        function_body("fn other() {}\n", "fn missing");
-    }
-
-    /// The other panic: a source that does not parse at all is refused before any boundary is
-    /// looked for. **The unbalanced body is that shape, and not the indentation mismatch the text
-    /// rule used to refuse**: a body whose close sits at another indentation parses, and now
-    /// slices (the boundary test above pins it).
-    #[test]
-    #[should_panic(expected = "must parse before a body is sliced")]
-    fn an_unparseable_source_is_the_shared_guard() {
-        function_body("fn method() {\n", "fn method");
-    }
 }
 
 /// The wait timeout in seconds — `TINIO_TEST_WAIT_TIMEOUT_SECS` overrides the
@@ -4043,191 +3985,6 @@ pub fn assert_step(logged: &str, step: &str) {
     );
 }
 
-/// The text of the function whose declaration carries `signature` — **one boundary rule for
-/// every structural test that slices a function out of `include_str!`.**
-///
-/// **The boundary is the parse's.** The source is parsed, the first `fn` or `impl` method whose
-/// signature carries `signature` is the declaration, and the slice runs from that declaration's
-/// first line to the line its body's closing brace is on: the tree says where the function ends,
-/// so no site spells a delimiter of its own and no slice can run past the function it names. The
-/// delimiters this replaced were each right for the file it was written in and wrong for its
-/// sibling: a `"\n    fn "` split finds no sibling when the method is its `impl`'s last, and a
-/// bare `"\n}"` finds the whole `impl`'s close rather than the method's.
-///
-/// **A mention of the signature that is not a declaration cannot be mistaken for it.** Only a
-/// declaration's own signature span is asked, and an attribute above a declaration — a doc
-/// comment included — sits outside that span, so prose naming the signature is never a candidate.
-/// That is structural where the text rule it replaced needed a rule about comment lines, and the
-/// module's `a_doc_mention_is_not_a_declaration` plants the case.
-///
-/// **The guard is this function's two panics**: a source that does not parse, and a parse in
-/// which no declaration carries the signature, fail here rather than handing the caller a slice
-/// of the wrong region. Callers keep asserting on what the slice contains; this is the boundary
-/// check they no longer spell one by one.
-///
-/// # Panics
-///
-/// When `source` does not parse, when no function declaration in it carries `signature`, or
-/// when the found declaration's line span does not resolve to a line of `source` (the offset
-/// lookup's two `expect`s — unreachable for a span the same parse produced).
-///
-/// # Examples
-///
-/// ```
-/// use tinio_util::testing::function_body;
-///
-/// let source = "fn a() {\n    if x {\n        b();\n    }\n}\n\nfn c() {}\n";
-/// let a = function_body(source, "fn a");
-/// assert!(a.contains("b();") && !a.contains("fn c"));
-/// ```
-pub fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
-    let file = syn::parse_file(source)
-        .unwrap_or_else(|e| panic!("the source must parse before a body is sliced: {e}"));
-    let mut finder = BodyFinder {
-        source,
-        signature,
-        found: None,
-    };
-    finder.visit_file(&file);
-    let Some((start_line, end_line)) = finder.found else {
-        panic!("no function declaration of this source carries `{signature}`");
-    };
-    let mut offset = 0usize;
-    let mut start = None;
-    let mut end = None;
-    for (i, line) in source.split_inclusive('\n').enumerate() {
-        if i + 1 == start_line {
-            start = Some(offset);
-        }
-        if i + 1 == end_line {
-            end = Some(offset + line.len());
-            break;
-        }
-        offset += line.len();
-    }
-    &source[start.expect("the start line exists")..end.expect("the end line exists")]
-}
-
-/// The declaration search [`function_body`] runs: the first `fn` or `impl` method whose signature
-/// carries the wanted text, kept as the `(first, last)` lines its slice spans.
-///
-/// The first match wins (`consider` returns once `found` is set), and the outer declaration is
-/// the first candidate on every path — an item is considered before its body is walked — so a
-/// nested function can never answer for the one that encloses it.
-struct BodyFinder<'s> {
-    source: &'s str,
-    signature: &'s str,
-    found: Option<(usize, usize)>,
-}
-
-impl<'s> BodyFinder<'s> {
-    /// Take `sig`'s declaration when `signature` is in its **own** lines and none was taken yet:
-    /// the attribute above it is a different node, so nothing a doc comment says can qualify a
-    /// declaration, and nothing it says can disqualify one either.
-    fn consider(&mut self, sig: &syn::Signature, block: &syn::Block) {
-        if self.found.is_some() {
-            return;
-        }
-        let first = sig.span().start().line;
-        let last = sig.span().end().line;
-        let hit = self
-            .source
-            .lines()
-            .skip(first - 1)
-            .take(last - first + 1)
-            .any(|line| line.contains(self.signature));
-        if hit {
-            self.found = Some((first, block.span().end().line));
-        }
-    }
-}
-
-impl<'s, 'ast> Visit<'ast> for BodyFinder<'s> {
-    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
-        self.consider(&f.sig, &f.block);
-        visit::visit_item_fn(self, f);
-    }
-
-    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
-        self.consider(&f.sig, &f.block);
-        visit::visit_impl_item_fn(self, f);
-    }
-}
-
-/// `true` when an item is test context: `#[cfg(...)]` naming `test` or the
-/// `testing` feature, or a `#[test]`-family fn attribute. Production
-/// features (`acl`, `parquet`, `versioning`, …) are not test context.
-///
-/// The one rule the repo's parsed source gates skip a subtree by: `#[cfg(test)]
-/// mod tests` (nested mods included), `#[cfg(all(test, unix))]`, `#[tokio::test]`
-/// and a `feature = "testing"` module all answer `true`, a `#[cfg(feature =
-/// "parquet")]` item answers `false`.
-pub fn is_test_gated(attrs: &[Attribute]) -> bool {
-    /// One predicate of a `#[cfg(...)]`: `test` and `feature = "testing"` are
-    /// the leaves that make an item test context, and `all(...)`/`any(...)`
-    /// nest them at any depth. A `not(...)` subtree is the opposite — the
-    /// production arm of the cfg — so it is not entered.
-    fn walk(meta: ParseNestedMeta<'_>, hit: &mut bool) {
-        if meta.path.is_ident("test") {
-            *hit = true;
-        }
-        if meta.path.is_ident("feature")
-            && let Ok(v) = meta.value()
-            && v.parse::<syn::LitStr>()
-                .is_ok_and(|s| s.value() == "testing")
-        {
-            *hit = true;
-        }
-        if meta.path.is_ident("all") || meta.path.is_ident("any") {
-            let _ = meta.parse_nested_meta(|nested| {
-                walk(nested, hit);
-                Ok(())
-            });
-        }
-    }
-
-    attrs.iter().any(|a| {
-        let path = a.path();
-        if path.is_ident("test")
-            || path.is_ident("rstest")
-            || path.segments.last().is_some_and(|s| s.ident == "test")
-        {
-            return true;
-        }
-        if !path.is_ident("cfg") {
-            return false;
-        }
-        let mut hit = false;
-        let _ = a.parse_nested_meta(|meta| {
-            walk(meta, &mut hit);
-            Ok(())
-        });
-        hit
-    })
-}
-
-/// The attributes of any item, for the gates that walk them.
-pub fn item_attrs(item: &Item) -> &[Attribute] {
-    match item {
-        Item::Const(i) => &i.attrs,
-        Item::Enum(i) => &i.attrs,
-        Item::ExternCrate(i) => &i.attrs,
-        Item::Fn(i) => &i.attrs,
-        Item::ForeignMod(i) => &i.attrs,
-        Item::Impl(i) => &i.attrs,
-        Item::Macro(i) => &i.attrs,
-        Item::Mod(i) => &i.attrs,
-        Item::Static(i) => &i.attrs,
-        Item::Struct(i) => &i.attrs,
-        Item::Trait(i) => &i.attrs,
-        Item::TraitAlias(i) => &i.attrs,
-        Item::Type(i) => &i.attrs,
-        Item::Union(i) => &i.attrs,
-        Item::Use(i) => &i.attrs,
-        _ => &[],
-    }
-}
-
 /// The workspace root above a gate's own manifest directory.
 ///
 /// **The caller passes `env!("CARGO_MANIFEST_DIR")` in, and that is the point of the
@@ -4260,21 +4017,6 @@ macro_rules! workspace_root {
     };
 }
 pub use crate::workspace_root;
-
-/// The repo-relative, `/`-separated path a walked file is named by.
-///
-/// The spelling matters twice: it is what a gate's violation message quotes, and it is what the
-/// gate's exemption list is compared against, so both sides read one string on every platform
-/// (`\` → `/`). `None` for a path outside `root`, which is a walker bug rather than a property
-/// of the file.
-pub fn repo_rel(root: &Path, path: &Path) -> Option<String> {
-    Some(
-        path.strip_prefix(root)
-            .ok()?
-            .to_string_lossy()
-            .replace('\\', "/"),
-    )
-}
 
 /// Every file under `root`, recursively and in a deterministic order, whose extension is `ext`.
 ///
@@ -4469,6 +4211,37 @@ fn drain(pipe: impl Read + Send + 'static, lines: Lines) -> JoinHandle<()> {
             raw.clear();
         }
     })
+}
+
+/// Feed one line of a child's event stream into `frame`, answering `decode` with the frame's text
+/// when the line closes it, and clearing `frame` either way.
+///
+/// **A frame is not a line.** `Event::encode` writes an `event:` line, a `data:` line and the
+/// blank line that closes them, so a decoder fed one line at a time sees an event name with no
+/// payload and drops it; accumulating to the blank line is what makes that line the frame's end
+/// rather than a line to skip. Text that is not one of our frames is dropped rather than fatal,
+/// which is what makes a stray write to stdout harmless (design decision 19).
+///
+/// The line's own terminator is not significant: it is trimmed and re-emitted as `\n`, so a
+/// reader holding a pipe's raw CRLF and one holding an already trimmed line build the same frame
+/// text, which `sse-core` dispatches alike.
+///
+/// **The decode arrives as a `fn`, and that is what leaves one `frame_line` in the tree.** The
+/// event a frame carries is `tinio_sandbox::Event`'s, and naming that type here would be a cycle —
+/// the sandbox stack depends on this crate (see [`PipedChild`]) — so a reader that owns the type
+/// hands in its own `Event::decode` and gets its own event back, rather than keeping a
+/// `frame_line` of its own that only adds the decode to this rule.
+pub fn frame_line<T>(
+    frame: &mut String,
+    line: &str,
+    decode: impl FnOnce(&str) -> Option<T>,
+) -> Option<T> {
+    if line.trim_end().is_empty() {
+        return decode(&mem::take(frame));
+    }
+    frame.push_str(line.trim_end());
+    frame.push('\n');
+    None
 }
 
 /// A spawned child with both pipes drained into shared buffers, killed and reaped when it drops.

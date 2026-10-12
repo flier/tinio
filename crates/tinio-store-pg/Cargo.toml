@@ -5,10 +5,13 @@ edition.workspace = true
 description = "PostgreSQL implementation of the tinio persistence contracts: schema migrations, a driver pool, and the metadata, version, content and block planes"
 publish = false
 
+[features]
+testing = []
+
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
-derive_more = { workspace = true, features = ["debug"] }
+derive_more = { workspace = true, features = ["debug", "display"] }
 futures.workspace = true
 hex.workspace = true
 parse-display.workspace = true
@@ -25,9 +28,6 @@ time.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing.workspace = true
 
-# The contract newtypes derive sqlx::Type/Encode/Decode, so this crate enables
-# the contract crate's sqlx feature -- the traits and the derive only, no driver
-# of its own. Nothing else in the workspace does.
 tinio-core = { workspace = true, features = ["sqlx"] }
 
 [dev-dependencies]
@@ -42,6 +42,7 @@ tokio = { workspace = true, features = [
 
 [lints.clippy]
 absolute_paths = "warn"
+allow_attributes = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"

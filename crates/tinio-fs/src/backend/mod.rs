@@ -327,7 +327,13 @@ pub struct FsStorage {
     /// their owner's mapped uid, bucket/prefix dirs to the bucket
     /// owner's — an unmapped owner stays server-user-owned (still
     /// `0600`/`0700`). Inert on Windows.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "the field is inert on Windows — only the unix ownership hardening reads it, so off unix it is deliberately never read"
+        )
+    )]
     owner_uids: HashMap<acl::OwnerId, u32>,
     /// The removal pipeline (D-A): `delete_bucket` enqueues the tombstone
     /// `remove_dir_all` here — the tree walk is physically isolated from
@@ -903,9 +909,12 @@ impl FsStorage {
     /// outside the bucket is ever referenced.
     #[cfg(feature = "versioning")]
     pub(crate) fn versions(&self, bucket: &Name) -> Versions<Rows, FsContent, LocalBlocks> {
+        let storage = self.storage_handle();
+        let rows = Rows::new(Arc::clone(&storage));
         Versions::new(
-            Rows::new(self.clone()),
-            FsContent::for_engine(Arc::new(self.clone())),
+            rows.clone(),
+            rows,
+            FsContent::for_engine(storage),
             BlobStore::new(LocalBlocks::new(self.blobs_dir().join(bucket.as_ref()))),
         )
     }
@@ -1082,7 +1091,10 @@ impl FsStorage {
     /// no-op. Errors propagate — the transaction rolls back as a unit,
     /// so a failed call leaves the upload records intact and a client
     /// retry re-runs the whole completion safely.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per element the completion's record transaction writes — bucket, key, upload id, etag, size, mtime, identity, checksum, parts, version id, seq and supersede stamp — the removal and the record happen together"
+    )]
     pub(crate) async fn complete_object_state(
         &self,
         bucket: &Name,
@@ -1300,9 +1312,19 @@ impl FsStorage {
     ) -> VersionPlane<Versions<Rows, FsContent, LocalBlocks>, Rows, LocalBlocks> {
         VersionPlane {
             versions: Arc::new(self.versions(bucket)),
-            version_rows: Arc::new(Rows::new(self.clone())),
+            version_rows: Arc::new(Rows::new(self.storage_handle())),
             blobs: BlobStore::new(LocalBlocks::new(self.blobs_dir().join(bucket.as_ref()))),
         }
+    }
+
+    /// This backend as the shared `Arc<FsStorage>` the version planes hold —
+    /// the one handle [`Self::receiver_handles`] builds per storage and every
+    /// content plane and hook already rides, so a version-creating operation
+    /// pays an Arc bump per plane rather than a deep copy of the root, the
+    /// state dir and the owner map.
+    #[cfg(feature = "versioning")]
+    fn storage_handle(&self) -> Arc<FsStorage> {
+        Arc::clone(&self.receiver_handles().storage)
     }
 }
 

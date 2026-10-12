@@ -37,6 +37,7 @@ ignored = ["humantime-serde"]
 
 [lints.clippy]
 absolute_paths = "warn"
+allow_attributes = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"

@@ -81,7 +81,7 @@ async fn the_order_does_not_move_with_the_database_locale() {
     }
     const BYTE_ORDER: [&str; 4] = ["0", "B", "_", "a"];
     let default_locale = TestDb::create().await.expect("a scratch database");
-    let builtin_c = TestDb::create_with("LOCALE_PROVIDER builtin BUILTIN_LOCALE 'C.UTF-8'")
+    let builtin_c = TestDb::create_builtin_locale()
         .await
         .expect("a scratch database with a non-locale default collation");
     for (n, db) in [&default_locale, &builtin_c].into_iter().enumerate() {
@@ -129,6 +129,12 @@ async fn the_order_does_not_move_with_the_database_locale() {
 
 /// The migration path: an empty database reaches the current version one step
 /// at a time, records each step, and a second run is idempotent.
+///
+/// The history is one file, so the forward path is the single step from an
+/// empty database (`schema_version` absent, read as 0) to version 1, and the
+/// bookkeeping holds exactly one row — one per embedded migration. The leg
+/// states the property, not the count, so a second migration would only add
+/// another step and another row.
 #[tokio::test]
 async fn migrations_advance_an_empty_database_and_are_idempotent() {
     if !require_dsn() {
@@ -147,6 +153,8 @@ async fn migrations_advance_an_empty_database_and_are_idempotent() {
             supported: SCHEMA_VERSION
         }
     );
+    // One row per embedded migration, so a one-file history records the single
+    // row for version 1 and `count(*)` equals the version.
     let applied = sqlx::query_file_scalar!("sql/tests/schema_version_rows.sql")
         .fetch_one(writable.as_driver())
         .await

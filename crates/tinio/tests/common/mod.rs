@@ -69,12 +69,11 @@ pub fn spawn(dir: &Path) -> Command {
 /// is pinned ([`spawn`]) or spell the flag list out again.
 ///
 /// **The child goes through the guard, and the capture recipe is the guard's own.**
-/// `Command::output()` was this line's shape — the raw spawn and wait, and the site
-/// `crates/tinio-util/tests/spawn_guard.rs` admits as a shape it must report — so
-/// `job::output` is what this helper calls now: the spawn is the guard's, and the three stdio
-/// modes a capture needs (`stdin` null, the other two piped) are the helper's rather than lines
-/// written out here. What it replaces left the modes to the caller because `job::spawn` takes
-/// the `Command` the builder left and sets no stdio of its own.
+/// `Command::output()` was this line's shape — the raw spawn-and-wait — so `job::output` is what
+/// this helper calls now: the spawn is the guard's, and the three stdio modes a capture needs
+/// (`stdin` null, the other two piped) are the helper's rather than lines written out here. What
+/// it replaces left the modes to the caller because `job::spawn` takes the `Command` the builder
+/// left and sets no stdio of its own.
 pub fn run_doctor(dir: &Path, root: &Path, flags: &[&str]) -> std::process::Output {
     let mut command = spawn(dir);
     command.arg("doctor").arg(root).args(flags);

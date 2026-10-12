@@ -6,17 +6,18 @@ description = "Shared runtime utilities for tinio: the evicting per-key lock map
 publish = false
 
 [dependencies]
+async-trait = { workspace = true, optional = true }
 bytes.workspace = true
 derive_more = { workspace = true, features = ["full"] }
 futures.workspace = true
 handlebars = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
 papaya.workspace = true
-proc-macro2 = { workspace = true, optional = true, features = ["span-locations"] }
 secrecy = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
-syn = { workspace = true, optional = true, features = ["full", "visit"] }
-tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
+sha2 = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v4"] }
@@ -24,7 +25,6 @@ uuid = { workspace = true, features = ["v4"] }
 tinio-core.workspace = true
 
 [dev-dependencies]
-syn = { workspace = true, features = ["full", "visit"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = [
     "macros",
@@ -52,19 +52,17 @@ windows-sys = { workspace = true, features = [
 bench = []
 render = ["dep:handlebars"]
 testing = [
-    "dep:proc-macro2",
+    "dep:async-trait",
+    "dep:hmac",
     "dep:rustix",
     "dep:serde_json",
-    "dep:syn",
+    "dep:sha2",
     "dep:tracing-subscriber",
 ]
 
-[[test]]
-name = "spawn_guard"
-required-features = ["testing"]
-
 [lints.clippy]
 absolute_paths = "warn"
+allow_attributes = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"

@@ -43,6 +43,7 @@ parquet = ["dep:parquet", "dep:arrow", "dep:bytes", "dep:time"]
 
 [lints.clippy]
 absolute_paths = "warn"
+allow_attributes = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"

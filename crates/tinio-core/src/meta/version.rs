@@ -154,6 +154,25 @@ impl Current {
     }
 }
 
+/// Whether moving a key's current slot to `seq` under `incoming` is a
+/// **backwards move within one identity** — the one rule every slot writer
+/// applies before it records a move.
+///
+/// A slot records the newest version it has been moved to, and the write
+/// transactions that commit such a move are serialised but not ordered by
+/// sequence: a lower-sequence advance of a real version committing after a
+/// higher-sequence one would leave the slot below the newest version it
+/// already named, which is the state the slot exists to prevent. A move to the
+/// **same** sequence is the crash window's own re-run, so it is not one.
+///
+/// The null version is not part of that numbering. Its `seq = 0` is its own
+/// space, so a suspended bucket's in-place write — the plan's `(Null, 0)` over
+/// a real current version — is not a rewind of it; only a real incoming
+/// identity is measured against the recorded sequence.
+pub fn slot_move_rewinds(incoming: Option<&version::Id>, seq: u64, recorded: u64) -> bool {
+    incoming.is_some() && seq < recorded
+}
+
 /// A decoded version row. `seq` is the row key's third element, so a row
 /// always carries the sequence it is stored at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,7 +213,10 @@ impl Stored {
     /// **null version** — a meaningful value the index does not key — exactly
     /// as the landed table layer rules. The metadata wires self-heal
     /// individually.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per element of the value tuple the row decodes from — the tuple is the storage wire shape, so the arity is the row's, not the function's"
+    )]
     pub fn from_raw(
         seq: u64,
         id: &str,
@@ -236,7 +258,10 @@ impl Stored {
     /// the `kind` is the contract's own and the tags and ACL arrive whole
     /// (the ACL carrying the owner, which the row splits out through
     /// [`Acl::into_parts`]).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per element of the contract's value tuple the row decodes from — the tuple is the storage wire shape, so the arity is the row's, not the function's"
+    )]
     pub fn from_values(
         seq: u64,
         id: &str,
@@ -272,7 +297,6 @@ impl Stored {
     }
 
     /// Encode the row back into its value tuple's elements.
-    #[allow(clippy::type_complexity)]
     pub fn to_raw(
         &self,
     ) -> (
@@ -490,6 +514,14 @@ pub trait VersionMeta: Send + Sync + 'static {
     /// slot below the newest version it already named, so
     /// [`VersionMeta::current_slot`] would resolve the marker bit off the stale
     /// row — the state the slot exists to prevent.
+    ///
+    /// **The row the slot moves off is stamped [`Stored::became_noncurrent`]**
+    /// in the same commit, under the two exemptions
+    /// [`VersionMeta::restore_slot`] names: a move at the **same** sequence
+    /// moves off nothing, and a sequence holding no row has nothing to stamp.
+    /// A row that already carries a stamp keeps it (the first stamp wins). The
+    /// retention passes age a noncurrent version from that stamp, so a backend
+    /// that skipped it would leave the row younger than it is.
     ///
     /// A key with **no** `object_meta` row gets one materialized to carry the
     /// slot columns, its content-derived elements (ETag, size, mtime, file

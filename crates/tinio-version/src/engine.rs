@@ -86,11 +86,13 @@ fn projected(err: impl Into<storage::Error>) -> Error {
 
 /// The version state machine over one backend's contracts and block store.
 ///
-/// `R` is the backend's rows — one type answering [`Metadata`],
-/// [`VersionMeta`] and the gated current slot ([`CurrentRows`]) — `C` its
-/// content plane ([`ObjectContent`]), and `B` the block store the shared
-/// blob engine runs over. The engine takes content **keys**, never paths: the
-/// content contract is the only thing that knows where a key's content lives.
+/// `R` is the row plane ([`Metadata`] and [`VersionMeta`]). `G` is the gate
+/// ([`CurrentRows`]): the one read of the key's current slot. A backend whose
+/// rows are also the gate passes that type twice and leaves `G` at its default,
+/// which is `R`. `C` is the content plane ([`ObjectContent`]) and `B` the block
+/// store the shared blob engine runs over. The engine takes content **keys**,
+/// never paths: the content contract is the only thing that knows where a key's
+/// content lives.
 ///
 /// # Examples
 ///
@@ -107,26 +109,50 @@ fn projected(err: impl Into<storage::Error>) -> Error {
 /// # #[allow(dead_code)]
 /// # fn demo<R, C>(rows: R, content: C, path: &std::path::Path)
 /// # where
-/// #     R: Metadata + VersionMeta + CurrentRows,
+/// #     R: Metadata + VersionMeta + CurrentRows + Clone,
 /// #     C: ObjectContent,
 /// # {
-/// let versions = Versions::new(rows, content, Store::new(LocalBlocks::new(path)));
+/// let versions = Versions::new(
+///     rows.clone(),
+///     rows,
+///     content,
+///     Store::new(LocalBlocks::new(path)),
+/// );
 /// # let _ = versions;
 /// # }
 /// ```
 #[derive(Debug, Clone)]
-pub struct Versions<R, C, B> {
-    /// The version rows and the key's current slot.
+pub struct Versions<R, C, B, G = R> {
+    /// The version rows and the object row a history record is copied from.
     rows: R,
+    /// The key's gated current slot.
+    gate: G,
     /// The key's content on the object-store side.
     content: C,
     /// The shared blob engine over this backend's block store.
     blobs: Store<B>,
 }
 
-impl<R, C, B> Versions<R, C, B>
+/// The **single-handle** engine: a backend whose rows are also their own gate (`G = R`), which is
+/// every backend but pg. [`Versions::new`] keeps the two-handle form pg's separate gate needs; a
+/// non-pg call site takes this one instead of spelling the same handle twice.
+impl<R, C, B> Versions<R, C, B, R>
 where
-    R: Metadata + VersionMeta + CurrentRows,
+    R: Metadata + VersionMeta + CurrentRows + Clone,
+    C: ObjectContent,
+    B: BlockStore,
+{
+    /// Serve the state machine over one handle that is both the row plane and the gate — the
+    /// degenerate `G = R` case, which [`Versions::new`] spells by passing the same handle twice.
+    pub fn rows_as_gate(rows: R, content: C, blobs: Store<B>) -> Self {
+        Versions::new(rows.clone(), rows, content, blobs)
+    }
+}
+
+impl<R, C, B, G> Versions<R, C, B, G>
+where
+    R: Metadata + VersionMeta,
+    G: CurrentRows,
     C: ObjectContent,
     B: BlockStore,
 {
@@ -144,16 +170,22 @@ where
     /// # #[allow(dead_code)]
     /// # fn demo<R, C>(rows: R, content: C, path: &std::path::Path)
     /// # where
-    /// #     R: Metadata + VersionMeta + CurrentRows,
+    /// #     R: Metadata + VersionMeta + CurrentRows + Clone,
     /// #     C: ObjectContent,
     /// # {
-    /// let versions = Versions::new(rows, content, Store::new(LocalBlocks::new(path)));
+    /// let versions = Versions::new(
+    ///     rows.clone(),
+    ///     rows,
+    ///     content,
+    ///     Store::new(LocalBlocks::new(path)),
+    /// );
     /// # let _ = versions;
     /// # }
     /// ```
-    pub fn new(rows: R, content: C, blobs: Store<B>) -> Self {
+    pub fn new(rows: R, gate: G, content: C, blobs: Store<B>) -> Self {
         Self {
             rows,
+            gate,
             content,
             blobs,
         }
@@ -248,7 +280,7 @@ where
     /// # }
     /// ```
     pub async fn current(&self, bucket: &Name, key: &object::Key) -> Result<Current, Error> {
-        Ok(self.rows.current(bucket, key).await?)
+        Ok(self.gate.current(bucket, key).await?)
     }
 
     /// Move the key's current version into history.
@@ -313,7 +345,7 @@ where
     /// # }
     /// ```
     pub async fn supersede(&self, bucket: &Name, key: &object::Key) -> Result<(), Error> {
-        let before = self.rows.current(bucket, key).await?;
+        let before = self.gate.current(bucket, key).await?;
         self.supersede_with(bucket, key, &before).await
     }
 
@@ -464,7 +496,7 @@ where
             // Re-resolve through the gate: the recorded identity the read was
             // resolved against must still be the slot's truth, or the content
             // changed under the read.
-            let after = self.rows.current(bucket, key).await?;
+            let after = self.gate.current(bucket, key).await?;
             if after == before {
                 if let Some(superseded) = superseded {
                     self.rows

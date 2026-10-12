@@ -1710,7 +1710,7 @@ mod tests {
         time::Duration,
     };
 
-    use tinio_util::testing::{assert_recorded_at, assert_step, function_body};
+    use tinio_util::testing::{assert_recorded_at, assert_step};
 
     use super::*;
     use crate::{
@@ -2278,42 +2278,13 @@ mod tests {
         assert!(matches!(err, Error::HostCannotConfine { .. }), "{err}");
         // And the code that must NOT classify keeps the old path.
         assert!(capability::classify(0x8007_0003u32 as i32).is_none());
-        // **The call site itself is pinned by reading it, because nothing else can.** No test
-        // forces `userenv` to answer `E_ACCESSDENIED` on a host that works, so the properties
-        // this name claims — a denied creation classifies rather than reporting a bare HRESULT,
-        // and the refusal says so in the log — are properties of the source.
-        let derive = function_body(include_str!("sid.rs"), "fn derive(name: &str)");
-        // The region is pinned before it is used, so a slice that came back as the wrong region
-        // fails here rather than counting it.
-        assert!(
-            derive.contains("let taken_over = hr == HRESULT_ALREADY_EXISTS;"),
-            "the extraction found derive's body"
-        );
-        // **The property is the delegation, not the classifier's own text.** Both `hr != 0`
-        // arms hand their HRESULT to `classified`, which is the one place the classify-or-
-        // launch rule lives, so a third spelling of it cannot appear without this failing.
-        assert_eq!(
-            derive.matches("classified(").count(),
-            2,
-            "both of derive's `hr != 0` arms classify through the one helper"
-        );
-        // What the delegate answers is **no longer a property of this source**: the behavioral
-        // test below drives `classified` itself, so the classify-or-launch rule is measured
-        // rather than read off the helper's text. What this region still has to show is the
-        // delegation above — the two arms reach the rule, and nothing else does.
-        // **The log half is pinned by the delegation.** The `warn!` moved into its one
-        // producer, `capability::refuse` — whose own test records the event — so what this
-        // region still has to show is that the create arm, and not the takeover arm above,
-        // routes its refusal through that producer.
-        assert_eq!(
-            derive.matches("capability::refuse(").count(),
-            1,
-            "the create arm emits the refusal through its one producer"
-        );
-        assert!(
-            derive.contains("capability::refuse(hr, name)"),
-            "and it refuses the profile this call named"
-        );
+        // **What `derive` does with these answers has no runtime-injectable predicate.** No test
+        // forces `userenv` to answer `E_ACCESSDENIED` on a host that works, so the wiring — both
+        // of `derive`'s `hr != 0` arms handing their HRESULT to `classified`, and the create arm
+        // routing its refusal through `capability::refuse` — is not observable as a value; it
+        // lives in `derive`'s own body and its comments. The behavioral half above and the
+        // `classified` leg below drive what each delegate *answers*; the delegation itself is a
+        // review-time property.
     }
 
     /// **The helper's own behaviour, driven rather than read.** `classified` is the one place

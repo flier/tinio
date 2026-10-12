@@ -16,6 +16,7 @@
 //! - [`store`] — the store, its access mode, and the ownership guard (PG12).
 //! - [`content`] — the `bytea`-chunked content plane (PG18/PG20/PG23/PG24).
 //! - [`blocks`] — the content-addressed block plane (PG14/PG19).
+//! - [`diagnostics`] — the read-only probes an operator's diagnosis asks for (PG4/PG6).
 //!
 //! # Ordering
 //!
@@ -24,13 +25,15 @@
 //! the server's locale. The connect-time UTF-8 check makes that identity real:
 //! `"C"` orders the server encoding's bytes (PG4).
 //!
-//! The crate *is* the PostgreSQL implementation, so it carries no feature of
-//! its own: a configuration that does not serve PostgreSQL does not depend on
-//! it at all (PG15) -- `pg` belongs to the consumer, as an optional
-//! dependency. The crate carries no feature at all: the database-backed tests
-//! are ordinary `#[cfg(test)]` legs, and they skip when `TINIO_PG_DSN` is
-//! unset, so the default build and `cargo test --workspace` stay database-free
-//! (PG8).
+//! The crate *is* the PostgreSQL implementation, so it carries no `pg` feature
+//! of its own: a configuration that does not serve PostgreSQL does not depend
+//! on it at all (PG15) -- `pg` belongs to the consumer, as an optional
+//! dependency. The one feature is `testing`, off by default and absent from
+//! every production graph: it publishes the scratch-database harness
+//! (`test_support::TestDb`) so other crates' tests share it. The
+//! database-backed tests are ordinary `#[cfg(test)]` legs, and
+//! they skip when `TINIO_PG_DSN` is unset, so the default build and
+//! `cargo test --workspace` stay database-free (PG8).
 
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
@@ -43,7 +46,9 @@ extern crate self as tinio_store_pg;
 pub extern crate sqlx as _sqlx;
 
 pub mod blocks;
+pub mod cleanup;
 pub mod content;
+pub mod diagnostics;
 pub mod meta;
 pub mod migrations;
 pub mod pool;
@@ -55,6 +60,10 @@ mod window;
 
 pub use error::Error;
 pub use store::{Access, Ownership, PgStore, SchemaState};
+
+#[cfg(any(test, feature = "testing"))]
+#[path = "tests/db.rs"]
+pub mod test_support;
 
 #[cfg(test)]
 mod tests;

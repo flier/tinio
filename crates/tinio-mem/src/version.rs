@@ -156,7 +156,10 @@ impl VersionOps for MemoryStorage {}
 /// `enabled` are the only callers and the import groups above are its own, so
 /// with the feature off neither the helper nor its imports are compiled.
 #[cfg(feature = "versioning")]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per element the version-addressed read's answer is built from — the row's fields, the version identity and the body slice all arrive as separate arguments at its callers"
+)]
 pub(crate) fn object_result(
     key: &object::Key,
     size: u64,
@@ -209,7 +212,13 @@ pub(crate) fn object_result(
 /// callers carry no cfg pair of their own. With the feature off no state
 /// row can exist — the writes that set one are compiled out — so there is
 /// nothing to read and the answer is the constant `false`.
-#[cfg_attr(not(feature = "versioning"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "versioning"),
+    expect(
+        dead_code,
+        reason = "with the feature off no state row can exist — the writes that set one are compiled out — so this reader has no caller and no row to read"
+    )
+)]
 pub(crate) fn records_versions(txn: &redb::ReadTransaction, bucket: &Name) -> Result<bool, Error> {
     #[cfg(feature = "versioning")]
     {
@@ -970,7 +979,10 @@ mod enabled {
     /// reentrant. The bytes are this core's to write: a caller that also
     /// publishes them through the content plane would store and meter them
     /// twice, and `row.size` must be `data.len()`, the length the meter bills.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the completion's inputs — storage, transaction, bucket/key, clock, bytes, row, parts and the release credit — are one transaction's field set, taken together because the caller holds the accounting lock across the call"
+    )]
     pub(crate) fn complete_versioned(
         storage: &MemoryStorage,
         txn: &mut WriteTransaction,
@@ -1040,7 +1052,9 @@ mod enabled {
         // blob table, credited with the parts the caller is about to release.
         // A limit breach aborts the whole transaction here, leaving the rows,
         // the bytes and the tracked total untouched.
-        storage.adjust_total_with_credit_unlocked(delta + history_bytes, credit)?;
+        storage
+            .content()
+            .adjust_total_with_credit_unlocked(delta + history_bytes, credit)?;
         Ok(CompletedWrite {
             version_id,
             records_versions,
@@ -1718,7 +1732,7 @@ mod enabled {
             // across it: the release below runs inside the write, and the
             // decorator's lock is not reentrant — the closure may only use the
             // `*_unlocked` entry point.
-            let guard = self.lock_accounting().await;
+            let guard = self.content().lock_accounting().await;
             let marker = self.db.write(|txn| -> Result<Marker, Error> {
                 check_bucket_write(txn, bucket)?;
                 if key.is_reserved() || key.is_folder_marker() {
@@ -1780,7 +1794,7 @@ mod enabled {
                 // counted as an object row) — it can only grow while another
                 // key still shares the materialized content, when the backend
                 // really does hold the bytes twice.
-                self.release_total_unlocked(delta);
+                self.content().release_total_unlocked(delta);
                 Ok(marker)
             })?;
             // The key's bytes left, or a restored version's took their place:
@@ -3219,7 +3233,7 @@ mod tests {
             }];
             // The accounting lock is the caller's, exactly as the multipart
             // path holds it across the core.
-            let guard = storage.lock_accounting().await;
+            let guard = storage.content().lock_accounting().await;
             let refused = storage.db.write(|txn| {
                 complete_versioned(&storage, txn, &b, &key, now, &data, &row, &retained, 10)
                     .map(|_| ())
@@ -3417,7 +3431,7 @@ mod tests {
                 size: data.len() as u64,
                 checksum: None,
             }];
-            let guard = storage.lock_accounting().await;
+            let guard = storage.content().lock_accounting().await;
             let done: CompletedWrite = storage
                 .db
                 .write(|txn| {

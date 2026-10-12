@@ -1,4 +1,5 @@
 use garde::{Error as GardeError, Validate};
+use parse_display::{Display, FromStr};
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
 
@@ -9,8 +10,38 @@ use crate::_core::storage::{
     META_BATCH_SIZE_MIN,
 };
 
-/// Backend behavior keys (`[storage]`; filesystem-only in v1 — the
-/// filesystem-specific keys live in `[storage.fs]`).
+pub mod pg;
+
+/// Which backend a run serves (`[storage] type`; the selector PG5 lands).
+///
+/// The default is [`Backend::Fs`], so a configuration that never writes the key keeps serving a
+/// filesystem root. The key parses in every build (§6): a build without the selected backend
+/// refuses at startup, naming what it does not carry, rather than ignoring a key it read.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_config::storage::Backend;
+///
+/// assert_eq!(Backend::default(), Backend::Fs);
+/// assert_eq!(Backend::Pg.to_string(), "pg");
+/// assert_eq!("fs".parse::<Backend>().unwrap(), Backend::Fs);
+/// assert!("s3".parse::<Backend>().is_err());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, Display, FromStr)]
+#[serde(rename_all = "lowercase")]
+#[display(style = "lowercase")]
+pub enum Backend {
+    /// The local filesystem backend (`tinio-fs`); the default.
+    #[default]
+    Fs,
+    /// The PostgreSQL backend (`tinio-pg`).
+    Pg,
+}
+
+/// Backend behavior keys (`[storage]`; the sections are per backend — the filesystem-specific
+/// keys live in `[storage.fs]`, the in-memory limits in `[storage.mem]`, the PostgreSQL keys in
+/// `[storage.pg]`).
 ///
 /// # Examples
 ///
@@ -19,10 +50,16 @@ use crate::_core::storage::{
 ///
 /// let storage = Config::default();
 /// assert!(!storage.fs.follow_symlinks); // secure default: reject symlinks
+/// assert_eq!(storage.backend.to_string(), "fs"); // no key written: filesystem
+/// assert!(storage.pg.is_none());
 /// ```
 #[derive(Debug, Clone, PartialEq, SmartDefault, Serialize, Deserialize, Validate)]
 #[garde(allow_unvalidated)]
 pub struct Config {
+    /// The backend selector (`[storage] type`; default `"fs"`). `type` is a Rust keyword, so the
+    /// field carries the TOML key through a `rename`.
+    #[serde(rename = "type", default)]
+    pub backend: Backend,
     /// Filesystem backend keys (`[storage.fs]`).
     #[serde(default)]
     #[garde(dive)]
@@ -33,6 +70,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[garde(dive)]
     pub mem: Option<Mem>,
+    /// PostgreSQL backend keys (`[storage.pg]`; read when `type = "pg"` — and by
+    /// `TINIO_PG_DSN`'s resolver, which overrides `dsn`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(dive)]
+    pub pg: Option<pg::Config>,
 }
 
 /// Filesystem backend keys (`[storage.fs]`; the `follow_symlinks` key moved
@@ -216,5 +258,56 @@ mod tests {
             let err = RootConfig::parse(bad).unwrap_err();
             assert!(matches!(err, Error::InvalidValue { .. }), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn the_type_key_defaults_to_fs_and_selects_pg() {
+        // No key (and no section at all): the filesystem backend, so a configuration written
+        // before the selector existed keeps its meaning.
+        let config = RootConfig::parse("version = 1").unwrap();
+        assert!(config.storage.is_none());
+        assert_eq!(Config::default().backend, Backend::Fs);
+
+        let config = RootConfig::parse("version = 1\n[storage]\ntype = \"pg\"").unwrap();
+        let storage = config.storage.as_ref().unwrap();
+        assert_eq!(storage.backend, Backend::Pg);
+        // The selector and the section are independent keys: `type = "pg"` with no
+        // `[storage.pg]` parses, because the dsn's other source is `TINIO_PG_DSN` (PG5) and the
+        // refusal for having neither belongs where the environment is readable.
+        assert!(storage.pg.is_none());
+        assert_eq!(storage.fs, Fs::default());
+    }
+
+    #[test]
+    fn an_unknown_type_names_the_alternatives() {
+        // A startup error naming the remedy: the value the key accepts is what the message has
+        // to carry, because the config file is the only place the key can be corrected.
+        let err = RootConfig::parse("version = 1\n[storage]\ntype = \"s3\"").unwrap_err();
+        assert!(matches!(err, Error::Parse { .. }), "{err}");
+        let rendered = err.to_string();
+        assert!(rendered.contains("fs"), "{rendered}");
+        assert!(rendered.contains("pg"), "{rendered}");
+    }
+
+    #[test]
+    fn a_pg_section_round_trips_beside_the_type_key() {
+        // The whole `[storage]` section in one text: the selector, the filesystem keys and the
+        // pg keys together, through parse -> to_toml -> parse.
+        let text = "version = 1\n[storage]\ntype = \"pg\"\n[storage.fs]\nfollow_symlinks = true\n[storage.pg]\ndsn = \"postgres://user:password@db.example:5432/tinio\"\npool = 4";
+        let config = RootConfig::parse(text).unwrap();
+        let again = RootConfig::parse(&config.to_toml().unwrap()).unwrap();
+        assert_eq!(config, again);
+        let storage = config.storage.as_ref().unwrap();
+        assert_eq!(storage.backend, Backend::Pg);
+        assert!(storage.fs.follow_symlinks);
+        assert_eq!(storage.pg.as_ref().unwrap().pool, 4);
+    }
+
+    #[test]
+    fn the_backend_spellings_are_the_contracts() {
+        assert_eq!(Backend::Fs.to_string(), "fs");
+        assert_eq!(Backend::Pg.to_string(), "pg");
+        assert_eq!("pg".parse::<Backend>().unwrap(), Backend::Pg);
+        assert!("s3".parse::<Backend>().is_err());
     }
 }

@@ -1,0 +1,75 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    s.seq AS \"seq!\",\n    s.version_id,\n    s.is_delete_marker,\n    r.kind AS \"kind?: Kind\"\nFROM current_slots AS s\nLEFT JOIN version_rows AS r\n    ON r.bucket = s.bucket AND r.key = s.key AND r.seq = s.seq\nWHERE s.bucket = $1 AND s.key = $2\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "current_slots",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "current_slots",
+            "name": "version_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "is_delete_marker",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "current_slots",
+            "name": "is_delete_marker"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "kind?: Kind",
+        "type_info": {
+          "Custom": {
+            "name": "version_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "marker"
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "kind"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "3dc81d34404cae1eb35591018cdd6c2966edff3e27bede719ef43edece3b74a9"
+}

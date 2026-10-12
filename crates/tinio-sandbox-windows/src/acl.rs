@@ -2923,7 +2923,10 @@ an inherited entry is answering for the wrong reason: {:08X?}",
     /// write back, which is what tells a skip from a write that happened to leave
     /// the same ACE.
     #[test]
-    #[allow(clippy::arc_with_non_send_sync)]
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "test context: `PackageSid` owns a raw `PSID` and is deliberately neither `Send` nor `Sync`, and the `Arc` is the shared ownership inside one thread that the code under test is given"
+    )]
     fn a_second_sibling_pass_writes_only_the_dll_that_lost_the_ace() {
         let dir = tempfile::tempdir().expect("temp dir");
         for name in ["one.dll", "two.dll"] {
@@ -3155,7 +3158,10 @@ an inherited entry is answering for the wrong reason: {:08X?}",
     /// rendering of the same directory, so the assertion does not rest on this
     /// crate's view of the DACL alone.
     #[test]
-    #[allow(clippy::arc_with_non_send_sync)]
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "test context: `PackageSid` owns a raw `PSID` and is deliberately neither `Send` nor `Sync`, and the `Arc` is the shared ownership the code under test is given"
+    )]
     fn two_grants_to_one_path_from_two_threads_keep_both_aces() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path();

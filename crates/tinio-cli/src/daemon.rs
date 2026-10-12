@@ -77,7 +77,10 @@ pub fn detach_if_requested(args: &Args, resolution: &Resolution) -> Result<(), E
         return Ok(());
     }
     let log_file = resolve::log_file(resolution, args)?;
-    let previous = recorded_pid(&resolution.state_dir);
+    let previous = State::read(&resolution.state_dir)
+        .ok()
+        .flatten()
+        .map(|state| state.pid);
     // The state file's own generator: one spelling of "an unguessable token" for the crate's two
     // producers of one (the length only sizes the launch file's name).
     let token = api_state::generate_token()?;
@@ -117,7 +120,10 @@ pub fn detach_if_requested(args: &Args, resolution: &Resolution) -> Result<(), E
 /// runtime). Edition 2024 marks env mutation `unsafe` because it races with concurrent
 /// `getenv` on other threads — there are none here.
 #[cfg(unix)]
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "edition 2024 marks env mutation `unsafe` because it races with `getenv` on other threads; this call runs on the single-threaded detach path, before the runtime exists"
+)]
 fn set_launch_env(token: &str) {
     // SAFETY: single-threaded detach path; see function docs.
     unsafe { env::set_var(LAUNCH_ENV, token) };
@@ -178,7 +184,13 @@ fn kill_recorded_daemon(state_dir: &Path, token: &str) {
 }
 
 /// Child argv: `env::args_os` minus `--daemon` (Windows only).
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(
+    not(any(windows, test)),
+    expect(
+        dead_code,
+        reason = "`--daemon` detach and the argv it rewrites are Windows-only, so off Windows nothing calls this"
+    )
+)]
 pub fn child_argv<I, S>(argv: I) -> Vec<OsString>
 where
     I: IntoIterator<Item = S>,
@@ -317,10 +329,6 @@ fn the_daemons_publication(resolution: &Resolution, expect: &ReadyExpect) -> Opt
     Some(state)
 }
 
-fn recorded_pid(state_dir: &Path) -> Option<u32> {
-    State::read(state_dir).ok().flatten().map(|state| state.pid)
-}
-
 fn control_channel_answers(control_name: &str) -> bool {
     if let Ok(address) = control_name.parse::<SocketAddr>() {
         return TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).is_ok();
@@ -352,6 +360,7 @@ mod tests {
 
     fn resolution_for(root: &Path) -> Resolution {
         Resolution {
+            pg_root: None,
             root: root.to_path_buf(),
             config: Config::default(),
             config_text: String::new(),

@@ -39,6 +39,8 @@ pub(crate) async fn run_checks(root: &Path, read_only: bool, proposals: Proposal
     let state = chosen_state_dir(&resolution, &candidates).await;
     #[cfg(not(feature = "api"))]
     let state = chosen_state_dir(&resolution);
+    // The fixture resolves a filesystem root, so the pg leg (and the root-skipping it drives)
+    // stays out of the run entirely — the fs path is the one it pins.
     checks(
         &Run {
             resolution: &resolution,
@@ -74,6 +76,7 @@ fn resolve_test(root: &Path, read_only: bool) -> (Resolution, Vec<PathBuf>) {
             config: None,
             read_only,
             state_dir: Some(root.join("home-state")),
+            pg_dsn: None,
         },
         &provenance,
     )

@@ -42,6 +42,7 @@ fn default_api_port() -> u16 {
 ///     config: None,
 ///     read_only: false,
 ///     state_dir: None,
+///     pg_dsn: None,
 /// };
 /// let located = locate(discovery, &Provenance::default())?;
 /// let args = Args {

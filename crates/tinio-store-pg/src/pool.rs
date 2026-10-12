@@ -37,6 +37,13 @@ pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 /// and `doctor` both read it back (PG12).
 const APPLICATION_NAME: &str = "tinio-store-pg";
 
+/// The session setting a read-only pool opens every connection with (PG6,
+/// PG26): the second of the three read-only layers, in place **before the first
+/// statement** because it rides the startup packet's `options` rather than
+/// being established by a statement of its own — the server refuses a write on
+/// such a session even when the entry guard above was bypassed.
+const READ_ONLY_SESSION_OPTION: (&str, &str) = ("default_transaction_read_only", "on");
+
 /// The TLS mode the store serves under (PG10).
 ///
 /// The mode set is the client's own: `disable`, `prefer` and `require`
@@ -88,19 +95,20 @@ impl SslMode {
     }
 }
 
-/// A connection string and what it says. The raw text is password-bearing and
-/// `Debug` skips it, so every rendering this type produces stays the redacted
-/// form (PG5, the module header).
+/// A connection string and what it says. Only the redacted text is kept — the
+/// raw, password-bearing one is consumed into the driver's options and never
+/// retained — so every rendering this type produces stays the redacted form
+/// (PG5, the module header).
 #[derive(Clone, Debug)]
 pub(crate) struct Dsn {
-    /// The dsn as given, for a reconnect on a dedicated connection.
-    #[debug(skip)]
-    raw: String,
     /// The dsn with its userinfo password replaced.
     dsn: String,
     host: String,
     database: String,
     mode: SslMode,
+    /// Whether the session is opened read-only (PG6): `default_transaction_read_only = on`
+    /// rides the connection's startup options.
+    read_only: bool,
     #[debug(skip)]
     options: PgConnectOptions,
 }
@@ -109,6 +117,18 @@ impl Dsn {
     /// Parse a dsn. The password is written into the driver's options and
     /// nowhere else: every rendering this type produces is the redacted form.
     pub(crate) fn parse(dsn: &str) -> Result<Self, Error> {
+        Self::parse_with(dsn, false)
+    }
+
+    /// Parse a dsn whose session is opened **read-only** (PG6, layer 2): the
+    /// driver's options carry `default_transaction_read_only = on` as a startup
+    /// option, so the setting is in place before the first statement rather
+    /// than established by one (PG26).
+    pub(crate) fn parse_read_only(dsn: &str) -> Result<Self, Error> {
+        Self::parse_with(dsn, true)
+    }
+
+    fn parse_with(dsn: &str, read_only: bool) -> Result<Self, Error> {
         let options: PgConnectOptions = dsn
             .parse()
             .map_err(|err| Error::database(&format!("invalid dsn: {err}"), dsn))?;
@@ -124,19 +144,26 @@ impl Dsn {
             _ => options.application_name(APPLICATION_NAME),
         };
         let options = options.ssl_mode(mode.driver());
+        // Appended, never set: a dsn that already carries `options=` keeps its
+        // own settings, and the read-only one rides beside them.
+        let options = if read_only {
+            options.options([READ_ONLY_SESSION_OPTION])
+        } else {
+            options
+        };
         Ok(Self {
-            raw: dsn.to_owned(),
             dsn: redact_userinfo(dsn),
             host,
             database,
             mode,
+            read_only,
             options,
         })
     }
 
-    /// The dsn as given, for a reconnect on a dedicated connection.
-    pub(crate) fn text(&self) -> &str {
-        &self.raw
+    /// Whether this dsn's session is opened read-only.
+    pub(crate) fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// The dsn with its userinfo password replaced.
@@ -193,8 +220,9 @@ fn names_an_ssl_mode(dsn: &str) -> bool {
 
 /// The store's connection pool and the facts `doctor` reports about it.
 ///
-/// `Debug` renders the identity (`mode`, `host`, `database`) and skips the
-/// driver's pool and the dsn, so a store's rendering carries no secret (PG5).
+/// `Debug` renders the identity (`mode`, `host`, `database`, `read_only`) and
+/// skips the driver's pool, the driver's options and the dsn, so a store's
+/// rendering carries no secret (PG5).
 ///
 /// # Examples
 ///
@@ -220,8 +248,17 @@ pub struct Pool {
     mode: SslMode,
     host: String,
     database: String,
+    read_only: bool,
+    /// The driver's options **every** connection this pool opens is built from — the pooled ones
+    /// and a dedicated out-of-pool one alike — so the read-only startup option reaches the
+    /// dedicated connection too and a pool cannot hand out a session with more privilege than it
+    /// was opened with (PG6). Carries the password: never rendered.
     #[debug(skip)]
-    dsn: String,
+    options: PgConnectOptions,
+    /// The dsn with its userinfo password replaced, for a connect failure's rendering (PG5).
+    /// Skipped by `Debug` like the driver's pool and the raw dsn: the rendering is the identity.
+    #[debug(skip)]
+    redacted: String,
 }
 
 impl Pool {
@@ -251,6 +288,66 @@ impl Pool {
         Self::open_with(dsn, max_connections, DEFAULT_ACQUIRE_TIMEOUT)
     }
 
+    /// Build a **read-only** pool for `dsn`: every connection it hands out is
+    /// opened with `default_transaction_read_only = on` as a startup option
+    /// (PG6, layer 2; the option rides the startup packet, so the server holds
+    /// the setting before the first statement — PG26).
+    ///
+    /// This is the session half of read-only mode. The entry guard
+    /// (`tinio-pg`'s `PgStorage`) is the half a caller sees; this one holds when
+    /// a statement reaches the server by some path the guard did not cover, and
+    /// the role's missing DML grants are the third.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_store_pg::pool::Pool;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), tinio_store_pg::Error> {
+    /// // Constructing opens nothing (the pool connects lazily), and
+    /// // [`Pool::is_read_only`] reports the mode every connection will carry.
+    /// let pool = Pool::open_read_only("postgres://user:password@db.example:5432/tinio", 4)?;
+    /// assert!(pool.is_read_only());
+    /// assert_eq!(pool.max_connections(), 4);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn open_read_only(dsn: &str, max_connections: u32) -> Result<Self, Error> {
+        Self::build(
+            Dsn::parse_read_only(dsn)?,
+            max_connections,
+            DEFAULT_ACQUIRE_TIMEOUT,
+        )
+    }
+
+    /// Build the pool for `dsn` in the mode `access` names — the choice every
+    /// caller that holds an [`crate::Access`] would otherwise re-spell (PG6). A read-only
+    /// access opens a pool whose sessions carry the read-only startup option, so a
+    /// diagnosis cannot write through the pool it inspects with.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_store_pg::{Access, pool::Pool};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), tinio_store_pg::Error> {
+    /// let dsn = "postgres://user:password@db.example:5432/tinio";
+    /// // Constructing opens nothing (the pool connects lazily).
+    /// assert!(Pool::open_for(dsn, 4, Access::ReadOnly)?.is_read_only());
+    /// assert!(!Pool::open_for(dsn, 4, Access::ReadWrite)?.is_read_only());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn open_for(dsn: &str, max_connections: u32, access: crate::Access) -> Result<Self, Error> {
+        if access.is_writable() {
+            Self::open(dsn, max_connections)
+        } else {
+            Self::open_read_only(dsn, max_connections)
+        }
+    }
+
     /// [`Pool::open`] with the acquire timeout made explicit.
     ///
     /// # Examples
@@ -276,12 +373,20 @@ impl Pool {
         max_connections: u32,
         acquire_timeout: Duration,
     ) -> Result<Self, Error> {
-        let parsed = Dsn::parse(dsn)?;
+        Self::build(Dsn::parse(dsn)?, max_connections, acquire_timeout)
+    }
+
+    /// The one constructor: a parsed dsn, a pool size and an acquire timeout
+    /// become a lazy pool plus the identity `doctor` reports. `open`,
+    /// `open_with` and `open_read_only` differ only in the dsn they hand it, so
+    /// the access mode is decided in exactly one place — the parse (PG6).
+    fn build(parsed: Dsn, max_connections: u32, acquire_timeout: Duration) -> Result<Self, Error> {
+        let options = parsed.options();
         let pool = PgPoolOptions::new()
             .max_connections(max_connections.max(1))
             .acquire_timeout(acquire_timeout)
             .test_before_acquire(true)
-            .connect_lazy_with(parsed.options());
+            .connect_lazy_with(options.clone());
         // PG10: the mode the connection is opened under is logged, and
         // [`Pool::ssl_mode`] reports the same value to `doctor`. The driver
         // exposes no post-handshake negotiation state, so this is the resolved
@@ -290,6 +395,7 @@ impl Pool {
             mode = %parsed.mode(),
             host = %parsed.host(),
             database = %parsed.database(),
+            read_only = parsed.read_only(),
             max_connections = max_connections.max(1),
             "postgres pool opened"
         );
@@ -298,13 +404,20 @@ impl Pool {
             mode: parsed.mode(),
             host: parsed.host().to_owned(),
             database: parsed.database().to_owned(),
-            dsn: parsed.text().to_owned(),
+            read_only: parsed.read_only(),
+            options,
+            redacted: parsed.redacted().to_owned(),
         })
     }
 
     /// The TLS mode the dsn asked for (PG10; `doctor` reports it).
     pub fn ssl_mode(&self) -> SslMode {
         self.mode
+    }
+
+    /// Whether this pool's sessions are opened read-only (PG6).
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// The host the dsn names.
@@ -317,10 +430,22 @@ impl Pool {
         &self.database
     }
 
-    /// The dsn as given: the reconnect a dedicated out-of-pool connection (the
-    /// ownership guard, the migration runner) needs. Never logged.
-    pub(crate) fn dsn_text(&self) -> &str {
-        &self.dsn
+    /// The driver's options for a **dedicated out-of-pool** connection — the
+    /// ownership guard, the migration runner (PG11/PG12).
+    ///
+    /// This is the pool's own session, the read-only startup option included
+    /// (PG6): a dedicated connection is opened **through the pool's mode**, so it
+    /// can never open with more privilege than the pool that asked for it. The
+    /// mode-less raw dsn this crate once handed out has no accessor any more, so
+    /// nothing can re-parse it and drop the mode by accident.
+    pub(crate) fn dedicated_options(&self) -> PgConnectOptions {
+        self.options.clone()
+    }
+
+    /// The dsn with its userinfo password replaced, for a connect failure's
+    /// rendering (PG5). Never the raw dsn: it carries the password.
+    pub(crate) fn redacted(&self) -> &str {
+        &self.redacted
     }
 
     /// The pool's configured maximum.
@@ -670,9 +795,93 @@ mod tests {
         let rendered = format!("{pool:?}");
         assert_eq!(
             rendered,
-            r#"Pool { mode: Disable, host: "db.internal", database: "tinio", .. }"#
+            r#"Pool { mode: Disable, host: "db.internal", database: "tinio", read_only: false, .. }"#
         );
         assert!(!rendered.contains("sup3rsecret"), "{rendered}");
+    }
+
+    /// The read-only pool (PG6, layer 2) carries `default_transaction_read_only
+    /// = on` as a **startup option** — the driver's `options` parameter, which
+    /// the server applies as the session opens, before any statement — and the
+    /// writable pool does not. The rendering names the mode.
+    #[test]
+    fn a_read_only_pool_opens_its_session_read_only() {
+        let dsn = "postgres://user:password@db.example:5432/tinio";
+        let writable = Dsn::parse(dsn).expect("the dsn parses");
+        assert!(!writable.read_only());
+        assert!(
+            !format!("{:?}", writable.options()).contains("default_transaction_read_only"),
+            "a writable session carries no read-only option"
+        );
+
+        let read_only = Dsn::parse_read_only(dsn).expect("the dsn parses");
+        assert!(read_only.read_only());
+        let rendered = format!("{:?}", read_only.options());
+        assert!(
+            rendered.contains("default_transaction_read_only=on"),
+            "the option is `-c default_transaction_read_only=on` in the startup \
+             options: {rendered}"
+        );
+    }
+
+    /// A dsn that names its own `options` keeps them: the read-only setting is
+    /// appended, never substituted.
+    #[test]
+    fn the_read_only_option_rides_beside_a_dsn_own_options() {
+        let parsed = Dsn::parse_read_only(
+            "postgres://user:password@db.example:5432/tinio?options=-c%20search_path%3Dtenant",
+        )
+        .expect("the dsn parses");
+        let rendered = format!("{:?}", parsed.options());
+        assert!(
+            rendered.contains("search_path=tenant"),
+            "the dsn's own option survives: {rendered}"
+        );
+        assert!(
+            rendered.contains("default_transaction_read_only=on"),
+            "and the read-only one joins it: {rendered}"
+        );
+    }
+
+    /// A **dedicated out-of-pool** connection — the ownership guard's, the
+    /// migration runner's — opens through the pool's own options, so a
+    /// read-only pool's dedicated connection carries the read-only startup
+    /// option too. This is the read-back the fix for the mode-less reconnect
+    /// rests on: before it, `connect_dedicated` re-parsed the raw dsn through
+    /// the writable arm and the option was dropped, so the dedicated
+    /// connection would have opened **writable** beside a read-only pool.
+    #[tokio::test]
+    async fn a_read_only_pools_dedicated_connection_is_read_only_too() {
+        let dsn = "postgres://user:password@db.example:5432/tinio";
+        let writable = Pool::open(dsn, 1).expect("the dsn parses");
+        assert!(!writable.is_read_only());
+        assert!(
+            !format!("{:?}", writable.dedicated_options())
+                .contains("default_transaction_read_only"),
+            "a writable pool's dedicated connection carries no read-only option"
+        );
+
+        let read_only = Pool::open_read_only(dsn, 1).expect("the dsn parses");
+        assert!(read_only.is_read_only());
+        let rendered = format!("{:?}", read_only.dedicated_options());
+        assert!(
+            rendered.contains("default_transaction_read_only=on"),
+            "the dedicated connection is opened through the pool's own read-only \
+             session: {rendered}"
+        );
+    }
+
+    /// [`Pool::is_read_only`] and the pool constructor agree: the writable
+    /// constructors report `false`, `open_read_only` reports `true`.
+    #[tokio::test]
+    async fn the_pool_reports_the_mode_it_was_opened_in() {
+        let dsn = "postgres://user:password@db.example:5432/tinio";
+        assert!(!Pool::open(dsn, 1).expect("the dsn parses").is_read_only());
+        assert!(
+            Pool::open_read_only(dsn, 1)
+                .expect("the dsn parses")
+                .is_read_only()
+        );
     }
 
     /// The wrapper is itself the executor the query macros take by value: the

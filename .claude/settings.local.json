@@ -1,4 +1,10 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(clip.exe)",
+      "Bash(docker exec tinio-store-pg *)"
+    ]
+  },
   "skillOverrides": {
     "github:code-review": "name-only",
     "github:code-review-swarm": "name-only",
@@ -19,10 +25,5 @@
     "github:swarm-pr": "name-only",
     "github:sync-coordinator": "name-only",
     "github:workflow-automation": "name-only"
-  },
-  "permissions": {
-    "allow": [
-      "Bash(clip.exe)"
-    ]
   }
 }

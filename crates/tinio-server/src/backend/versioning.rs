@@ -2470,6 +2470,7 @@ mod tests {
         assert_eq!(out.is_truncated, Some(false));
     }
 
+    #[cfg(feature = "versioning")]
     #[tokio::test]
     async fn list_object_versions_separates_versions_from_markers_newest_first() {
         let (backend, b) = versioned_setup(State::Enabled).await;

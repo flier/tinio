@@ -31,7 +31,7 @@ use crate::{
     _sandbox::{self, Terminal, serve},
     _server::identity,
 };
-use crate::{_sandbox::Child, Error, commands::start::Args, resolve::Resolution};
+use crate::{_config::storage, _sandbox::Child, Error, commands::start::Args, resolve::Resolution};
 
 /// Runs the confinement — §1 step i, the **dynamic** half, after the fork.
 ///
@@ -120,6 +120,7 @@ use crate::{_sandbox::Child, Error, commands::start::Args, resolve::Resolution};
 ///
 /// # fn main() -> Result<(), tinio_cli::Error> {
 /// let resolution = Resolution {
+///     pg_root: None,
 ///     root: PathBuf::from("/srv/data"),
 ///     config: Config::default(),
 ///     config_text: String::new(),
@@ -442,8 +443,12 @@ fn publish_state(
 ///
 /// **The two cannot both be honoured**, which is why the combination is a warning rather than two
 /// grants: the confinement cuts the confined process's outbound connections, and the OTLP exporter
-/// is the only outbound path this product has. The operator's ruling is that the combination is
-/// **warned about, naming both, and the confinement proceeds** (design decision 25, FR-036) —
+/// is an outbound path this product has. **It is not the only one any more**: the pg backend's
+/// connection to its database is the other, and a pg run under a confinement is not warned about
+/// but **refused up front** ([`refuse_pg_under_confinement`]) — losing an observer is not grounds
+/// for refusing to serve, losing the store is. The operator's ruling for the OTLP case is that the
+/// combination is **warned about, naming both, and the confinement proceeds** (design decision 25,
+/// FR-036) —
 /// losing an observer is not grounds for refusing to serve — so this answers the sentence's two
 /// facts and `crate::commands::start::run` emits the event, where the log is live and stdout's
 /// frames are `crate::events`' own.
@@ -461,6 +466,39 @@ pub(crate) fn lost_export<'a>(
     // whose export nobody is about to cut — answers `None` here without a second test of
     // `enabled`.
     Some((request.channel?.name(), endpoint?))
+}
+
+/// The refusal a **pg backend under a requested confinement** answers with, or `None` when either
+/// half is absent.
+///
+/// **A confinement and a postgres store cannot be honoured together.** The confinement cuts the
+/// confined process's outbound connections, and since the pg backend exists the store's connection
+/// to its database is such a path — so a jailed pg run has no route to its store and could never
+/// serve. FR-036's own trade ([`lost_export`]) is a **warning** because what it costs is an
+/// observer; here what is lost is the store itself, so the combination is **refused** up front,
+/// naming both settings, in the shape the run's other static refusals use (it precedes the fork,
+/// the directories and the confinement) — a silent unservable run is worse than a refusal.
+///
+/// **It answers rather than emits**, for `lost_export`'s reason: the caller (the pre-runtime half)
+/// owns the refusal's rendering. The channel is read off the [`Request`] rather than recomputed —
+/// `plan` is the one reader of that precedence rule.
+pub(crate) fn refuse_pg_under_confinement(
+    request: &Request,
+    backend: storage::Backend,
+) -> Option<Error> {
+    if backend != storage::Backend::Pg {
+        return None;
+    }
+    let channel = request.channel?;
+    Some(Error::Usage(format!(
+        "{} asks for a confinement, but `[storage] type = \"pg\"` cannot serve under one: the \
+         confinement cuts the confined process's outbound connections, and the pg store's \
+         connection to its database is exactly such a path — a jailed pg run has no route to its \
+         store. Serve the filesystem backend under the confinement, or drop the confinement \
+         ({}) to serve PostgreSQL",
+        channel.name(),
+        channel.name(),
+    )))
 }
 
 /// `serve::Spec::apply` must hand back a child when this target launches one.

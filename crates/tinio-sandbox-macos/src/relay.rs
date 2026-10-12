@@ -32,20 +32,20 @@
 //! **The strongest argument this plan first made for `signal-hook` is void, and
 //! it is better said plainly than left standing.** It argued that the crate
 //! keeps `tinio-sandbox-macos` on `unsafe_code = "forbid"`. It does not, and it
-//! cannot: the crate is `deny` with enumerated `#[allow(unsafe_code)]` sites
+//! cannot: the crate is `deny` with enumerated `#[expect(unsafe_code)]` sites
 //! (the inherited-descriptor rebuild in `launch`, the libSystem FFI in `apply`,
 //! and `apply`'s validator `fork`; design decision 14), because no route to any of
 //! them is safe. What remains is a smaller but real argument — a safe crate
 //! still beats one more hand-written `unsafe` site under `deny`. A
 //! hand-rolled handler is precisely where async-signal-safety bugs live, and
 //! taking that route would mean adding the new site to decision 14's list — an
-//! explicit, reviewable change that no `#[allow(unsafe_code)]` may make quietly. One small dependency is the cheaper
+//! explicit, reviewable change that no `#[expect(unsafe_code)]` may make quietly. One small dependency is the cheaper
 //! of the two, and its marginal cost is small: `signal-hook-registry`, the crate
 //! that actually owns the handler and the self-pipe, is already in the tree
 //! transitively. This is a preference between two working options rather than a
 //! lint-forced choice, and a maintainer who rejects the dependency must take the
 //! lint route explicitly — not read this plan as licence for a quiet
-//! `#[allow(unsafe_code)]`.
+//! `#[expect(unsafe_code)]`.
 
 // Every use below belongs to the crate's one platform, and none of them carries
 // a gate of its own: the crate root takes `#![cfg(target_os = "macos")]`, so a

@@ -68,7 +68,10 @@ use crate::{
 /// a range never carries the source's ETag.
 #[cfg(unix)]
 impl FsStorage {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the contract's `copy_part` shape — source and destination bucket/key, upload id, part number and range — which this unix fast path must match to override it"
+    )]
     pub(crate) async fn copy_part_fast(
         &self,
         src_bucket: &bucket::Name,
@@ -349,7 +352,13 @@ impl MultipartOps for FsStorage {
         };
         // The key path the publish landed on — consumed by the unix chown
         // below, and by the error path that removes a wrongly-owned file.
-        #[cfg_attr(not(unix), allow(unused_variables))]
+        #[cfg_attr(
+            not(unix),
+            expect(
+                unused_variables,
+                reason = "`target` is consumed only by the unix chown below, so off unix the binding is deliberately unused"
+            )
+        )]
         let target = published.path.as_path();
         let (size, mtime) = (published.size, published.mtime);
         // The unix ownership hardening (spec 2026-09-05 §5a): the

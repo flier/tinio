@@ -66,8 +66,7 @@ pub(crate) mod metrics;
 /// own test targets turn it on through the self dev-dependency in `Cargo.toml`,
 /// and `tinio-server`'s Linux e2e target asks for it from its own edge.
 #[cfg(any(test, feature = "testing"))]
-#[allow(
-    clippy::unwrap_used,
+#[expect(
     clippy::expect_used,
     clippy::panic,
     reason = "test support: behind `testing` (docs/style.md §Panics, design 2026-10-09 D7)"

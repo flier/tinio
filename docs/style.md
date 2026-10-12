@@ -23,6 +23,7 @@
 - Garde: custom rule `fn(&T, &Context) -> garde::Result`; rules private; entry = constructor.
 - Thin `lib.rs`/`mod.rs`; path-expose; `{Name, name}`; module fns.
 - Schema: drop prefix; `Config`+`Version`; table open/ensure via the crate's macro.
+- Production parses only the operator's file (`Config::load`) or launcher text, never a fabricated text; build the struct; tests exempt.
 - ETag: `Single` / `Composed`; parse `ETag::new`; emit `Display`; content/composed constructors.
 
 ## Error & async
@@ -40,7 +41,7 @@
 - `unwrap_err` / `expect_err` / `unreachable!` / `todo!` / `unimplemented!` are in that family too (D1).
 - `#[expect(<lint>, reason = "…")]`, prefix one of four (D2): `literal:` compile-time input; `infallible:` cannot fail by construction.
 - `guarded:` invariant visible in the same expression; `argued:` unreachable, argument + catching mechanism in the reason.
-- Runtime-failable never; eliminate over annotate.
+- Runtime-failable never; eliminate over annotate; `#[expect(…, reason)]`, never `#[allow(…)]` on an outer attribute (D2).
 - Lock: `.lock()` recovers — `.unwrap_or_else(PoisonError::into_inner)`; never unwrap, never propagate (D3).
 - Out of rule: indexing/slicing, arithmetic overflow, `debug_assert!` (D4).
 
@@ -49,13 +50,14 @@
 - Test code carries a stated `#[allow]`/`#[expect]`, one of two prefixes (D7):
 - `test support:` a test-support module or non-test target (bench, `harness = false` binary, integration helpers).
 - `test context:` a test-gated module or test fn.
-- Gate: six lints warn per crate (CI `-D warnings`); assert family + reason prefixes by `crates/tinio-e2e/tests/policy.rs` (D7, D8).
+- `#![allow(…)]` boundaries are outside `clippy::allow_attributes` — an `unsafe_code` module, a shared test module (D2, D7).
+- Gate: eight lints warn per crate (CI `-D warnings`); assert family + reason prefixes are held by review (D7, D8).
 
 ## SQL
 
-- Format: sqruff (postgres, 80 cols, upper keywords/literals, lower idents); lint after edit, CI `sql` job.
-- Ignore list holds dialect gaps; drop an entry once parseable.
-- One-line statements inline in `query!` / `query_as!` / `query_scalar!`; longer → `sql/<group>/<name>.sql`.
+- Every `.sql` file: sqruff-formatted and lint-clean after edit (postgres, 80 cols, upper keywords/literals, lower idents); CI `sql` job.
+- One-line statements inline in `query!` / `query_as!` / `query_scalar!`; only longer → `sql/<group>/<name>.sql`.
+- Statement files (the `sql/<group>/<name>.sql` a macro names, not a migration) carry no comments; the reason lives at the Rust call site.
 - Longer form via `query_file*!`; DDL, templated or macro-unexpressable array binds → `include_str!`.
 - Migrations: `sqlx::migrate!` directory — no Rust list of versions.
 - Returning columns decode into a row struct beside the call (field order = column order), never by position.

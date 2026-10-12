@@ -123,6 +123,11 @@ pub struct Config {
 
 impl Config {
     /// Parse a TOML string and run fail-fast validation.
+    ///
+    /// This is the spelling for text with **no file behind it**: the configuration bytes a
+    /// launcher forwarded to a confined child (design decision 18) parse here, because the
+    /// confinement exposes no path for [`load`](Self::load) to open. Everywhere else production
+    /// loads a document with `load` or builds the struct; tests and examples use this.
     pub fn parse(input: &str) -> Result<Self, Error> {
         Self::parse_at(input, Path::new("(inline)"))
     }
@@ -157,6 +162,48 @@ impl Config {
         }
         config.validate().map_err(Error::from_report)?;
         Ok(config)
+    }
+
+    /// The backend `[storage] type` selects (PG5): the key's own default when there is no
+    /// `[storage]` section at all.
+    ///
+    /// **This is the one reading of the selector**, so the serving half's refusal, the resolution's
+    /// pg decision and the root-side diagnostics cannot disagree about which backend a document
+    /// names.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_config::{Config, storage::Backend};
+    ///
+    /// assert_eq!(Config::default().backend(), Backend::Fs);
+    /// let pg = Config::parse("version = 1\n[storage]\ntype = \"pg\"").expect("config");
+    /// assert_eq!(pg.backend(), Backend::Pg);
+    /// ```
+    pub fn backend(&self) -> storage::Backend {
+        self.storage
+            .as_ref()
+            .map_or(storage::Backend::Fs, |storage| storage.backend)
+    }
+
+    /// The `[storage.pg]` section, when the document has one.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_config::Config;
+    ///
+    /// let pg = Config::parse(
+    ///     "version = 1\n[storage]\ntype = \"pg\"\n[storage.pg]\ndsn = \"postgres://db/tinio\"",
+    /// )
+    /// .expect("config");
+    /// assert_eq!(pg.pg_section().expect("the section").pool, 8);
+    /// assert!(Config::default().pg_section().is_none());
+    /// ```
+    pub fn pg_section(&self) -> Option<&storage::pg::Config> {
+        self.storage
+            .as_ref()
+            .and_then(|storage| storage.pg.as_ref())
     }
 
     /// Serialize to TOML (used by the first-start auto-create).

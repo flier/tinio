@@ -112,7 +112,10 @@ pub struct AccessFields {
 impl AccessFields {
     /// Build the fields of one request (the data-plane emission shape).
     /// One argument per [`AccessField`] — the schema's fixed set.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per `AccessField` — the schema's fixed set — so the arity is the data model's and the variant order is the index"
+    )]
     pub fn new(
         remote_addr: String,
         remote_user: String,

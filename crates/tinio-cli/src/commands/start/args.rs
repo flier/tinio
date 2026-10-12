@@ -241,8 +241,8 @@ mod tests {
         _util::testing::assert_send_sync,
         Error,
         cli::{
-            ACCESS_KEY_VAR, Cli, Command, HOST_VAR, LOG_FORMAT_VAR, LOG_LEVEL_VAR, PORT_VAR,
-            READ_ONLY_VAR, SANDBOX_VAR, SECRET_KEY_VAR, parse, provenance,
+            ACCESS_KEY_VAR, Cli, Command, HOST_VAR, LOG_FORMAT_VAR, LOG_LEVEL_VAR, PG_DSN_VAR,
+            PORT_VAR, READ_ONLY_VAR, SANDBOX_VAR, SECRET_KEY_VAR, parse, provenance,
         },
     };
 
@@ -287,6 +287,7 @@ mod tests {
             ("state-dir", STATE_DIR_VAR),
             ("access-key", ACCESS_KEY_VAR),
             ("secret-key", SECRET_KEY_VAR),
+            ("pg-dsn", PG_DSN_VAR),
         ] {
             assert_eq!(
                 argument(flag).get_env().map(|name| name.to_string_lossy()),

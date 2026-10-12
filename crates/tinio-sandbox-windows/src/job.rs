@@ -195,12 +195,12 @@ mod tests {
     //! The Job object, tested against an unconfined child: the primitive is
     //! independent of the AppContainer, and a failure here is then unambiguous.
     //!
-    //! **The spawn site takes the guard, so this move costs `spawn_guard` nothing.**
-    //! `sleeper` spawns through `tinio_util::job::spawn` rather than a raw
-    //! `Command::spawn`, and the guard's scan reads `crates/*/tests/**` only — so
-    //! there was no `ALLOWED` entry for the retired `tests/job.rs` to move and no
-    //! hole to record. The 2026-10-01 placement cleanup moved these legs here from
-    //! `tests/job.rs` (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`).
+    //! **The spawn site takes the guard.** `sleeper` spawns through
+    //! `tinio_util::job::spawn` rather than a raw `Command::spawn`, like every
+    //! harness spawn site (docs/tests.md §Harness & guards) — so the
+    //! 2026-10-01 placement cleanup that moved these legs here from `tests/job.rs`
+    //! (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`) left no raw
+    //! site behind.
 
     use std::{
         os::windows::io::AsRawHandle,

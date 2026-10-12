@@ -19,14 +19,12 @@ tracing.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 tinio-sandbox-windows.workspace = true
 
-# The facade's test binds **every** name this crate re-exports, and the fork probe's
-# `await_verdict` takes a pid as `rustix::process::Pid` — the one foreign type on that surface.
-# `process` alone: nothing here forks, opens a pipe or sends a signal, it only names the type.
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { workspace = true, features = ["process"] }
 
 [lints.clippy]
 absolute_paths = "warn"
+allow_attributes = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"

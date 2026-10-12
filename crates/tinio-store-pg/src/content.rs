@@ -61,12 +61,14 @@ use crate::{Error, PgStore, PgTx, begin, window::clip_chunk};
 /// (the contract's `ContentKey` distinguishes object from part by shape, not
 /// by a stored tag), so it stays beside its only plane rather than on a
 /// contract type -- the store carries no parallel *contract* type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, derive_more::Display)]
 #[sqlx(type_name = "content_kind", rename_all = "lowercase")]
-enum ContentKind {
+pub enum ContentKind {
     /// An object's chunks.
+    #[display("object")]
     Object,
     /// A multipart part's chunks.
+    #[display("part")]
     Part,
 }
 
@@ -142,18 +144,17 @@ pub fn publish_plan(len: u64) -> PublishPlan {
     }
 }
 
-/// The live head's sequence and length, which every read resolves the object's
-/// bytes against.
-struct StoredLiveHead {
-    live_seq: i64,
-    live_len: i64,
-}
-
-/// A live head locked `FOR UPDATE`: the generation a rename, copy, or guarded
-/// removal is allowed to act on, plus the publish identity when one was stored.
-struct LockedHead {
-    live_seq: i64,
-    live_len: i64,
+/// The live generation a caller may put back after a publish it has to undo,
+/// and the row shape every head read decodes: the sequence, the length and the
+/// publish identity, in `content_heads`'s own columns (aliased to these field
+/// names by the two statements that read them).
+///
+/// A key with no live generation has no value: the undo clears `live_seq`
+/// rather than restoring one.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveGeneration {
+    seq: i64,
+    len: i64,
     publish_id: Option<i64>,
 }
 
@@ -347,9 +348,9 @@ async fn lock_head(
     bucket: &str,
     kind: ContentKind,
     ckey: &str,
-) -> Result<Option<LockedHead>, Error> {
+) -> Result<Option<LiveGeneration>, Error> {
     Ok(query_file_as!(
-        LockedHead,
+        LiveGeneration,
         "sql/content/lock_live_head.sql",
         bucket,
         kind as _,
@@ -370,7 +371,7 @@ async fn live_source(
     mut tx: PgTx,
     wire: &str,
     from: &object::Key,
-) -> Result<(PgTx, LockedHead), Error> {
+) -> Result<(PgTx, LiveGeneration), Error> {
     let from_ckey = object_ckey(from);
     let Some(source) = lock_head(&mut tx, wire, ContentKind::Object, &from_ckey).await? else {
         tx.rollback().await?;
@@ -434,33 +435,168 @@ async fn read_generation(
 }
 
 /// Flip the staged generation live and record `publish_id` (`None` clears a
-/// previous tag). Zero rows means a later allocation already owns the head.
-async fn flip_head(staged: &PgStaged, publish_id: Option<i64>) -> Result<(), Error> {
+/// previous tag) — the visibility point.
+///
+/// **The flip is one statement, and both halves of the guard live in its
+/// `WHERE`.** The count subquery is compared against the generation's planned
+/// chunk count, and the head's `next_seq` must still be this generation's, so an
+/// interrupted publish stays invisible and a superseded generation can never go
+/// live. The lock is that statement's own CTE, whose `SELECT ... FOR UPDATE`
+/// holds the generation's chunk rows for the whole statement — so a sweep that
+/// would reclaim chunks out from under a body being written cannot delete them
+/// inside the count-and-flip window.
+///
+/// **A zero-row flip is ambiguous by construction, and the ambiguity is resolved
+/// only on that path**, inside the same transaction, by re-reading the count.
+/// The count is what decides it, because the two failures are not the same
+/// answer: a short run — a sweep that reclaimed chunks anyway — is
+/// [`Error::PublishRaced`] and is not flipped, because re-homing cannot put
+/// missing chunks back; a head whose sequence moved says a later allocation
+/// already owns the head and this publish lost the *allocation* race. Two
+/// concurrent PUTs of one key must resolve to one of the two bodies, never to a
+/// 5xx, so the loser re-homes its generation onto the head's next free sequence
+/// and flips there (see [`re_home_and_flip`]) instead of surfacing the error.
+///
+/// Answers the sequence the flip made live: the staged generation's own, or the
+/// one a re-home moved it onto.
+async fn flip_head(staged: &PgStaged, publish_id: Option<i64>) -> Result<i64, Error> {
+    let expected = publish_plan(staged.landed).chunks as i64;
+    let mut tx = begin(&staged.pool).await?;
+    let published = sqlx::query_file!(
+        "sql/content/publish_head.sql",
+        &staged.bucket,
+        staged.kind as _,
+        &staged.ckey,
+        staged.seq,
+        staged.landed as i64,
+        publish_id,
+        expected
+    )
+    .execute(&mut *tx)
+    .await?;
+    if published.rows_affected() == 1 {
+        tx.commit().await?;
+        return Ok(staged.seq);
+    }
+    let found = query_file_scalar!(
+        "sql/content/generation_count.sql",
+        &staged.bucket,
+        staged.kind as _,
+        &staged.ckey,
+        staged.seq
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.rollback().await?;
+    if found != expected {
+        return Err(Error::PublishRaced);
+    }
+    // **One attempt, not a retry loop.** `re_home_and_flip` re-allocates the head and flips in
+    // one transaction, and the allocation's row lock is held through the flip, so no concurrent
+    // writer can move `next_seq` out from under it: a second attempt could only repeat the
+    // first. The `Err` below is the invariant's floor, kept rather than a silent success.
+    if let Some(seq) = re_home_and_flip(staged, publish_id).await? {
+        return Ok(seq);
+    }
+    Err(Error::PublishRaced)
+}
+
+/// Re-home the staged generation and make it live, in one transaction.
+///
+/// A publish whose generation a later allocation superseded cannot flip it —
+/// that is the guard's whole purpose — so this moves the generation's chunk
+/// rows onto the head's next free sequence and flips that. Because the
+/// re-allocation and the flip share this transaction, the head row stays locked
+/// from the allocation to the flip and a concurrent allocation waits behind it,
+/// so the flip's guard is satisfied by construction. Answers whether the
+/// generation is now live.
+///
+/// The move changes the rows' key. `content.chunk` is `STORAGE EXTERNAL`, so a
+/// 1 MiB chunk is stored out-of-line and PostgreSQL copies its TOAST pointer,
+/// not its bytes, into the new heap tuple; a body small enough to keep its
+/// chunks inline (below the TOAST threshold) is physically rewritten by the
+/// `seq` update, so this is not a blanket "no body bytes are rewritten" — it is
+/// a re-key of the generation's own rows, never a re-read or re-upload of the
+/// body.
+///
+/// **The rows must survive the whole window** between the superseding
+/// allocation and this move. The head's `allocated_at` gate protects only the
+/// head's current `next_seq` generation, so a generation a later allocation
+/// superseded is published-and-unprotected for that entire span — not merely
+/// the length of this transaction. That is what the per-row `content.published`
+/// stamp and the cleanup predicates that read it are for: they
+/// keep a recent generation, superseded or not, out of the sweep, and still age
+/// a crashed partial out after the grace. As a floor against a reclaim that got
+/// through anyway, the move's row count is checked against the generation's
+/// chunk count and a short move is rolled back rather than flipped onto a live
+/// head whose chunk run does not match its `live_len`.
+///
+/// Answers the sequence the flip made live, `None` when the flip lost.
+async fn re_home_and_flip(
+    staged: &PgStaged,
+    publish_id: Option<i64>,
+) -> Result<Option<i64>, Error> {
+    let mut tx = begin(&staged.pool).await?;
+    let seq = query_file_scalar!(
+        "sql/content/alloc_head.sql",
+        &staged.bucket,
+        staged.kind as _,
+        staged.ckey
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let moved = sqlx::query_file!(
+        "sql/content/move_generation.sql",
+        &staged.bucket,
+        staged.kind as _,
+        staged.ckey,
+        staged.seq,
+        seq
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let chunks = publish_plan(staged.landed).chunks as u64;
+    if moved != chunks {
+        // A concurrent reclaim took rows out from under the generation: flipping
+        // now would make a live head whose chunk run is short, and `open` would
+        // answer `Corrupt` on a body the metadata row reports whole. Fail
+        // loudly instead of serving it.
+        tx.rollback().await?;
+        return Err(Error::PublishRaced);
+    }
     let published = sqlx::query_file!(
         "sql/content/publish_head.sql",
         &staged.bucket,
         staged.kind as _,
         staged.ckey,
-        staged.seq,
+        seq,
         staged.landed as i64,
-        publish_id
+        publish_id,
+        chunks as i64
     )
-    .execute(&staged.pool)
-    .await?;
-    if published.rows_affected() == 0 {
-        return Err(Error::PublishRaced);
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if published == 1 {
+        tx.commit().await?;
+        return Ok(Some(seq));
     }
-    Ok(())
+    tx.rollback().await?;
+    Ok(None)
 }
 
-/// The compare and the delete share one commit. `id` set means the stored
-/// publish identity must match too.
+/// The lock, the compare and the delete are one transaction, so a publish that lands
+/// between them loses the bytes it just stored. `id` set means the stored publish
+/// identity must match too; `matches` compares the stored generation against whatever
+/// the caller holds — the raw bytes, or the content MD5 the caller would otherwise have
+/// to retain.
 async fn remove_guarded(
     store: &PgStore,
     bucket: &bucket::Name,
     key: &ContentKey,
-    expected: &[u8],
     id: Option<PublishId>,
+    matches: impl Fn(&[u8]) -> bool,
 ) -> Result<bool, Error> {
     let (kind, ckey) = content_key(key);
     let wire = bucket.to_string();
@@ -476,16 +612,8 @@ async fn remove_guarded(
             return Ok(false);
         }
     }
-    let stored = read_generation(
-        &mut tx,
-        bucket,
-        kind,
-        &ckey,
-        head.live_seq,
-        head.live_len as u64,
-    )
-    .await?;
-    if stored.as_slice() != expected {
+    let stored = read_generation(&mut tx, bucket, kind, &ckey, head.seq, head.len as u64).await?;
+    if !matches(&stored) {
         tx.rollback().await?;
         return Ok(false);
     }
@@ -494,46 +622,104 @@ async fn remove_guarded(
     Ok(true)
 }
 
-/// The same commit as [`remove_guarded`], comparing a content MD5 instead of
-/// the raw bytes the caller would otherwise have to retain.
-async fn remove_guarded_etag(
-    store: &PgStore,
-    bucket: &bucket::Name,
-    key: &ContentKey,
-    etag: &ETag,
-    id: PublishId,
-) -> Result<bool, Error> {
-    let ETag::Single(_) = etag else {
-        return Ok(false);
-    };
-    let (kind, ckey) = content_key(key);
-    let wire = bucket.to_string();
-    let mut tx = begin(store.pool()).await?;
-    let Some(head) = lock_head(&mut tx, &wire, kind, &ckey).await? else {
-        tx.rollback().await?;
-        return Ok(false);
-    };
-    let stored_id = head.publish_id.map(|bits| bits as u64);
-    if stored_id != Some(u64::from(id)) {
-        tx.rollback().await?;
-        return Ok(false);
+impl PgStore {
+    /// The live length of one content key, of **either** kind — the object half is the
+    /// contract's own [`ObjectContent::stat`], the part half is a question the contracts leave
+    /// to the backend (D23: a part carries no size anywhere, and the multipart listing and the
+    /// completion are what join it). `None` when the key holds no live generation, so residue
+    /// reads as absent exactly as it does for an object (PG23).
+    ///
+    /// The timestamp and the identity a [`ContentEntry`] carries have no part counterpart: the
+    /// content relation keeps neither (D42), so this answers the length the caller asked for
+    /// and nothing it did not.
+    pub async fn live_len(
+        &self,
+        bucket: &bucket::Name,
+        key: &ContentKey,
+    ) -> Result<Option<u64>, Error> {
+        Ok(self
+            .live_generation(bucket, key)
+            .await?
+            .map(|head| head.len as u64))
     }
-    let stored = read_generation(
-        &mut tx,
-        bucket,
-        kind,
-        &ckey,
-        head.live_seq,
-        head.live_len as u64,
-    )
-    .await?;
-    if ETag::from_content(stored.as_slice()) != *etag {
-        tx.rollback().await?;
-        return Ok(false);
+
+    /// The key's live generation, or `None` when nothing is live.
+    ///
+    /// A completion that publishes and then fails reads this before the publish
+    /// and again after it, and [`Self::restore_live`] puts the earlier value
+    /// back while the later sequence is still the one `live_seq` names.
+    pub async fn live_generation(
+        &self,
+        bucket: &bucket::Name,
+        key: &ContentKey,
+    ) -> Result<Option<LiveGeneration>, Error> {
+        let (kind, ckey) = content_key(key);
+        let row = query_file_as!(
+            LiveGeneration,
+            "sql/content/live_generation.sql",
+            bucket,
+            kind as _,
+            ckey
+        )
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
     }
-    drain_key(&mut tx, &wire, kind, &ckey).await?;
-    tx.commit().await?;
-    Ok(true)
+
+    /// Put `previous` back as the live generation, but only while `published`
+    /// is still the one `live_seq` names.
+    ///
+    /// `previous: None` clears the live generation: the publish was the key's
+    /// first, and undoing it leaves no content. A zero-row update is success —
+    /// a newer writer already owns the head, and this call must not take it.
+    /// Answers whether this call restored the head.
+    pub async fn restore_live(
+        &self,
+        bucket: &bucket::Name,
+        key: &ContentKey,
+        published: LiveGeneration,
+        previous: Option<LiveGeneration>,
+    ) -> Result<bool, Error> {
+        let (kind, ckey) = content_key(key);
+        let (seq, len, publish_id) = match previous {
+            Some(previous) => (Some(previous.seq), previous.len, previous.publish_id),
+            None => (None, 0, None),
+        };
+        let updated = sqlx::query_file!(
+            "sql/content/restore_live.sql",
+            bucket,
+            kind as _,
+            ckey,
+            seq,
+            len,
+            publish_id,
+            published.seq
+        )
+        .execute(self.pool())
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Publish the staged generation — tagged with `id` when one is given — and
+    /// answer the [`LiveGeneration`] the flip committed.
+    ///
+    /// The generation is the staged one's own sequence, or the sequence a re-home
+    /// moved it onto, so a caller that may have to undo the publish keeps the
+    /// value instead of re-reading the head it just moved.
+    pub async fn publish_generation(
+        &self,
+        mut staged: PgStaged,
+        id: Option<PublishId>,
+    ) -> Result<LiveGeneration, Error> {
+        staged.finish().await?;
+        let publish_id = id.map(|id| u64::from(id) as i64);
+        let seq = flip_head(&staged, publish_id).await?;
+        Ok(LiveGeneration {
+            seq,
+            len: staged.landed as i64,
+            publish_id,
+        })
+    }
 }
 
 #[async_trait]
@@ -563,17 +749,18 @@ impl ObjectContent for PgStore {
         })
     }
 
-    /// Flush the staged tail and flip the head in one guarded statement. The flip is the
-    /// visibility point; a stage another allocation superseded answers
-    /// [`Error::PublishRaced`] and its rows stay residue.
+    /// Flush the staged tail and flip the head — one guarded statement on the ordinary
+    /// path, and the visibility point. A stage another allocation superseded re-homes its
+    /// generation onto the head's next free sequence and flips there, so a racing publish
+    /// is last-writer-wins and never surfaces an error; only a stage whose publish never
+    /// runs leaves its rows as residue for the sweep.
     async fn publish(
         &self,
         _bucket: &bucket::Name,
-        mut staged: PgStaged,
+        staged: PgStaged,
         _key: &ContentKey,
     ) -> Result<(), Error> {
-        staged.finish().await?;
-        flip_head(&staged, None).await
+        self.publish_generation(staged, None).await.map(|_| ())
     }
 
     /// Publish and store `id` in the same statement that flips the head, so a
@@ -581,12 +768,11 @@ impl ObjectContent for PgStore {
     async fn publish_tagged(
         &self,
         _bucket: &bucket::Name,
-        mut staged: PgStaged,
+        staged: PgStaged,
         _key: &ContentKey,
         id: PublishId,
     ) -> Result<(), Error> {
-        staged.finish().await?;
-        flip_head(&staged, Some(u64::from(id) as i64)).await
+        self.publish_generation(staged, Some(id)).await.map(|_| ())
     }
 
     /// Open the live generation, clipped to `range` when one is given. A key with no live
@@ -600,20 +786,11 @@ impl ObjectContent for PgStore {
     ) -> Result<BodyStream, Error> {
         let (kind, ckey) = content_key(key);
         let wire = bucket.to_string();
-        let head = query_file_as!(
-            StoredLiveHead,
-            "sql/content/live_head.sql",
-            &wire,
-            kind as _,
-            ckey
-        )
-        .fetch_optional(self.pool())
-        .await?;
-        let Some(head) = head else {
+        let Some(head) = self.live_generation(bucket, key).await? else {
             return Err(Error::MissingContent(key.clone()));
         };
-        let seq = head.live_seq;
-        let len = head.live_len as u64;
+        let seq = head.seq;
+        let len = head.len as u64;
         let (start, end) = match range {
             // `resolve` clamps an inclusive end to the last byte and rejects a
             // start past it; a zero-byte object rejects every range. The range
@@ -708,7 +885,7 @@ impl ObjectContent for PgStore {
         key: &ContentKey,
         expected: &[u8],
     ) -> Result<bool, Error> {
-        remove_guarded(self, bucket, key, expected, None).await
+        remove_guarded(self, bucket, key, None, |stored| stored == expected).await
     }
 
     /// Compare, match the stored publish identity, and delete in one transaction.
@@ -721,7 +898,7 @@ impl ObjectContent for PgStore {
         expected: &[u8],
         id: PublishId,
     ) -> Result<bool, Error> {
-        remove_guarded(self, bucket, key, expected, Some(id)).await
+        remove_guarded(self, bucket, key, Some(id), |stored| stored == expected).await
     }
 
     async fn remove_if_etag(
@@ -731,7 +908,13 @@ impl ObjectContent for PgStore {
         etag: &ETag,
         id: PublishId,
     ) -> Result<bool, Error> {
-        remove_guarded_etag(self, bucket, key, etag, id).await
+        let ETag::Single(_) = etag else {
+            return Ok(false);
+        };
+        remove_guarded(self, bucket, key, Some(id), |stored| {
+            ETag::from_content(stored) == *etag
+        })
+        .await
     }
 
     /// Move an object's bytes and its head together, in one transaction. A self-move is the
@@ -785,8 +968,8 @@ impl ObjectContent for PgStore {
         let to_ckey = object_ckey(to);
         let tx = begin(self.pool()).await?;
         let (mut tx, source) = live_source(tx, &wire, from).await?;
-        let source_seq = source.live_seq;
-        let len = source.live_len;
+        let source_seq = source.seq;
+        let len = source.len;
         drain_key(&mut tx, &wire, ContentKind::Object, &to_ckey).await?;
         let seq = query_file_scalar!(
             "sql/content/alloc_head.sql",
@@ -814,7 +997,8 @@ impl ObjectContent for PgStore {
             to_ckey,
             seq,
             len,
-            None::<i64>
+            None::<i64>,
+            publish_plan(len as u64).chunks as i64
         )
         .execute(&mut *tx)
         .await?;

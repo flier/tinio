@@ -28,6 +28,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 tinio-store-redb.workspace = true
+tinio-util = { workspace = true, features = ["testing"] }
 
 [[bench]]
 name = "listing"
@@ -35,6 +36,7 @@ harness = false
 
 [lints.clippy]
 absolute_paths = "warn"
+allow_attributes = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"

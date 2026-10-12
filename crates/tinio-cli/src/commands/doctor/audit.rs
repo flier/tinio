@@ -14,7 +14,15 @@ use crate::{
     _core::{bucket, object},
     _fs::is_symlink_or_reparse,
     report::{Finding, Severity},
+    resolve::Resolution,
 };
+
+/// The on-disk-name check's name, owned here for the row the walk emits: the real row and a pg
+/// run's skipped one read it from one place, so a rename cannot desync them.
+const NAMES_CHECK: &str = "on-disk names";
+
+/// The symlink check's name, owned here likewise.
+const SYMLINKS_CHECK: &str = "symlinks";
 
 /// The audit walk: the on-disk names at **any** depth, and the link entries, run off the
 /// runtime's workers.
@@ -25,8 +33,16 @@ use crate::{
 /// One `spawn_blocking` for the whole traversal — not one per entry — because it is a
 /// synchronous `std::fs` loop inside an async command that also drives `tokio::fs` work on
 /// the same pool.
-pub(super) async fn walk_findings(root: &Path, follow_symlinks: bool) -> Vec<Finding> {
-    let walked = root.to_path_buf();
+pub(super) async fn walk_findings(resolution: &Resolution, follow_symlinks: bool) -> Vec<Finding> {
+    if resolution.is_pg() {
+        // A pg run has no served root, so the walk does not run: each row keeps the name the walk
+        // would have emitted, from the one source below (ruling R8).
+        return vec![
+            Finding::check(NAMES_CHECK, Severity::Ok, super::checks::PG_NO_ROOT),
+            Finding::check(SYMLINKS_CHECK, Severity::Ok, super::checks::PG_NO_ROOT),
+        ];
+    }
+    let walked = resolution.root.to_path_buf();
     let named = walked.clone();
     match spawn_blocking(move || walk_audit(&walked)).await {
         Ok(walk) => {
@@ -47,12 +63,12 @@ pub(super) async fn walk_findings(root: &Path, follow_symlinks: bool) -> Vec<Fin
         // leg says the same instead of disappearing with it.
         Err(err) => vec![
             Finding::check(
-                "on-disk names",
+                NAMES_CHECK,
                 Severity::Error,
                 format!("the audit walk did not run: {err}"),
             ),
             Finding::check(
-                "symlinks",
+                SYMLINKS_CHECK,
                 Severity::Warn,
                 format!("not inspected: the audit walk did not run: {err}"),
             ),
@@ -95,13 +111,13 @@ fn push_sample(samples: &mut Vec<String>, text: String) {
 pub(crate) fn name_finding(samples: Vec<String>, total: usize) -> Finding {
     if total == 0 {
         return Finding::check(
-            "on-disk names",
+            NAMES_CHECK,
             Severity::Ok,
             "every bucket name and object key is valid",
         );
     }
     Finding::check(
-        "on-disk names",
+        NAMES_CHECK,
         Severity::Warn,
         sampled_detail(total, &samples, "invalid name(s)"),
     )
@@ -120,16 +136,16 @@ pub(crate) fn symlink_finding(
     // row is `ok` and says so rather than warning about what the server does on purpose.
     if follow_symlinks {
         return Finding::check(
-            "symlinks",
+            SYMLINKS_CHECK,
             Severity::Ok,
             format!("following is enabled; {total} link entr(ies) are served"),
         );
     }
     if total == 0 {
-        return Finding::check("symlinks", Severity::Ok, "no link entries present");
+        return Finding::check(SYMLINKS_CHECK, Severity::Ok, "no link entries present");
     }
     Finding::check(
-        "symlinks",
+        SYMLINKS_CHECK,
         Severity::Warn,
         sampled_detail(
             total,
@@ -186,7 +202,7 @@ pub(crate) fn inspection_finding(walk: &Walk, root: &Path) -> Option<Finding> {
     let skipped = walk.unreadable_dirs + walk.unreadable_entries;
     (skipped > 0).then(|| {
         Finding::check(
-            "on-disk names",
+            NAMES_CHECK,
             Severity::Warn,
             format!(
                 "not inspected: {} directories and {} entries under {} could not be read",

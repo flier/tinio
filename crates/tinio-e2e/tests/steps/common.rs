@@ -16,9 +16,10 @@
 //! contains/omits/equals) live here too, so a new feature does not have
 //! to hunt for them in a feature-specific step module.
 
+// The pg backend's configuration values — `TINIO_PG_DSN`, the secret pair the backend's `Config`
+// takes (PG5), the crate's own constructor types and the reset connection. Only the `pg`
+// feature's constructors below reach them.
 use std::{
-    io,
-    io::ErrorKind,
     net::SocketAddr,
     path::{Path, PathBuf},
     str,
@@ -28,24 +29,34 @@ use std::{
 
 use cucumber::{given, then};
 use md5::{Digest, Md5};
+#[cfg(feature = "pg")]
+use sqlx::PgConnection;
 use tempfile::TempDir;
-use tinio_sandbox::Event;
+#[cfg(feature = "pg")]
+use tinio_pg::_store_pg::test_support::{base_dsn, truncate_all};
+#[cfg(feature = "pg")]
+use tinio_pg::{Access, Config as PgConfig, PgStorage};
+#[cfg(feature = "pg")]
+use tinio_util::secret::{Secret, SecretKey};
+use tinio_util::testing::{http::exchange, sigv4::Signer};
+#[cfg(feature = "pg")]
+use tokio::sync::{OnceCell, Semaphore, SemaphorePermit};
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     sync::watch,
     time::sleep,
 };
 
-use super::sigv4::Signer;
 pub use crate::_fs::testing::fs_options;
 use crate::{
     _core::{mode::AccessMode, storage::Storage},
     _fs::{FsOptions, FsStorage, Scanner, ScannerOptions},
     _mem::MemoryStorage,
     _server::{
-        _config::Config, Capabilities, DataPlane, Identity, PlaneConfig,
+        _config::{Config, auth, owner, users},
+        Capabilities, DataPlane, Identity, PlaneConfig,
         identity::IdentityFromConfig,
     },
 };
@@ -87,27 +98,30 @@ pub const ACL_USER_B_ID: &str = "8b3873bb48d62959c9316b8bc5a1c11dcb3e14dce9426cc
 /// The fixture config behind the @acl identity — the same
 /// `[auth]`/`[owner]`/`[[users]]` assembly `serve` wires (spec §6), so
 /// the e2e plane has real configured principals, not test-constructed
-/// ones. Built from the access-key / canonical-ID constants above, so
-/// the config and the Gherkin literals cannot drift.
+/// ones. Built from the schema's own section types (the way `clients.rs`'s
+/// `config_for` builds its capability file), so a renamed key is a compile
+/// error here rather than a document the run reads as an unset default.
 fn acl_fixture_config() -> Config {
-    let toml = format!(
-        r#"version = 1
-[auth]
-access_key = "{root_ak}"
-secret_key = "{root_sk}"
-[owner]
-canonical_id = "{ACL_ROOT_ID}"
-display_name = "ops"
-[[users]]
-access_key = "{userb_ak}"
-secret_key = "user-b-secret"
-canonical_id = "{ACL_USER_B_ID}"
-display_name = "bob"
-"#,
-        root_ak = ACL_ROOT.0,
-        root_sk = ACL_ROOT.1,
-        userb_ak = ACL_USER_B.0,
-    );
+    let config = Config {
+        auth: Some(auth::Config {
+            access_key: ACL_ROOT.0.to_owned(),
+            secret_key: auth::Secret::from(auth::SecretKey::from(ACL_ROOT.1.to_owned())),
+        }),
+        owner: Some(owner::Config {
+            canonical_id: ACL_ROOT_ID.to_owned(),
+            display_name: "ops".to_owned(),
+            ..Default::default()
+        }),
+        users: Some(vec![users::Config {
+            access_key: ACL_USER_B.0.to_owned(),
+            secret_key: auth::Secret::from(auth::SecretKey::from(ACL_USER_B.1.to_owned())),
+            canonical_id: Some(ACL_USER_B_ID.to_owned()),
+            display_name: Some("bob".to_owned()),
+            local_uid: None,
+        }]),
+        ..Default::default()
+    };
+    let toml = toml::to_string(&config).expect("the acl fixture config serializes");
     Config::parse(&toml).expect("the acl fixture config parses")
 }
 
@@ -124,6 +138,9 @@ pub enum Backend {
     #[default]
     Fs,
     Mem,
+    /// The shared PostgreSQL backend (`tinio_pg::PgStorage`), served only in a `--features pg`
+    /// build (PG8/PG17).
+    Pg,
 }
 
 /// Which fs-server variant a scenario's tags demand.
@@ -148,8 +165,96 @@ pub struct Server {
     /// the served root: alive for the server's lifetime — never read
     /// otherwise.
     _home: Option<TempDir>,
+    /// The exclusive permit the shared pg database is served under (PG8/PG17),
+    /// held for the server's lifetime and released when it drops — never read,
+    /// because holding it IS the guarantee that no two pg scenarios reset and
+    /// run at once.
+    #[cfg(feature = "pg")]
+    _pg_permit: Option<SemaphorePermit<'static>>,
     served: Option<PathBuf>,
     shutdown: watch::Sender<bool>,
+}
+
+/// The one shared pg backend, constructed on the first `@pg` scenario and reused by every later
+/// one. **Constructed once, never per scenario**: `PgStorage::connect` (writable) takes the
+/// ownership advisory lock and holds it for the process's life (PG12), so a second construction
+/// inside this process would be refused — the shared value, reset per scenario, is the shape
+/// that lock forces (PG8's "one shared database, one scenario at a time").
+#[cfg(feature = "pg")]
+static PG_STORAGE: OnceCell<PgStorage> = OnceCell::const_new();
+
+/// The dsn the pg pass runs against — `TINIO_PG_DSN`, its only source, so no credential is
+/// spelled in this file (PG25).
+///
+/// **The variable's name and its normalization are the store harness's**, not a third spelling
+/// of both: this pass already enables `tinio-store-pg`'s `testing` through `tinio-pg`, so
+/// `base_dsn` is the same reader the store's own DB-backed legs and `tinio-pg`'s test targets
+/// use. What is local is the *failure*: a `@pg` scenario cannot skip, so a missing variable is
+/// this pass's panic rather than a leg's early return.
+#[cfg(feature = "pg")]
+fn pg_dsn() -> String {
+    base_dsn()
+        .expect("the pg pass needs TINIO_PG_DSN (the compose fixture's dsn, never written here)")
+}
+
+/// The shared pg backend, migrated on first use (`PgStorage::connect` runs the migrations).
+#[cfg(feature = "pg")]
+async fn pg_storage() -> &'static PgStorage {
+    PG_STORAGE
+        .get_or_init(|| async {
+            let config = PgConfig::new(Secret::from(SecretKey::from(pg_dsn())), 8);
+            PgStorage::connect(&config, Access::ReadWrite)
+                .await
+                .expect("construct the pg backend against TINIO_PG_DSN")
+        })
+        .await
+}
+
+/// The one permit the shared pg database is served under (see [`pg_storage_reset`]).
+#[cfg(feature = "pg")]
+static PG_EXCLUSIVE: Semaphore = Semaphore::const_new(1);
+
+/// The shared pg backend, this scenario's scratch home, and the exclusive permit they are served
+/// under — the body [`Server::pg`] and [`Server::acl_pg`] share, so the reset discipline is
+/// written once.
+///
+/// **The permit is what makes the shared database safe at any concurrency.** The pass is correct
+/// only one scenario at a time: one scenario's reset would truncate another's live rows, and the
+/// CI invocation's `--concurrency 1` is not something the harness can check (PG8). So the permit
+/// is taken here, next to the reset, and held until the server drops. A hand-run, or any future
+/// concurrency change, therefore serializes the pg scenarios instead of failing them with no
+/// cause in the message.
+#[cfg(feature = "pg")]
+async fn pg_storage_reset() -> (PgStorage, TempDir, SemaphorePermit<'static>) {
+    let permit = PG_EXCLUSIVE
+        .acquire()
+        .await
+        .expect("the shared pg database's exclusive permit");
+    let storage = pg_storage().await.clone();
+    reset_pg_database().await;
+    (storage, tempfile::tempdir().unwrap(), permit)
+}
+
+/// Reset the shared database for one scenario (PG17): truncate every table the schema owns except
+/// the migration bookkeeping, so the next scenario starts on an empty database while the schema
+/// stays. The storage is neither re-migrated nor re-constructed (its ownership lock forbids that —
+/// see [`PG_STORAGE`]).
+///
+/// A fresh connection, not the storage's pool: the pool belongs to `PgStorage`, whose raw-SQL
+/// surface is private to the store crate, and one connection per reset is what a serialized pass
+/// costs. The statement itself is `tinio-store-pg`'s ([`truncate_all`]): the store owns which
+/// tables the schema has and which one is the migration bookkeeping, so a migration that renames
+/// or adds a table cannot leave rows behind for a harness that spelled the names itself.
+#[cfg(feature = "pg")]
+async fn reset_pg_database() {
+    use sqlx::Connection as _;
+
+    let mut conn = PgConnection::connect(&pg_dsn())
+        .await
+        .expect("connect to TINIO_PG_DSN to reset the database for the next scenario");
+    truncate_all(&mut conn)
+        .await
+        .expect("truncate the schema for the next scenario");
 }
 
 impl Server {
@@ -163,6 +268,49 @@ impl Server {
     /// Serve the in-memory reference backend.
     pub async fn mem(caps: Capabilities) -> Self {
         Self::spawn_with(MemoryStorage::new().unwrap(), caps.into(), None, None).await
+    }
+
+    /// Serve the shared PostgreSQL backend, its database reset for this scenario (PG17).
+    #[cfg(feature = "pg")]
+    pub async fn pg(caps: Capabilities) -> Self {
+        Self::pg_server(caps, false).await
+    }
+
+    /// Serve the shared PostgreSQL backend on the identity-wired acl plane (the `@acl`
+    /// scenarios), reset for this scenario exactly as [`Server::pg`] does.
+    #[cfg(feature = "pg")]
+    pub async fn acl_pg(caps: Capabilities) -> Self {
+        Self::pg_server(caps, true).await
+    }
+
+    /// The shared pg server [`Server::pg`] and [`Server::acl_pg`] differ only by the plane over:
+    /// one database reset, one scratch home, one permit, whatever the plane.
+    ///
+    /// The backend is constructed **once per process** ([`pg_storage`]) and the per-scenario
+    /// reset is the truncate in [`reset_pg_database`] — the plan's "truncate + re-migrate +
+    /// construct" is a truncate over one construct-once storage, because a writable
+    /// `PgStorage::connect` takes the ownership advisory lock and holds it for the process's
+    /// life (PG12), so a second construction inside this process is refused. The reset leaves
+    /// the schema (and its `schema_version` row) in place, so the storage is already migrated;
+    /// "construct" is the fresh [`DataPlane`] this spawns over a clone of that one storage. The
+    /// exclusive permit [`pg_storage_reset`] takes is what makes the shared database safe at any
+    /// concurrency (PG8), rather than the pass's `--concurrency` flag.
+    ///
+    /// The scenario also gets a scratch state dir of its own — the pg backend serves no root,
+    /// but a scenario's temp state is kept alive for the server's lifetime, [`Server::read_only`]'s
+    /// shape.
+    #[cfg(feature = "pg")]
+    async fn pg_server(caps: Capabilities, acl: bool) -> Self {
+        let (storage, home, permit) = pg_storage_reset().await;
+        let plane = if acl {
+            DataPlane::new_with_acl(storage, caps, acl_fixture_identity())
+        } else {
+            DataPlane::new(storage, PlaneConfig::from(caps))
+        };
+        let mut server = Self::spawn_plane(plane, None, None).await;
+        server._home = Some(home);
+        server._pg_permit = Some(permit);
+        server
     }
 
     /// Serve a filesystem backend over a nested root: the base tempdir
@@ -222,12 +370,10 @@ impl Server {
 
     /// Bind the data plane — plus an optional background scanner on a
     /// cloned shutdown receiver (it aborts on shutdown) — and spawn its
-    /// accept loop. `plane` carries both the capability toggles and the
-    /// write policy, so a caller opts into read-only mode by handing in
-    /// [`PlaneConfig::read_only`].
-    async fn spawn_with<S: Storage>(
-        storage: S,
-        plane: PlaneConfig,
+    /// accept loop. This owns the bind/watch/served bookkeeping; the
+    /// callers below own which plane they hand in.
+    async fn spawn_plane(
+        plane: DataPlane,
         root: Option<TempDir>,
         scanner: Option<Scanner>,
     ) -> Self {
@@ -239,37 +385,6 @@ impl Server {
         if let Some(scanner) = scanner {
             tokio::spawn(scanner.run(rx.clone()));
         }
-        let data_plane = DataPlane::new(storage, plane);
-        tokio::spawn(async move {
-            data_plane.serve(listener, rx).await.unwrap();
-        });
-        let served = root.as_ref().map(|r| r.path().to_path_buf());
-        Self {
-            addr,
-            _root: root,
-            _home: None,
-            served,
-            shutdown,
-        }
-    }
-
-    /// Bind the identity-wired acl plane (`DataPlane::new_with_acl` —
-    /// ConfigAuth + AclAccess, the @acl-scenario server) over the given
-    /// identity: the same bind/serve/shutdown shape as `spawn_with`,
-    /// which itself stays untouched so the legacy 12 feature files keep
-    /// running unsigned.
-    async fn spawn_with_acl<S: Storage>(
-        storage: S,
-        caps: Capabilities,
-        root: Option<TempDir>,
-        identity: Arc<Identity>,
-    ) -> Self {
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (shutdown, rx) = watch::channel(false);
-        let plane = DataPlane::new_with_acl(storage, caps, identity);
         tokio::spawn(async move {
             plane.serve(listener, rx).await.unwrap();
         });
@@ -278,9 +393,33 @@ impl Server {
             addr,
             _root: root,
             _home: None,
+            #[cfg(feature = "pg")]
+            _pg_permit: None,
             served,
             shutdown,
         }
+    }
+
+    /// The legacy no-identity plane over `storage`, on the capability and write policy `plane`
+    /// carries, so a caller opts into read-only mode by handing in [`PlaneConfig::read_only`].
+    async fn spawn_with<S: Storage>(
+        storage: S,
+        plane: PlaneConfig,
+        root: Option<TempDir>,
+        scanner: Option<Scanner>,
+    ) -> Self {
+        Self::spawn_plane(DataPlane::new(storage, plane), root, scanner).await
+    }
+
+    /// The identity-wired acl plane (`DataPlane::new_with_acl` — ConfigAuth + AclAccess, the
+    /// @acl-scenario server) over `identity`, so the legacy feature files keep running unsigned.
+    async fn spawn_with_acl<S: Storage>(
+        storage: S,
+        caps: Capabilities,
+        root: Option<TempDir>,
+        identity: Arc<Identity>,
+    ) -> Self {
+        Self::spawn_plane(DataPlane::new_with_acl(storage, caps, identity), root, None).await
     }
 
     /// Serve a fresh filesystem-backed root on the identity-wired acl
@@ -314,6 +453,38 @@ impl Server {
     pub fn root(&self) -> Option<&Path> {
         self.served.as_deref()
     }
+
+    /// The scenario's tag-driven facts — the backend, the fs variant, the capability set and
+    /// whether the scenario asked for the identity-wired plane — as the running server.
+    ///
+    /// **One match, because the two axes cross**: `@acl` is independent of the backend axis, so
+    /// a `@pg` acl scenario is [`Server::acl_pg`] and not a fourth branch. Each backend's own
+    /// constructor stays the home of its setup; this only decides which one a scenario wants.
+    /// The `@pg` arm is gated once: a build without the feature carries no `PgStorage` (PG15),
+    /// so it fails loud here rather than silently serving another backend.
+    pub async fn from_tags(
+        backend: Backend,
+        fs_kind: FsKind,
+        caps: Capabilities,
+        acl: bool,
+    ) -> Self {
+        match (backend, fs_kind, acl) {
+            (Backend::Mem, _, true) => Self::acl_mem(caps).await,
+            (Backend::Mem, _, false) => Self::mem(caps).await,
+            (Backend::Fs, _, true) => Self::acl(caps).await,
+            (Backend::Fs, FsKind::NestedRoot, false) => Self::fs_nested(caps).await,
+            (Backend::Fs, FsKind::ColdListing(interval), false) => {
+                Self::fs_with_scanner_interval(caps, interval).await
+            }
+            (Backend::Fs, FsKind::Plain, false) => Self::fs(caps).await,
+            #[cfg(feature = "pg")]
+            (Backend::Pg, _, true) => Self::acl_pg(caps).await,
+            #[cfg(feature = "pg")]
+            (Backend::Pg, _, false) => Self::pg(caps).await,
+            #[cfg(not(feature = "pg"))]
+            (Backend::Pg, _, _) => panic!("a @pg scenario needs a build with --features pg"),
+        }
+    }
 }
 
 impl Drop for Server {
@@ -322,24 +493,9 @@ impl Drop for Server {
     }
 }
 
-/// A raw HTTP response: status, headers (lower-cased names), body bytes.
-#[derive(Debug, Clone, Default)]
-pub struct LastResponse {
-    pub status: u16,
-    pub body: Vec<u8>,
-    pub headers: Vec<(String, String)>,
-}
-
-impl LastResponse {
-    /// The first value of `name` (case-insensitive; the stored names
-    /// are lower-cased at parse).
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    }
-}
+/// A raw HTTP response, the framing's own type ([`tinio_util::testing::http`]):
+/// status, headers (lower-cased names), body bytes.
+pub use tinio_util::testing::http::Response as LastResponse;
 
 /// Raw HTTP client used by every step (one per scenario): bound to the
 /// scenario's server by the `#[before]` hook, then every request goes
@@ -400,24 +556,9 @@ impl Client {
     }
 }
 
-/// One HTTP/1.1 request on a fresh connection; the response is read to
-/// EOF (`Connection: close`) and de-chunked when needed.
-///
-/// Retry policy — the connect stage only, up to 2 retries ~50 ms apart,
-/// on `ConnectionAborted` / `ConnectionRefused` (the Windows loopback
-/// accept race: with scenarios running in parallel, each binding its own
-/// ephemeral-port listener, the stack sometimes aborts a connection
-/// before the server accepts it — the flake root the CI `--retry 1`
-/// papers over). Two manifestations are covered:
-///
-/// - `TcpStream::connect` itself fails, or
-/// - the first write (the request head) fails after zero bytes were
-///   transmitted — the connection died in the accept queue; the server
-///   never received a byte, so the request cannot have executed.
-///
-/// Once ANY byte has been sent, no retry happens: the server may already
-/// have started executing the request (e.g. a PUT that wrote the object),
-/// and a retry could double-apply a non-idempotent write.
+/// One HTTP/1.1 request on a fresh connection; the framing is
+/// [`tinio_util::testing::http::exchange`]'s, shared with `tinio-cli`'s pg serving leg. The retry
+/// budget is the Windows loopback accept race's (see that function).
 pub async fn request(
     addr: SocketAddr,
     method: &str,
@@ -425,77 +566,7 @@ pub async fn request(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> LastResponse {
-    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
-    if !headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-    {
-        head += &format!("Content-Length: {}\r\n", body.len());
-    }
-    for (k, v) in headers {
-        head += &format!("{k}: {v}\r\n");
-    }
-    head += "\r\n";
-    let retryable = |e: &io::Error| {
-        matches!(
-            e.kind(),
-            ErrorKind::ConnectionAborted | ErrorKind::ConnectionRefused
-        )
-    };
-    let mut attempt = 0;
-    loop {
-        // Phase 1 — connect + transmit the request head. Both may abort
-        // before any byte reaches the server; both are retried (see the
-        // policy above).
-        let mut stream = match TcpStream::connect(addr).await {
-            Ok(s) => s,
-            Err(e) if retryable(&e) && attempt < 2 => {
-                attempt += 1;
-                sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            Err(e) => panic!("cannot connect to {addr}: {e}"),
-        };
-        match stream.write(head.as_bytes()).await {
-            Ok(n) if n == head.len() => {}
-            Ok(n) => {
-                // A partial head (rare): finish it. Any failure from here
-                // on is a genuine post-transmission failure — never
-                // retried.
-                stream
-                    .write_all(&head.as_bytes()[n..])
-                    .await
-                    .expect("finish the request head");
-            }
-            Err(e) if retryable(&e) && attempt < 2 => {
-                // Zero bytes were sent: the connection died in the accept
-                // queue and the request never reached the server — the
-                // same safety class as a connect failure.
-                attempt += 1;
-                sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            Err(e) => panic!("cannot send request to {addr}: {e}"),
-        }
-        // Phase 2 — body and response. The body write is never retried:
-        // the head went out, so the server may already have executed the
-        // request. The response read can still catch the same accept-queue
-        // abort: if the connection dies BEFORE any response byte arrives
-        // the server never executed the request (it was still queued), so
-        // retrying is safe. A read that aborts mid-stream (partial bytes
-        // already received) is never retried — the request ran.
-        stream.write_all(body).await.expect("send the request body");
-        let mut raw = Vec::new();
-        match stream.read_to_end(&mut raw).await {
-            Ok(_) => return parse_response(&raw),
-            Err(e) if raw.is_empty() && retryable(&e) && attempt < 2 => {
-                attempt += 1;
-                sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            Err(e) => panic!("read the response from {addr}: {e}"),
-        }
-    }
+    exchange(&addr.to_string(), addr, method, path, headers, body, 2).await
 }
 
 /// A PUT whose body is cut off mid-stream: the headers declare
@@ -525,16 +596,9 @@ pub async fn eventually(cond: impl FnMut() -> bool) -> bool {
 
 /// The text between the first `open`/`close` tag pair — empty when the
 /// opener (or the closer) is absent, so a missing tag never yields a
-/// garbage slice of the body.
-pub fn extract(text: &str, open: &str, close: &str) -> String {
-    let Some(start) = text.find(open).map(|i| i + open.len()) else {
-        return String::new();
-    };
-    let Some(end) = text[start..].find(close).map(|i| start + i) else {
-        return String::new();
-    };
-    text[start..end].to_string()
-}
+/// garbage slice of the body. The rule is [`tinio_util::testing::extract`]'s,
+/// re-exported rather than copied.
+pub use tinio_util::testing::extract;
 
 /// Plant a file at `rel`, relative to the served root, creating its
 /// parents — the out-of-band fixture body shared by this module's `the
@@ -723,87 +787,4 @@ pub(super) async fn sorted_entries(dir: &Path) -> Vec<String> {
     }
     names.sort();
     names
-}
-
-/// Feed one line of a child's event stream into `frame`, returning the event when the line closes
-/// a frame, and clearing `frame` either way.
-///
-/// **A frame is not a line** (design decision 19): `Event::encode` writes an `event:` line, a
-/// `data:` line and the blank line that closes them, so a decoder fed one line at a time sees an
-/// event name with no payload and drops it; accumulating to the blank line is what makes that
-/// line the frame's end rather than a line to skip. Text that is not one of our frames is dropped
-/// rather than fatal, which is what makes a stray write to stdout harmless.
-///
-/// The line's own terminator is not significant: it is trimmed and re-emitted as `\n`, so a
-/// reader holding a pipe's raw CRLF and one holding an already trimmed line build the same frame
-/// text, which `sse-core` dispatches alike.
-///
-/// **The one home in this crate**: `steps/cli.rs`'s `frames` reads a whole captured stream with it
-/// and `steps/clients.rs`'s readiness reader reads a live pipe with it, so a frame means the same
-/// thing on both — a captured file and a stream still being written.
-/// (`crates/tinio-server/tests/common/mod.rs`'s `frame_line` is the same rule for the legs that
-/// live beside that crate, whose `tests/` tree this one cannot import.)
-pub fn frame_line(frame: &mut String, line: &str) -> Option<Event> {
-    if line.trim_end().is_empty() {
-        let event = Event::decode(frame);
-        frame.clear();
-        return event;
-    }
-    frame.push_str(line.trim_end());
-    frame.push('\n');
-    None
-}
-
-/// Split a raw HTTP response into status, headers, and (de-chunked) body.
-fn parse_response(raw: &[u8]) -> LastResponse {
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("response header terminator");
-    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().expect("status line");
-    let code: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .expect("status code");
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|line| {
-            line.split_once(':')
-                .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_string()))
-        })
-        .collect();
-    let mut body = raw[split + 4..].to_vec();
-    let chunked = headers
-        .iter()
-        .any(|(k, v)| k == "transfer-encoding" && v.to_lowercase().contains("chunked"));
-    if chunked {
-        body = dechunk(&body);
-    }
-    LastResponse {
-        status: code,
-        headers,
-        body,
-    }
-}
-
-/// Reassemble a chunked transfer-coded body (trailers ignored).
-fn dechunk(mut rest: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let pos = rest
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .expect("chunk size line");
-        let size_text = str::from_utf8(&rest[..pos]).unwrap();
-        let size = usize::from_str_radix(size_text.trim(), 16).expect("chunk size");
-        rest = &rest[pos + 2..];
-        if size == 0 {
-            break;
-        }
-        out.extend_from_slice(&rest[..size]);
-        rest = &rest[size + 2..];
-    }
-    out
 }

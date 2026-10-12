@@ -656,7 +656,10 @@ pub fn paginate(entries: &[Entry], params: &ListParams) -> Listing {
 // `GetObjectResult` (plan 3 renders both variants directly); the size gap vs
 // the marker variant is the price of that shape — the value is built once per
 // read and never held in a collection.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the variant gap is the pinned interface's own shape — `Object` owns the whole `GetObjectResult` — and the value is built once per read and never held in a collection"
+)]
 #[derive(Debug)]
 pub enum ReadResult {
     /// An object version's content and metadata.

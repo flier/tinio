@@ -19,7 +19,7 @@
 //! that pins the supersede-before-publish order.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     io,
     sync::{
         Arc, Mutex,
@@ -31,13 +31,12 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream;
+pub(crate) use tinio_util::testing::blocks::MemBlocks as BlockMem;
 
 use crate::{
     _blob::Store,
     _core::{
-        ByteRange, ETag, MultipartUpload, acl,
-        blob::{BlockHash, BlockStore, Entry, EntryStream, Published, StagedBlock},
-        bucket, checksum,
+        ByteRange, ETag, MultipartUpload, acl, bucket, checksum,
         content::{ContentEntry, ContentKey, ObjectContent, PublishId, StagedObject},
         cors, meta, multipart, object,
         storage::{self, BodyStream},
@@ -899,111 +898,6 @@ impl CurrentRows for TestMeta {
     }
 }
 
-/// The in-memory block plane: staged bytes are held in memory, filed on
-/// publish, and every method answers what the contract requires. The spec's
-/// E7 names this double; the base builds one for its version plane.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct BlockMem(Arc<Mutex<BTreeMap<BlockHash, Vec<u8>>>>);
-
-/// A block staged into [`BlockMem`]'s map.
-#[derive(Debug, Default)]
-pub(crate) struct BlockMemStaged(Vec<u8>);
-
-#[async_trait]
-impl StagedBlock for BlockMemStaged {
-    async fn write(&mut self, chunk: Bytes) -> io::Result<()> {
-        self.0.extend_from_slice(&chunk);
-        Ok(())
-    }
-}
-
-impl BlockMem {
-    /// The blocks that sort strictly after `after`, ascending.
-    fn entries(&self, after: Option<&BlockHash>) -> Vec<Entry> {
-        self.0
-            .lock()
-            .expect("the block plane")
-            .iter()
-            .filter(|(hash, _)| after.is_none_or(|after| *hash > after))
-            .map(|(hash, bytes)| Entry {
-                hash: *hash,
-                len: bytes.len() as u64,
-                published: SystemTime::now(),
-            })
-            .collect()
-    }
-}
-
-#[async_trait]
-impl BlockStore for BlockMem {
-    type Error = storage::Error;
-    type Staged = BlockMemStaged;
-
-    async fn stage(&self) -> Result<Self::Staged, Self::Error> {
-        Ok(BlockMemStaged::default())
-    }
-
-    async fn publish(
-        &self,
-        staged: Self::Staged,
-        hash: &BlockHash,
-    ) -> Result<Published, Self::Error> {
-        let mut blocks = self.0.lock().expect("the block plane");
-        if blocks.contains_key(hash) {
-            return Ok(Published::Existing);
-        }
-        blocks.insert(*hash, staged.0);
-        Ok(Published::Stored)
-    }
-
-    async fn contains(&self, hash: &BlockHash) -> Result<bool, Self::Error> {
-        Ok(self.0.lock().expect("the block plane").contains_key(hash))
-    }
-
-    async fn open(
-        &self,
-        hash: &BlockHash,
-        range: Option<ByteRange>,
-    ) -> Result<BodyStream, Self::Error> {
-        let blocks = self.0.lock().expect("the block plane");
-        let bytes = blocks
-            .get(hash)
-            .ok_or_else(|| storage::io(io::Error::new(io::ErrorKind::NotFound, "no such block")))?;
-        let slice = match range {
-            Some(range) => {
-                let (start, end) = range.resolve(bytes.len() as u64)?;
-                bytes[start as usize..=end as usize].to_vec()
-            }
-            None => bytes.clone(),
-        };
-        Ok(Box::pin(stream::once(
-            async move { Ok(Bytes::from(slice)) },
-        )))
-    }
-
-    async fn remove(&self, hash: &BlockHash) -> Result<(), Self::Error> {
-        self.0.lock().expect("the block plane").remove(hash);
-        Ok(())
-    }
-
-    async fn list(
-        &self,
-        after: Option<&BlockHash>,
-        limit: usize,
-    ) -> Result<Vec<Entry>, Self::Error> {
-        Ok(self.entries(after).into_iter().take(limit).collect())
-    }
-
-    async fn walk(
-        &self,
-        after: Option<&BlockHash>,
-    ) -> Result<EntryStream<Self::Error>, Self::Error> {
-        Ok(Box::pin(stream::iter(
-            self.entries(after).into_iter().map(Ok),
-        )))
-    }
-}
-
 /// What a publish saw of the key's state **at the moment it ran** — the
 /// ordered pipeline's instrument.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1541,7 +1435,7 @@ impl Base {
         C: ObjectContent,
     {
         VersionPlane {
-            versions: Arc::new(Versions::new(
+            versions: Arc::new(Versions::rows_as_gate(
                 (*self.counted).clone(),
                 content,
                 Store::new(self.blocks.clone()),

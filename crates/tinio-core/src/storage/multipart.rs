@@ -206,7 +206,10 @@ pub trait MultipartOps: Send + Sync + 'static {
     /// filesystem-level copy. A part's ETag is always the content MD5 of
     /// the part bytes (the range, when present). The copy path carries
     /// no client checksum (R1) — no tee slot.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the trait method's own signature: source and destination bucket/key, upload id, part number and range are the S3 UploadPartCopy request's parts, and every implementor must spell them the same way"
+    )]
     async fn copy_part(
         &self,
         src_bucket: &bucket::Name,

@@ -52,11 +52,6 @@ use crate::_sandbox::{
 };
 #[cfg(all(feature = "sandbox", unix))]
 use crate::_util::path::path_contains;
-// The shared structural reader — the boundary rule the one structural test below slices `plan.rs`'s
-// function with. **Unconditional, unlike its neighbour below, and deliberately so**: that test runs
-// in every build's test graph, so a `cfg` beside this import would leave it uncompiled where the
-// test is.
-use crate::_util::testing::function_body;
 // The shared recording device (`tinio_util::testing`), which this crate's dev edge turns on.
 #[cfg(all(feature = "sandbox", target_os = "linux"))]
 use crate::_util::testing::{assert_recorded_at, assert_step, record_events};
@@ -69,6 +64,7 @@ fn requested(root: &Path, state_dir: &Path) -> Resolution {
     let mut config = Config::parse(config_text).expect("config");
     config.server.sandbox = true;
     Resolution {
+        pg_root: None,
         root: root.to_path_buf(),
         config,
         config_text: config_text.to_owned(),
@@ -91,6 +87,7 @@ fn requested(root: &Path, state_dir: &Path) -> Resolution {
 #[cfg(feature = "sandbox")]
 fn underived(root: &Path, state_dir: &Path) -> Resolution {
     Resolution {
+        pg_root: None,
         state_dir_override: None,
         ..requested(root, state_dir)
     }
@@ -134,6 +131,7 @@ fn no_channel_is_a_disabled_request() {
     // nothing is exposed. The config is the **default** one rather than [`requested`]'s,
     // which says `sandbox = true` — this leg is the one that has no channel at all.
     let resolution = Resolution {
+        pg_root: None,
         root: Path::new("/srv/data").to_path_buf(),
         config: Config::default(),
         config_text: String::new(),
@@ -255,12 +253,9 @@ fn the_request_names_the_channel_it_came_from() {
 /// flipped without its backend is caught there — what is left for the CLI to keep is that a
 /// `true` answer really is met by a `confine` call on this target.
 ///
-/// `clippy::assertions_on_constants` is allowed **deliberately, and this is the one place the
-/// lint's premise does not hold**: it reads a constant assertion as one that can never fail,
-/// while here the answer is the subject and a future edit is exactly what makes this leg
-/// fail. Nothing else is allowed for it.
+/// The assertion below is this leg's subject; `clippy::assertions_on_constants` reads a call
+/// and not a constant, so the exemption this leg used to carry was never needed and is gone.
 #[cfg(feature = "sandbox")]
-#[allow(clippy::assertions_on_constants, unreachable_code)]
 #[test]
 fn the_linux_arm_is_wired_because_a_confine_call_exists_on_this_target() {
     if _sandbox::platform_facts().launches_child {
@@ -933,29 +928,36 @@ fn a_host_refusal_keeps_its_classification_rather_than_flattening() {
     assert_eq!(mapped.exit_code(), 1);
 }
 
+#[cfg(feature = "sandbox")]
 #[test]
-fn the_hosts_own_answer_is_a_third_refusal_and_not_a_fourth_path() {
-    // **Layer one, and it is the whole of this seam's proof** (the plan-grilling ruling).
-    // The workspace's own precedent for a structural test is
-    // `crates/tinio-server/src/backend/ops.rs:287-310`.
-    //
-    // The guarantee is that the three facts are asked in ONE function, so a request that
-    // reaches `confine` is one this build, this target and this host all committed to
-    // applying. **No seam exists to force the facade's answer** — `backend_available` is a
-    // `pub const fn` over `cfg!`, and `tinio-cli` has no dev-dependency on the Windows crate
-    // — so the predicate's behaviour is proven where it is real (Task 11's Low-integrity
-    // doctor scenario) and this test binds the call site. A text search is not a behaviour,
-    // and the plan says so rather than implying otherwise.
-    let body = function_body(include_str!("plan.rs"), "fn refuse_unhonourable");
+fn the_hosts_own_answer_is_the_third_fact_plan_turns_on() {
+    // **A value, driven through the public entry.** A request `plan` honours is one this build,
+    // this target **and this host** all committed to: on a target whose backend is wired the
+    // answer turns on the host's own probe (`can_confine`), so `plan` honours the request exactly
+    // where that probe does and answers the host refusal where it does not — the third refusal,
+    // not a fourth path. The build and target facts are the siblings' (`a_requested_confinement_
+    // is_refused_or_honoured_by_name`); this leg is the host's. `refuse_unhonourable` itself is
+    // private to `plan`, so the public `plan` — which calls it — is what the leg drives.
+    if !_sandbox::backend_available() {
+        return; // the target fact is another leg's; here the subject is this host's answer
+    }
+    let resolution = requested(Path::new("/srv/data"), Path::new("/srv/data/.tinio"));
+    let answer = plan(
+        &resolution,
+        &Args::for_test(Path::new("/srv/data")),
+        &Provenance::default(),
+    );
     assert_eq!(
-        body.matches("can_confine()").count(),
-        1,
-        "the host fact is asked once, beside the build and target facts"
+        answer.is_ok(),
+        _sandbox::can_confine().is_ok(),
+        "`plan` honours a request exactly where the host's own probe does"
     );
-    assert!(
-        body.contains("backend_available()"),
-        "and the target fact stays"
-    );
+    if let Err(err) = answer {
+        assert!(
+            matches!(err, Error::SandboxHostCannotConfine(_)),
+            "the host's refusal keeps its class: {err}"
+        );
+    }
 }
 
 /// **The launcher's classification is a value, and the sentence is its rendering** —

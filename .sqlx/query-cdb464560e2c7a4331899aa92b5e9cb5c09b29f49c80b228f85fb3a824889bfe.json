@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    live_seq AS \"seq!\",\n    live_len AS \"len!\",\n    publish_id\nFROM content_heads\nWHERE\n    bucket = $1\n    AND kind = $2\n    AND ckey = $3\n    AND live_seq IS NOT NULL\nFOR UPDATE\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "content_heads",
+            "name": "live_seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "len!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "content_heads",
+            "name": "live_len"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "publish_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "content_heads",
+            "name": "publish_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "content_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "part"
+              ]
+            }
+          }
+        },
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "cdb464560e2c7a4331899aa92b5e9cb5c09b29f49c80b228f85fb3a824889bfe"
+}

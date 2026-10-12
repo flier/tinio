@@ -1684,7 +1684,7 @@ impl Plane {
     /// descriptor number back into a socket is `unsafe`, and this crate carries no site for it;
     /// the platform crate that rebuilds it (the macOS backend's
     /// `tinio_sandbox_macos::launch::control`, one of that crate's **three** enumerated
-    /// `#[allow(unsafe_code)]` sites — the `inherited_fd` rebuild, the libSystem FFI module the
+    /// `#[expect(unsafe_code)]` sites — the `inherited_fd` rebuild, the libSystem FFI module the
     /// in-process mechanism applies through, and that mechanism's validator's `fork`) is what
     /// hands the object over.
     ///
@@ -2186,7 +2186,7 @@ async fn serve_transport(
 // `clippy.toml`'s in-tests keys reach the unwrap/expect/panic family only — `unreachable` has no
 // `allow-*-in-tests` key (design 2026-10-09 D7) — so the module carries the stated allow the rule
 // calls for (docs/style.md §Panics).
-#[allow(
+#[expect(
     clippy::unreachable,
     reason = "test context: these `unreachable!`s close the tests' own control flow — `LocalForm` selections the tests made themselves and a `for` loop whose exits are its `assert!` and its `return` (docs/style.md §Panics)"
 )]
@@ -2887,7 +2887,10 @@ mod tests {
     // the lint cannot see: the guard is the process-wide serialisation of every-thread recordings,
     // and the recording it protects is the whole test, so there is no earlier point at which it
     // could be dropped.
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "test context: `recorder`'s guard is held across this test's awaits on purpose — it is the process-wide serialisation of every-thread recordings and the recording it protects is the whole test, so there is no earlier point at which it could be dropped"
+    )]
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_client_that_never_closes_holds_its_instance_only_under_the_bounded_drain() {

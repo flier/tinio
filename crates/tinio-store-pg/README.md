@@ -4,7 +4,7 @@
 
 The crate *is* the PostgreSQL implementation, so it carries no `pg` feature of its own: a configuration that does not serve PostgreSQL does not depend on this crate at all, and `pg` is that consumer's optional dependency on it (PG15).
 
-The crate carries no feature: the database-backed tests are ordinary `#[cfg(test)]` legs that skip when `TINIO_PG_DSN` is unset, so the default build and `cargo test --workspace` stay database-free (PG8/PG15) and only a run with the dsn set needs a running PostgreSQL.
+The one feature is `testing`, off by default: it publishes the scratch-database harness (`test_support::TestDb`) for other crates' tests, and a production graph leaves it off. The database-backed tests are ordinary `#[cfg(test)]` legs that skip when `TINIO_PG_DSN` is unset, so the default build and `cargo test --workspace` stay database-free (PG8/PG15) and only a run with the dsn set needs a running PostgreSQL.
 
 ## Layout
 
@@ -87,4 +87,4 @@ The macros check every statement against the schema at compile time. With no `DA
 cargo xtask sqlx update
 ```
 
-The files are formatted by sqruff (`.sqruff`: dialect `postgres`, 80 columns): run `sqruff fix crates/tinio-store-pg/sql` after editing one, and the CI `sql` job lints them. `.sqruffignore` lists the four statements that dialect cannot parse.
+The files are formatted by sqruff (`.sqruff`: dialect `postgres`, 80 columns): run `sqruff fix crates/tinio-store-pg/sql` after editing one, and the CI `sql` job lints them. Every statement parses in that dialect, so no file is exempt: the four the ignore list once held were rewritten (three spelled `= ANY (array)`, which the dialect cannot parse at all, as `IN (SELECT unnest($n::TYPE[]))`; one spelled its `CREATE DATABASE` locale clause out rather than splicing it).

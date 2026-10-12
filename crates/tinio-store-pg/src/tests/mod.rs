@@ -4,5 +4,5 @@
 //! is unset, so `cargo test --workspace` stays database-free (PG8, PG15).
 
 pub mod conformance;
-pub mod db;
+pub use crate::test_support as db;
 pub mod fixtures;

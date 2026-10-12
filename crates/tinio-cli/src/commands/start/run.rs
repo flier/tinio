@@ -14,8 +14,8 @@ use std::{
 use tracing::subscriber::set_global_default;
 
 #[cfg(feature = "api")]
-use super::metrics::ServerMetrics;
-use super::{Args, Ready, Server};
+use super::metrics::{ServerMetrics, WriteLockStatsSource};
+use super::{Args, Ready, Served, Server};
 #[cfg(feature = "api")]
 use crate::_api::state::State;
 #[cfg(feature = "api")]
@@ -24,18 +24,24 @@ use crate::_api::{
     metrics::{DEFAULT_TTL, Gauges, MetricsSource},
 };
 #[cfg(feature = "api")]
+use crate::_core::storage::Storage;
+#[cfg(feature = "api")]
 use crate::daemon;
+#[cfg(feature = "pg")]
+use crate::{_config::storage::pg::DEFAULT_POOL_SIZE, _pg, _util::secret::Secret};
 use crate::{
     _config::{
         self, Config,
         log::{AccessFormat, Format, Verbosity},
         state::prepare_home_derived,
+        storage::Backend,
     },
     _fs::{Error as FsError, FsStorage},
     _sandbox::{Adopted, Attribution, Child, Refused, disarm_signal_relay, supervise},
     _server::{identity, log},
     Error,
     cli::Provenance,
+    commands::is_pg_root,
     events,
     resolve::{self, Located, Pipelines, Resolution},
     sandbox, signal,
@@ -92,6 +98,7 @@ use crate::{
 ///     config: None,
 ///     read_only: false,
 ///     state_dir: None,
+///     pg_dsn: None,
 /// };
 /// let located = locate(discovery, &Provenance::default())?;
 /// let args = Args {
@@ -114,6 +121,26 @@ pub fn run(
     adopted: Option<Adopted>,
     provenance: &Provenance,
 ) -> Result<Server, Error> {
+    // **A synthetic pg root is served as pg only when the configuration selects pg** (ruling R8,
+    // restated now that the backend is servable). `resolve::locate`'s pg arm derives the root
+    // `~/.tinio/pg/<hash of the dsn>/` in two cases: a configuration that says
+    // `[storage] type = "pg"`, and the fallback a bare `TINIO_PG_DSN=… tinio server` with no `DIR`
+    // reaches. Only the first is a pg run; the second carries no `[storage]` section, so the chain
+    // below would answer `fs` — and would **create** `<synthetic>/.tinio/.tinio.toml` on the way —
+    // and serving a filesystem root inside a directory that exists only because a pg dsn was
+    // addressed is silently the wrong backend.
+    //
+    // **The two arms are one condition** ("the root is the synthetic one") read where the fact is
+    // knowable: with **no named configuration** the chain below would *mint* the document, so the
+    // refusal is here, ahead of the resolution; with a named configuration that does not select
+    // pg, the resolution reads (never creates) it, and the check after it refuses. A filesystem
+    // run records no pg arm whatever the environment holds — `is_pg_root` reads that record and
+    // nothing else — which is what keeps "`TINIO_PG_DSN` selects nothing" true.
+    let synthetic = is_pg_root(&located.root, located.pg_root.as_deref());
+    if synthetic && located.config.is_none() {
+        return Err(pg_root_without_config());
+    }
+
     // f, on the discovery answers and the authoritative flags: config path, load, and the fold.
     // **A confined child takes the document from its launch payload** (decision 18): the text
     // travelled with the launch because the file it came from can sit outside every exposure,
@@ -122,6 +149,22 @@ pub fn run(
         Some(adopted) => resolve::server_confined(located, &args, provenance, adopted.config())?,
         None => resolve::server(located, &args, provenance)?,
     };
+
+    // **The pg backend is served now** (PG5): `[storage] type = "pg"` reaches `Served::Pg` and the
+    // storage is constructed inside the runtime (its `connect` is async and this half is the
+    // pre-runtime one). A build that does **not** carry the `pg` feature cannot serve such a
+    // configuration and refuses it truthfully — the keys parse in every build (§6), so this
+    // refusal is what keeps a configuration the build cannot honour from being silently ignored.
+    #[cfg(not(feature = "pg"))]
+    if resolution.config.backend() == Backend::Pg {
+        return Err(pg_not_servable());
+    }
+    // The other arm of the synthetic-root guard: a **named** configuration that does not select pg
+    // resolved a filesystem run under the dsn's synthetic root. Nothing was created (the named
+    // document was read, not minted) and serving it would be the wrong backend silently.
+    if synthetic && resolution.config.backend() != Backend::Pg {
+        return Err(pg_root_without_config());
+    }
 
     // f: the three static determinations, every unhonourable one refused here — before the
     // fork, so the refusal reaches the operator's shell, and before the directories below, so a
@@ -154,6 +197,19 @@ pub fn run(
         // is named. Nothing is threaded through this call site for it.
         sandbox::plan(&resolution, &args, provenance)?
     };
+
+    // **A confinement and a pg store cannot be honoured together** (the sandbox crate's own
+    // finding): the confinement cuts the confined process's outbound connections, and a pg run's
+    // store connection is exactly such a path, so a jailed pg run could never serve. It is refused
+    // **here** — after `plan` has answered which channel asked (the request is that record), and
+    // before the fork and the directories — so a refused run neither forks nor confines itself.
+    // The fs backend is unaffected: it serves from local files, and its confinement is the whole
+    // point of the mode.
+    if let Some(refusal) =
+        sandbox::refuse_pg_under_confinement(&request, resolution.config.backend())
+    {
+        return Err(refusal);
+    }
 
     // **The built-in credential pair's refusal is a static one too** (audit run-2, P2): the
     // predicate is `tinio_server::identity::uses_builtin_fallback` and the sentence is
@@ -262,9 +318,12 @@ pub fn run(
 
     // **FR-036's trade: a configured OTLP endpoint and a confinement cannot both be honoured, and
     // the combination is warned about, naming both, rather than refused** (design decision 25,
-    // `contracts/cli.md`). The confinement cuts the confined process's outbound connections and the
-    // exporter is the only outbound path this product has, so what is lost is the export — and
-    // losing an observer is not grounds for refusing to serve, so the run proceeds.
+    // `contracts/cli.md`). The confinement cuts the confined process's outbound connections. The
+    // OTLP exporter is an outbound path this product has; **the pg store's database connection is
+    // the other, and a pg run under a confinement is refused up front**
+    // (`sandbox::refuse_pg_under_confinement`), so the only outbound path a run that reaches this
+    // warning has is the export — and losing an observer is not grounds for refusing to serve, so
+    // the run proceeds.
     //
     // **It sits on the one line both arms reach with the log live**, and that is now the
     // confinement's guarantee rather than this call's position: `confine` above installs the
@@ -282,8 +341,10 @@ pub fn run(
         tracing::warn!(
             channel = %channel,
             endpoint = %endpoint,
-            "the confinement cuts the outbound path the OTLP exporter is the only user of, so \
-             this run's export is lost: the confinement proceeds and the observer does not"
+            "the confinement cuts the outbound path only the OTLP exporter uses (the pg store's \
+             database connection is this product's other outbound path, and a pg run under a \
+             confinement is refused before it is served), so this run's export is lost: the \
+             confinement proceeds and the observer does not"
         );
     }
 
@@ -372,98 +433,57 @@ pub fn run(
     // arrives during startup reaches the same shutdown path as one that arrives later.
     let handles = signal::install()?;
 
-    // `FsStorage::new` opens the state database (and takes its exclusive lock: this is where a
-    // second server on the same root is refused, before the control channel is even reached),
-    // and a launcher has already returned by this line — so this is the child, or the single
-    // non-launching process.
+    // The pipelines and the backend. **The two backends' construction points differ, and that is
+    // the pre-runtime problem stated rather than hidden**: the filesystem storage is opened
+    // synchronously here — `FsStorage::new` opens the state database and takes its exclusive lock
+    // (this is where a second server on the same root is refused, before the control channel is
+    // even reached), and its management plane is bound with it, both before the runtime, as §1 has
+    // it — while the pg backend is only **selected** here (its construction inputs travel on
+    // `Served::Pg`), because `PgStorage::connect` is async and is built on the one runtime `serve`
+    // is dispatched on. A launcher has already returned by this line, so this is the child, or the
+    // single non-launching process.
     let pipelines = Pipelines::build(&resolution.config.pipeline.clone().unwrap_or_default())?;
-    let mut storage = FsStorage::new(
-        &resolution.root,
-        resolve::fs_options(&resolution, Some(&pipelines)),
-    )
-    .map_err(|err| match err {
-        // The storage constructor's own io failure, classified like the two above: what it
-        // opens under the root — the state database and the staging areas — is the path a
-        // confinement refuses first, and it arrives wrapped in the backend's error rather than
-        // as an io error of its own.
-        FsError::Io(io) => {
-            sandbox::classify_io(io, Refused::Path(resolution.root.clone()), confined)
+    let backend = match resolution.config.backend() {
+        #[cfg(feature = "pg")]
+        Backend::Pg => {
+            let (config, access) = pg_backend_config(&resolution, args.env.pg_dsn.as_ref())?;
+            Served::Pg { config, access }
         }
-        other => Error::from(other),
-    })?;
-    if let Some(s3) = resolution.config.s3.as_ref() {
-        // `[s3] max_concurrent_uploads` caps in-progress multipart uploads, so an
-        // authenticated client cannot accumulate an unbounded number of them.
-        storage.set_max_concurrent_uploads(s3.max_concurrent_uploads);
-    }
-
-    #[cfg(feature = "api")]
-    let plane = {
-        let metrics = Arc::new(ServerMetrics::new(&pipelines, &storage));
-        // Plan A's `Options::gauges` is what feeds the plane's `/metrics`. The field is not
-        // optional in the literal, and omitting it would answer 404 on every scrape: the
-        // source is this task's adapter, and the plane's `serve` is what drives it.
-        let source: Arc<dyn MetricsSource> = metrics.clone();
-        let gauges = Arc::new(Gauges::new(source, DEFAULT_TTL));
-        // `[server] host`/`port`, the flags folded in — what `/status` reports as the host.
-        let bind = resolution.address()?;
-        let options = ApiOptions {
-            selection: super::api_options(&resolution, &args)?, // `[api]` + the `--api*` flags
-            state_dir: resolution.state_dir.clone(), // the plane's only filesystem anchor
-            root: resolution.root.clone(),           // canonical: `state.root` too
-            host: bind.ip().to_string(),
-            stop: handles.stopper.clone(), // `/stop` sends on the one shutdown channel
-            gauges: Some(gauges),          // 404 on `/metrics` without it
-            // **The launcher's token, when this process was launched by one** (design decision
-            // 17's private channel, extended to the one secret the two processes share). The
-            // launcher generated it *and* published `state` with it, and **the launcher platforms
-            // reach that answer by different routes**. On Windows the cause is the file's DACL:
-            // current-user-only and protected, so this process — inside the container, with the
-            // package SID as its identity — could not write it. **On macOS nothing refuses the
-            // write**, and the cause is ownership instead: `state` must name the launcher, whose
-            // `--daemon` readiness check compares the file's pid against the pid it spawned and
-            // whose `Plane::shutdown` removal guard expects itself, and the token is minted by the
-            // process that publishes. `platform_facts` and `serve::Spec` are that reason's home,
-            // as they are for the channel handoff below. Either way a plane here that minted its own
-            // token would refuse every client that read that file: `/status` and `/stop` would
-            // answer 401 for a server that is running and discoverable. `None` is every run that
-            // owns its own `state`: the unconfined ones, and the in-place platforms.
-            token: adopted
-                .as_ref()
-                .and_then(|adopted| adopted.token().map(str::to_owned)),
-        };
-        // **A launcher already bound the control channel, and this process serves on what it
-        // inherited** (`Adopted::controls`). Windows' reason is identity: the channel's pipes carry
-        // a current-user-only DACL, and inside the container this process's identity is the package
-        // SID, so `CreateNamedPipeW` here would be refused `ERROR_ACCESS_DENIED` — which
-        // `bind_pipe` reports as "another server is already listening", a message about a second
-        // server for a channel no one could create. macOS' reason is the profile: the confined
-        // child's unix `bind()` is a network operation the profile grants nothing for, so
-        // `bind_unix` here would be refused `Operation not permitted` — and the rule that used to
-        // cover it was a bind *grant* rather than a filter, which is what the handoff removes. The
-        // bind stays the answer for every other launch: an empty list is an unconfined run, an
-        // in-place platform, an `api`-less build, or a selection with no local channel, and those
-        // processes are the ones that must own the single-instance claim themselves.
-        //
-        // **Every inherited instance, not the first** (Windows): one instance answers a client and
-        // then stops listening, and this process cannot create the next one, so the pool it was
-        // handed is the whole of what it will ever serve on. A unix channel is one socket, and the
-        // platform crate refuses any other count. `Plane::open` is that split: empty controls bind,
-        // Windows adopts the handle values, macOS adopts the socket `inherited_socket` rebuilt
-        // (`sandbox::adopted_control` — an object, never a number this process turns back into a
-        // socket), and an in-place target refuses a non-empty list.
-        //
-        // **The call is spelled twice because the signature is two signatures**: the socket
-        // argument is `#[cfg(target_os = "macos")]` on `Plane::open`, so the targets that inherit
-        // no unix socket name a shorter call rather than a placeholder value — which is the whole
-        // of what the deleted `InheritedSocket::absent()` was.
-        let controls = adopted.as_ref().map(Adopted::controls).unwrap_or(&[]);
-        #[cfg(target_os = "macos")]
-        let plane = Plane::open(options, controls, inherited_socket(adopted.as_ref())?)
-            .map_err(|err| classify_plane(err, confined))?;
-        #[cfg(not(target_os = "macos"))]
-        let plane = Plane::open(options, controls).map_err(|err| classify_plane(err, confined))?;
-        plane
+        _ => {
+            let mut storage = FsStorage::new(
+                &resolution.root,
+                resolve::fs_options(&resolution, Some(&pipelines)),
+            )
+            .map_err(|err| match err {
+                // The storage constructor's own io failure, classified like the two above: what it
+                // opens under the root — the state database and the staging areas — is the path a
+                // confinement refuses first, and it arrives wrapped in the backend's error rather
+                // than as an io error of its own.
+                FsError::Io(io) => {
+                    sandbox::classify_io(io, Refused::Path(resolution.root.clone()), confined)
+                }
+                other => Error::from(other),
+            })?;
+            if let Some(s3) = resolution.config.s3.as_ref() {
+                // `[s3] max_concurrent_uploads` caps in-progress multipart uploads, so an
+                // authenticated client cannot accumulate an unbounded number of them.
+                storage.set_max_concurrent_uploads(s3.max_concurrent_uploads);
+            }
+            #[cfg(feature = "api")]
+            let plane = open_management_plane(
+                &storage,
+                &resolution,
+                &args,
+                adopted.as_ref(),
+                &handles,
+                &pipelines,
+            )?;
+            Served::Fs(Box::new(super::Prepared {
+                storage,
+                #[cfg(feature = "api")]
+                plane,
+            }))
+        }
     };
 
     Ok(Server::Ready(Box::new(Ready {
@@ -471,13 +491,170 @@ pub fn run(
         args,
         adopted,
         handles,
-        storage,
+        backend,
         pipelines,
-        #[cfg(feature = "api")]
-        plane,
         on_ready: None,
     })))
     // k is `run::on_runtime`'s: no runtime is created anywhere in this module.
+}
+
+/// The management plane over `storage` — the control channel that is the plane's
+/// single-instance gate, bound before the repair runs (design decision 12).
+///
+/// **One implementation, two call sites** (the backend-generic serving seam): a filesystem run
+/// binds it here, in the pre-runtime half, so the gate still precedes the runtime; a pg run binds
+/// it inside [`serve`](super::serve::serve), after its storage is constructed and before the
+/// repair. Nothing about the bind is backend-specific — the storage is read only by the metrics
+/// adapter's `/metrics` gauges — so it is written once and generic over the served backend.
+///
+/// The gauges' source is `ServerMetrics`, which reads the storage through the contract's generic
+/// walk and takes the write-lock family through [`WriteLockStatsSource`] (fs only).
+#[cfg(feature = "api")]
+pub(super) fn open_management_plane<S>(
+    storage: &S,
+    resolution: &Resolution,
+    args: &Args,
+    adopted: Option<&Adopted>,
+    handles: &signal::Handles,
+    pipelines: &Pipelines,
+) -> Result<Plane, Error>
+where
+    S: Storage + WriteLockStatsSource + Clone + 'static,
+{
+    let confined = adopted.is_some();
+    let metrics = Arc::new(ServerMetrics::new(pipelines, storage));
+    // Plan A's `Options::gauges` is what feeds the plane's `/metrics`. The field is not optional in
+    // the literal, and omitting it would answer 404 on every scrape: the source is this task's
+    // adapter, and the plane's `serve` is what drives it.
+    let source: Arc<dyn MetricsSource> = metrics.clone();
+    let gauges = Arc::new(Gauges::new(source, DEFAULT_TTL));
+    // `[server] host`/`port`, the flags folded in — what `/status` reports as the host.
+    let bind = resolution.address()?;
+    let options = ApiOptions {
+        selection: super::api_options(resolution, args)?, // `[api]` + the `--api*` flags
+        state_dir: resolution.state_dir.clone(),          // the plane's only filesystem anchor
+        root: resolution.root.clone(),                    // canonical: `state.root` too
+        host: bind.ip().to_string(),
+        stop: handles.stopper.clone(), // `/stop` sends on the one shutdown channel
+        gauges: Some(gauges),          // 404 on `/metrics` without it
+        // **The launcher's token, when this process was launched by one** (design decision 17's
+        // private channel, extended to the one secret the two processes share). The launcher
+        // generated it *and* published `state` with it, and **the launcher platforms reach that
+        // answer by different routes**. On Windows the cause is the file's DACL: current-user-only
+        // and protected, so this process — inside the container, with the package SID as its
+        // identity — could not write it. **On macOS nothing refuses the write**, and the cause is
+        // ownership instead: `state` must name the launcher, whose `--daemon` readiness check
+        // compares the file's pid against the pid it spawned and whose `Plane::shutdown` removal
+        // guard expects itself, and the token is minted by the process that publishes.
+        // `platform_facts` and `serve::Spec` are that reason's home, as they are for the channel
+        // handoff below. Either way a plane here that minted its own token would refuse every
+        // client that read that file: `/status` and `/stop` would answer 401 for a server that is
+        // running and discoverable. `None` is every run that owns its own `state`: the unconfined
+        // ones, and the in-place platforms.
+        token: adopted.and_then(|adopted| adopted.token().map(str::to_owned)),
+    };
+    // **A launcher already bound the control channel, and this process serves on what it
+    // inherited** (`Adopted::controls`). Windows' reason is identity: the channel's pipes carry a
+    // current-user-only DACL, and inside the container this process's identity is the package SID,
+    // so `CreateNamedPipeW` here would be refused `ERROR_ACCESS_DENIED` — which `bind_pipe` reports
+    // as "another server is already listening", a message about a second server for a channel no
+    // one could create. macOS' reason is the profile: the confined child's unix `bind()` is a
+    // network operation the profile grants nothing for, so `bind_unix` here would be refused
+    // `Operation not permitted` — and the rule that used to cover it was a bind *grant* rather than
+    // a filter, which is what the handoff removes. The bind stays the answer for every other
+    // launch: an empty list is an unconfined run, an in-place platform, an `api`-less build, or a
+    // selection with no local channel, and those processes are the ones that must own the
+    // single-instance claim themselves.
+    //
+    // **Every inherited instance, not the first** (Windows): one instance answers a client and then
+    // stops listening, and this process cannot create the next one, so the pool it was handed is
+    // the whole of what it will ever serve on. A unix channel is one socket, and the platform crate
+    // refuses any other count. `Plane::open` is that split: empty controls bind, Windows adopts the
+    // handle values, macOS adopts the socket `inherited_socket` rebuilt (`sandbox::adopted_control`
+    // — an object, never a number this process turns back into a socket), and an in-place target
+    // refuses a non-empty list.
+    //
+    // **The call is spelled twice because the signature is two signatures**: the socket argument is
+    // `#[cfg(target_os = "macos")]` on `Plane::open`, so the targets that inherit no unix socket
+    // name a shorter call rather than a placeholder value — which is the whole of what the deleted
+    // `InheritedSocket::absent()` was.
+    let controls = adopted.map(Adopted::controls).unwrap_or(&[]);
+    #[cfg(target_os = "macos")]
+    let plane = Plane::open(options, controls, inherited_socket(adopted)?)
+        .map_err(|err| classify_plane(err, confined))?;
+    #[cfg(not(target_os = "macos"))]
+    let plane = Plane::open(options, controls).map_err(|err| classify_plane(err, confined))?;
+    Ok(plane)
+}
+
+/// The pg backend's runtime configuration and access mode, from the resolved config and the
+/// authoritative flags (PG5/PG6/PG12).
+///
+/// **The dsn is `resolve::pg::resolve_dsn`'s answer** — the parsed `TINIO_PG_DSN` over
+/// `[storage.pg] dsn` — so the value the storage opens and the value the synthetic root was
+/// derived from are one; the pool is `[storage.pg] pool` (defaulting to the store's own
+/// [`DEFAULT_POOL_SIZE`](crate::_config::storage::pg::DEFAULT_POOL_SIZE)); and the mode is the
+/// resolution's, `ReadWrite` for a run that takes the ownership guard (PG12) and `ReadOnly` for
+/// one that does not. Nothing here connects — the storage is constructed on the runtime.
+///
+/// **The one `(Config, Access)` builder both the serving half and the doctor's pg leg call**, so
+/// the dsn a run opens and the dsn it diagnoses cannot be resolved two ways.
+#[cfg(feature = "pg")]
+pub(crate) fn pg_backend_config(
+    resolution: &Resolution,
+    pg_dsn: Option<&Secret>,
+) -> Result<(_pg::Config, _pg::Access), Error> {
+    let section = resolution.config.pg_section();
+    let dsn = resolve::pg::resolve_dsn(section, pg_dsn)?;
+    let pool = section.map_or(DEFAULT_POOL_SIZE, |pg| pg.pool);
+    let access = if resolution.read_only {
+        _pg::Access::ReadOnly
+    } else {
+        _pg::Access::ReadWrite
+    };
+    Ok((_pg::Config::new(dsn, pool), access))
+}
+
+/// **The feature-off pg refusal** (PG15/§6): a build without the `pg` feature cannot serve
+/// `[storage] type = "pg"`, and says so rather than ignoring a configuration it cannot honour.
+///
+/// The keys parse in every build, so a server that silently served `fs` for such a configuration
+/// would be the worst outcome; this is the sentence that keeps it from being silent, and it names
+/// the operator's two remedies (the build, or the backend).
+///
+/// **This is the whole body now.** The feature-on arm is gone: the same `Backend::Pg` that used
+/// to answer here now selects [`Served::Pg`](super::Served) and is served. What remains is the
+/// build that genuinely cannot, which is why the function is `#[cfg]`-free and the caller gates
+/// it — the previous two-arm shape existed only while a pg configuration in a `pg` build was also
+/// a refusal.
+#[cfg(not(feature = "pg"))]
+fn pg_not_servable() -> Error {
+    Error::Usage(
+        "`[storage] type = \"pg\"` needs the `pg` cargo feature, which this build does not \
+         carry: rebuild with it, or set `[storage] type = \"fs\"`"
+            .into(),
+    )
+}
+
+/// The synthetic-root refusal both arms of the R8 guard answer with: this run's root is the leaf
+/// a pg dsn derived, but its configuration does not select the pg backend, so serving it would be
+/// a filesystem root inside a directory that exists only because a pg dsn was addressed.
+///
+/// **A usage error, and it names both remedies**: the configuration that makes the run a pg one
+/// (`[storage] type = "pg"`), and the alternative a bare `TINIO_PG_DSN` with no `[storage]` may
+/// actually have wanted (a positional `DIR`, to serve files). The two call sites — no named
+/// configuration (refused before the chain could *create* one) and a named configuration that did
+/// not select pg — are one condition (the root is synthetic, the backend is not pg), so the
+/// sentence has one home rather than two.
+fn pg_root_without_config() -> Error {
+    Error::Usage(
+        "this run's root is the synthetic one a pg dsn derived, but its configuration does not \
+         select `[storage] type = \"pg\"`, so serving it would be a filesystem root inside a \
+         directory that exists only because a pg dsn was addressed: add the pg backend to the \
+         configuration (with `[storage.pg] dsn`, or the TINIO_PG_DSN this run already carries), \
+         or name a positional DIR to serve a filesystem root"
+            .into(),
+    )
 }
 
 /// The unix socket [`Plane::open`] adopts — **macOS's function, because macOS is the one target
@@ -712,7 +889,7 @@ fn otlp_endpoint(config: &Config) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::{OpenOptions, create_dir_all, read_dir, read_to_string},
+        fs::{self, OpenOptions, create_dir_all, read_dir, read_to_string},
         io::Write as _,
         path::{Path, PathBuf},
         process::Command,
@@ -855,6 +1032,7 @@ mod tests {
     /// launcher will serve (an in-root one is refused before this point).
     fn read_only(root: &Path, state_dir: &Path) -> Resolution {
         Resolution {
+            pg_root: None,
             root: root.to_path_buf(),
             config: Config::default(),
             config_text: String::new(),
@@ -922,6 +1100,289 @@ mod tests {
         assert_eq!(
             root_entries, 0,
             "nothing under the served root may be created by a read-only run"
+        );
+    }
+    /// **A dsn-addressed pg run is refused, and refused before anything is written** (ruling R8).
+    ///
+    /// A bare `tinio server` with a pg dsn exported and no `DIR` resolves the dsn's synthetic root
+    /// (`resolve::locate`'s fallback). Without this guard the run falls through to the filesystem
+    /// backend — the synthetic root carries no `[storage]` section, so the backend check further
+    /// down answers `fs` — and it *creates* a configuration under that leaf on the way. The
+    /// subject here is a scratch leaf under a temp directory, so the leg is also the proof that the
+    /// refusal precedes the resolution: the root must not exist afterwards.
+    #[test]
+    fn a_pg_dsn_with_no_dir_is_refused_before_anything_is_created() {
+        use crate::{
+            _util::secret::{Secret, SecretKey},
+            commands::EnvArgs,
+        };
+
+        let scratch = TempDir::new().expect("temp");
+        let root = scratch.path().join("pg-root");
+        let dsn = Secret::from(SecretKey::from(
+            "postgres://tinio:tinio@127.0.0.1:55432/tinio?sslmode=disable".to_owned(),
+        ));
+        let located = Located {
+            root: root.clone(),
+            read_only: false,
+            state_dir: root.join(".tinio"),
+            // The pg arm ran: this is the record the guard reads.
+            pg_root: Some(root.clone()),
+            config: None,
+            state_dir_override: Some(root.clone()),
+            config_doc: None,
+        };
+        let args = Args {
+            env: EnvArgs {
+                pg_dsn: Some(dsn),
+                ..EnvArgs::default()
+            },
+            ..Args::default()
+        };
+
+        let err = run(args, located, None, &Provenance::default())
+            .err()
+            .expect("a pg dsn-addressed run is not served");
+        assert!(err.to_string().contains("pg"), "{err}");
+        assert!(!root.exists(), "the refused run created {root:?}");
+    }
+
+    /// **F1's shape, on the serving half**: an fs run whose `TINIO_STATE_DIR` *is* the served root,
+    /// with a pg dsn exported, must not be refused. The guard reads two values — `Located::pg_root`
+    /// and the root — and the dsn is not one of them, so an operator who exported the variable
+    /// keeps serving their directory. The leg states the pair exactly as `run` consumes it, with
+    /// the scenario's arguments in hand.
+    #[test]
+    fn an_fs_run_that_names_its_own_root_as_the_state_dir_is_not_refused() {
+        use crate::{
+            _util::secret::{Secret, SecretKey},
+            commands::EnvArgs,
+        };
+
+        let scratch = TempDir::new().expect("temp");
+        let root = scratch.path().to_path_buf();
+        let args = Args {
+            env: EnvArgs {
+                pg_dsn: Some(Secret::from(SecretKey::from(
+                    "postgres://tinio:tinio@127.0.0.1:55432/tinio?sslmode=disable".to_owned(),
+                ))),
+                ..EnvArgs::default()
+            },
+            ..Args::default()
+        };
+        let located = Located {
+            root: root.clone(),
+            read_only: false,
+            state_dir: root.join(".tinio"),
+            // The filesystem arm ran, whatever the environment holds.
+            pg_root: None,
+            config: None,
+            state_dir_override: Some(root.clone()),
+            config_doc: None,
+        };
+
+        assert!(
+            args.env.pg_dsn.is_some(),
+            "the scenario: the variable is exported"
+        );
+        assert!(
+            !is_pg_root(&located.root, located.pg_root.as_deref()),
+            "an fs run is not a pg one, so the guard does not fire and it serves normally"
+        );
+    }
+
+    /// The **second** arm of the synthetic-root guard: a run whose root is the dsn's synthetic
+    /// leaf but whose *named* configuration does not select pg is refused — serving it would be a
+    /// filesystem root inside a directory that exists only because a pg dsn was addressed. The
+    /// named document is read (never minted), so nothing is created.
+    #[test]
+    fn a_synthetic_root_with_a_non_pg_config_is_refused() {
+        let scratch = TempDir::new().expect("temp");
+        let root = scratch.path().join("pg-root");
+        let config = scratch.path().join("fs.toml");
+        fs::write(&config, "version = 1\n[storage]\ntype = \"fs\"\n")
+            .expect("write the fs configuration");
+        let located = Located {
+            root: root.clone(),
+            read_only: false,
+            state_dir: root.join(".tinio"),
+            // The pg arm ran (a dsn-addressed root), but the named document is not pg.
+            pg_root: Some(root.clone()),
+            config: Some(config),
+            state_dir_override: Some(root.clone()),
+            config_doc: None,
+        };
+
+        let err = run(Args::default(), located, None, &Provenance::default())
+            .err()
+            .expect("a synthetic root with a non-pg config is refused");
+        assert!(err.to_string().contains("pg"), "{err}");
+        assert!(!root.exists(), "the refused run created {root:?}");
+    }
+
+    /// **A pg configuration needs the `pg` feature** (PG15/§6): a build without it refuses rather
+    /// than silently serving a filesystem root, and the sentence names the build. This is the case
+    /// the interim refusal's own leg covered, kept because the keys parse in every build — the
+    /// refusal is what keeps a configuration the build cannot honour from being ignored. Nothing
+    /// is created: the named document is read, not minted, and the refusal precedes the
+    /// directories.
+    #[cfg(not(feature = "pg"))]
+    #[test]
+    fn a_pg_configuration_is_refused_without_the_feature() {
+        let scratch = TempDir::new().expect("temp");
+        let root = scratch.path().join("pg-root");
+        let config = scratch.path().join("pg.toml");
+        fs::write(
+            &config,
+            "version = 1\n[storage]\ntype = \"pg\"\n[storage.pg]\n\
+             dsn = \"postgres://user:password@db.example:5432/tinio\"\n",
+        )
+        .expect("write the pg configuration");
+        let located = Located {
+            root: root.clone(),
+            read_only: false,
+            state_dir: root.join(".tinio"),
+            pg_root: Some(root.clone()),
+            config: Some(config),
+            state_dir_override: Some(root.clone()),
+            config_doc: None,
+        };
+
+        let err = run(Args::default(), located, None, &Provenance::default())
+            .err()
+            .expect("a pg configuration needs the feature");
+        let rendered = err.to_string();
+        assert!(rendered.contains("pg"), "{rendered}");
+        assert!(
+            rendered.contains("feature"),
+            "the remedy names the build: {rendered}"
+        );
+        assert!(!root.exists(), "the refused run created {root:?}");
+    }
+
+    /// **A pg configuration selects the pg backend, and its construction inputs resolve** — the
+    /// two things `run` now does instead of refusing (the interim refusal this slice replaced).
+    /// The leg connects to nothing: the storage is built on the runtime, so selection is a pure
+    /// decision ([`pg_backend_config`]) and is exactly what a database-free run can prove. The
+    /// round trip itself is a `serve`-level leg (`serve::tests`).
+    #[cfg(feature = "pg")]
+    #[test]
+    fn a_pg_configuration_selects_the_pg_backend() {
+        use secrecy::ExposeSecret;
+
+        use crate::{
+            _util::secret::{Secret, SecretKey},
+            commands::EnvArgs,
+        };
+
+        const DSN: &str = "postgres://user:hunter2@db.example:5432/tinio";
+        const OVERRIDE: &str = "postgres://user:envpw@db.example:5432/other";
+
+        fn resolution(dsn: Option<&str>, read_only: bool) -> Resolution {
+            let line = dsn.map_or(String::new(), |dsn| format!("dsn = \"{dsn}\"\n"));
+            let text = format!("version = 1\n[storage]\ntype = \"pg\"\n[storage.pg]\n{line}");
+            Resolution {
+                pg_root: None,
+                root: PathBuf::from("/srv/pg"),
+                config: Config::parse(&text).expect("the pg configuration parses"),
+                config_text: text,
+                config_path: PathBuf::from("/srv/pg/.tinio/.tinio.toml"),
+                read_only,
+                state_dir: PathBuf::from("/srv/pg/.tinio"),
+                state_dir_override: None,
+                config_error: None,
+            }
+        }
+
+        let writable = resolution(Some(DSN), false);
+        assert_eq!(
+            writable.config.backend(),
+            Backend::Pg,
+            "the selector is the configuration's"
+        );
+        let (config, access) = pg_backend_config(&writable, None).expect("the section's dsn");
+        assert_eq!(config.pool(), 8, "PG9's default pool size");
+        assert_eq!(
+            config.dsn().expose_secret().as_ref(),
+            DSN,
+            "the section's own dsn is the one the storage opens"
+        );
+        assert!(
+            matches!(access, _pg::Access::ReadWrite),
+            "a writable run takes the ownership guard (PG12)"
+        );
+
+        // A read-only run selects the mode the constructor takes no guard for (PG12).
+        let (_, access) =
+            pg_backend_config(&resolution(Some(DSN), true), None).expect("the section's dsn");
+        assert!(matches!(access, _pg::Access::ReadOnly));
+
+        // `TINIO_PG_DSN` overrides the section (PG5), and the override is what the synthetic
+        // root and the storage both see.
+        let args = Args {
+            env: EnvArgs {
+                pg_dsn: Some(Secret::from(SecretKey::from(OVERRIDE.to_owned()))),
+                ..EnvArgs::default()
+            },
+            ..Args::default()
+        };
+        let (config, _) =
+            pg_backend_config(&writable, args.env.pg_dsn.as_ref()).expect("the override answers");
+        assert_eq!(config.dsn().expose_secret().as_ref(), OVERRIDE);
+    }
+
+    /// A pg configuration with no dsn from either source is refused — still by `resolve_dsn`,
+    /// naming both remedies, unchanged by the backend now being served.
+    #[cfg(feature = "pg")]
+    #[test]
+    fn a_pg_configuration_without_a_dsn_is_refused() {
+        let text = "version = 1\n[storage]\ntype = \"pg\"\n";
+        let resolution = Resolution {
+            pg_root: None,
+            root: PathBuf::from("/srv/pg"),
+            config: Config::parse(text).expect("the pg configuration parses"),
+            config_text: text.to_owned(),
+            config_path: PathBuf::from("/srv/pg/.tinio/.tinio.toml"),
+            read_only: false,
+            state_dir: PathBuf::from("/srv/pg/.tinio"),
+            state_dir_override: None,
+            config_error: None,
+        };
+
+        let err = pg_backend_config(&resolution, None).expect_err("no dsn: the run is refused");
+        let rendered = err.to_string();
+        assert!(rendered.contains("TINIO_PG_DSN"), "{rendered}");
+        assert!(rendered.contains("dsn"), "{rendered}");
+    }
+
+    /// **A confinement and a pg store cannot be honoured together** (the sandbox crate's finding):
+    /// the confinement cuts the confined process's outbound connections and the pg store's
+    /// connection is such a path, so the combination is refused up front — naming both settings —
+    /// rather than served unservable. Each half alone is not a refusal: a filesystem run keeps the
+    /// confinement, and a pg run that asked for none is not refused.
+    #[test]
+    fn a_confinement_under_pg_is_refused_and_the_fs_or_unconfined_run_is_not() {
+        use crate::sandbox::{Channel, Request};
+
+        let asked = Request {
+            channel: Some(Channel::Flag),
+        };
+        let refusal = sandbox::refuse_pg_under_confinement(&asked, Backend::Pg)
+            .expect("a pg run under a confinement is refused");
+        // A usage error: the operator asked for two settings that cannot both hold.
+        assert!(matches!(refusal, Error::Usage(_)), "{refusal}");
+        let text = refusal.to_string();
+        assert!(text.contains("--sandbox"), "names the channel: {text}");
+        assert!(text.contains("pg"), "names the backend: {text}");
+        assert!(text.contains("confinement"), "{text}");
+
+        assert!(
+            sandbox::refuse_pg_under_confinement(&asked, Backend::Fs).is_none(),
+            "a filesystem run serves from local files and keeps its confinement"
+        );
+        assert!(
+            sandbox::refuse_pg_under_confinement(&Request { channel: None }, Backend::Pg).is_none(),
+            "a pg run that asked for no confinement is not refused"
         );
     }
 }

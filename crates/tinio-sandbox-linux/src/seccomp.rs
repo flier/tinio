@@ -482,7 +482,7 @@ pub fn filter_program(arch: Arch) -> Vec<SockFilter> {
 
 // The `prctl` declaration is **not** here, and that is not a matter of style:
 // under edition 2024 an `extern` block is itself an unsafe construct, so at
-// module scope it is a fourth one that no `#[allow(unsafe_code)]` on a sibling
+// module scope it is a fourth one that no `#[expect(unsafe_code)]` on a sibling
 // item covers — and the crate is `deny`. It is declared inside `install`
 // instead, where that function's own attribute covers the declaration as well
 // as the call, which is what keeps this crate's enumerated count at three
@@ -570,7 +570,10 @@ pub enum Seccomp {
 /// # let _ = installed;
 /// ```
 #[instrument(skip_all, ret, fields(arch = field::Empty, instructions = field::Empty))]
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "the `unsafe extern \"C\"` `prctl` declaration is deliberately local to this body — edition 2024 makes an `extern` block unsafe in its own right — so the attribute must sit on the function"
+)]
 pub fn install() -> Result<Seccomp> {
     // Declared here, not at module scope: edition 2024 makes an `extern` block
     // unsafe in its own right, and this attribute covers the body's items while

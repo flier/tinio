@@ -190,6 +190,21 @@ pub(crate) struct Plan {
     pub(crate) records_versions: bool,
 }
 
+impl Plan {
+    /// The row-less plan: no identity, no sequence, no supersede. It is what a
+    /// publish that records nothing answers — an unversioned bucket, the
+    /// content contract's visibility-point publish, and every write in a
+    /// stripped build.
+    pub(crate) fn rowless() -> Self {
+        Self {
+            marker: Marker::none(),
+            seq: 0,
+            superseded: None,
+            records_versions: false,
+        }
+    }
+}
+
 /// How a publish treats the version tables: the fs write paths supersede the
 /// outgoing version on the way (its row committed before the rename — the
 /// engine's protocol step 3), while the content contract's [`ObjectContent::publish`]
@@ -253,12 +268,7 @@ impl FsStorage {
         #[cfg(not(feature = "versioning"))]
         {
             let _ = (bucket, key);
-            Ok(Plan {
-                marker: Marker::none(),
-                seq: 0,
-                superseded: None,
-                records_versions: false,
-            })
+            Ok(Plan::rowless())
         }
     }
 
@@ -329,12 +339,7 @@ impl FsStorage {
         // state read.
         let plan = match publication {
             Publication::Versioned => self.plan_publish(bucket, key).await?,
-            Publication::Bytes | Publication::BytesUnderLock => Plan {
-                marker: Marker::none(),
-                seq: 0,
-                superseded: None,
-                records_versions: false,
-            },
+            Publication::Bytes | Publication::BytesUnderLock => Plan::rowless(),
         };
         // The unix dir hardening (spec 2026-09-05 §5a): a prefix dir
         // implicitly created by this write lands `0700` and chowned to the
@@ -379,7 +384,7 @@ mod enabled {
     // about to publish: the top-level `Plan`, shared with the feature-off
     // branch so the two can never drift — and the stamping helper the state
     // transactions share.
-    use super::{Plan, stamp_superseded};
+    use super::{Plan, StoreError, stamp_superseded};
     use crate::{
         _core::{
             ByteRange, ETag,
@@ -483,7 +488,7 @@ mod enabled {
             bucket: &Name,
             key: &object::Key,
         ) -> Result<(Current, Option<object_meta::Stored>), Error> {
-            let judged = Rows::new(self.clone())
+            let judged = Rows::new(self.storage_handle())
                 .current_with_row(bucket, key)
                 .await
                 .map_err(Error::from)?;
@@ -503,16 +508,9 @@ mod enabled {
                     let state = bucket_versioning::Table::open_readonly(txn)?
                         .get(bucket.as_ref().as_str())?
                         .unwrap_or_default();
-                    let table = rows::Table::open_readonly(txn)?;
-                    let (bucket, key) = (bucket.as_ref().as_str(), key.as_ref().as_str());
-                    let latest = table.latest(bucket, key)?.map_or(0, |(seq, _)| seq);
-                    let null_at_zero = table.get(bucket, key, 0)?.is_some();
                     Ok((
                         state,
-                        Seqs {
-                            latest,
-                            null_at_zero,
-                        },
+                        seqs_in(txn, bucket.as_ref().as_str(), key.as_ref().as_str())?,
                     ))
                 })
                 .map_err(Error::from)
@@ -529,14 +527,11 @@ mod enabled {
             let key = key.clone();
             self.handle()
                 .read(move |txn| {
-                    let table = rows::Table::open_readonly(txn)?;
-                    let (bucket, key) = (bucket.as_ref().as_str(), key.as_ref().as_str());
-                    let latest = table.latest(bucket, key)?.map_or(0, |(seq, _)| seq);
-                    let null_at_zero = table.get(bucket, key, 0)?.is_some();
-                    Ok(Seqs {
-                        latest,
-                        null_at_zero,
-                    })
+                    Ok(seqs_in(
+                        txn,
+                        bucket.as_ref().as_str(),
+                        key.as_ref().as_str(),
+                    )?)
                 })
                 .map_err(Error::from)
         }
@@ -552,12 +547,7 @@ mod enabled {
             // gate.
             let (state, seqs) = self.state_and_seqs(bucket, key)?;
             if state == State::Unversioned {
-                return Ok(Plan {
-                    marker: Marker::none(),
-                    seq: 0,
-                    superseded: None,
-                    records_versions: false,
-                });
+                return Ok(Plan::rowless());
             }
             // The gated current slot with the row it was judged from (the
             // degraded-slot rule's home is `gated_current`) and the key's
@@ -735,7 +725,7 @@ mod enabled {
         /// read path's self-heal territory); the gated read and its rules live
         /// in [`Self::gated_current`].
         async fn slot(&self, bucket: &Name, key: &object::Key) -> Result<Option<Found>, Error> {
-            let judged = Rows::new(self.clone())
+            let judged = Rows::new(self.storage_handle())
                 .current_with_row(bucket, key)
                 .await
                 .map_err(Error::from)?;
@@ -896,7 +886,7 @@ mod enabled {
             // named. The scan itself stays raw: the successor decision needs
             // the wire-level `is_history` and the bounded two-row prefix read
             // that the contract's decoded rows do not expose.
-            let adapter = Rows::new(self.clone());
+            let adapter = Rows::new(self.storage_handle());
             let Some(stored_row) = adapter
                 .get_version(bucket, key, seq)
                 .await
@@ -993,6 +983,19 @@ mod enabled {
                 .await
                 .map_err(Error::from)
         }
+    }
+
+    /// The key's sequence view from within `txn` — the two facts the shared
+    /// write decision takes ([`Seqs`]), read together because `state_and_seqs`
+    /// answers the bucket's state in the same transaction.
+    fn seqs_in(txn: &redb::ReadTransaction, bucket: &str, key: &str) -> Result<Seqs, StoreError> {
+        let table = rows::Table::open_readonly(txn)?;
+        let latest = table.latest(bucket, key)?.map_or(0, |(seq, _)| seq);
+        let null_at_zero = table.get(bucket, key, 0)?.is_some();
+        Ok(Seqs {
+            latest,
+            null_at_zero,
+        })
     }
 
     /// The contract row a restore installs, from the version row the successor
@@ -1194,7 +1197,7 @@ mod enabled {
             if key.is_reserved() || key.is_folder_marker() {
                 return Ok(CurrentVersion::Absent);
             }
-            let judged = Rows::new(self.clone())
+            let judged = Rows::new(self.storage_handle())
                 .current_with_row(bucket, key)
                 .await?;
             Ok(if !judged.current.exists {

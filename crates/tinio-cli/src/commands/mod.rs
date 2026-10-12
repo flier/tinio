@@ -19,18 +19,21 @@ pub mod status;
 #[cfg(feature = "api")]
 pub mod stop;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Args};
 
 #[cfg(feature = "api")]
 use crate::_api::client::{self, Report};
-use crate::_config::state::parse_state_dir;
 #[cfg(any(feature = "api", test))]
 use crate::{
     _config::state,
     Error,
     resolve::{self, Located, Resolution},
+};
+use crate::{
+    _config::state::parse_state_dir,
+    _util::secret::{Secret, SecretKey},
 };
 
 /// The environment-only channels the resolution reads: `TINIO_STATE_DIR` and the `[auth]` pair.
@@ -89,6 +92,33 @@ pub struct EnvArgs {
         hide = true
     )]
     pub secret_key: Option<String>,
+    /// The PostgreSQL dsn (`TINIO_PG_DSN`, PG5): it **overrides** `[storage.pg] dsn` and selects
+    /// nothing — the backend is `[storage] type`'s answer alone, so a host with the variable
+    /// exported still serves a filesystem root unless the key says `pg`.
+    ///
+    /// Parsed into a `Secret` **immediately**, so a rendering of this struct (or of `Args`) that
+    /// redacts the credential pair redacts the dsn's password with it — the reason the field is
+    /// not a `String` like the pair above, whose values reach `Secret`s in the `[auth]` fold. Read
+    /// through `resolve::pg::named`, which is what turns an exported-but-empty
+    /// value into the unset variable it means — clap cannot, because its `value_parser` is handed
+    /// the empty string and must return one.
+    #[arg(
+        long = "pg-dsn",
+        env = "TINIO_PG_DSN",
+        value_name = "DSN",
+        hide = true,
+        value_parser = parse_pg_dsn
+    )]
+    pub pg_dsn: Option<Secret>,
+}
+
+/// `--pg-dsn`'s parser: the material becomes a [`Secret`] at the parse, so the credential never
+/// travels as a `String`. **An empty value is read as unset, never refused**
+/// ([`pg::named`](crate::resolve::pg::named)): an empty dsn names nothing. The value is trimmed:
+/// a dsn's surrounding whitespace is never meaningful, while an environment file's CRLF line
+/// ending is.
+fn parse_pg_dsn(raw: &str) -> Result<Secret, String> {
+    Ok(Secret::from(SecretKey::from(raw.trim().to_owned())))
 }
 
 /// The arguments `status`, `stop` and `doctor` share: a root and the mode.
@@ -267,6 +297,26 @@ pub(crate) async fn probe_pair(candidates: &[PathBuf]) -> Result<Answer, Error> 
     stopped.ok_or_else(|| Error::Operational("no state directory to probe".into()))
 }
 
+/// Whether this run is a **pg** one — its root is the synthetic root `locate`'s pg arm derived, so
+/// it has **no served root** (PG5/PG13; ruling R8).
+///
+/// The serving half's refusal ([`start::run`](crate::commands::start::run)) and the doctor's
+/// root-skipping check list ([`doctor::checks`](crate::commands::doctor::checks)) both ask it, so
+/// the two cannot disagree about which runs those are.
+///
+/// **The input is `Located::pg_root`, the field the pg arm sets and the filesystem arm leaves
+/// `None`** — never a value re-derived from something else the run carries. That is deliberate and
+/// it is a corrected design: re-deriving the synthetic root from the dsn and
+/// `state_dir_override` answers `true` for a filesystem run whose `TINIO_STATE_DIR` happens to
+/// equal its own root (the override *is* that variable), which would refuse a service that has
+/// nothing to do with PostgreSQL. Reading the arm's own record is exactly "did this run take the
+/// pg arm", and the comparison with `root` keeps the record honest about which root it derived.
+/// The rule "`TINIO_PG_DSN` selects nothing" holds by construction then: an exported dsn on a
+/// filesystem run changes no field this function reads.
+pub(crate) fn is_pg_root(root: &Path, pg_root: Option<&Path>) -> bool {
+    pg_root.is_some_and(|synthetic| synthetic == root)
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
@@ -275,7 +325,7 @@ mod tests {
     use crate::{
         _config::state::STATE_DIR_VAR,
         _util::testing::assert_send_sync,
-        cli::{ACCESS_KEY_VAR, Cli, SECRET_KEY_VAR},
+        cli::{ACCESS_KEY_VAR, Cli, PG_DSN_VAR, SECRET_KEY_VAR},
     };
 
     #[test]
@@ -308,6 +358,7 @@ mod tests {
                         if name == STATE_DIR_VAR
                             || name == ACCESS_KEY_VAR
                             || name == SECRET_KEY_VAR
+                            || name == PG_DSN_VAR
                 );
                 if hidden_channel {
                     assert!(
@@ -324,5 +375,23 @@ mod tests {
     fn the_public_surface_is_send_and_sync() {
         assert_send_sync::<DirArgs>();
         assert_send_sync::<EnvArgs>();
+    }
+
+    /// The predicate's three arms — and the shape F1 was: a root that is *also* a value some other
+    /// field could carry is not pg, because the input is the arm's own record and not a
+    /// re-derivation. `Located::pg_root` is `None` for every filesystem run, `TINIO_PG_DSN`
+    /// exported or not.
+    #[test]
+    fn only_the_pg_arms_record_makes_a_root_synthetic() {
+        let root = Path::new("/srv/data");
+        assert!(
+            is_pg_root(root, Some(root)),
+            "the pg arm records its own root"
+        );
+        assert!(!is_pg_root(root, None), "a filesystem run records none");
+        assert!(
+            !is_pg_root(root, Some(Path::new("/srv/other"))),
+            "a record naming another root is not this root's"
+        );
     }
 }

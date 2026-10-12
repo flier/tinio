@@ -25,6 +25,8 @@ use crate::_api::bind::reclaim_stale;
 // client resolution instead, so an unconditional import would be dead in this build.
 #[cfg(not(feature = "api"))]
 use crate::resolve::for_doctor;
+#[cfg(feature = "pg")]
+use crate::resolve::pg;
 use crate::{
     _config::state::prepare_home_derived,
     _core::cleanup::{Cleanup, CleanupOptions, RepairActionLevel, RepairKind},
@@ -103,6 +105,7 @@ pub struct Args {
 ///     config: None,
 ///     read_only: false,
 ///     state_dir: None,
+///     pg_dsn: None,
 /// };
 /// let located = locate(discovery, &Provenance::default())?;
 /// let args = Args::default();
@@ -112,6 +115,16 @@ pub struct Args {
 /// # }
 /// ```
 pub async fn run(args: Args, located: Located) -> Result<ExitCode, Error> {
+    // R8's addressing channel, captured **before** `args.dir` moves into the client resolution
+    // below: `TINIO_PG_DSN` (the hidden `--pg-dsn` is its flag). A pg run has no served root, so
+    // the dsn is what tells this run which database it is diagnosing, and it is read by the `pg`
+    // leg alone — so the binding is gated exactly as the flags pair below is, rather than captured
+    // unread in a build with no backend (the default feature set has none, and CI's lint job runs
+    // `-D warnings` over it). The *other* input the check list needs — whether it is diagnosing a
+    // database or a served root — is not the dsn at all but the arm the resolution took, and that
+    // record travels on the [`Resolution`] the chain below builds.
+    #[cfg(feature = "pg")]
+    let pg_dsn = pg::named(args.dir.env.pg_dsn.clone());
     // The two flags are `api`-gated, so they are read once, here, behind the same gate:
     // everything below names the local pair and never the fields, which is what keeps this body
     // compiling in a build without the plane.
@@ -220,6 +233,17 @@ pub async fn run(args: Args, located: Located) -> Result<ExitCode, Error> {
         )
         .await
     };
+    // **The pg leg (ruling R8)**: a pg run has no served root — its state dir is the dsn-derived
+    // synthetic root — and this arm carries no `--config`, so the instance is addressed through
+    // `TINIO_PG_DSN` (the hidden `--pg-dsn` is its other channel) or `[storage.pg] dsn`. Its rows
+    // are appended in every mode, plain, `--dry-run` and `--fix` alike: the check is a diagnosis,
+    // and `--fix` never repairs a database (`Cleanup`'s repair is the store's own slice).
+    #[cfg(feature = "pg")]
+    let report = {
+        let mut report = report;
+        report.extend(checks::pg_findings(&resolution, pg_dsn.as_ref()).await);
+        report
+    };
     println!(
         "{}",
         if args.json {
@@ -252,31 +276,24 @@ pub(crate) async fn state_dir_for_run(
     for dir in candidates {
         let probe = liveness(dir).await?;
         let answered = probe.channel_answers;
-        probes.push((dir.clone(), probe));
+        // Decision 19's selection is this early return: the candidate whose channel answered — a
+        // same-version server or a foreign-version document that still dials — settles the answer,
+        // so the ones behind it are neither probed nor needed and no scan for it is owed later.
         if answered {
-            break;
+            return Ok(state_dir(resolution, dir.clone(), probe));
         }
+        probes.push((dir.clone(), probe));
     }
-    // Decision 19's selection, over the probes this run just took: the first candidate whose
-    // channel answered — a same-version server or a foreign-version document that still dials —
-    // else the candidate the resolution named, else the pair's first element.
+    // Nothing answered: the candidate the resolution named is the one to diagnose and — in a
+    // `--fix` run — the one to repair, because a stale `state` file and a stale socket are exactly
+    // what a repair may clear *because* nothing answered. The pair's first element answers when it
+    // holds no such candidate.
     let index = probes
         .iter()
-        .position(|(_, probe)| probe.channel_answers)
-        .or_else(|| {
-            probes
-                .iter()
-                .position(|(dir, _)| dir == &resolution.state_dir)
-        })
+        .position(|(dir, _)| dir == &resolution.state_dir)
         .unwrap_or_default();
     Ok(match probes.into_iter().nth(index) {
-        Some((dir, probe)) => StateDir {
-            resolved: dir == resolution.state_dir,
-            dir,
-            liveness: probe.liveness,
-            control_name: probe.control_name,
-            channel_answers: probe.channel_answers,
-        },
+        Some((dir, probe)) => state_dir(resolution, dir, probe),
         // `state_dir_candidates` always answers a pair; this is the empty-pair arm, answered
         // rather than unwrapped because library code does not panic.
         None => StateDir {
@@ -287,6 +304,19 @@ pub(crate) async fn state_dir_for_run(
             channel_answers: false,
         },
     })
+}
+
+/// One probed candidate as the answer: whether it is the resolved directory, and its own liveness
+/// facts.
+#[cfg(feature = "api")]
+fn state_dir(resolution: &Resolution, dir: PathBuf, probe: Probe) -> StateDir {
+    StateDir {
+        resolved: dir == resolution.state_dir,
+        dir,
+        liveness: probe.liveness,
+        control_name: probe.control_name,
+        channel_answers: probe.channel_answers,
+    }
 }
 
 /// Without the plane there is no `state` file and no control channel: nothing to probe, and no

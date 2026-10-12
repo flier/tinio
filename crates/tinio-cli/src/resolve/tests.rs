@@ -25,6 +25,7 @@ fn discovery_for(root: &Path) -> Discovery {
         config: None,
         read_only: false,
         state_dir: None,
+        pg_dsn: None,
     }
 }
 
@@ -38,6 +39,7 @@ fn resolution_with(root: &Path, state_dir: &Path, config_text: &str) -> Resoluti
     // production path can produce. `config_text` is the text the config was parsed from — the
     // chain keeps both, because the launch payload carries the text.
     Resolution {
+        pg_root: None,
         root: root.to_path_buf(),
         read_only: config.server.read_only,
         config,
@@ -154,6 +156,7 @@ fn locate_resolves_the_root_the_mode_and_the_state_dir() {
         config: None,
         read_only: true,
         state_dir: Some(relocated.clone()),
+        pg_dsn: None,
     };
     let located = locate(
         discovery,
@@ -234,6 +237,7 @@ fn an_adopted_run_reads_the_payload_not_the_explicit_config_path() {
         // Read-only relocates the state dir, and the override is what keeps this leg out of the
         // developer's real home (`locate_resolves_the_root_the_mode_and_the_state_dir`).
         state_dir: Some(dir.path().join("state")),
+        pg_dsn: None,
     };
 
     // The unconfined contract is untouched: a path that is not a file is a usage error.
@@ -259,6 +263,44 @@ fn an_adopted_run_reads_the_payload_not_the_explicit_config_path() {
         "the path is still what the resolution names"
     );
     assert_eq!(located.state_dir, dir.path().join("state"));
+}
+
+/// **A broken file's refusal names the file it came from.** `document` loads through
+/// `Config::load`, whose refusal labels its source with the path, so a broken document is named
+/// rather than left for the operator to hunt down. **`locate` itself refuses it**, at the anchor
+/// read: swallowing that failure here is what made a broken `--config` with no `DIR` answer the
+/// storage-root usage error instead of naming the file. This is the file arm; the
+/// launcher-forwarded text is the design's one text parse (`resume`'s adopted arm, design
+/// decision 18), not a file.
+#[test]
+fn a_broken_file_refusal_names_the_file() {
+    let dir = tempfile::TempDir::new().expect("temp");
+    let root = dir.path().join("root");
+    fs::create_dir_all(&root).expect("root");
+    let config_path = dir.path().join("outside/sandbox.toml");
+    fs::create_dir_all(config_path.parent().expect("outside dir")).expect("outside dir");
+    // Malformed TOML: an unterminated basic string, refused before any key is read.
+    fs::write(
+        &config_path,
+        "version = 1\n[server]\nhost = \"unterminated\n",
+    )
+    .expect("write the broken document");
+
+    let err = locate(
+        Discovery {
+            dir: Some(root.clone()),
+            config: Some(config_path.clone()),
+            read_only: false,
+            state_dir: Some(dir.path().join("state")),
+            pg_dsn: None,
+        },
+        &Provenance::default(),
+    )
+    .expect_err("the file's document refuses at the anchoring read");
+    assert!(
+        err.to_string().contains("sandbox.toml"),
+        "names the file: {err}"
+    );
 }
 
 #[test]

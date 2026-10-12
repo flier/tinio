@@ -46,7 +46,7 @@ use std::{env::consts::OS, io};
 pub(crate) use child::on_stop;
 pub use child::{adopted_control, adopted_listener, apply_self_confinement, filter_argv};
 pub use confine::confine;
-pub(crate) use confine::lost_export;
+pub(crate) use confine::{lost_export, refuse_pg_under_confinement};
 pub use plan::{Channel, Request, StateDirSource, plan, resolve_flag};
 #[cfg(all(test, feature = "sandbox"))]
 pub(crate) use product::{

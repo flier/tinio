@@ -9,6 +9,15 @@
 //! `cargo clean -p tinio-store-pg`. `sqlx check` compares the generated set
 //! with the cache and never writes to it; `sqlx update` makes the cache exactly
 //! the generated set, and touches it only after generation succeeds.
+//!
+//! A generated entry is the driver's inference about the **live database**, not
+//! a function of the SQL text alone: a column's `nullable` comes from
+//! `pg_attribute.attnotnull`, patched from the plan the server gives the
+//! statement, so a cache recorded against another shape — an older fixture
+//! volume, a column that has since gained `NOT NULL` — re-reads as `changed`
+//! for a statement whose SQL never moved. That is the drift this mode exists to
+//! report: re-record it with `sqlx update` against the fixture the gate runs,
+//! rather than editing the entry or the comparison to match.
 
 use std::{
     collections::BTreeMap,

@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use tokio::runtime::Handle;
 
+#[cfg(feature = "pg")]
+use crate::_pg::PgStorage;
 use crate::{
     _api::metrics::MetricsSource,
     _core::{
@@ -21,6 +23,32 @@ use crate::{
     resolve::Pipelines,
 };
 
+/// The write-lock snapshot a backend publishes to `/metrics`, when it has one.
+///
+/// **The one backend-specific bit of this adapter**, and the reason it is a trait rather than a
+/// second `ServerMetrics`: the scan ([`count_storage`]) is the contract's generic walk and is
+/// written once, while the write-lock histograms are the filesystem's own lane — a backend whose
+/// writes carry no such lane answers `None`, and the gauges publish zeros rather than a fiction.
+/// The fs arm is `Some` because `FsStorage` records a write lock per transaction; pg's is `None`
+/// because its writes are the store's rows and hand out no wait-duration distribution.
+pub(super) trait WriteLockStatsSource {
+    /// The snapshot, or `None` for a backend with no filesystem write lane.
+    fn write_lock_stats(&self) -> Option<WriteLockStats>;
+}
+
+impl WriteLockStatsSource for FsStorage {
+    fn write_lock_stats(&self) -> Option<WriteLockStats> {
+        Some(write_lock_snapshot(FsStorage::write_lock_stats(self)))
+    }
+}
+
+#[cfg(feature = "pg")]
+impl WriteLockStatsSource for PgStorage {
+    fn write_lock_stats(&self) -> Option<WriteLockStats> {
+        None
+    }
+}
+
 /// The CLI's `tinio_api::metrics::MetricsSource` — the registry side of a `/metrics` scrape.
 ///
 /// `tinio-api` must not depend on `tinio-server` (design decision 23: the edge is the reverse
@@ -33,7 +61,11 @@ use crate::{
 /// is its only caller, which is what retires the TTL cache decision 23 describes: there is no
 /// staged copy in this crate and nothing to keep in step, because the reader's own schedule
 /// *is* the schedule.
-pub(super) struct ServerMetrics {
+///
+/// **Generic over the served backend** (the backend-generic serving seam): the scan is the
+/// contract's own walk, so this adapter reads any `Storage`, and the one backend-specific family
+/// — the write-lock histograms — travels through [`WriteLockStatsSource`].
+pub(super) struct ServerMetrics<S> {
     /// The cheap families — pipeline gauges and write-lock histograms — as the type
     /// `tinio_server::MetricsRefresh` (`Arc<dyn Fn() + Send + Sync>`), re-exported out of
     /// `tinio-server` because its `data` module is private.
@@ -42,11 +74,14 @@ pub(super) struct ServerMetrics {
     /// deliberately dyn-incompatible (its associated error type and its `where Self: Storage`
     /// bounds), so `dyn Storage` is never spelled in this crate — [`counts`](ServerMetrics)
     /// is what reads it, and this field is why the read is possible at all.
-    storage: FsStorage,
+    storage: S,
 }
 
-impl ServerMetrics {
-    pub(super) fn new(pipelines: &Pipelines, storage: &FsStorage) -> Self {
+impl<S> ServerMetrics<S>
+where
+    S: Storage + WriteLockStatsSource + Clone + Send + Sync + 'static,
+{
+    pub(super) fn new(pipelines: &Pipelines, storage: &S) -> Self {
         Self {
             refresh: refresh_handle(pipelines, storage),
             storage: storage.clone(),
@@ -54,17 +89,21 @@ impl ServerMetrics {
     }
 }
 
-/// The cheap families' closure, built once in [`run()`] and shared with the adapter.
+/// The cheap families' closure, built once in the pre-runtime half and shared with the adapter.
 ///
 /// The two pipelines' `.stats()` snapshots are taken **at call time**, not at start-up, and
-/// the storage's `write_lock_stats()` is converted to `WriteLockStats` by [`write_lock_stats`].
-pub(super) fn refresh_handle(pipelines: &Pipelines, storage: &FsStorage) -> MetricsRefresh {
+/// the storage's write-lock snapshot (when the backend has one) is converted to
+/// `WriteLockStats` by [`write_lock_snapshot`].
+pub(super) fn refresh_handle<S>(pipelines: &Pipelines, storage: &S) -> MetricsRefresh
+where
+    S: WriteLockStatsSource + Clone + Send + Sync + 'static,
+{
     let (io, db, storage) = (pipelines.io(), pipelines.db(), storage.clone());
     Arc::new(move || {
         metrics::refresh(
             io.stats(),
             db.stats(),
-            write_lock_stats(storage.write_lock_stats()),
+            storage.write_lock_stats().unwrap_or_default(),
         )
     })
 }
@@ -72,7 +111,7 @@ pub(super) fn refresh_handle(pipelines: &Pipelines, storage: &FsStorage) -> Metr
 /// The write-lock snapshot of the fs storage into the metric layer's plain-data form — the
 /// wiring-point conversion that keeps `tinio-server`'s metrics decoupled from backend
 /// snapshot types.
-fn write_lock_stats(snapshot: WriteLockSnapshot) -> WriteLockStats {
+fn write_lock_snapshot(snapshot: WriteLockSnapshot) -> WriteLockStats {
     WriteLockStats {
         wait_buckets: snapshot.wait_buckets,
         total_buckets: snapshot.total_buckets,
@@ -198,7 +237,10 @@ async fn scan_objects<S: Storage>(storage: &S, name: &Name, counts: &mut Counts)
     }
 }
 
-impl MetricsSource for ServerMetrics {
+impl<S> MetricsSource for ServerMetrics<S>
+where
+    S: Storage + Send + Sync + 'static,
+{
     /// The cheap families — the call `Gauges::refresh` makes on every scrape, and the same arc
     /// the data plane's retired hook held, so the two cannot drift.
     fn refresh(&self) {

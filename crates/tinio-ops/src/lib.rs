@@ -28,8 +28,9 @@
 //!
 //! **What it writes.** The bucket group's twelve bodies, the object group's
 //! thirteen (the version-creating put beside the version-free lifecycle, and
-//! the read-heal they share), the multipart group's seven and the version
-//! group's eight of its nine. The inventory those answer (E2's 44 operations) is counted once, per group and per backend, in the design's `Coverage as landed` table (`docs/superpowers/specs/2026-10-03-ops-engine-design.md`) — this is the module map, not a second count. A backend
+//! the read-heal they share), the multipart group's seven, the version
+//! group's nine and the version-creating delete the version group's module
+//! carries beside them. The inventory those answer (E2's 44 operations) is counted once, per group and per backend, in the design's `Coverage as landed` table (`docs/superpowers/specs/2026-10-03-ops-engine-design.md`) — this is the module map, not a second count. A backend
 //! takes the groups its storage can express: `mem` takes the bucket group, the
 //! version-free object bodies, five multipart bodies and the listing, and
 //! keeps its version group, its version-creating writes and four documented
@@ -37,19 +38,21 @@
 //! stays backend-side, because a bucket the API has never sighted has no row
 //! to enumerate), the object group's fourteen implemented bodies (its
 //! `put_object` is the core trait's default over the engine's stage and
-//! commit), all seven multipart bodies and eight of the nine version bodies.
+//! commit), all seven multipart bodies and all nine version bodies.
 //!
-//! **What it does not write.** Four inventory operations stay backend-side, and
-//! each group's module doc carries its reason. The version-addressed **delete**
-//! ([`version`]): the restore it runs moves the current slot **backwards to a
-//! real identity** — a move `advance_slot` refuses — and commits that move, the
-//! object row and the row/index drop as one transaction, so the contracts
-//! express neither half. The multipart **completion** ([`multipart`]): each
-//! backend's commit half is one state transaction (fs's assembly, the version
-//! branch and the consumed upload; mem's in-transaction version decision).
-//! **Copy** stays with the backends (fs renames within a bucket; mem reads
-//! then writes). The version-creating **delete** stays with them too: a marker
-//! written as a version row would displace the one null version.
+//! **What it does not write.** Two inventory operations stay backend-side, and
+//! each group's module doc carries its reason: the multipart **completion**
+//! ([`multipart`]) — each backend's commit half is one state transaction (fs's
+//! assembly, the version branch and the consumed upload; mem's in-transaction
+//! version decision) — and **copy**, which stays with the backends (fs renames
+//! within a bucket; mem reads then writes). The version-addressed **delete** is
+//! a body ([`version`]'s `delete_object_version`), whose restore moves the
+//! current slot **backwards to a real identity** — a move `advance_slot`
+//! refuses — in one transaction with the object row and the row/index drop;
+//! the version-creating **delete**'s ordering is the same module's
+//! `create_delete_marker`, and only its slot write is the backend's
+//! `tinio_version::MarkerWrite` port, because a marker is a recorded slot with
+//! **no** version row, a state no contract write expresses.
 //! `list_object_versions`, `current_version` and `ensure_rename_allowed` are
 //! the trait's backend-side methods by decision (E14) — never bodies the
 //! inventory expects here.

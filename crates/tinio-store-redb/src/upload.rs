@@ -63,7 +63,10 @@ where
     /// `key_matches` + `get` pair of `get_upload` in one lookup. Returns
     /// `(key, initiated-at, tags wire, owner wire, acl wire)` (owned —
     /// the guard cannot outlive the closure).
-    #[allow(clippy::type_complexity)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "the return type is the row's wire tuple — key, initiated-at, tags, owner and ACL wires — which is the shape the one lookup hands its caller"
+    )]
     pub fn get_matching(
         &self,
         bucket: &str,
@@ -147,7 +150,10 @@ where
 impl<'txn> table::Table<'txn, Def> {
     /// Upsert one upload row — the create-time tags, owner and ACL wires
     /// ride in the row (spec 2026-08-31; owner/ACL spec 2026-09-05).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per column of the upload row — bucket, upload id, key, initiated-at, tags, owner and ACL — the table's own `put` spelling the row out"
+    )]
     pub fn put(
         &mut self,
         bucket: &str,

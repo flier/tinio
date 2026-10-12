@@ -461,8 +461,10 @@ pub async fn get_http(addr: SocketAddr, call: Call<'_>) -> Result<RawResponse, E
 /// `running: false` — so without this substitution `tinio status` would report a running server
 /// as "stopped", deterministically, on every wildcard bind. `state.control_name` itself stays
 /// what the bind wrote: this function changes only the address a connection is made to, at the
-/// one place the recorded name becomes a connection.
-fn dialable(addr: SocketAddr) -> SocketAddr {
+/// one place the recorded name becomes a connection. **Public because the e2e suite's
+/// management requests dial a recorded control address too**, and a second copy of the
+/// substitution is a second answer to which address a wildcard bind is reachable at.
+pub fn dialable(addr: SocketAddr) -> SocketAddr {
     let ip = match addr.ip() {
         IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),

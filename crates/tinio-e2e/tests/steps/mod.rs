@@ -26,7 +26,6 @@ pub mod multipart;
 pub mod objects;
 pub mod reserved_paths;
 pub mod select;
-pub mod sigv4;
 pub mod tag_filter;
 pub mod versioning;
 
@@ -112,15 +111,19 @@ pub fn has_tag(tags: &[String], tag: &str) -> bool {
 /// the same configuration whichever way the server runs.
 pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
     let tagged = |t: &str| has_tag(tags, t);
-    // Backend: an explicit @fs/@mem scenario tag wins; otherwise the
-    // TINIO_E2E_BACKEND env override (the CI mem pass); default fs.
+    // Backend: an explicit @pg/@mem/@fs scenario tag wins; otherwise the
+    // TINIO_E2E_BACKEND env override (the CI mem and pg passes); default fs.
     let env_backend = env::var("TINIO_E2E_BACKEND").ok();
-    let backend = if tagged("mem") {
+    let backend = if tagged("pg") {
+        Backend::Pg
+    } else if tagged("mem") {
         Backend::Mem
     } else if tagged("fs") {
         Backend::Fs
     } else if env_backend.as_deref() == Some("mem") {
         Backend::Mem
+    } else if env_backend.as_deref() == Some("pg") {
+        Backend::Pg
     } else {
         Backend::Fs
     };
@@ -226,32 +229,24 @@ fn before_hook<'a>(
             ));
             return;
         }
-        let server = if has_tag(&scenario.tags, "acl") {
-            // The identity-wired acl plane (Task 15, grilling Q2): the
-            // config-driven Identity (fixture [auth]/[owner]/[[users]])
-            // through `DataPlane::new_with_acl` — the enforced mode the
-            // @acl scenarios exercise. `@acl-off` is NOT this branch
-            // (the caps gate off runs the legacy no-identity plane,
-            // like the other @minimal-caps off-mode scenarios).
-            match backend {
-                Backend::Mem => Server::acl_mem(caps).await,
-                Backend::Fs => Server::acl(caps).await,
-            }
-        } else if has_tag(&scenario.tags, "read-only") {
+        let acl = has_tag(&scenario.tags, "acl");
+        let server = if !acl && has_tag(&scenario.tags, "read-only") {
             // The read-only plane (FR-023): every mutating operation
-            // answers AccessDenied. Checked ahead of the `(backend,
-            // fs_kind)` dispatch below, which would otherwise need a
-            // read-only arm per `FsKind`.
+            // answers AccessDenied. Checked ahead of the backend
+            // dispatch, which would otherwise need a read-only arm per
+            // `FsKind`; an `@acl` scenario outranks it, as the branch
+            // below is the wider plane.
             Server::read_only(caps).await
         } else {
-            match (backend, fs_kind) {
-                (Backend::Mem, _) => Server::mem(caps).await,
-                (Backend::Fs, FsKind::NestedRoot) => Server::fs_nested(caps).await,
-                (Backend::Fs, FsKind::ColdListing(interval)) => {
-                    Server::fs_with_scanner_interval(caps, interval).await
-                }
-                (Backend::Fs, FsKind::Plain) => Server::fs(caps).await,
-            }
+            // The two tag axes are independent — the backend says which
+            // storage to serve, `@acl` whether to serve it on the
+            // identity-wired plane (Task 15, grilling Q2: the
+            // config-driven Identity from the fixture
+            // `[auth]`/`[owner]`/`[[users]]`, through
+            // `DataPlane::new_with_acl`). `@acl-off` is NOT the acl arm
+            // (the caps gate off runs the legacy no-identity plane, like
+            // the other @minimal-caps off-mode scenarios).
+            Server::from_tags(backend, fs_kind, caps, acl).await
         };
         world.client.bind(server.addr());
         world.server = Some(server);
@@ -276,6 +271,11 @@ fn after_hook<'a>(
             world.ext_second.take();
             if let Some(mut cli) = world.cli.take() {
                 cli.teardown();
+                // A `@pg` scenario's scratch database goes last: PG12's ownership lock is
+                // process-lifetime, so it may only be dropped once `teardown` above has ended the
+                // servers that hold it — and the shared `tinio` fixture belongs to every other leg.
+                #[cfg(feature = "pg")]
+                cli.drop_pg_scratch().await;
             }
             // Before the server, whose tempdir may be the restricted root: a directory at
             // mode 0500 refuses `remove_dir_all`, so the mode has to be back first

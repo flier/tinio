@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH doomed AS (\n    SELECT\n        u.bucket,\n        u.ckey\n    FROM unnest($1::text[], $2::text[]) AS u (bucket, ckey)\n),\n\ngone_chunks AS (\n    DELETE FROM content AS c\n    USING doomed AS d\n    WHERE\n        c.bucket = d.bucket\n        AND c.kind = 'part'::content_kind\n        AND c.ckey = d.ckey\n)\n\nDELETE FROM content_heads AS h\nUSING doomed AS d\nWHERE\n    h.bucket = d.bucket\n    AND h.kind = 'part'::content_kind\n    AND h.ckey = d.ckey\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cde26e57381a1aff72416cbfa635a7fc7bf8c793e785792d18b2dfb602ae6046"
+}

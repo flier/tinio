@@ -18,7 +18,6 @@
     clippy::unimplemented,
     reason = "test context: `unimplemented` has no in-tests key (docs/style.md §Panics)"
 )]
-
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     io,
@@ -30,13 +29,13 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream;
+use tinio_util::testing::blocks::MemBlocks;
 use tokio::fs;
 
 use crate::{
     _blob::Store,
     _core::{
         BodyStream, ByteRange, ETag, MultipartUpload, acl,
-        blob::{BlockHash, BlockStore, Entry, EntryStream, Published, StagedBlock},
         bucket::{self, Name},
         checksum,
         content::{ContentEntry, ContentKey, ObjectContent, StagedObject},
@@ -69,7 +68,7 @@ pub(crate) struct Fixture {
 pub(crate) fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let ports = Fake::new(dir.path());
-    let versions = Versions::new(
+    let versions = Versions::rows_as_gate(
         ports.clone(),
         ports.clone(),
         Store::new(MemBlocks::default()),
@@ -121,12 +120,6 @@ struct Inner {
     swap_on_open: Mutex<VecDeque<Current>>,
     /// How many batch removals the engine has asked for.
     batch_removals: Mutex<usize>,
-}
-
-/// The wire form an identity is indexed under (`None` is the literal
-/// `null`).
-fn id_wire(id: Option<&version::Id>) -> String {
-    id.map_or_else(|| "null".to_owned(), |id| id.as_str().to_owned())
 }
 
 impl Fake {
@@ -243,7 +236,7 @@ impl Fake {
             self.inner.index.lock().unwrap().remove(&(
                 bucket.to_string(),
                 key.to_string(),
-                id_wire(row.id.as_ref()),
+                version::wire_of(row.id.as_ref()),
             ));
         }
     }
@@ -271,8 +264,10 @@ impl Fake {
 }
 
 #[async_trait]
-#[async_trait]
-#[allow(unused_variables)]
+#[expect(
+    unused_variables,
+    reason = "this category's calls are all `unimplemented!` in the double, so their parameters go unread"
+)]
 impl BucketMeta for Fake {
     async fn created_at(
         &self,
@@ -402,7 +397,10 @@ impl BucketMeta for Fake {
 }
 
 #[async_trait]
-#[allow(unused_variables)]
+#[expect(
+    unused_variables,
+    reason = "the calls no engine path reaches are `unimplemented!` in the double, so their parameters go unread"
+)]
 impl ObjectMeta for Fake {
     async fn get(
         &self,
@@ -567,8 +565,10 @@ impl ObjectMeta for Fake {
 }
 
 #[async_trait]
-#[async_trait]
-#[allow(unused_variables)]
+#[expect(
+    unused_variables,
+    reason = "this category's calls are all `unimplemented!` in the double, so their parameters go unread"
+)]
 impl UploadMeta for Fake {
     async fn create(
         &self,
@@ -679,7 +679,10 @@ impl UploadMeta for Fake {
 }
 
 #[async_trait]
-#[allow(unused_variables)]
+#[expect(
+    unused_variables,
+    reason = "the calls no engine path reaches are `unimplemented!` in the double, so their parameters go unread"
+)]
 impl ObjectContent for Fake {
     type Error = storage::Error;
     type Staged = FakeStaged;
@@ -907,7 +910,7 @@ impl VersionMeta for Fake {
                 "a restore names a version row that is absent",
             )));
         };
-        if id_wire(consumed.id.as_ref()) != id_wire(id.as_ref()) {
+        if version::wire_of(consumed.id.as_ref()) != version::wire_of(id.as_ref()) {
             return Err(storage::io(io::Error::other(
                 "a restore names a version row of another identity",
             )));
@@ -938,7 +941,7 @@ impl VersionMeta for Fake {
         key: &object::Key,
         row: &Stored,
     ) -> Result<(), storage::Error> {
-        let wire = id_wire(row.id.as_ref());
+        let wire = version::wire_of(row.id.as_ref());
         let (bucket_name, key_name) = (bucket.to_string(), key.to_string());
         let at = (bucket_name.clone(), key_name.clone(), row.seq);
         let mut rows = self.inner.rows.lock().unwrap();
@@ -1095,7 +1098,7 @@ impl VersionMeta for Fake {
             .index
             .lock()
             .unwrap()
-            .get(&(bucket.to_string(), key.to_string(), id_wire(id)))
+            .get(&(bucket.to_string(), key.to_string(), version::wire_of(id)))
             .copied())
     }
 }
@@ -1104,117 +1107,6 @@ impl VersionMeta for Fake {
 impl CurrentRows for Fake {
     async fn current(&self, bucket: &Name, key: &object::Key) -> Result<Current, storage::Error> {
         Ok(self.content_slot(bucket, key))
-    }
-}
-
-/// An in-memory block store (the shape `tinio_core::blob`'s own example
-/// pins): staged bytes are held in memory, filed on publish.
-#[derive(Debug, Default)]
-pub(crate) struct MemBlocks(Mutex<BTreeMap<BlockHash, Vec<u8>>>);
-
-impl MemBlocks {
-    /// How many blocks the store holds.
-    pub(crate) fn len(&self) -> usize {
-        self.0.lock().unwrap().len()
-    }
-}
-
-/// The sink a staged block's bytes are held in.
-#[derive(Default)]
-pub(crate) struct Sink(Vec<u8>);
-
-#[async_trait]
-impl StagedBlock for Sink {
-    async fn write(&mut self, chunk: Bytes) -> io::Result<()> {
-        self.0.extend_from_slice(&chunk);
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl BlockStore for MemBlocks {
-    type Error = storage::Error;
-    type Staged = Sink;
-
-    async fn stage(&self) -> Result<Self::Staged, Self::Error> {
-        Ok(Sink::default())
-    }
-
-    async fn publish(
-        &self,
-        staged: Self::Staged,
-        hash: &BlockHash,
-    ) -> Result<Published, Self::Error> {
-        let mut blocks = self.0.lock().unwrap();
-        if blocks.contains_key(hash) {
-            return Ok(Published::Existing);
-        }
-        blocks.insert(*hash, staged.0);
-        Ok(Published::Stored)
-    }
-
-    async fn contains(&self, hash: &BlockHash) -> Result<bool, Self::Error> {
-        Ok(self.0.lock().unwrap().contains_key(hash))
-    }
-
-    async fn open(
-        &self,
-        hash: &BlockHash,
-        range: Option<ByteRange>,
-    ) -> Result<BodyStream, Self::Error> {
-        let blocks = self.0.lock().unwrap();
-        let bytes = blocks
-            .get(hash)
-            .ok_or_else(|| storage::io(io::Error::new(io::ErrorKind::NotFound, "no such block")))?;
-        let slice = match range {
-            Some(range) => {
-                let (start, end) = range.resolve(bytes.len() as u64)?;
-                bytes[start as usize..=end as usize].to_vec()
-            }
-            None => bytes.clone(),
-        };
-        Ok(Box::pin(stream::once(
-            async move { Ok(Bytes::from(slice)) },
-        )))
-    }
-
-    async fn remove(&self, hash: &BlockHash) -> Result<(), Self::Error> {
-        self.0.lock().unwrap().remove(hash);
-        Ok(())
-    }
-
-    async fn list(
-        &self,
-        after: Option<&BlockHash>,
-        limit: usize,
-    ) -> Result<Vec<Entry>, Self::Error> {
-        Ok(self.entries(after).into_iter().take(limit).collect())
-    }
-
-    async fn walk(
-        &self,
-        after: Option<&BlockHash>,
-    ) -> Result<EntryStream<Self::Error>, Self::Error> {
-        Ok(Box::pin(stream::iter(
-            self.entries(after).into_iter().map(Ok),
-        )))
-    }
-}
-
-impl MemBlocks {
-    /// The stored blocks after `after`, in address order.
-    fn entries(&self, after: Option<&BlockHash>) -> Vec<Entry> {
-        self.0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(hash, _)| after.is_none_or(|after| *hash > after))
-            .map(|(hash, bytes)| Entry {
-                hash: *hash,
-                len: bytes.len() as u64,
-                published: SystemTime::now(),
-            })
-            .collect()
     }
 }
 

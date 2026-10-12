@@ -55,23 +55,10 @@ use std::{
 
 use tinio_util::testing::{walk_files, workspace_root};
 
-/// The SigV4 signer's golden-vector unit tests (Task 15): the cucumber
-/// binary's harness is disabled, so the signer's `#[cfg(test)]` module
-/// rides this default-harness binary — the AWS-published canonical-
-/// request and signature vectors pin the canonicalization (an
-/// independent oracle, not a test of the server against itself). The
-/// signer's production code is exercised through the cucumber binary
-/// only, hence the dead-code allow on this include.
-#[cfg(test)]
-#[path = "steps/sigv4.rs"]
-#[allow(dead_code)]
-mod sigv4;
-
 /// The runner's default tag filter (Task A1): the platform rule is one
 /// function over the target, and the cucumber binary is `harness = false`, so
-/// its unit tests ride this default-harness binary — the same include
-/// `steps/sigv4.rs` above uses. `default_filter` is what the cucumber
-/// binary's `main` calls, so nothing here is test-only dead code.
+/// its unit tests ride this default-harness binary. `default_filter` is what the
+/// cucumber binary's `main` calls, so nothing here is test-only dead code.
 #[cfg(test)]
 #[path = "steps/tag_filter.rs"]
 mod tag_filter;
@@ -609,6 +596,12 @@ fn collect_tags_takes_only_at_prefixed_ids() {
     );
     // An @-prefixed ID inside a comment line is prose too.
     let text = "# @FR-099 is cited, not tagged\n@SC-001\nFeature: X\n";
+    assert_eq!(collect_tags(text), BTreeSet::from(["SC-001".to_string()]));
+    // A backend/classification tag (`@pg`, and the `@fs`/`@mem` it sits beside) is not a spec ID,
+    // so it is never collected — which is what "the traceability check accepts `@pg`" means: the
+    // `@pg` axis PG17 adds is a scenario-classification tag, not a traceability tag, and a
+    // feature carrying one is neither an orphan nor a missing spec ID.
+    let text = "@pg @fs @mem @SC-001\nFeature: X\n  @pg\n  Scenario: s\n";
     assert_eq!(collect_tags(text), BTreeSet::from(["SC-001".to_string()]));
 }
 

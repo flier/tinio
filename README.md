@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/flier/tinio/actions/workflows/ci.yml/badge.svg)](https://github.com/flier/tinio/actions/workflows/ci.yml)
 
-An S3-compatible object storage server in Rust. tinio hosts the [`s3s`](https://crates.io/crates/s3s) protocol layer over a pluggable storage contract: a filesystem backend and an in-memory reference backend, driven by real third-party clients (`aws` cli v2, `rclone`, `mc`, `boto3`) in CI.
+An S3-compatible object storage server in Rust. tinio hosts the [`s3s`](https://crates.io/crates/s3s) protocol layer over a pluggable storage contract: filesystem, in-memory and PostgreSQL backends, driven by real third-party clients (`aws` cli v2, `rclone`, `mc`, `boto3`) in CI.
 
 ## Layout
 
@@ -11,6 +11,7 @@ An S3-compatible object storage server in Rust. tinio hosts the [`s3s`](https://
 | `tinio-core` | The `Storage` contract: buckets, objects, multipart, copy, tagging, checksums, pagination |
 | `tinio-fs` | Filesystem backend — object files under `<root>/<bucket>/`, redb metadata, async pipelines |
 | `tinio-mem` | In-memory reference backend (conformance oracle) |
+| `tinio-pg` / `tinio-store-pg` | PostgreSQL backend and its persistence layer — the `Storage`/`VersionOps`/`Cleanup` implementation over `sqlx` (the `pg` feature) |
 | `tinio-server` | The s3s data plane: routing, SigV4 auth, XML, error mapping, metrics |
 | `tinio-sandbox` / `-core` / `-linux` / `-macos` / `-windows` | Process confinement: the `Backend` contract, per-platform implementations, and a facade |
 | `tinio-api` | The management plane: the `state` file and single-instance bind, the local channel / named pipe / TCP transports, `/status`, `/stop`, `/metrics`, `/openapi.json` |

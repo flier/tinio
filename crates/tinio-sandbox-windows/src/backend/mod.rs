@@ -409,7 +409,10 @@ fn prepare_launch<'a>(
     // acquisition warned about and which is the behaviour of a launcher that had
     // no lock at all.
     let window = ProfileLock::acquire(&package);
-    #[allow(clippy::arc_with_non_send_sync)]
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "`PackageSid` owns a raw `PSID` and is deliberately neither `Send` nor `Sync`, so the `Arc` is shared ownership within this one launch rather than a thread handoff"
+    )]
     let sid = Arc::new(PackageSid::derive(&package)?);
     // **The capability list is resolved straight from the options, which is the
     // only shape it can take**: [`CapabilitySids::resolve`] is handed the closed

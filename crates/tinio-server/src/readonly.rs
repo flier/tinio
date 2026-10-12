@@ -29,8 +29,8 @@ impl<T> S3ReadonlyBackend<T> {
 
 macro_rules! readonly_impl {
     (
-        read { $( $(#[gated($($rg:ident $(: $rf:literal)?),+)])? $(#[on_ok($rh:expr)])? fn $r:ident ( $ri:ident ) -> $ro:ident; )* }
-        write { $( $(#[gated($($wg:ident $(: $wf:literal)?),+)])? $(#[on_ok($wh:expr)])? fn $w:ident ( $wi:ident ) -> $wo:ident; )* }
+        read { $( $(#[handler($rop:ident)])? $(#[gated($($rg:ident $(: $rf:literal)?),+)])? $(#[on_ok($rh:expr)])? fn $r:ident ( $ri:ident ) -> $ro:ident; )* }
+        write { $( $(#[handler($wop:ident)])? $(#[gated($($wg:ident $(: $wf:literal)?),+)])? $(#[on_ok($wh:expr)])? fn $w:ident ( $wi:ident ) -> $wo:ident; )* }
     ) => {
         #[async_trait]
         impl<T: S3 + Send + Sync> S3 for S3ReadonlyBackend<T> {
@@ -182,8 +182,8 @@ mod tests {
     /// decorator's own operation set — same rows, same `#[cfg]`s.
     macro_rules! readonly_probe {
         (
-            read { $( $(#[gated($($rg:ident $(: $rf:literal)?),+)])? $(#[on_ok($rh:expr)])? fn $r:ident ( $ri:ident ) -> $ro:ident; )* }
-            write { $( $(#[gated($($wg:ident $(: $wf:literal)?),+)])? $(#[on_ok($wh:expr)])? fn $w:ident ( $wi:ident ) -> $wo:ident; )* }
+            read { $( $(#[handler($rop:ident)])? $(#[gated($($rg:ident $(: $rf:literal)?),+)])? $(#[on_ok($rh:expr)])? fn $r:ident ( $ri:ident ) -> $ro:ident; )* }
+            write { $( $(#[handler($wop:ident)])? $(#[gated($($wg:ident $(: $wf:literal)?),+)])? $(#[on_ok($wh:expr)])? fn $w:ident ( $wi:ident ) -> $wo:ident; )* }
         ) => {
             #[async_trait]
             impl S3 for RecordingBackend {

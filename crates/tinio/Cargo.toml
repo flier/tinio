@@ -40,6 +40,7 @@ full=[
     "mem",
     "multipart",
     "openapi",
+    "pg",
     "sandbox",
     "select",
     "tls",
@@ -56,6 +57,7 @@ mem = ["tinio-cli/mem"]
 multipart = ["tinio-server/multipart"]
 openapi = ["tinio-api/openapi"]
 otel = ["tinio-server/otel"]
+pg = ["tinio-cli/pg"]
 sandbox = ["tinio-cli/sandbox"]
 select = ["tinio-server/select"]
 tls = ["tinio-api/tls", "tinio-cli/tls"]
@@ -63,6 +65,7 @@ versioning = ["tinio-server/versioning", "tinio-cli/versioning"]
 
 [lints.clippy]
 absolute_paths = "warn"
+allow_attributes = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"

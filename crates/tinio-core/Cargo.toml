@@ -16,6 +16,7 @@ hex.workspace = true
 md-5.workspace = true
 parse-display.workspace = true
 percent-encoding.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
 sha2.workspace = true
 sqlx = { workspace = true, optional = true, default-features = false, features = [
@@ -29,12 +30,6 @@ unicode-properties = { workspace = true, features = ["general-category"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [features]
-# Gives the contract newtypes and value types `sqlx::Type`/`Encode`/`Decode`
-# (the traits, the derive, sqlx's JSON adapter and PostgreSQL's own type layer
-# -- no runtime, no connection, no backend), so a backend binds a
-# `bucket::Name`, an `object::Key`, an `object::Tags` or an `acl::Acl` as it is
-# instead of a `to_string()` copy. `tinio-store-pg` is the only enabler: it
-# depends on this crate with the feature on.
 sqlx = ["dep:sqlx", "dep:serde_json"]
 
 [dev-dependencies]
@@ -54,6 +49,7 @@ ignored = ["md-5"]
 
 [lints.clippy]
 absolute_paths = "warn"
+allow_attributes = "warn"
 expect_used = "warn"
 panic = "warn"
 todo = "warn"

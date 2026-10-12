@@ -25,8 +25,10 @@ use smart_default::SmartDefault;
 #[cfg(feature = "api")]
 use crate::commands::{status, stop};
 use crate::{
+    _util::secret::Secret,
     Error,
-    commands::{doctor, start},
+    commands::{EnvArgs, doctor, start},
+    resolve::pg,
     service,
 };
 
@@ -199,6 +201,23 @@ pub const ACCESS_KEY_VAR: &str = "TINIO_ACCESS_KEY";
 /// ```
 pub const SECRET_KEY_VAR: &str = "TINIO_SECRET_KEY";
 
+/// `--pg-dsn`'s variable name (config `[storage.pg] dsn`, PG5), the pg backend's connection
+/// string.
+///
+/// **It overrides the config key and nothing else**: the backend is selected by
+/// `[storage] type` alone, so an exported dsn can never turn a filesystem run into a pg one. A
+/// secret's documented channel is the environment, which is why the flag carrying it is hidden
+/// (the same rule `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY` follow).
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_cli::cli::PG_DSN_VAR;
+///
+/// assert_eq!(PG_DSN_VAR, "TINIO_PG_DSN");
+/// ```
+pub const PG_DSN_VAR: &str = "TINIO_PG_DSN";
+
 /// The provenance of every env-backed key, in one place.
 ///
 /// **The lookup happens on the subcommand's own matches**, descended into by the name the parse
@@ -369,6 +388,15 @@ pub struct Discovery {
     /// `TINIO_STATE_DIR`, the state-dir override — read here and never after the `.env` load:
     /// the file lives *in* the directory this value selects.
     pub state_dir: Option<PathBuf>,
+    /// `TINIO_PG_DSN` (`--pg-dsn`), the pg backend's dsn (PG5). Read by the **discovery** parse
+    /// because the synthetic root it decides is part of this parse's answers: a pg run's root is
+    /// derived from the dsn's hash, which is what [`crate::resolve::locate`] needs before the
+    /// config file — itself found under that root — can be read.
+    ///
+    /// **An empty value is not here**: the parse's `EnvArgs::resolved_pg_dsn` reads an empty
+    /// variable as the unset one it means, so `None` is "no dsn addressed" rather than "a dsn
+    /// whose material is empty".
+    pub pg_dsn: Option<Secret>,
 }
 
 impl Command {
@@ -405,27 +433,30 @@ impl Command {
                 config: args.config.clone(),
                 read_only: args.read_only,
                 state_dir: args.env.state_dir.clone(),
+                pg_dsn: pg::named(args.env.pg_dsn.clone()),
             },
             #[cfg(feature = "api")]
-            Self::Status(args) | Self::Stop(args) => Discovery {
-                dir: args.dir.clone(),
-                config: None,
-                read_only: args.read_only,
-                state_dir: args.env.state_dir.clone(),
-            },
-            Self::Doctor(args) => Discovery {
-                dir: args.dir.dir.clone(),
-                config: None,
-                read_only: args.dir.read_only,
-                state_dir: args.dir.env.state_dir.clone(),
-            },
-            Self::Service(args) => Discovery {
-                dir: args.dir.clone(),
-                config: None,
-                read_only: args.read_only,
-                state_dir: args.env.state_dir.clone(),
-            },
+            Self::Status(args) | Self::Stop(args) => {
+                client_discovery(args.dir.clone(), args.read_only, &args.env)
+            }
+            Self::Doctor(args) => {
+                client_discovery(args.dir.dir.clone(), args.dir.read_only, &args.dir.env)
+            }
+            Self::Service(args) => client_discovery(args.dir.clone(), args.read_only, &args.env),
         }
+    }
+}
+
+/// The `Discovery` the client commands share — the status, stop, doctor and service arms all
+/// answer it: no `--config` (that flag is the server's alone), and the state dir and pg dsn the
+/// environment named.
+fn client_discovery(dir: Option<PathBuf>, read_only: bool, env: &EnvArgs) -> Discovery {
+    Discovery {
+        dir,
+        config: None,
+        read_only,
+        state_dir: env.state_dir.clone(),
+        pg_dsn: pg::named(env.pg_dsn.clone()),
     }
 }
 
@@ -453,6 +484,7 @@ mod tests {
             STATE_DIR_VAR,
             ACCESS_KEY_VAR,
             SECRET_KEY_VAR,
+            PG_DSN_VAR,
         ];
         for command in Cli::command().get_subcommands() {
             for arg in command.get_arguments() {

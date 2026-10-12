@@ -65,6 +65,14 @@ impl<'q> Encode<'q, Postgres> for Acl {
     }
 }
 
+/// The `acl[]` array a batch write builds: `Acl` is a composite, so the array
+/// type is derived from the element's own name.
+impl PgHasArrayType for Acl {
+    fn array_type_info() -> PgTypeInfo {
+        PgTypeInfo::array_of("acl")
+    }
+}
+
 impl<'r> Decode<'r, Postgres> for Acl {
     fn decode(value: PgValueRef<'r>) -> Result<Self, BoxDynError> {
         let mut decoder = PgRecordDecoder::new(value)?;
@@ -204,6 +212,14 @@ where
 
     fn compatible(ty: &DB::TypeInfo) -> bool {
         <Json<BTreeMap<String, String>> as Type<DB>>::compatible(ty)
+    }
+}
+
+/// The `jsonb[]` array a batch write builds: the element's own type is the
+/// adapter's, so the array type is derived by name.
+impl PgHasArrayType for Tags {
+    fn array_type_info() -> PgTypeInfo {
+        PgTypeInfo::array_of("jsonb")
     }
 }
 

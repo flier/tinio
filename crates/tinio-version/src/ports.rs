@@ -1,16 +1,21 @@
-//! The one port the engine still declares, beside the contracts it runs on.
+//! The ports the engine still declares, beside the contracts it runs on.
 //!
 //! The engine is written against the persistence contracts
 //! ([`Metadata`](tinio_core::meta::Metadata) and
 //! [`VersionMeta`](tinio_core::meta::VersionMeta)) and the content contract
 //! ([`ObjectContent`](tinio_core::content::ObjectContent)): the rows, the
 //! current slot, the content reads and the publish are the backends' contract
-//! implementations', not a private port's. `CurrentRows` survives because no
-//! contract counterpart can replace it — the metadata contract's point read
-//! deliberately does **not** gate, while the engine must only ever see the
-//! backend's **gated** current (the F01/F04 rule a read applies) — so the
-//! gated slot stays a backend port. The block plane needs no port at all: the
-//! engine holds [`Store`](tinio_blob::Store) directly.
+//! implementations', not a private port's. Two ports stay. `CurrentRows`
+//! survives because no contract counterpart can replace it — the metadata
+//! contract's point read deliberately does **not** gate, while the engine must
+//! only ever see the backend's **gated** current (the F01/F04 rule a read
+//! applies) — so the gated slot stays a backend port. `MarkerWrite` survives
+//! because a version-creating delete leaves a **slot with no version row**, a
+//! state no contract write expresses: `put_version` writes a row (and a
+//! null-identity one displaces the key's other null row, the history a
+//! suspended `DELETE` must leave), and `advance_slot` derives the marker bit
+//! from a row a marker does not have. The block plane needs no port at all:
+//! the engine holds [`Store`](tinio_blob::Store) directly.
 //!
 //! Every port method answers [`storage::Error`] — the engine has one error
 //! type, and an implementation projects its own in with `.map_err(Into::into)`.
@@ -138,6 +143,66 @@ pub trait CurrentRows: Send + Sync + 'static {
     /// already applied (a recorded identity the content no longer matches
     /// answers the null current, never a stale identifier).
     async fn current(&self, bucket: &Name, key: &object::Key) -> Result<Current, storage::Error>;
+}
+
+/// The marker write: the one write a version-creating delete needs that no
+/// contract call expresses.
+///
+/// A delete marker is a **slot with no version row**. The contract's
+/// [`put_version`](tinio_core::meta::VersionMeta::put_version) writes a version
+/// row, and a **null-identity** row displaces the key's other null-id row — the
+/// superseded null version a suspended `DELETE` must leave in history — while
+/// [`advance_slot`](tinio_core::meta::VersionMeta::advance_slot) derives the
+/// marker bit from a row a marker does not have. So the engine's
+/// version-creating delete hands the marker's slot write here, and the
+/// implementation records the bit, materializes the key's object row and
+/// stamps the version the slot moves off, in one transaction of its own model.
+///
+/// # Examples
+///
+/// ```rust
+/// use async_trait::async_trait;
+/// use tinio_core::{bucket::Name, object, storage, version::Id};
+/// use tinio_version::MarkerWrite;
+///
+/// struct Slots;
+///
+/// #[async_trait]
+/// impl MarkerWrite for Slots {
+///     async fn mark_current_marker(
+///         &self,
+///         _: &Name,
+///         _: &object::Key,
+///         _: Option<Id>,
+///         _: u64,
+///         _: Option<u64>,
+///     ) -> Result<(), storage::Error> {
+///         Ok(())
+///     }
+/// }
+///
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let bucket = tinio_core::bucket::name("demo").unwrap();
+/// Slots
+///     .mark_current_marker(&bucket, &object::key("a.txt").unwrap(), None, 0, None)
+///     .await
+///     .unwrap();
+/// # });
+/// ```
+#[async_trait]
+pub trait MarkerWrite: Send + Sync + 'static {
+    /// Make `id` the key's current version and record the **marker** bit: the
+    /// marker's slot, the key's (empty) object row, and the stamp this move
+    /// owes `moved_off` — the sequence of the version the marker supersedes,
+    /// or `None` when it supersedes none.
+    async fn mark_current_marker(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        id: Option<version::Id>,
+        seq: u64,
+        moved_off: Option<u64>,
+    ) -> Result<(), storage::Error>;
 }
 
 /// What the engine's [`materialize`](crate::Versions::materialize) left at the

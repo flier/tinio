@@ -46,6 +46,38 @@
 -- derivation fixed", and object_parts.algorithm carries it for "no per-part
 -- checksum" (the column is NOT NULL, so the empty sentinel has no NULL to
 -- become), values no closed set can hold.
+--
+-- current_slots.is_delete_marker records the delete-marker bit a restore
+-- installs. `VersionMeta::restore_slot` consumes the version row whose kind the
+-- bit came from, so `current_slot` can no longer resolve a restored marker from
+-- the row at the slot's sequence: the bit must live in the slot's own record.
+-- Every slot write maintains this column -- `advance_slot` derives it from
+-- the row at the slot's sequence inside its own statement, `restore_slot`
+-- writes the consumed row's kind -- and `current_slot` reads the row's kind
+-- when the row exists, falling back to this column when it does not.
+--
+-- content_heads.allocated_at records when the head's current generation was
+-- allocated. `alloc_head` commits chunk rows at the new `next_seq` while the
+-- head's `live_seq` moves only at the separate publish flip, so for the whole
+-- duration of a large body (and across the finish-to-flip gap) the content
+-- relation holds rows at the staged sequence that no live generation names.
+-- Cleanup must be able to tell that generation from the residue of a
+-- publish that crashed, and the only fact that separates them is age: this
+-- column is the allocation instant the grace window is measured from, and it
+-- advances with `next_seq` on every allocation.
+--
+-- content.published is a per-row write stamp on every content generation, so
+-- the orphan sweep can tell a generation a concurrent publish superseded from a
+-- crashed partial's residue. The head's `allocated_at` protects the current
+-- `next_seq` generation from the allocation instant. A chunk of that same
+-- generation whose own stamp is still inside the grace window protects the
+-- whole generation, including chunks written earlier: a body that is still
+-- landing batches stays out of the sweep after the allocation itself has aged.
+-- A generation a later allocation superseded falls out of the head gate the
+-- moment that allocation commits, and is protected only by its own stamps.
+-- The cleanup predicates read the stamp beside the head gate. Its
+-- `DEFAULT now()` is volatile: an insert path that does not name the column
+-- reads as freshly stamped rather than as aged residue.
 
 -- The ACL composite: one grantee is its own composite and one grant pairs it
 -- with a permission, so the ACL adds its owner. grantee_kind tags the two
@@ -182,6 +214,7 @@ CREATE TABLE IF NOT EXISTS current_slots (
     key text COLLATE "C" NOT NULL,
     version_id text,
     seq bigint NOT NULL,
+    is_delete_marker boolean NOT NULL DEFAULT FALSE,
     PRIMARY KEY (bucket, key)
 );
 
@@ -205,6 +238,7 @@ CREATE TABLE IF NOT EXISTS content_heads (
     -- The caller's publish identity, stored as a bigint bit pattern. NULL is an
     -- untagged publish: a tagged removal does not take it.
     publish_id bigint,
+    allocated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (bucket, kind, ckey)
 );
 
@@ -215,6 +249,7 @@ CREATE TABLE IF NOT EXISTS content (
     seq bigint NOT NULL,
     chunk_no integer NOT NULL,
     chunk bytea NOT NULL,
+    published timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (bucket, kind, ckey, seq, chunk_no)
 );
 
