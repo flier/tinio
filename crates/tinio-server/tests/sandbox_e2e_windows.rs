@@ -332,8 +332,23 @@ fn a_child_that_never_reports_is_the_parents_own_error_frame() {
     // grant — which propagates exactly the same way, and which is what the ruled
     // behaviour this leg's old induction leaned on is about — can put an ACE a
     // confined child could satisfy back onto the file.
+    //
+    // **The explicit ACE is `M` and not the `RX` a read-only exposure names, and the product
+    // is why.** A configuration this product creates carries
+    // `tinio_winsec::create_restricted`'s descriptor — the calling user alone,
+    // `FILE_ALL_ACCESS` — so `M`, which includes `DELETE`, is the nearest spelling this crate's
+    // own table has of what the product installs, and `RX` was the fixture's divergence from
+    // it. What the divergence cost is the scratch tree: `RX` leaves the owner without
+    // `DELETE` on the file while the parent's `M` carries no `FILE_DELETE_CHILD` — a right of
+    // `FullControl`, not of `Modify` — so `TempDir`'s drop deletes the `.env` beside it,
+    // refuses here and swallows the refusal: one leaked scratch tree per run. Measured before
+    // the change: fifty of them under `%TMP%`, each holding exactly
+    // `tree\root\.tinio\.tinio.toml` and nothing else; measured after: the leg passes and the
+    // tree goes. What the child may reach is unchanged — the entry is the calling user's, the
+    // seal is still what keeps the launcher's inheritable AppContainer grant off the file, and
+    // the read-back below is what says so.
     seal_to_current_user(&tree);
-    let spec = acl::grant_spec(&current_user_sid(), Target::File, AccessMode::ReadOnly);
+    let spec = acl::grant_spec(&current_user_sid(), Target::File, AccessMode::ReadWrite);
     testing::icacls(&config, &["/inheritance:r"]);
     testing::icacls(&config, &["/grant:r", &spec, "/q"]);
 
