@@ -19,26 +19,34 @@ use crate::{
         acl::{Acl, AclGrants},
         bucket::{self, Bucket},
         cors, object,
-        storage::{BucketOps, already_exists, no_such_bucket, not_empty},
+        storage::{BucketOps, already_exists, no_such_bucket},
     },
     _ops::bucket::paginate_buckets,
     path::{STATE_DIR_NAME, bucket_path_lexical},
     tombstone,
 };
 
-/// A bucket counts as empty when it has no files and no directories
-/// anywhere (folder-marker directories are content, per the conformance
-/// harness), no in-progress multipart uploads, and no `.tinio` staging
-/// residue (FR-020 — the reserved segment is never served or listed, so
-/// a crashed/failed cross-volume commit's staging dir must not make the
-/// bucket undeletable; the startup repair clears it).
+/// The **content plane's** emptiness predicate: a bucket counts as empty when
+/// it has no files and no directories anywhere (folder-marker directories are
+/// content, per the conformance harness) and no `.tinio` staging residue
+/// (FR-020 — the reserved segment is never served or listed, so a
+/// crashed/failed cross-volume commit's staging dir must not make the bucket
+/// undeletable; the startup repair clears it).
+///
+/// This is one **plane's** answer, deliberately not the whole emptiness
+/// decision: the row planes' halves — an in-progress upload, and an
+/// `object_meta` row (a delete marker writes no file under the tree and is
+/// one) — are the ops engine's, which composes content, uploads and rows in
+/// [`BucketOps::delete_bucket`](tinio_ops::BucketOps::delete_bucket). The
+/// rule therefore has one home for every backend, instead of an fs-local
+/// copy beside the directory walk.
+///
+/// The walk answers off one `read_dir`: the common non-empty bucket never
+/// reaches the row planes at all.
 pub(crate) async fn bucket_is_empty(
     storage: &FsStorage,
     name: &bucket::Name,
 ) -> Result<bool, Error> {
-    if storage.multipart_store().has_uploads(name).await? {
-        return Ok(false);
-    }
     let bucket_dir = storage.bucket_dir(name).await?;
     let mut entries = match fs::read_dir(&bucket_dir).await {
         Ok(entries) => entries,
@@ -136,29 +144,18 @@ impl FsStorage {
     /// The bucket teardown: unpublish the directory (the tombstone rename),
     /// drop the bucket's rows and derived state — `remove_bucket_state` owns
     /// the `BUCKETS` row and the version/blob tables — and hand the tree to
-    /// the removal pipeline. This is the whole of `delete_bucket`, shared with
-    /// the content contract's `remove_bucket`.
-    pub(crate) async fn unpublish_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
-        // The emptiness check and the unpublish rename are one critical
-        // section against every write into this bucket: a concurrent
-        // PUT's rename cannot land in a directory about to disappear
-        // with 200 returned. Other buckets are not serialized here.
-        let _guard = self.lock_bucket_mutations(name).await;
-        self.ensure_bucket(name).await?;
-        if !bucket_is_empty(self, name).await? {
-            return Err(not_empty(name).into());
-        }
-        self.unpublish_bucket_locked(name).await
-    }
-
-    /// The teardown body: the tombstone move, the derived state's removal
-    /// (best-effort) and the removal pipeline's reclaim.
+    /// the removal pipeline. It is the whole of `delete_bucket`, and the one
+    /// teardown the S3 surface's `DeleteBucket` and the content contract's
+    /// `remove_bucket` both end in: the emptiness rule is not restated beside
+    /// it, both enter through [`BucketOps::delete_bucket`] (the guard, the
+    /// namespace probe and the ops engine's three-probe composition).
     ///
-    /// The caller holds the bucket's mutation guard — this is the critical
-    /// section [`Self::unpublish_bucket`] and the ops engine's
-    /// `Hooks::before_bucket_delete` both run inside — and has established
-    /// that the bucket holds no content. Taking that lock again here would
-    /// deadlock the per-bucket mutex, which the map hands out non-re-entrantly.
+    /// The caller holds the bucket's mutation guard — [`BucketOps::delete_bucket`]
+    /// takes it and runs the ops engine's probes inside it, and
+    /// `Hooks::before_bucket_delete` (this method) runs under that same hold
+    /// — and has established that the bucket holds no content. Taking the
+    /// lock again here would deadlock the per-bucket mutex, which the map
+    /// hands out non-re-entrantly.
     pub(crate) async fn unpublish_bucket_locked(&self, name: &bucket::Name) -> Result<(), Error> {
         // Unpublish: rename the lexical root entry onto
         // `<root>/.tinio/deleting/<id>` (same volume as the name — a
@@ -593,6 +590,80 @@ mod tests {
         assert!(
             storage.bucket_store().load_all().await.unwrap().is_empty(),
             "a read wrote nothing back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_store_refuses_a_marker_only_bucket() {
+        // Invariant 8 of the shared-emptiness change: the refusal must not
+        // depend on the store's ability to write. A delete marker is an
+        // `object_meta` row with no file, so the tree alone reads empty and
+        // only the row probe can refuse — and that probe is read-only, so it
+        // answers `NotEmpty` on a store whose every write is refused at the
+        // handle, before the unpublish's first write is reached. The
+        // read-only **delete** path was otherwise untested on fs.
+        use crate::{_core::mode::AccessMode, FsOptions, testutil::fs_options};
+
+        // The marker state is built by a writable handle over the root; the
+        // read-only arm below is the same root reopened.
+        let root = tempfile::tempdir().unwrap();
+        let b = bucket::name("data").unwrap();
+        let key = object::key("notes.txt").unwrap();
+        {
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+            storage
+                .create_bucket(&b, None, &Acl::default_private(None))
+                .await
+                .unwrap();
+            storage
+                .set_bucket_versioning(&b, State::Enabled)
+                .await
+                .unwrap();
+            storage
+                .put_object(&b, &key, body(b"payload"))
+                .await
+                .unwrap();
+            let marker = storage.delete_object(&b, &key).await.unwrap();
+            assert!(marker.is_delete_marker, "the marker is the live version");
+        }
+        assert_eq!(
+            fs::read_dir(root.path().join("data")).unwrap().count(),
+            0,
+            "the marker leaves no file: the tree alone reads empty"
+        );
+
+        // Reopen the root read-only: the state database is the root's own,
+        // opened read-only (FR-023 amended), so the row probe still answers.
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                access: AccessMode::ReadOnly,
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        // The handle reads the root's own database, not the degraded empty
+        // view: the bucket row is visible through it — which is what makes
+        // the row probe below the whole of the refusal.
+        assert!(
+            !storage.bucket_store().load_all().await.unwrap().is_empty(),
+            "the read-only handle reads the root's recorded state"
+        );
+        // The premise the leg rests on: this handle really cannot write — a
+        // bucket-row element write is refused at the state layer (nothing is
+        // published to the tree, so the fixture is untouched).
+        let tags = object::Tags::from_pairs([("team".into(), "core".into())]).unwrap();
+        let refused = storage.put_bucket_tags(&b, &tags).await.unwrap_err();
+        assert!(
+            refused.is_read_only(),
+            "a read-only handle must refuse the element write: {refused:?}"
+        );
+
+        let err: StorageError = storage.delete_bucket(&b).await.unwrap_err().into();
+        assert!(matches!(err, NotEmpty(_)), "{err:?}");
+        assert!(
+            root.path().join("data").is_dir(),
+            "the refusal ran before the unpublish: the bucket is still there"
         );
     }
 

@@ -30,7 +30,7 @@ Domain glossary for the tinio workspace. English only. This file is a glossary �
 ## Storage & server
 
 - **Served root** — the directory a server instance serves; the fs backend keeps its state and buckets inside it, and never writes outside it.
-- **Synthetic root** — the pg run's stand-in for a served root: `~/.tinio/pg/<hash of the dsn>/`, or `TINIO_STATE_DIR` when set, so config discovery, the state dir and the CLI surface work unchanged though a pg run serves no directory; a positional `DIR` under `[storage] type = "pg"` is a usage error.
+- **Synthetic root** — the pg run's stand-in for a served root: `~/.local/state/tinio/pg/<hash of the dsn's credential-free identity>/` (identity = `scheme://host:port/database`; credentials and query dropped, so a password rotation does not move it), or `TINIO_STATE_DIR` when set, so config discovery, the state dir and the CLI surface work unchanged though a pg run serves no directory; the family leaves `.tinio` alone so a pg start cannot make `$HOME` a discoverable root; a positional `DIR` under `[storage] type = "pg"` is a usage error.
 - **State dir** — the fs backend's metadata database and temp areas: `.tinio/` inside the served root in normal mode; in read-only mode it stays the root's own `<root>/.tinio/`, opened read-only (its `meta.redb` is the storage's metadata source), while only the run's **tool state** relocates to the home state dir (see Read-only mode).
 - **Scanner** — the fs backend's background sweeper (temp cleanup, interrupted-upload cleanup); "cold listing" exercises listing before the scanner has caught up.
 - **Capability toggle** — a server configuration switch that enables/disables an S3 operation or feature (multipart, copy, list v1/v2, delete-objects, checksum validation).

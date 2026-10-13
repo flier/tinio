@@ -34,7 +34,7 @@ use crate::{
         ETag, bucket,
         content::{ContentEntry, ContentKey, ObjectContent, StagedObject, stage_body},
         object,
-        storage::{self, BodyStream, ByteRange, access_denied},
+        storage::{self, BodyStream, BucketOps, ByteRange, access_denied},
     },
     Error,
     backend::{
@@ -566,11 +566,28 @@ impl ObjectContent for FsContent {
         self.storage.create_bucket_dir(bucket, None).await
     }
 
+    /// The content plane's bucket teardown, through the same path the S3
+    /// surface's `DeleteBucket` takes: this backend's own
+    /// [`BucketOps::delete_bucket`](tinio_core::storage::BucketOps::delete_bucket)
+    /// — the bucket mutation guard, the namespace probe and the engine call —
+    /// rather than a teardown of its own.
+    ///
+    /// Emptiness is **not** re-decided here. It has one home, the ops
+    /// engine's [`BucketOps::delete_bucket`](tinio_ops::BucketOps::delete_bucket),
+    /// which composes this plane's `is_empty` with the in-progress uploads
+    /// ([`UploadMeta::has_uploads`](tinio_core::meta::UploadMeta::has_uploads))
+    /// and the object rows
+    /// ([`ObjectMeta::has_objects`](tinio_core::meta::ObjectMeta::has_objects)).
+    /// Routing through it is what keeps this path from tearing down a bucket
+    /// the composition refuses: a **delete marker** writes no bytes and an
+    /// in-progress upload writes none, so a content-only probe reads such a
+    /// bucket empty and the namespace would be gone.
+    ///
+    /// Idempotent: an absent namespace is already removed (the row-backed
+    /// plane's no-op remove).
     async fn remove_bucket(&self, bucket: &bucket::Name) -> Result<(), Error> {
-        match self.storage.unpublish_bucket(bucket).await {
+        match BucketOps::delete_bucket(&*self.storage, bucket).await {
             Ok(()) => Ok(()),
-            // Idempotent: an absent namespace is already removed (the
-            // row-backed plane's no-op remove).
             Err(err) if is_no_such_bucket(&err) => Ok(()),
             Err(err) => Err(err),
         }
@@ -587,7 +604,7 @@ impl ObjectContent for FsContent {
 }
 #[cfg(test)]
 mod tests {
-    use std::{io::ErrorKind, path::Path, sync::Arc};
+    use std::{io::ErrorKind, path::Path, sync::Arc, time::SystemTime};
 
     use bytes::Bytes;
     use futures::StreamExt;
@@ -600,6 +617,7 @@ mod tests {
             acl::Acl,
             bucket,
             content::{ContentKey, ObjectContent, StagedObject},
+            meta::{ObjectMeta, object as meta_object},
             multipart, object,
             storage::{
                 BucketOps, ByteRange, Error as StorageError, ListObjectsParams, MultipartOps,
@@ -607,7 +625,7 @@ mod tests {
             },
         },
         _util::testing::{body, metadata::assert_content_conformance, read_body},
-        fsutil,
+        Error, fsutil,
         testutil::storage,
     };
 
@@ -827,6 +845,92 @@ mod tests {
             (probe.len, probe.identity, probe.mtime),
             "the page and the point probe agree on the stamp (B1)"
         );
+    }
+
+    /// `remove_bucket` enforces the **whole** emptiness rule, not this
+    /// plane's half of it. The rule has one home — the ops engine's
+    /// `BucketOps::delete_bucket`, which composes `is_empty` with the upload
+    /// and object-row probes — and this path reaches it through fs's own
+    /// `delete_bucket`, so a bucket whose only state is a row or an upload is
+    /// refused here too. Both buckets below read **empty** to the content
+    /// plane (a delete marker writes no bytes, and a fresh upload writes
+    /// none), so against the content-only teardown this path used to run both
+    /// legs go green by succeeding where they must refuse.
+    #[tokio::test]
+    async fn remove_bucket_refuses_a_bucket_the_composition_refuses() {
+        let (_root, storage) = storage();
+        let storage = Arc::new(storage);
+        let content = storage.content();
+        let acl = Acl::default_private(None);
+
+        // The **object-row** probe: a row with no content behind it — a
+        // delete marker's shape (the recorded marker bit is the backend's
+        // own and never crosses the contract).
+        let marker = bucket::name("row-only").unwrap();
+        storage.create_bucket(&marker, None, &acl).await.unwrap();
+        ObjectMeta::put(
+            &*storage.meta_store().engine(),
+            &marker,
+            &object::key("notes.txt").unwrap(),
+            &detached_row(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            content.is_empty(&marker).await.unwrap(),
+            "the row is the bucket's only state: the content plane holds nothing"
+        );
+        assert!(
+            matches!(
+                content.remove_bucket(&marker).await,
+                Err(Error::Storage(StorageError::NotEmpty(_)))
+            ),
+            "a bucket holding only an object row is not empty"
+        );
+        storage
+            .head_bucket(&marker)
+            .await
+            .expect("the refused teardown left the namespace in place");
+
+        // The **upload** probe: an upload in progress, before any part lands.
+        let pending = bucket::name("upload-only").unwrap();
+        storage.create_bucket(&pending, None, &acl).await.unwrap();
+        storage
+            .create_multipart_upload(
+                &pending,
+                &object::key("big.bin").unwrap(),
+                None,
+                object::Tags::empty(),
+                None,
+                &acl,
+            )
+            .await
+            .unwrap();
+        assert!(
+            content.is_empty(&pending).await.unwrap(),
+            "an upload with no part written holds no content yet"
+        );
+        assert!(
+            matches!(
+                content.remove_bucket(&pending).await,
+                Err(Error::Storage(StorageError::NotEmpty(_)))
+            ),
+            "a bucket holding only an in-progress upload is not empty"
+        );
+    }
+
+    /// One object row with nothing behind it — a **delete marker's** shape.
+    fn detached_row() -> meta_object::Row {
+        meta_object::Row {
+            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            size: 0,
+            mtime: SystemTime::now(),
+            identity: 0,
+            tags: object::Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
+        }
     }
 
     /// A completed multipart object's metadata is present **exactly when**

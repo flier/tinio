@@ -15,6 +15,25 @@
 //! doctor's ledger and the JSON report render pg rows exactly as they render
 //! fs rows.
 //!
+//! # The bound
+//!
+//! Every scan here is a **keyset page stream** — `tinio-store-pg`'s cleanup
+//! statements each read `LIMIT cleanup::CLEANUP_BATCH_ROWS` rows from a cursor
+//! that is strictly past the last row the previous page returned, in that
+//! scan's own key order — so a pass holds **one page** of rows at a time and a
+//! removal binds one page's arrays rather than the whole scan's. A pass reads
+//! `⌈N / CLEANUP_BATCH_ROWS⌉` statements per scan, where `N` is the candidates
+//! the scan's predicate admits, and a page that comes back short is the last
+//! one. `tinio-store-pg`'s `cleanup` module states what each statement's page
+//! costs the server, measured.
+//!
+//! Two things are still proportional to the answer rather than to a page, and
+//! both are the report's own shape rather than a row array: a dry run names one
+//! action per candidate (the same shape `tinio-fs`'s sweep yields), and the
+//! block sweep's [`LiveSet`] holds one address per live block — a sweep cannot
+//! judge a block without the set — while the version rows it folds in arrive
+//! one page at a time.
+//!
 //! Three rules bind the module:
 //!
 //! - **A live chunk is never reclaimed, and neither is a publish in flight.**
@@ -27,9 +46,10 @@
 //!   body that is still landing batches keeps the chunks it wrote earlier.
 //!   `stage` commits those chunks while `live_seq` moves only at the flip
 //!   (PG18). A generation a later allocation superseded loses the head gate
-//!   and is protected only by its own stamps. The predicate is the store's,
-//!   evaluated once by its own scan, and the removal deletes only the keys that
-//!   scan returned, so the two cannot drift apart.
+//!   and is protected only by its own stamps. The scan finds candidates. The
+//!   removal deletes a candidate only when the same head gate still calls it
+//!   residue: a publish does not change the generation's sequence, so the
+//!   scan's key alone is not proof the rows are still dead.
 //! - **A listing never shows residue** (PG23) is the store's, not this
 //!   module's: `ObjectContent::scan` is row-backed (it reads `content_heads`
 //!   with a live generation), so an orphan chunk is invisible to every listing
@@ -47,18 +67,22 @@
 //! ([`PgCleanup`]) rather than `PgStorage` itself — the same shape
 //! `tinio-fs`'s `FsCleanup` has.
 
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::HashSet,
+    mem,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
-use futures::stream;
+use futures::{StreamExt, stream};
 use tinio_blob::{LiveSet, Store};
 use tinio_core::{
-    bucket,
+    blob::BlockHash,
     cleanup::{
         ActionStream, Cleanup, CleanupOptions, RepairAction, RepairActionLevel, RepairKind,
         retention_enabled, retires,
     },
-    meta::{BucketMeta, VersionMeta},
+    meta::VersionMeta,
     object, storage,
 };
 
@@ -200,110 +224,154 @@ impl PgCleanup {
     /// grace by their own `published` stamp, and outside the head's current
     /// allocation).
     ///
-    /// The store's scan is the predicate's one home and drives both paths: a
-    /// report answers one "would reclaim …" action per orphan generation, and a
-    /// real run removes exactly the keys the scan returned, answering the count
-    /// the store's own delete reports.
+    /// The scan's pages are consumed one at a time. A report answers one "would
+    /// reclaim …" action per candidate **as its page arrives**; a real run
+    /// deletes each page's candidates in one statement, which the store answers
+    /// only for the rows that page's predicate still calls residue, and the run
+    /// reports the total it removed. Nothing is written before the page it
+    /// belongs to is read, so a report is always the state the fix would have
+    /// seen.
     async fn reclaim_orphan_chunks(
         &self,
         remove: bool,
         actions: &mut Vec<Result<RepairAction, Error>>,
     ) {
-        let rows = match self.store.orphan_chunks(self.grace).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                actions.push(Err(Error::from(err)));
-                return;
+        let mut pages = self.store.orphan_chunk_pages(self.grace);
+        let mut reclaimed = 0_u64;
+        while let Some(page) = pages.next().await {
+            let rows = match page {
+                Ok(rows) => rows,
+                Err(err) => {
+                    actions.push(Err(Error::from(err)));
+                    return;
+                }
+            };
+            if !remove {
+                for row in &rows {
+                    actions.push(Ok(RepairAction {
+                        level: RepairActionLevel::Warn,
+                        description: format!(
+                            "would reclaim orphan {} chunk `{}` (generation {}) of {}",
+                            row.kind, row.ckey, row.seq, row.bucket
+                        ),
+                    }));
+                }
+                continue;
             }
-        };
-        if rows.is_empty() {
-            return;
-        }
-        if !remove {
-            for row in &rows {
-                actions.push(Ok(RepairAction {
-                    level: RepairActionLevel::Warn,
-                    description: format!(
-                        "would reclaim orphan {} chunk `{}` (generation {}) of {}",
-                        row.kind, row.ckey, row.seq, row.bucket
-                    ),
-                }));
+            match self.store.reclaim_orphan_chunks(&rows, self.grace).await {
+                Ok(gone) => reclaimed = reclaimed.saturating_add(gone),
+                Err(err) => {
+                    actions.push(Err(Error::from(err)));
+                    return;
+                }
             }
-            return;
         }
-        match self.store.reclaim_orphan_chunks(&rows).await {
-            Ok(gone) => actions.push(Ok(RepairAction {
+        if reclaimed > 0 {
+            actions.push(Ok(RepairAction {
                 level: RepairActionLevel::Warn,
-                description: format!("reclaimed {gone} orphan chunk row(s)"),
-            })),
-            Err(err) => actions.push(Err(Error::from(err))),
+                description: format!("reclaimed {reclaimed} orphan chunk row(s)"),
+            }));
         }
     }
 
     /// Reclaim staged parts whose upload is gone — one action per part, a
     /// report and a real run alike (the parts are a handful against the chunk
     /// table's rows, and the action names the part an operator would otherwise
-    /// have to find by its key). Both paths read the store's scan, and a real
-    /// run's removals are the one statement keyed by the keys it returned.
+    /// have to find by its key). Both paths read the store's pages, and a real
+    /// run's removals are one statement per page, keyed by the keys it
+    /// returned: a part's chunks and its head go in that one statement, so a
+    /// page that fails part way cannot leave a head whose chunks are gone.
     async fn reclaim_orphan_parts(
         &self,
         remove: bool,
         actions: &mut Vec<Result<RepairAction, Error>>,
     ) {
-        let rows: Vec<OrphanPart> = match self.store.orphan_part_heads().await {
-            Ok(rows) => rows,
-            Err(err) => {
+        let mut pages = self.store.orphan_part_pages();
+        while let Some(page) = pages.next().await {
+            let rows: Vec<OrphanPart> = match page {
+                Ok(rows) => rows,
+                Err(err) => {
+                    actions.push(Err(Error::from(err)));
+                    return;
+                }
+            };
+            if remove && let Err(err) = self.store.reclaim_orphan_parts(&rows).await {
                 actions.push(Err(Error::from(err)));
                 return;
             }
-        };
-        if rows.is_empty() {
-            return;
-        }
-        if remove && let Err(err) = self.store.reclaim_orphan_parts(&rows).await {
-            actions.push(Err(Error::from(err)));
-            return;
-        }
-        for row in &rows {
-            let verb = if remove { "reclaimed" } else { "would reclaim" };
-            actions.push(Ok(RepairAction {
-                level: RepairActionLevel::Warn,
-                description: format!(
-                    "{verb} staged part `{}` of {} whose upload is gone",
-                    row.ckey, row.bucket
-                ),
-            }));
+            for row in &rows {
+                let verb = if remove { "reclaimed" } else { "would reclaim" };
+                actions.push(Ok(RepairAction {
+                    level: RepairActionLevel::Warn,
+                    description: format!(
+                        "{verb} staged part `{}` of {} whose upload is gone",
+                        row.ckey, row.bucket
+                    ),
+                }));
+            }
         }
     }
 
     /// Expire the noncurrent versions past the retention thresholds.
     ///
-    /// The store's scan answers every history row newest-first per key —
-    /// contiguously, because that is the read's own order — so the retention
-    /// rule ([`retires`], `tinio-core`'s) is applied per key in one pass,
-    /// and one `VersionMeta::expire_many` retires them: one durable commit per
-    /// key rather than one per version.
+    /// The store answers the history rows newest-first per key, one page at a
+    /// time, and a page boundary can fall **inside** a key: the retention rule
+    /// ([`retires`], `tinio-core`'s) ranks a row by its position among *all* of
+    /// the key's history rows, so the trailing key of every page is held back
+    /// until the page that carries its last row arrives. Each complete key is
+    /// then one `VersionMeta::expire_many`, one durable commit per key rather
+    /// than one per version.
     async fn expire_versions(&self, remove: bool, actions: &mut Vec<Result<RepairAction, Error>>) {
         if !retention_enabled(self.noncurrent_keep, self.noncurrent_expire) {
             return; // the unset-key reading: keep every version
         }
-        let rows: Vec<HistoryRow> = match self.store.retention_rows().await {
-            Ok(rows) => rows,
-            Err(err) => {
-                actions.push(Err(Error::from(err)));
-                return;
-            }
-        };
         let now = SystemTime::now();
+        let mut pages = self.store.retention_row_pages();
+        let mut held: Vec<HistoryRow> = Vec::new();
+        while let Some(page) = pages.next().await {
+            let page = match page {
+                Ok(page) => page,
+                Err(err) => {
+                    actions.push(Err(Error::from(err)));
+                    return;
+                }
+            };
+            let mut run = mem::take(&mut held);
+            run.extend(page);
+            let Some(last) = run.last() else { continue };
+            // The first row of the buffer's last key ends the part of it the
+            // rule can already judge; the rest waits for the next page.
+            let start = run
+                .iter()
+                .take(run.len() - 1)
+                .rposition(|row| row.bucket != last.bucket || row.key != last.key)
+                .map_or(0, |position| position + 1);
+            held = run.split_off(start);
+            self.expire_run(&run, remove, now, actions).await;
+        }
+        self.expire_run(&held, remove, now, actions).await;
+    }
+
+    /// Apply the retention rule to a run of history rows that begins and ends
+    /// on a key boundary, one key at a time.
+    async fn expire_run(
+        &self,
+        rows: &[HistoryRow],
+        remove: bool,
+        now: SystemTime,
+        actions: &mut Vec<Result<RepairAction, Error>>,
+    ) {
         let mut index = 0;
         while index < rows.len() {
             let bucket = rows[index].bucket.clone();
             let key_wire = rows[index].key.clone();
-            let mut end = index;
+            let mut end = index + 1;
             while end < rows.len() && rows[end].bucket == bucket && rows[end].key == key_wire {
                 end += 1;
             }
-            let seqs: Vec<u64> = rows[index..end]
+            let history = &rows[index..end];
+            index = end;
+            let seqs: Vec<u64> = history
                 .iter()
                 .enumerate()
                 .filter(|(position, row)| {
@@ -318,7 +386,6 @@ impl PgCleanup {
                 })
                 .map(|(_, row)| row.seq as u64)
                 .collect();
-            index = end;
             if seqs.is_empty() {
                 continue;
             }
@@ -352,11 +419,11 @@ impl PgCleanup {
 
     /// Reclaim the blocks no live version row references.
     ///
-    /// The live set is the union of every version row's block list, built once
-    /// ([`LiveSet::from_blobs`]); the sweep's walk then judges the store
-    /// against it and the grace window, so a block a publish just stored but no
-    /// row names yet is kept. A report names the candidates; a real run removes
-    /// them and reports what went.
+    /// The live set is the union of every version row's block list, folded in
+    /// one page at a time ([`PgStore::live_blob_pages`]); the sweep's walk then
+    /// judges the store against it and the grace window, so a block a publish
+    /// just stored but no row names yet is kept. A report names the candidates;
+    /// a real run removes them and reports what went.
     async fn reclaim_blocks(&self, remove: bool, actions: &mut Vec<Result<RepairAction, Error>>) {
         let live = match self.live_set().await {
             Ok(live) => live,
@@ -403,21 +470,21 @@ impl PgCleanup {
     }
 
     /// Every live block address: the union of the block lists of every version
-    /// row of every bucket. The rows are read per bucket through the store's
-    /// contract (`VersionMeta::bucket_rows`), the same reduction
-    /// `tinio_blob::LiveSet::from_blobs` performs for the fs sweep.
+    /// row of every bucket, folded from one page of rows at a time. The set
+    /// itself is one address per live block — the sweep's own input — while the
+    /// rows carrying them are the store's [`PgStore::live_blob_pages`], whose
+    /// pages are bounded.
     async fn live_set(&self) -> Result<LiveSet, Error> {
-        let buckets = BucketMeta::load_all(&self.store).await?;
-        let mut blobs = Vec::new();
-        for (name, _created) in buckets {
-            let Ok(bucket) = bucket::name(&name) else {
-                continue;
-            };
-            for row in VersionMeta::bucket_rows(&self.store, &bucket).await? {
-                blobs.push(row.blob);
+        let mut pages = self.store.live_blob_pages();
+        let mut hashes: HashSet<BlockHash> = HashSet::new();
+        while let Some(page) = pages.next().await {
+            for blob in page? {
+                for block in blob.blocks() {
+                    hashes.insert(block.hash);
+                }
             }
         }
-        Ok(LiveSet::from_blobs(blobs))
+        Ok(LiveSet::from_hashes(hashes))
     }
 }
 
@@ -467,408 +534,5 @@ impl Cleanup for PgCleanup {
         self.reclaim_orphan_chunks(remove, &mut actions).await;
         self.reclaim_orphan_parts(remove, &mut actions).await;
         Ok(Box::pin(stream::iter(actions)))
-    }
-}
-
-#[cfg(test)]
-#[expect(
-    clippy::absolute_paths,
-    reason = "test support: the leg spells the crate's public path absolutely on purpose — a shortened path would not prove the public one"
-)]
-mod tests {
-    use futures::StreamExt;
-    use tinio_core::{
-        blob::BlockHash,
-        cleanup::CleanupOptions,
-        content::{ContentKey, ObjectContent, StagedObject},
-        storage::{ListObjectsParams, ObjectOps},
-    };
-    use tinio_util::testing::hex;
-
-    use super::*;
-    use crate::{
-        _store_pg::{
-            _sqlx::{query, query_scalar},
-            pool::Pool,
-            test_support::TestDb,
-        },
-        Access, PgStorage,
-    };
-
-    /// Drain an action stream into the actions it reported.
-    async fn collect(actions: ActionStream<Error>) -> Vec<RepairAction> {
-        let mut out = Vec::new();
-        let mut actions = actions;
-        while let Some(action) = actions.next().await {
-            out.push(action.expect("a repair action"));
-        }
-        out
-    }
-
-    /// One scalar count, bound to the fixture bucket.
-    async fn count(pool: &Pool, bucket: &str, sql: &'static str) -> i64 {
-        query_scalar::<_, i64>(sql)
-            .bind(bucket)
-            .fetch_one(pool)
-            .await
-            .expect("a count")
-    }
-
-    /// The planted-orphan leg (PG7, PG23): a chunk no head names, a staged part whose upload
-    /// is gone, an expired version row and a block no version row references are all reported
-    /// in a dry run and reclaimed by the fix, while a live chunk and a **publish still in
-    /// flight** are never reported and a listing never shows residue.
-    #[tokio::test]
-    async fn planted_orphans_report_in_a_dry_run_and_the_fix_reclaims_them() {
-        let Ok(_) = std::env::var("TINIO_PG_DSN") else {
-            eprintln!("skipping: TINIO_PG_DSN is not set");
-            return;
-        };
-        let db = TestDb::create().await.expect("a scratch database");
-        let pool = Pool::open(&db.dsn, 4).expect("a pool over the scratch database");
-        let store = PgStore::connect_with_pool(pool.clone(), Access::ReadWrite)
-            .await
-            .expect("a writable store (migrating the scratch database)");
-
-        let bucket = bucket::name("cleanup-leg").expect("a valid bucket name");
-        let wire = "cleanup-leg";
-        let part_ckey = format!("p:{}:0001", hex(b"gone-upload"));
-        let dead_block = BlockHash::of(b"dead-block").to_hex();
-
-        // The fixture, planted through SQL: a bucket, one **live** object (`live.txt`), and
-        // the four orphan shapes the scans are about.
-        query(
-            "INSERT INTO buckets (name, created, tags, acl, cors) \
-             VALUES ($1, now(), '{}'::jsonb, ROW(NULL::text, ARRAY[]::acl_grant[])::acl, '')",
-        )
-        .bind(wire)
-        .execute(&pool)
-        .await
-        .expect("the bucket row");
-        query(
-            "INSERT INTO content_heads (bucket, kind, ckey, next_seq, live_seq, live_len) \
-             VALUES ($1, 'object', 'o:live.txt', 1, 1, 4)",
-        )
-        .bind(wire)
-        .execute(&pool)
-        .await
-        .expect("the live head");
-        query(
-            "INSERT INTO content (bucket, kind, ckey, seq, chunk_no, chunk) \
-             VALUES ($1, 'object', 'o:live.txt', 1, 0, $2)",
-        )
-        .bind(wire)
-        .bind(b"live".as_slice())
-        .execute(&pool)
-        .await
-        .expect("the live chunk");
-        query(
-            "INSERT INTO object_meta (bucket, key, etag, size, mtime, identity, tags, checksum, acl) \
-             VALUES ($1, 'live.txt', 'e', 4, now(), 0, '{}'::jsonb, '', ROW(NULL::text, ARRAY[]::acl_grant[])::acl)",
-        )
-        .bind(wire)
-        .execute(&pool)
-        .await
-        .expect("the live object row");
-        // (a) an orphan chunk: a generation no head names, its row stamped past the grace
-        // (an absent/current stamp would read as in flight under the sweep's age gate).
-        query(
-            "INSERT INTO content (bucket, kind, ckey, seq, chunk_no, chunk, published) \
-             VALUES ($1, 'object', 'o:orphan.txt', 7, 0, $2, now() - interval '2 hours')",
-        )
-        .bind(wire)
-        .bind(b"dead".as_slice())
-        .execute(&pool)
-        .await
-        .expect("the orphan chunk");
-        // (b) a staged part whose upload is gone: a head and a chunk, no `uploads` row.
-        query(
-            "INSERT INTO content_heads (bucket, kind, ckey, next_seq, live_seq, live_len) \
-             VALUES ($1, 'part', $2, 1, 1, 1)",
-        )
-        .bind(wire)
-        .bind(part_ckey.as_str())
-        .execute(&pool)
-        .await
-        .expect("the part head");
-        query(
-            "INSERT INTO content (bucket, kind, ckey, seq, chunk_no, chunk) \
-             VALUES ($1, 'part', $2, 1, 0, $3)",
-        )
-        .bind(wire)
-        .bind(part_ckey.as_str())
-        .bind(b"p".as_slice())
-        .execute(&pool)
-        .await
-        .expect("the part chunk");
-        // (c) two history version rows at a key with no current slot; the keep budget of one
-        // expires the older.
-        for (seq, id) in [(1_i64, "planted-v1"), (2_i64, "planted-v2")] {
-            query(
-                "INSERT INTO version_rows (bucket, key, seq, id, blob, size, etag, created, \
-                 became_noncurrent, kind, tags, checksum, acl) \
-                 VALUES ($1, 'v.txt', $2, $3, '', 0, 'planted', now(), 1, 'object', \
-                 '{}'::jsonb, '', ROW(NULL::text, ARRAY[]::acl_grant[])::acl)",
-            )
-            .bind(wire)
-            .bind(seq)
-            .bind(id)
-            .execute(&pool)
-            .await
-            .expect("a planted version row");
-        }
-        // (d) a block no version row references, published past the grace.
-        query(
-            "INSERT INTO blocks (hash, seq, chunk, len, published) \
-             VALUES ($1, 0, $2, 1, now() - interval '1 hour')",
-        )
-        .bind(dead_block.as_str())
-        .bind(b"b".as_slice())
-        .execute(&pool)
-        .await
-        .expect("the dead block");
-
-        // C1's fixture: a publish **still in flight**. `stage` allocates the generation and
-        // commits its chunks while the head's `live_seq` is still NULL — exactly what the
-        // orphan predicate must not read as residue.
-        let inflight = object::key("inflight.txt").expect("a valid key");
-        let mut staged = store
-            .stage(&bucket, &ContentKey::Object(inflight.clone()))
-            .await
-            .expect("a staged generation");
-        staged
-            .write(vec![0_u8; 4 * 1024 * 1024].into())
-            .await
-            .expect("the staged body");
-        drop(staged);
-
-        // PG23: a listing is row-backed, so both the residue and the in-flight object are
-        // invisible before any cleanup runs.
-        let reader = PgStorage::connect_with_pool(pool.clone(), Access::ReadOnly)
-            .await
-            .expect("a read-only reader");
-        let listed: Vec<String> = reader
-            .list_objects(ListObjectsParams {
-                bucket: bucket.clone(),
-                prefix: String::new(),
-                delimiter: None,
-                start_after: None,
-                max_keys: 100,
-            })
-            .await
-            .expect("a listing")
-            .objects
-            .iter()
-            .map(|info| info.key.to_string())
-            .collect();
-        assert!(
-            listed.iter().any(|key| key == "live.txt"),
-            "the live object is listed: {listed:?}"
-        );
-        assert!(
-            !listed.iter().any(|key| key == "orphan.txt"),
-            "a listing never shows residue: {listed:?}"
-        );
-        assert!(
-            !listed.iter().any(|key| key == "inflight.txt"),
-            "a listing never shows an unflipped publish: {listed:?}"
-        );
-
-        // I2: the store's own mode decides. A read-only store's report still diagnoses, and
-        // its real run writes nothing at all.
-        let read_only = PgStore::connect_with_pool(pool.clone(), Access::ReadOnly)
-            .await
-            .expect("a read-only store");
-        let ro_report = PgCleanup::new(
-            read_only.clone(),
-            CleanupOptions {
-                dry_run: true,
-                ..Default::default()
-            },
-        );
-        let actions = collect(ro_report.repair(RepairKind::Full).await.expect("a report")).await;
-        assert!(
-            actions
-                .iter()
-                .any(|action| action.description.contains("orphan.txt")),
-            "a read-only dry run still reports: {actions:?}"
-        );
-        let ro_fix = PgCleanup::new(read_only.clone(), CleanupOptions::default());
-        let _ = collect(ro_fix.repair(RepairKind::Full).await.expect("a run")).await;
-        assert_eq!(
-            count(
-                &pool,
-                wire,
-                "SELECT count(*) FROM content WHERE bucket = $1 AND ckey = 'o:orphan.txt'"
-            )
-            .await,
-            1,
-            "a read-only store's cleanup removes nothing, whatever the options say"
-        );
-
-        // The dry run: every orphan is named, the live chunk and the in-flight publish are
-        // not, and nothing is removed.
-        let dry = PgCleanup::new(
-            store.clone(),
-            CleanupOptions {
-                dry_run: true,
-                ..Default::default()
-            },
-        )
-        .with_retention(1, 0);
-        let actions = collect(dry.repair(RepairKind::Full).await.expect("a dry run")).await;
-        let text = actions
-            .iter()
-            .map(|action| action.description.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("orphan.txt"), "the orphan chunk: {text}");
-        assert!(text.contains(&part_ckey), "the upload-gone part: {text}");
-        assert!(text.contains("v.txt"), "the expired version row: {text}");
-        assert!(
-            text.contains("unreferenced block"),
-            "the dead block: {text}"
-        );
-        assert!(
-            !text.contains("live.txt"),
-            "a live chunk is never reported: {text}"
-        );
-        assert!(
-            !text.contains("inflight.txt"),
-            "a publish still in flight is never reported: {text}"
-        );
-        assert_eq!(
-            count(
-                &pool,
-                wire,
-                "SELECT count(*) FROM content WHERE bucket = $1"
-            )
-            .await,
-            7,
-            "a dry run removes nothing"
-        );
-
-        // The fix: the same handle in write mode reclaims exactly those rows.
-        let fix = PgCleanup::new(store.clone(), CleanupOptions::default()).with_retention(1, 0);
-        let actions = collect(fix.repair(RepairKind::Full).await.expect("a fix")).await;
-        assert!(
-            actions
-                .iter()
-                .any(|action| action.description.contains("reclaimed")),
-            "the fix reports what it reclaimed: {actions:?}"
-        );
-
-        assert_eq!(
-            count(
-                &pool,
-                wire,
-                "SELECT count(*) FROM content WHERE bucket = $1 AND ckey = 'o:orphan.txt'"
-            )
-            .await,
-            0,
-            "the orphan chunk is reclaimed"
-        );
-        assert_eq!(
-            count(
-                &pool,
-                wire,
-                "SELECT count(*) FROM content_heads WHERE bucket = $1 AND kind = 'part'"
-            )
-            .await,
-            0,
-            "the upload-gone part's head is reclaimed"
-        );
-        assert_eq!(
-            count(
-                &pool,
-                wire,
-                "SELECT count(*) FROM content WHERE bucket = $1 AND kind = 'part'"
-            )
-            .await,
-            0,
-            "the upload-gone part's chunks are reclaimed"
-        );
-        assert_eq!(
-            count(
-                &pool,
-                wire,
-                "SELECT count(*) FROM version_rows WHERE bucket = $1 AND seq = 1"
-            )
-            .await,
-            0,
-            "the older history row is expired"
-        );
-        assert_eq!(
-            count(
-                &pool,
-                wire,
-                "SELECT count(*) FROM version_rows WHERE bucket = $1 AND seq = 2"
-            )
-            .await,
-            1,
-            "the keep budget spares the newest history row"
-        );
-        assert_eq!(
-            count(
-                &pool,
-                wire,
-                "SELECT count(*) FROM content WHERE bucket = $1 AND ckey = 'o:live.txt'"
-            )
-            .await,
-            1,
-            "a live chunk is never reclaimed"
-        );
-        assert_eq!(
-            count(&pool, wire, "SELECT count(*) FROM blocks WHERE hash = $1").await,
-            0,
-            "the dead block is removed, not merely reported"
-        );
-        assert!(
-            count(
-                &pool,
-                wire,
-                "SELECT count(*) FROM content WHERE bucket = $1 AND ckey = 'o:inflight.txt'"
-            )
-            .await
-                > 0,
-            "a publish still in flight keeps its chunks"
-        );
-
-        // The grace is a window, not a permanent shield: aged past it on **both** gates —
-        // the head's allocation and the rows' own write stamp — a crashed partial publish's
-        // chunks are reclaimed like any other residue.
-        query(
-            "UPDATE content_heads SET allocated_at = now() - interval '2 hours' \
-             WHERE bucket = $1 AND ckey = 'o:inflight.txt'",
-        )
-        .bind(wire)
-        .execute(&pool)
-        .await
-        .expect("the aged allocation");
-        query(
-            "UPDATE content SET published = now() - interval '2 hours' \
-             WHERE bucket = $1 AND ckey = 'o:inflight.txt'",
-        )
-        .bind(wire)
-        .execute(&pool)
-        .await
-        .expect("the aged rows");
-        let aged = PgCleanup::new(store.clone(), CleanupOptions::default());
-        let _ = collect(aged.repair(RepairKind::Full).await.expect("a control run")).await;
-        assert_eq!(
-            count(
-                &pool,
-                wire,
-                "SELECT count(*) FROM content WHERE bucket = $1 AND ckey = 'o:inflight.txt'"
-            )
-            .await,
-            0,
-            "past the grace, a crashed generation's chunks are reclaimed"
-        );
-
-        drop(reader);
-        drop(read_only);
-        drop(store);
-        db.drop_db().await;
     }
 }

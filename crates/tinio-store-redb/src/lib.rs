@@ -43,6 +43,7 @@ pub mod part_checksum;
 pub mod part_data;
 #[doc(hidden)]
 pub mod part_meta;
+pub mod part_stamp;
 pub mod scan;
 pub mod state;
 pub mod store;
@@ -139,7 +140,7 @@ impl Metadata for RedbMetadata {
     type Error = Error;
 }
 
-/// Create the ten shared tables inside a write transaction
+/// Create the eleven shared tables inside a write transaction
 /// (idempotent). Backends create their local tables in the same
 /// transaction alongside.
 pub fn ensure_all(txn: &mut redb::WriteTransaction) -> Result<(), Error> {
@@ -149,6 +150,7 @@ pub fn ensure_all(txn: &mut redb::WriteTransaction) -> Result<(), Error> {
     part::Table::ensure(txn)?;
     upload_checksum::Table::ensure(txn)?;
     part_checksum::Table::ensure(txn)?;
+    part_stamp::Table::ensure(txn)?;
     object_part::Table::ensure(txn)?;
     version::Table::ensure(txn)?;
     version_index::Table::ensure(txn)?;
@@ -173,7 +175,7 @@ mod tests {
     fn assert_same<A: Same<B>, B>() {}
 
     #[test]
-    fn ensure_all_creates_exactly_the_ten_tables_idempotently() {
+    fn ensure_all_creates_exactly_the_eleven_tables_idempotently() {
         let db = Database::builder()
             .create_with_backend(InMemoryBackend::new())
             .unwrap();
@@ -203,6 +205,7 @@ mod tests {
                 "object_meta",
                 "object_parts",
                 "part_checksums",
+                "part_stamps",
                 "parts",
                 "upload_checksums",
                 "uploads",

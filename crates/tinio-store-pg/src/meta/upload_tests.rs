@@ -1,16 +1,51 @@
+use std::{
+    collections::BTreeSet,
+    time::{Duration, SystemTime},
+};
+
+use tokio::time::sleep;
+
 use crate::{
     _core::{
-        ETag,
+        ETag, MultipartUpload,
         acl::Acl,
-        checksum,
+        bucket, checksum,
         meta::{UploadMeta, upload::Row as UploadRow},
         multipart::{self, PartNumber},
         object,
+        storage::{group_and_paginate_unordered, uploads_order},
     },
-    Error,
+    Error, PgStore,
     tests::fixtures::{ETAG_A, bucket_row, key, name, scratch, tags},
     timestamp::{unix_micros, unix_seconds as at},
 };
+
+const ETAG_B: &str = "0cc175b9c0f1b6a831c399e269772661";
+
+/// The host clock in unix milliseconds, for the leg that bounds a stored
+/// write stamp.
+fn now_millis() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_millis(),
+    )
+    .expect("a millisecond stamp the store can hold")
+}
+
+/// The stored write stamp of one part row, in unix milliseconds.
+async fn stamp_of(store: &PgStore, bucket: &bucket::Name, upload_id: &str, number: i64) -> i64 {
+    sqlx::query_scalar!(
+        r#"SELECT modified_at AS "stamp!" FROM parts WHERE bucket = $1 AND upload_id = $2 AND number = $3"#,
+        bucket,
+        upload_id,
+        number
+    )
+    .fetch_one(store.pool())
+    .await
+    .expect("the part row the test just wrote")
+}
 
 fn part(number: u32) -> PartNumber {
     multipart::part_number(number).expect("a valid part number")
@@ -131,6 +166,22 @@ async fn upload_rows_round_trip_and_the_key_check_binds() {
         .expect("the key matches");
     assert!(records[0].is_some());
     assert!(records[1].is_none());
+    // One answer per occurrence: a number asked for twice answers its record
+    // twice, not `None` on its second read.
+    let repeated = UploadMeta::part_records(
+        &store,
+        &data,
+        &target,
+        upload_id,
+        &[part(3), part(3), part(9)],
+    )
+    .await
+    .unwrap()
+    .expect("the key matches");
+    assert!(
+        repeated[0].is_some() && repeated[1].is_some() && repeated[2].is_none(),
+        "a duplicated part number answers its record per occurrence"
+    );
     assert!(
         UploadMeta::part_records(&store, &data, &absent, upload_id, &[part(1)])
             .await
@@ -444,5 +495,418 @@ async fn the_uploads_page_filters_rolls_up_and_resumes_after_its_marker() {
         vec!["dir/b"]
     );
     assert!(!more && marker.is_none());
+    db.drop_db().await;
+}
+
+/// The corpus the bounded-listing legs share: a delimiter group with several
+/// members, a nested group, a key of its own, and the keys that pin the prefix
+/// bound's arithmetic — one carrying `U+10FFFF` immediately after the prefix,
+/// one whose body *is* that code point (a prefix with no successor), and one a
+/// bound of `prefix || chr(1114111)` would silently drop.
+const LISTING_KEYS: [&str; 7] = [
+    "dir/a.txt",
+    "dir/b.txt",
+    "dir/sub/c.txt",
+    "hot/x",
+    "hot/\u{10FFFF}",
+    "hot/\u{10FFFF}x",
+    "zebra.txt",
+];
+
+/// Seed the shared corpus into `data` — two uploads per key, three for the
+/// first, so a chunk boundary falls inside a same-key group and the cursor's
+/// resume *within* a key is exercised — and answer the bucket's whole upload
+/// set (the listing's materialized read).
+async fn seed_listing_corpus(store: &PgStore, data: &bucket::Name) -> Vec<MultipartUpload> {
+    for (index, raw) in LISTING_KEYS.iter().enumerate() {
+        let target = key(raw);
+        let scoops = if index == 0 { 3 } else { 2 };
+        for scoop in 0..scoops {
+            let upload_id = format!("upload-{index}-{scoop}");
+            UploadMeta::create(store, data, &upload_id, &state(&upload_id, &target))
+                .await
+                .unwrap();
+        }
+    }
+    UploadMeta::list_uploads(store, data).await.unwrap()
+}
+
+/// The bounded listing read answers exactly what the shared engine answers over
+/// the materialized set — the same page, roll-up, truncation flag and resume
+/// marker for the same `(prefix, delimiter, marker, max_uploads)`, over a matrix
+/// that covers the delimiter roll-up, the resume inside a same-key group, a
+/// marker inside a rolled-up prefix and the prefix bound's last-code-point
+/// arithmetic. The oracle is the engine fed the prefix's whole upload set, which
+/// is the shape this read had before it was bounded (F17).
+#[tokio::test]
+async fn the_bounded_page_answers_what_the_materialized_engine_answers() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let data = name("plane-upload-bounded");
+    bucket_row(&store, &data).await;
+    let all = seed_listing_corpus(&store, &data).await;
+    assert_eq!(all.len(), LISTING_KEYS.len() * 2 + 1, "the corpus landed");
+    // The markers: a row's own composite order, a bare `key-marker`'s
+    // `U+10FFFF` sentinel, a rolled-up prefix (no row at all) and one past
+    // every row in the bucket.
+    let markers = [
+        None,
+        Some("dir/a.txt\u{0}upload-0-1"),
+        Some("dir/a.txt\u{10FFFF}"),
+        Some("dir/"),
+        Some("zzz\u{0}upload-9-9"),
+    ];
+    let mut combos = 0usize;
+    for prefix in [
+        "",
+        "dir/",
+        "dir/sub/",
+        "hot/",
+        "hot/\u{10FFFF}",
+        "hot\u{10FFFF}",
+        "z",
+        "q",
+    ] {
+        for delimiter in [None, Some("/")] {
+            for marker in markers {
+                for max in [0usize, 1, 3, 1000] {
+                    combos += 1;
+                    let materialized: Vec<MultipartUpload> = all
+                        .iter()
+                        .filter(|upload| upload.key.as_ref().starts_with(prefix))
+                        .cloned()
+                        .collect();
+                    let expected = group_and_paginate_unordered(
+                        materialized,
+                        prefix,
+                        delimiter,
+                        marker,
+                        max,
+                        |upload: &MultipartUpload| upload.key.as_ref(),
+                        |upload: &MultipartUpload| uploads_order(&upload.key, &upload.upload_id),
+                    );
+                    let got = UploadMeta::list_uploads_page(
+                        &store, &data, prefix, delimiter, marker, max,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        got, expected,
+                        "prefix={prefix:?} delimiter={delimiter:?} marker={marker:?} max={max}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(combos, 320, "the matrix ran");
+    db.drop_db().await;
+}
+
+/// The prefix bound is exact at the largest code point: a key carrying
+/// `U+10FFFF` immediately after the prefix is listed, and so is a key whose
+/// body *is* that code point (a prefix with no successor, which the read serves
+/// without an upper bound rather than inventing one that drops it).
+#[tokio::test]
+async fn the_prefix_bound_keeps_a_key_carrying_the_last_code_point() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let data = name("plane-upload-bound-last");
+    bucket_row(&store, &data).await;
+    seed_listing_corpus(&store, &data).await;
+    for (prefix, expected) in [
+        ("hot/", vec!["hot/x", "hot/\u{10FFFF}", "hot/\u{10FFFF}x"]),
+        ("hot/\u{10FFFF}", vec!["hot/\u{10FFFF}", "hot/\u{10FFFF}x"]),
+        ("hot\u{10FFFF}", vec![]),
+    ] {
+        let (uploads, prefixes, more, marker) =
+            UploadMeta::list_uploads_page(&store, &data, prefix, None, None, 1000)
+                .await
+                .unwrap();
+        let keys: Vec<String> = uploads
+            .iter()
+            .map(|upload| upload.key.to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            keys, expected,
+            "prefix={prefix:?}: a bound of `prefix || chr(1114111)` drops the key beyond it"
+        );
+        assert!(prefixes.is_empty() && !more && marker.is_none());
+    }
+    db.drop_db().await;
+}
+
+/// A stored checksum label outside the API's ten algorithms heals: the part or
+/// the upload is served **without** its checksum instead of failing the read —
+/// the contract's own rule for that column, and the difference between a
+/// listing that survives a bad row and `Cleanup`'s sweep failing outright.
+#[tokio::test]
+async fn a_corrupt_checksum_label_heals_every_read() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let data = name("plane-upload-heal");
+    bucket_row(&store, &data).await;
+    let target = key("heal.bin");
+    let upload_id = "plane-upload-heal";
+    let mut upload = state(upload_id, &target);
+    upload.checksum = Some(checksum::Upload {
+        algorithm: checksum::Algorithm::Crc32,
+        r#type: None,
+    });
+    UploadMeta::create(&store, &data, upload_id, &upload)
+        .await
+        .unwrap();
+    let tee = checksum::PartChecksum::default();
+    tee.digest
+        .set(checksum::Part {
+            algorithm: checksum::Algorithm::Crc32,
+            value: checksum::Value("AA==".to_owned()),
+        })
+        .expect("a fresh tee");
+    UploadMeta::put_part(
+        &store,
+        &data,
+        &target,
+        upload_id,
+        part(1),
+        &ETag::new(ETAG_A).unwrap(),
+        Some(&tee),
+    )
+    .await
+    .unwrap();
+    // Both checksum rows now name an algorithm no read can decode.
+    sqlx::query!(
+        "UPDATE part_checksums SET algorithm = 'BLAKE3' WHERE bucket = $1 AND upload_id = $2",
+        &data,
+        upload_id
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    sqlx::query!(
+        "UPDATE upload_checksums SET algorithm = 'BLAKE3' WHERE bucket = $1 AND upload_id = $2",
+        &data,
+        upload_id
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let listed = UploadMeta::list_parts(&store, &data, upload_id, part(1))
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1, "the part is still listed");
+    assert!(
+        listed[0].checksum.is_none(),
+        "…served without the label no read can decode"
+    );
+    let page = UploadMeta::list_parts_page(&store, &data, upload_id, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(page.rows.len(), 1);
+    assert!(page.rows[0].checksum.is_none());
+    let records = UploadMeta::part_records(&store, &data, &target, upload_id, &[part(1)])
+        .await
+        .unwrap()
+        .expect("the key matches");
+    assert!(records[0].as_ref().is_some_and(|r| r.checksum.is_none()));
+    let got = UploadMeta::get(&store, &data, &target, upload_id)
+        .await
+        .unwrap()
+        .expect("the upload is still there");
+    assert!(
+        got.checksum.is_none(),
+        "the upload is served without the spec no read can decode"
+    );
+    assert_eq!(
+        UploadMeta::list_uploads(&store, &data).await.unwrap().len(),
+        1
+    );
+    let (uploads, _, _, _) = UploadMeta::list_uploads_page(&store, &data, "", None, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(
+        UploadMeta::walk_uploads(&store).await.unwrap().len(),
+        1,
+        "the sweep's own walk serves the upload rather than failing on the row"
+    );
+    db.drop_db().await;
+}
+
+/// A stored part number the contract's `u32` cannot name is not served: it
+/// reads as absent, exactly as a domain-invalid ETag does, instead of being
+/// answered as the part its `as` truncation would invent (2^32 would answer
+/// part 0).
+#[tokio::test]
+async fn a_stored_part_number_outside_the_contract_reads_as_absent() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let data = name("plane-upload-number");
+    bucket_row(&store, &data).await;
+    let target = key("stored.bin");
+    let upload_id = "plane-upload-number";
+    UploadMeta::create(&store, &data, upload_id, &state(upload_id, &target))
+        .await
+        .unwrap();
+    UploadMeta::put_part(
+        &store,
+        &data,
+        &target,
+        upload_id,
+        part(1),
+        &ETag::new(ETAG_A).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    sqlx::query!(
+        "UPDATE parts SET number = 4294967296 WHERE bucket = $1 AND upload_id = $2",
+        &data,
+        upload_id
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert!(
+        UploadMeta::list_parts(&store, &data, upload_id, part(1))
+            .await
+            .unwrap()
+            .is_empty(),
+        "the row the contract cannot name is not served as another part"
+    );
+    let records = UploadMeta::part_records(&store, &data, &target, upload_id, &[part(1)])
+        .await
+        .unwrap()
+        .expect("the key matches");
+    assert!(records[0].is_none());
+    db.drop_db().await;
+}
+
+/// Every part write stamps the part's **own** modification time: the per-part
+/// write stamp the listing serves as its `LastModified`, which is not the
+/// upload's creation instant — a part uploaded later must report the later
+/// instant.
+#[tokio::test]
+async fn a_part_write_stamps_the_parts_own_modification_time() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let data = name("plane-upload-stamp");
+    bucket_row(&store, &data).await;
+    let target = key("stamped.bin");
+    let upload_id = "plane-upload-stamp";
+    UploadMeta::create(&store, &data, upload_id, &state(upload_id, &target))
+        .await
+        .unwrap();
+    let before = now_millis();
+    UploadMeta::put_part(
+        &store,
+        &data,
+        &target,
+        upload_id,
+        part(1),
+        &ETag::new(ETAG_A).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    let first = stamp_of(&store, &data, upload_id, 1).await;
+    let after = now_millis();
+    assert!(
+        first >= before - 1_000 && first <= after + 1_000,
+        "the stamp is the write's own unix-millisecond instant ({first}), not the upload's own initiation time"
+    );
+    // A rewrite moves it: the row's stamp is the last write's, so a part
+    // uploaded later does not inherit the earlier instant.
+    sleep(Duration::from_millis(50)).await;
+    UploadMeta::put_part(
+        &store,
+        &data,
+        &target,
+        upload_id,
+        part(1),
+        &ETag::new(ETAG_B).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    let rewritten = stamp_of(&store, &data, upload_id, 1).await;
+    assert!(
+        rewritten > first,
+        "the rewrite moves the part's own stamp ({first} -> {rewritten})"
+    );
+    db.drop_db().await;
+}
+
+/// **The ruling**: every listed part reports **its own** write stamp, never the
+/// upload's creation time. Two parts of one upload, written seconds apart, are
+/// projected the way the backend projects them — `to_info(size, upload's
+/// creation)` — and must answer two different instants, both later than the
+/// upload's own.
+///
+/// This is the contract-level half of the ruling: the projection reads the
+/// part row's stamp, so a row that carries none still answers the fallback
+/// ([`a_part_write_stamps_the_parts_own_modification_time`]'s fallback arm).
+#[tokio::test]
+async fn two_parts_of_one_upload_report_their_own_write_stamps() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let data = name("plane-upload-two-stamps");
+    bucket_row(&store, &data).await;
+    let target = key("two-parts.bin");
+    let upload_id = "plane-upload-two-stamps";
+    UploadMeta::create(&store, &data, upload_id, &state(upload_id, &target))
+        .await
+        .unwrap();
+    UploadMeta::put_part(
+        &store,
+        &data,
+        &target,
+        upload_id,
+        part(1),
+        &ETag::new(ETAG_A).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    sleep(Duration::from_millis(1_100)).await;
+    UploadMeta::put_part(
+        &store,
+        &data,
+        &target,
+        upload_id,
+        part(2),
+        &ETag::new(ETAG_B).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    // The upload's own creation instant — what this round replaces as the
+    // listing's `LastModified`.
+    let created = UploadMeta::get(&store, &data, &target, upload_id)
+        .await
+        .unwrap()
+        .expect("the upload the test just created")
+        .initiated_at;
+    let rows = UploadMeta::list_parts(&store, &data, upload_id, part(1))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "both parts are listed");
+    let first = rows[0].to_info(0, created).unwrap().last_modified;
+    let second = rows[1].to_info(0, created).unwrap().last_modified;
+    assert!(
+        first > created,
+        "part 1 answers its own write stamp ({first:?}), not the upload's creation time ({created:?})"
+    );
+    assert!(
+        second > first,
+        "the second part's stamp is strictly later than the first's ({first:?} -> {second:?})"
+    );
     db.drop_db().await;
 }

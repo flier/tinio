@@ -1,0 +1,168 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    key,\n    etag,\n    size,\n    mtime,\n    identity,\n    tags AS \"tags: object::Tags\",\n    checksum,\n    acl AS \"acl: Acl\"\nFROM object_meta\nWHERE bucket = $1 AND key IN (SELECT unnest($2::text[]))\nORDER BY key COLLATE \"C\"\nFOR UPDATE\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "etag",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "etag"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "mtime",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "mtime"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "identity",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "identity"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "tags: object::Tags",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "checksum",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "checksum"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "acl: Acl",
+        "type_info": {
+          "Custom": {
+            "name": "acl",
+            "kind": {
+              "Composite": [
+                [
+                  "owner",
+                  "Text"
+                ],
+                [
+                  "grants",
+                  {
+                    "Custom": {
+                      "name": "acl_grant[]",
+                      "kind": {
+                        "Array": {
+                          "Custom": {
+                            "name": "acl_grant",
+                            "kind": {
+                              "Composite": [
+                                [
+                                  "grantee",
+                                  {
+                                    "Custom": {
+                                      "name": "acl_grantee",
+                                      "kind": {
+                                        "Composite": [
+                                          [
+                                            "grantee_kind",
+                                            "Text"
+                                          ],
+                                          [
+                                            "grantee_value",
+                                            "Text"
+                                          ]
+                                        ]
+                                      }
+                                    }
+                                  }
+                                ],
+                                [
+                                  "permission",
+                                  "Text"
+                                ]
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "acl"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3c88989d6fcefd38f741ec110cc76facfddd9de170f1dba1cd634848cb43b864"
+}

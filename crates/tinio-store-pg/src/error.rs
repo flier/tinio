@@ -48,6 +48,44 @@ pub enum Error {
     /// bare "db error" rendering hides every constraint a caller can trip.
     #[error("postgres: {0}")]
     Database(String),
+    /// A write the database refused because the session is read-only
+    /// (`SQLSTATE 25006`).
+    ///
+    /// The engine's write-on-read rule degrades a read whose cold entry would
+    /// have materialized a row only when the failure *says* read-only
+    /// ([`storage::Error::Io`] carrying `io::ErrorKind::ReadOnlyFilesystem`),
+    /// and a read-only instance's listing arrives here: its cold entry heals
+    /// through `ObjectMeta::put_preserving`, whose contract promises the
+    /// in-transaction bucket-row assertion, so the `FOR UPDATE` is refused by
+    /// the session before anything is written. Spelling that refusal as a
+    /// read-only I/O error is what lets the listing serve instead of failing
+    /// (found by the 2026-10-13 review round).
+    #[error("postgres: the session is read-only: {0}")]
+    ReadOnlySession(String),
+    /// The dsn asks for a TLS mode this store does not serve (PG10, R1): only
+    /// `disable` and `require` are accepted, and only an explicit `disable`
+    /// gives up TLS. The driver's `prefer` cannot be mapped onto anything safe
+    /// — sqlx sets `accept_invalid_certs` for every mode below `verify-ca`, so
+    /// a `prefer` session installs a verifier that accepts any certificate —
+    /// and a mode the driver's own parse would drop is a mode the operator
+    /// would believe was in force.
+    #[error(
+        "postgres sslmode refused: {reason}; this store accepts only `disable` and `require`, and only an explicit `disable` gives up TLS (require verifies the chain and the hostname)"
+    )]
+    SslMode {
+        /// What was asked for and by whom, in one clause.
+        reason: String,
+    },
+    /// A **writable** store was handed a pool whose sessions are opened
+    /// read-only (PG6, layer 2). The other direction is repaired by re-opening
+    /// the pool's session; this one cannot be — the pool's options carry the
+    /// read-only startup option this crate appended, and a pool holds no
+    /// un-redacted dsn to rebuild them from — so a store the caller asked to
+    /// write with must be built over a pool that may write.
+    #[error(
+        "a writable store cannot be opened over a read-only pool: build it with Pool::open, or Pool::open_for(dsn, n, Access::ReadWrite), so its sessions may write"
+    )]
+    ReadOnlyPoolForAWriter,
     /// The server encoding is not UTF-8, so `COLLATE "C"` would order the
     /// server encoding's bytes rather than the contract's UTF-8 sequence
     /// (PG4). The store refuses to serve.
@@ -119,6 +157,23 @@ pub enum Error {
         found: i64,
         /// The version this binary migrates to.
         supported: i64,
+    },
+    /// The checksum the database recorded for a migration disagrees with the
+    /// embedded file (R5, PG11). The schema is one file per version and
+    /// `SCHEMA_VERSION` says which, so an edit to a landed migration is exactly
+    /// the change that silently diverges a fresh database from an existing one:
+    /// the recorded digest is the only thing that can tell, and a disagreement
+    /// is refused with the pg remedy rather than served.
+    #[error(
+        "postgres schema checksum for version {version} is {found} in this database and {expected} in this binary: the schema the database was built from is not the schema this binary carries, so upgrade the binary to the one that built it, or dump the database with pg_dump and restore it into a database this binary created — never drop and rebuild, because these tables hold the only copy of the bytes"
+    )]
+    SchemaChecksum {
+        /// The version whose recorded checksum disagrees.
+        version: i64,
+        /// The digest the database recorded, as hex.
+        found: String,
+        /// The digest of the embedded migration, as hex.
+        expected: String,
     },
     /// The bucket row is absent.
     #[error("no such bucket: {0}")]
@@ -228,6 +283,12 @@ impl Error {
     }
 }
 
+/// `read_only_sql_transaction`: PostgreSQL's refusal of a write on a session
+/// whose `default_transaction_read_only` is on. The one SQLSTATE this store
+/// reads structurally, because the engine's write-on-read degradation keys on
+/// it ([`Error::ReadOnlySession`]).
+const READ_ONLY_SQLSTATE: &str = "25006";
+
 impl From<sqlx::Error> for Error {
     fn from(err: sqlx::Error) -> Self {
         let raw = match &err {
@@ -243,7 +304,16 @@ impl From<sqlx::Error> for Error {
         // No dsn is in scope on this hop, so the redaction is the userinfo
         // strip: the password never reaches a rendering even when the driver
         // embedded the connection string in its own message.
-        Self::Database(redact_userinfo(&raw))
+        let message = redact_userinfo(&raw);
+        // A read-only session's refusal is the one driver error this store
+        // reads structurally rather than merely keeping: `25006` is
+        // `read_only_sql_transaction`, and the engine's write-on-read
+        // degradation keys on it (see `Error::ReadOnlySession`).
+        if matches!(&err, sqlx::Error::Database(db) if db.code().as_deref() == Some(READ_ONLY_SQLSTATE))
+        {
+            return Self::ReadOnlySession(message);
+        }
+        Self::Database(message)
     }
 }
 
@@ -265,6 +335,12 @@ impl From<Error> for storage::Error {
                 format!("no such block: {hash}"),
             )),
             Error::Io(err) => storage::Error::Io(err),
+            // A read-only refusal keeps its kind, because that is the whole
+            // point of the variant: the engine's `served_without_writing`
+            // degrades only on `ReadOnlyFilesystem` (see `ReadOnlySession`).
+            Error::ReadOnlySession(message) => {
+                storage::Error::Io(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, message))
+            }
             Error::Storage(inner) => inner,
             other => storage::Error::Io(io::Error::other(other.to_string())),
         }

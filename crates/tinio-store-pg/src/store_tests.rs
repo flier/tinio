@@ -5,8 +5,8 @@
 use sqlx::postgres::types::Oid;
 
 use super::{
-    Access, LockHolder, MIGRATION_LOCK_KEY, OWNERSHIP_LOCK_KEY, OWNERSHIP_LOST_EXIT, SchemaState,
-    describe_holder, key_parts, ownership_lost,
+    Access, LockHolder, MIGRATION_LOCK_KEY, OWNERSHIP_LOCK_KEY, OWNERSHIP_LOST_EXIT, OwnershipLoss,
+    PgStore, SchemaState, describe_holder, key_parts, ownership_lost,
 };
 
 #[test]
@@ -31,12 +31,61 @@ fn a_matching_schema_pends_nothing() {
     assert_eq!(behind.pending(), 1);
 }
 
+/// The direction a pool cannot be rebuilt in (PG6, layer 2) is refused **before
+/// any SQL**, which is what makes this leg runnable without a database: the
+/// pool connects lazily, and the mismatch is a fact about the pool.
+#[tokio::test]
+async fn a_writable_store_over_a_read_only_pool_is_refused_without_connecting() {
+    let pool =
+        crate::pool::Pool::open_read_only("postgres://user:password@db.example:5432/tinio", 1)
+            .expect("the dsn parses");
+    let err = PgStore::connect_with_pool(pool, Access::ReadWrite)
+        .await
+        .expect_err("a writable store over a read-only pool is refused");
+    assert!(
+        matches!(err, crate::error::Error::ReadOnlyPoolForAWriter),
+        "{err}"
+    );
+    assert!(err.to_string().contains("Pool::open"), "{err}");
+
+    let inspected = PgStore::inspect_with_pool(
+        crate::pool::Pool::open_read_only("postgres://user:password@db.example:5432/tinio", 1)
+            .expect("the dsn parses"),
+        Access::ReadWrite,
+    )
+    .await
+    .expect_err("the inspection path refuses it the same way");
+    assert!(
+        matches!(inspected, crate::error::Error::ReadOnlyPoolForAWriter),
+        "{inspected}"
+    );
+}
+
 /// The status a lost ownership lock terminates with is a supervisor's
 /// contract, not an internal detail: an operator's restart policy keys on the
 /// number, so the value is pinned rather than left to the one call site.
 #[test]
 fn the_ownership_loss_exit_status_is_pinned() {
     assert_eq!(OWNERSHIP_LOST_EXIT, 75);
+}
+
+/// What a lost re-verify reports: the probe that *answered* "not held" carries
+/// no reason, and the prose [`super::exit_on_lost_ownership`] renders is the
+/// same answer either way.
+#[test]
+fn a_loss_reports_the_probe_failure_when_there_was_one() {
+    let answered = OwnershipLoss {
+        key: OWNERSHIP_LOCK_KEY,
+        reason: None,
+    };
+    assert_eq!(answered.key, OWNERSHIP_LOCK_KEY);
+    assert_eq!(answered.reason, None);
+    let failed = OwnershipLoss {
+        key: OWNERSHIP_LOCK_KEY,
+        reason: Some("connection closed".to_owned()),
+    };
+    assert_ne!(answered, failed);
+    assert_eq!(failed.reason.as_deref(), Some("connection closed"));
 }
 
 /// Every answer a holding session's one `pg_stat_activity` row can give.

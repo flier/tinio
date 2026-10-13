@@ -8,6 +8,10 @@
 //! `PART_CHECKSUMS` row (the checksum), and the completed object's retained
 //! parts are the `OBJECT_PARTS` rows. Every decode self-heals an element
 //! exactly as the landed table layer does.
+//!
+//! A part row carries the store's own write stamp for that part: the stamp's
+//! meaning, and the one datum a stamp-less row decodes to, are the field's
+//! own contract ([`PartRow::written_at`]).
 
 use std::time::SystemTime;
 
@@ -130,8 +134,8 @@ impl Row {
     }
 }
 
-/// One uploaded part as the contract answers it: its number, its ETag and its
-/// stored checksum.
+/// One uploaded part as the contract answers it: its number, its ETag, its
+/// stored checksum and its own write stamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartRow {
     /// Part number.
@@ -141,6 +145,19 @@ pub struct PartRow {
     /// The stored per-part checksum (`None` = none, or a domain-invalid stored
     /// wire — self-healing).
     pub checksum: Option<checksum::Part>,
+    /// The instant the **store** last wrote this part — its own write stamp,
+    /// which is what the listed part's `LastModified` answers
+    /// ([`PartRow::to_info`]). `None` = the row predates the stamp: the decode
+    /// allowance for a part stored before this datum existed (and for a
+    /// database that predates it), never a licence for a live backend to omit
+    /// it — the shared conformance suite pins that a written part carries one.
+    ///
+    /// The stamp is the store's, not the caller's: a backend reads it from its
+    /// own plane (the part file's modification time, the row's write instant).
+    /// The projection's `fallback` — the upload's creation instant — is what a
+    /// stamp-less old row answers, so a database written before the stamp keeps
+    /// reading with a coherent `LastModified` rather than failing to decode.
+    pub written_at: Option<SystemTime>,
 }
 
 impl PartRow {
@@ -148,11 +165,16 @@ impl PartRow {
     /// a domain-invalid ETag — the part reads as absent (self-healing, the
     /// point read's rule); a domain-invalid checksum self-heals to `None` and
     /// the part is still listed.
+    ///
+    /// The element pair carries the part's identity only, so the decoded row
+    /// holds no write stamp ([`Self::written_at`] is `None`): a reader that
+    /// read a stamp column sets it.
     pub fn from_raw(number: u32, etag: &str, algorithm: &str, value: &str) -> Option<Self> {
         Some(Self {
             number,
             etag: ETag::new(etag).ok()?,
             checksum: checksum::Part::from_wire_opt(algorithm, value),
+            written_at: None,
         })
     }
 
@@ -171,9 +193,16 @@ impl PartRow {
         }
     }
 
-    /// The part as the S3 surface answers it. The stat elements (size,
-    /// modification time) belong to the backend's own content plane and are
-    /// the caller's.
+    /// The part as the S3 surface answers it. The size belongs to the
+    /// backend's own content plane and is the caller's; the modification time
+    /// is the row's **own** write stamp ([`Self::written_at`]).
+    ///
+    /// `fallback` is the stamp-less row's answer, and the reason this
+    /// projection takes one: a row that predates the stamp decodes to
+    /// [`Self::written_at`] `None`, and answers the upload's creation instant
+    /// — what every backend served before the stamp existed, kept rather than
+    /// invented so an old row still reads. A conformant backend's own rows
+    /// carry the stamp, so the fallback is never what a live row answers.
     ///
     /// A stored part number outside the API's `1..=10000` is not a
     /// representable [`multipart::PartInfo`]: the S3 surface has no such
@@ -185,16 +214,34 @@ impl PartRow {
     pub fn to_info(
         &self,
         size: u64,
-        last_modified: SystemTime,
+        fallback: SystemTime,
     ) -> Result<multipart::PartInfo, storage::Error> {
         Ok(multipart::PartInfo {
             part_number: multipart::part_number(self.number)?,
             size,
             etag: self.etag.clone(),
-            last_modified,
+            last_modified: self.written_at.unwrap_or(fallback),
             checksum: self.checksum.clone(),
         })
     }
+}
+
+/// One cursor chunk of a bucket's uploads: the rows a bounded read served in
+/// the listing's own order, and whether the store holds any row after them.
+///
+/// The chunk is the unit a backend with a keyset read answers one statement
+/// of. [`UploadMeta::list_uploads_page`] reads every row of the prefix before
+/// it cuts one page — 100k uploads cost a scan of all of them per page
+/// (F17) — so the page is assembled from chunks instead: the composite order
+/// of the last served row is the next read's bound, and the pull repeats
+/// until the page's roll-up is complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadsChunk {
+    /// The rows served, ascending by the composite `key\0upload_id` order
+    /// ([`crate::storage::uploads_order`]).
+    pub uploads: Vec<MultipartUpload>,
+    /// Whether the store holds at least one row after the chunk's last one.
+    pub more: bool,
 }
 
 /// One page of [`UploadMeta::list_parts_page`]: the rows the join served, the
@@ -225,8 +272,9 @@ pub struct PartsPage {
 
 /// The completion-time record of one requested part: the stored ETag and
 /// checksum, or `None` when the part was never stored. The completion rule
-/// compares the client's ETag against this record, so the size and the stat
-/// elements (which the completion does not need) stay out of it.
+/// compares the client's ETag against this record, so the size stays out of it
+/// — while the part's own write stamp rides it, because the completion joins
+/// the same part rows the listing does ([`PartRow::written_at`]'s rule).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartRecord {
     /// Part number.
@@ -236,17 +284,23 @@ pub struct PartRecord {
     /// The stored per-part checksum (`None` = none, or a domain-invalid stored
     /// wire — self-healing).
     pub checksum: Option<checksum::Part>,
+    /// The instant the **store** last wrote the part —
+    /// [`PartRow::written_at`]'s value and rule (`None` = a row that predates
+    /// the stamp).
+    pub written_at: Option<SystemTime>,
 }
 
 impl PartRecord {
     /// Decode the `PARTS` element and the `PART_CHECKSUMS` elements, with the
-    /// same self-heal as [`PartRow::from_raw`].
+    /// same self-heal as [`PartRow::from_raw`] and the same absent write stamp
+    /// (the element pair carries none).
     pub fn from_raw(number: u32, etag: &str, algorithm: &str, value: &str) -> Option<Self> {
         let row = PartRow::from_raw(number, etag, algorithm, value)?;
         Some(Self {
             number: row.number,
             etag: row.etag,
             checksum: row.checksum,
+            written_at: row.written_at,
         })
     }
 }
@@ -257,6 +311,7 @@ impl From<&PartRow> for PartRecord {
             number: row.number,
             etag: row.etag.clone(),
             checksum: row.checksum.clone(),
+            written_at: row.written_at,
         }
     }
 }
@@ -337,6 +392,10 @@ pub trait UploadMeta: Send + Sync + 'static {
         Self: Metadata;
 
     /// The upload's parts at or after `from`, in ascending part-number order.
+    ///
+    /// Every row carries the store's own write stamp for that part, under the
+    /// field's contract ([`PartRow::written_at`]) — the stamp a listed part
+    /// answers as its `LastModified` ([`PartRow::to_info`]).
     async fn list_parts(
         &self,
         bucket: &bucket::Name,
@@ -420,6 +479,58 @@ pub trait UploadMeta: Send + Sync + 'static {
     ) -> Result<(Vec<MultipartUpload>, Vec<String>, bool, Option<String>), <Self as Metadata>::Error>
     where
         Self: Metadata;
+
+    /// One chunk of the bucket's uploads, in the listing's own order — the
+    /// composite `key\0upload_id` of [`crate::storage::uploads_order`],
+    /// ascending — strictly after `after` (`None` = the first row inside
+    /// `prefix`), capped at `max` rows.
+    ///
+    /// This is the cursor form a listing page is assembled with:
+    /// [`UploadMeta::list_uploads_page`] reads every row of the prefix before
+    /// it cuts one page, so the page body pulls this chunk by chunk and stops
+    /// only once the shared pager's `max + 1`-entry lookahead is satisfied —
+    /// never at a chunk boundary: a delimiter group is one entry however many
+    /// rows it spans, so a bound applied before the roll-up would split a
+    /// group across chunks and the page would come back short of its last
+    /// entry. A backend whose rows are seekable overrides this body with a
+    /// keyset read; the page it answers is the one
+    /// [`UploadMeta::list_uploads_page`] answers for the same arguments.
+    ///
+    /// The default body is the materialized read — today's behaviour, so a
+    /// backend that does not override this costs exactly what it always did:
+    /// the whole prefix is read, filtered by the cursor and capped at `max`.
+    /// It reaches that answer by delegating to
+    /// [`UploadMeta::list_uploads_page`], which reads **every row of the
+    /// prefix** before it cuts a page — so a pager that loops this default
+    /// pays one full-prefix scan **per chunk**, the very cost the
+    /// bounded-listing work exists to remove. That is why a store whose rows
+    /// can be seeked overrides it (redb's keyset read, pg's seeked statement),
+    /// and why the default is deliberately **not** removed: correctness never
+    /// depends on the override landing.
+    ///
+    /// `max == 0` answers no rows and `more == false`: a chunk the caller
+    /// requested nothing of must never read as more remaining, or the resume
+    /// arithmetic would advance past uploads it never received.
+    async fn list_uploads_chunk(
+        &self,
+        bucket: &bucket::Name,
+        prefix: &str,
+        after: Option<&str>,
+        max: usize,
+    ) -> Result<UploadsChunk, <Self as Metadata>::Error>
+    where
+        Self: Metadata,
+    {
+        // The engine's own marker is exclusive-after on the composite order,
+        // which is exactly this chunk's cursor. No delimiter: a chunk is
+        // plain rows, never a roll-up, so the engine's page is the `max`
+        // smallest orders after the cursor and its truncation flag is
+        // `more`.
+        let (uploads, _prefixes, more, _next) = self
+            .list_uploads_page(bucket, prefix, None, after, max)
+            .await?;
+        Ok(UploadsChunk { uploads, more })
+    }
 
     /// Whether the bucket has any in-progress upload (the empty-bucket probe).
     async fn has_uploads(&self, bucket: &bucket::Name) -> Result<bool, <Self as Metadata>::Error>
@@ -520,6 +631,9 @@ mod tests {
                 algorithm: checksum::Algorithm::Crc32,
                 value: checksum::Value("NhCmhg==".into()),
             }),
+            // The element pair carries no stamp, so the round trip's row holds
+            // none either.
+            written_at: None,
         };
         let (etag, algorithm, value) = part.to_raw();
         assert_eq!(PartRow::from_raw(10, &etag, &algorithm, &value), Some(part));
@@ -537,6 +651,7 @@ mod tests {
             number: 2,
             etag: ETag::new("900150983cd24fb0d6963f7d28e17f72").unwrap(),
             checksum: None,
+            written_at: None,
         };
         let record = PartRecord::from(&row);
         assert_eq!(record.number, 2);
@@ -546,6 +661,34 @@ mod tests {
             Some(record)
         );
         assert_eq!(PartRecord::from_raw(2, "not-an-etag", "", ""), None);
+    }
+
+    /// The listed part's modification time is the **part's own** write stamp:
+    /// a row that records one answers it, and only a row that records none
+    /// answers the fallback the caller passes (the upload's creation time).
+    #[test]
+    fn a_part_reports_its_own_write_stamp_and_falls_back_only_when_it_has_none() {
+        let written = from_nanos(1_700_000_000_000_000_000);
+        let upload_created = from_nanos(1_600_000_000_000_000_000);
+        let mut row = PartRow {
+            number: 1,
+            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            checksum: None,
+            written_at: Some(written),
+        };
+        assert_eq!(
+            row.to_info(5, upload_created).unwrap().last_modified,
+            written,
+            "a part's LastModified is the store's own stamp for that part"
+        );
+        // The completion-time view carries the same stamp.
+        assert_eq!(PartRecord::from(&row).written_at, Some(written));
+        // The store that records none answers the fallback, not an invention.
+        row.written_at = None;
+        assert_eq!(
+            row.to_info(5, upload_created).unwrap().last_modified,
+            upload_created
+        );
     }
 
     /// A stored part number outside the API range is not a representable
@@ -559,6 +702,7 @@ mod tests {
                 number,
                 etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
                 checksum: None,
+                written_at: None,
             };
             assert!(
                 matches!(

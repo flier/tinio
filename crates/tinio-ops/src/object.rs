@@ -191,18 +191,19 @@ pub(crate) const COMPOSED_MTIME_JITTER: Duration = Duration::from_secs(60);
 /// compensated.
 ///
 /// The contract asks only that an id be unique per publish across the window a
-/// compensation lives in — one publish and the row write that follows it — so a
-/// process-local sequence mixed with the clock is enough, and it keeps two
-/// runs (and two writers within one run) apart without a dependency the engine
-/// does not already have.
-fn mint_publish_id() -> PublishId {
+/// compensation lives in — one publish and the row write that follows it. The
+/// unix second occupies the high half and a process-local sequence the low
+/// half. Mixing the two with xor is not injective: a sequence and a clock that
+/// move by the same bits land on one id, and the compensation can then delete
+/// another publish of the same bytes.
+pub fn mint_publish_id() -> PublishId {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let sequence = NEXT.fetch_add(1, AtomicOrdering::Relaxed);
-    let clock = SystemTime::now()
+    let sequence = NEXT.fetch_add(1, AtomicOrdering::Relaxed) & 0xFFFF_FFFF;
+    let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|since| since.as_nanos() as u64)
+        .map(|since| since.as_secs())
         .unwrap_or_default();
-    PublishId::from(sequence ^ clock)
+    PublishId::from((secs << 32) | sequence)
 }
 
 /// The absolute time difference between two instants (symmetric — a drift into

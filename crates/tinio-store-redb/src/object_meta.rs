@@ -37,7 +37,7 @@ use crate::{
     },
     acl::{decode_acl_wire, decode_owner_wire},
     error::Error,
-    scan::{drain_pair, for_each_pair},
+    scan::{drain_pair, for_each_pair, has_prefix_pair},
     table::{self, TableDef},
 };
 
@@ -209,6 +209,16 @@ where
             return Ok(None);
         };
         Ok(validate(guard.value()))
+    }
+
+    /// Whether `bucket` has any object row. The entries of one bucket are
+    /// contiguous from `(bucket, "")` — the first key at or after the lower
+    /// bound is in the bucket iff any exist — and the probe **decodes
+    /// nothing**: a delete marker's row, a corrupt-etag row and a
+    /// domain-invalid key row all count as rows, which is the bucket
+    /// teardown's rule (see [`crate::_core::meta::ObjectMeta::has_objects`]).
+    pub fn has_bucket(&self, bucket: &str) -> Result<bool, Error> {
+        has_prefix_pair(&self.0, (bucket, ""), |b, _| b == bucket)
     }
 
     /// Visit every row of `bucket` (contiguous from `(bucket, "")`) with
@@ -823,5 +833,41 @@ mod tests {
             ["c.txt"],
             "a bound past the middle still ends at the bucket's last row"
         );
+    }
+
+    #[test]
+    fn object_meta_has_bucket_counts_every_row_and_decodes_none() {
+        // The teardown probe's whole rule, at its one home: the entries of one
+        // bucket are contiguous from `(bucket, "")`, so the first key at or
+        // after the lower bound answers it, and the probe decodes nothing — a
+        // delete marker's row, a corrupt-etag row and a domain-invalid-key row
+        // are all rows. One row of each flavour sits in its own bucket, so a
+        // probe that walked (or decoded) would answer differently.
+        let h = handle();
+        let row = |etag: &'static str, marker: bool| {
+            (etag, 0u64, 0u64, 0u64, "", "", "", "", "null", 0u64, marker)
+        };
+        let etag = "d41d8cd98f00b204e9800998ecf8427e";
+        h.write(|txn| -> Result<(), Error> {
+            let mut t = Table::open(txn)?;
+            assert!(!t.has_bucket("data")?, "a bucket with no row has none");
+            t.insert(("data", "a.txt"), row(etag, false))?;
+            t.insert(("marker", "a.txt"), row(etag, true))?;
+            t.insert(("invalid-key", "../evil"), row(etag, false))?;
+            t.insert(("corrupt-etag", "a.txt"), row("not-an-etag", false))?;
+            assert!(t.has_bucket("data")?);
+            assert!(t.has_bucket("marker")?, "a delete marker's row counts");
+            assert!(
+                t.has_bucket("invalid-key")?,
+                "a domain-invalid key row counts"
+            );
+            assert!(t.has_bucket("corrupt-etag")?, "a corrupt-etag row counts");
+            assert!(
+                !t.has_bucket("data-2")?,
+                "another bucket's rows never count"
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 }

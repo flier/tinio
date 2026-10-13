@@ -1237,7 +1237,7 @@ impl ObjectOps for FsStorage {
             {
                 let plane = self.version_plane(bucket);
                 self.objects()
-                    .put_object_versioned(&plane, bucket, key, staged, tags, owner, acl)
+                    .put_object_versioned(&plane, bucket, key, staged, tags, owner, acl, self)
                     .await
                     .map_err(Error::from)?
             }

@@ -459,6 +459,16 @@ pub trait ObjectMeta: Send + Sync + 'static {
         Self: Metadata;
 
     /// Remove one row. `Ok(false)` is a missing row; `Ok(true)` was present.
+    ///
+    /// **The key's version slot is not this call's.** `current_slots` is the
+    /// version plane's own state ([`VersionMeta::current_slot`](crate::meta::VersionMeta::current_slot)), a slot with no
+    /// object row is a recorded state the contract admits, and the calls that
+    /// retire a slot are the version plane's own `advance_slot` and
+    /// `restore_slot` plus the bucket teardown — never a row removal (the
+    /// 2026-10-13 ruling, which the fs and redb stores already follow and pg
+    /// followed only in its version plane). The retained part list *is* this
+    /// call's: it goes with the row, exactly as it does for
+    /// [`ObjectMeta::remove_many`].
     async fn remove(
         &self,
         bucket: &bucket::Name,
@@ -506,6 +516,30 @@ pub trait ObjectMeta: Send + Sync + 'static {
         &self,
         bucket: &bucket::Name,
     ) -> Result<Vec<(object::Key, Option<Row>)>, <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// Whether the bucket holds **any object row** — the bucket teardown's
+    /// metadata-plane probe.
+    ///
+    /// A current **delete marker** is a row here and writes no content, so the
+    /// content plane alone cannot answer it: a bucket whose only remaining
+    /// state is a marker must refuse the teardown (S3's own rule, and the
+    /// predicate the pg backend's teardown already carries:
+    /// `exists(SELECT 1 FROM object_meta WHERE bucket = $1)`). The retained
+    /// part list is this plane's too — a row with no part rows still counts.
+    ///
+    /// The probe is over the bucket's own key range and **decodes nothing**,
+    /// so a domain-invalid key row counts exactly as a healthy one does — the
+    /// newly agreed cross-backend rule, which pg's `exists` has always
+    /// answered. Version rows and index entries are another plane's and are
+    /// deliberately **not** consulted: they do not block a teardown.
+    ///
+    /// Deliberately not defaulted: the only bodies this trait's other methods
+    /// could spell are the two traversals, and neither answers the rule —
+    /// `walk` fails on a corrupt row and `walk_healing` skips a
+    /// domain-invalid key row, while a probe must count both and never fail.
+    async fn has_objects(&self, bucket: &bucket::Name) -> Result<bool, <Self as Metadata>::Error>
     where
         Self: Metadata;
 

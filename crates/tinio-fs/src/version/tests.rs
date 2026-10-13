@@ -17,7 +17,10 @@ use crate::{
         storage::{self, BucketOps, ObjectOps, VersionOps},
         version::{self, ListParams},
     },
-    _store_redb::{object_meta::Stored, version as rows},
+    _store_redb::{
+        object_meta::{self, Stored},
+        version as rows,
+    },
     _util::testing::conformance_versioning,
     FsStorage,
     database::Error as DatabaseError,
@@ -111,6 +114,22 @@ fn version_rows(storage: &FsStorage, b: &bucket::Name, key: &object::Key) -> Vec
 /// The key's file exists in the bucket tree.
 fn file_exists(root: &tempfile::TempDir, key: &str) -> bool {
     fs::metadata(root.path().join("data").join(key)).is_ok()
+}
+
+/// Whether the bucket holds any `object_meta` row — the shared table probe
+/// ([`object_meta::Table::has_bucket`], the one `ObjectMeta::has_objects` and
+/// the teardown's `remove_if_empty` both answer from), read through the
+/// store's own handle like [`version_rows`] is. It **decodes nothing**, so a
+/// delete marker's row counts; the store's own `walk` is the wrong oracle (it
+/// drops a marker's row and materializes the bucket).
+fn has_object_rows(storage: &FsStorage, b: &bucket::Name) -> bool {
+    let b = b.clone();
+    storage
+        .handle()
+        .read(move |txn| {
+            Ok(object_meta::Table::open_readonly(txn)?.has_bucket(b.as_ref().as_str())?)
+        })
+        .unwrap()
 }
 
 /// The key's recorded `object_meta` row — the pair the staleness gate judges.
@@ -1412,6 +1431,163 @@ async fn deleting_the_last_version_of_a_prefixed_key_prunes_the_prefix_directory
 }
 
 #[tokio::test]
+async fn a_bucket_holding_only_a_delete_marker_is_not_empty() {
+    let (root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let key = object::key("notes.txt").unwrap();
+    let only = put(&storage, &b, &key, b"first").await.version_id.unwrap();
+    let marker = storage
+        .delete_object(&b, &key)
+        .await
+        .unwrap()
+        .id
+        .expect("an enabled bucket's marker carries an identity");
+
+    // A marker writes no file: the tree alone reads empty, so the
+    // directory-based check this leg used to satisfy would delete the
+    // bucket. The metadata-plane row still refuses (S3's own rule, and the
+    // pg backend's teardown gate).
+    assert_eq!(
+        fs::read_dir(root.path().join("data")).unwrap().count(),
+        0,
+        "the marker leaves no file behind"
+    );
+    assert!(
+        has_object_rows(&storage, &b),
+        "the marker is an object_meta row"
+    );
+    let err = storage::Error::from(storage.delete_bucket(&b).await.unwrap_err());
+    assert!(matches!(err, storage::Error::NotEmpty(_)), "{err:?}");
+
+    // Every version and the marker removed: the rows go with the last one,
+    // and the bucket deletes again.
+    storage
+        .delete_object_version(&b, &key, Some(&marker))
+        .await
+        .unwrap();
+    storage
+        .delete_object_version(&b, &key, Some(&only))
+        .await
+        .unwrap();
+    assert!(
+        !has_object_rows(&storage, &b),
+        "the last version's removal drops the key's object row"
+    );
+    storage.delete_bucket(&b).await.unwrap();
+}
+
+#[tokio::test]
+async fn version_history_alone_does_not_block_a_teardown() {
+    // Invariant 4 of the shared-emptiness change: a bucket's `version` /
+    // `version_index` rows are **not** an emptiness probe — the teardown
+    // clears them with the rest of the derived state (pg deletes them under
+    // the same `clear` flag; this is fs agreeing), instead of letting them
+    // pin the bucket undeletable.
+    //
+    // The state is reachable through the public API by **leaving the
+    // versioning epoch**: an enabled bucket's superseded version is history,
+    // and once the bucket stops recording versions the version-free DELETE
+    // takes the live object row and leaves that history behind — so the
+    // bucket holds version rows and no object row.
+    let (root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let key = object::key("notes.txt").unwrap();
+    put(&storage, &b, &key, b"first").await;
+    put(&storage, &b, &key, b"second").await;
+    assert!(
+        !version_rows(&storage, &b, &key).is_empty(),
+        "the superseded version left history"
+    );
+    assert!(
+        storage.blobs_dir().join("data").is_dir(),
+        "and its content is in the bucket's block subtree"
+    );
+
+    storage
+        .set_bucket_versioning(&b, version::State::Unversioned)
+        .await
+        .unwrap();
+    storage.delete_object(&b, &key).await.unwrap();
+    assert!(
+        !has_object_rows(&storage, &b),
+        "the version-free delete removed the object row"
+    );
+    assert!(
+        !version_rows(&storage, &b, &key).is_empty(),
+        "and left the version history: the bucket holds version rows, no object row"
+    );
+    assert_eq!(
+        fs::read_dir(root.path().join("data")).unwrap().count(),
+        0,
+        "the tree alone reads empty: the version rows are all that is left"
+    );
+
+    // The teardown proceeds — the rows are no probe — and the removal
+    // pipeline takes them with the bucket's other state.
+    storage.delete_bucket(&b).await.unwrap();
+    assert!(!root.path().join("data").exists());
+    assert!(
+        version_rows(&storage, &b, &key).is_empty(),
+        "the teardown cleared the version rows"
+    );
+    assert!(
+        !storage.blobs_dir().join("data").exists(),
+        "and the bucket's block subtree with them"
+    );
+}
+
+#[tokio::test]
+async fn a_versioned_bucket_with_live_content_and_a_marker_is_not_empty() {
+    let (root, storage, b) = fixture().await;
+    storage
+        .set_bucket_versioning(&b, version::State::Enabled)
+        .await
+        .unwrap();
+    let keep = object::key("keep.txt").unwrap();
+    let gone = object::key("gone.txt").unwrap();
+    let live = put(&storage, &b, &keep, b"keep").await.version_id.unwrap();
+    put(&storage, &b, &gone, b"gone").await;
+    let marker = storage.delete_object(&b, &gone).await.unwrap();
+    assert!(marker.is_delete_marker);
+    assert!(file_exists(&root, "keep.txt"), "the live object stays");
+    assert!(
+        !file_exists(&root, "gone.txt"),
+        "the markered object's file is gone"
+    );
+
+    // The live version goes too: the tree now holds nothing, so a
+    // directory-only predicate answers empty — the marker's row is the only
+    // refusal left, and it must still answer it (the old directory-only gate
+    // deleted the bucket here, which is the property this leg pins).
+    storage
+        .delete_object_version(&b, &keep, Some(&live))
+        .await
+        .unwrap();
+    assert!(
+        !file_exists(&root, "keep.txt"),
+        "the removed live version leaves no file"
+    );
+    assert_eq!(
+        fs::read_dir(root.path().join("data")).unwrap().count(),
+        0,
+        "the tree alone reads empty once the live version is gone"
+    );
+    assert!(
+        has_object_rows(&storage, &b),
+        "the marker's object_meta row is the content the tree cannot see"
+    );
+
+    let err = storage::Error::from(storage.delete_bucket(&b).await.unwrap_err());
+    assert!(matches!(err, storage::Error::NotEmpty(_)), "{err:?}");
+}
+
+#[tokio::test]
 async fn a_simple_delete_of_a_prefixed_key_prunes_the_prefix_directory() {
     let (root, storage, b) = fixture().await;
     storage
@@ -1428,7 +1604,10 @@ async fn a_simple_delete_of_a_prefixed_key_prunes_the_prefix_directory() {
         !root.path().join("data").join("logs").exists(),
         "the marker path prunes the emptied prefix directory too"
     );
-    storage.delete_bucket(&b).await.unwrap();
+    // The pruned tree is empty, but the marker is still an `object_meta`
+    // row: the teardown refuses, as the pg backend's does.
+    let err = storage::Error::from(storage.delete_bucket(&b).await.unwrap_err());
+    assert!(matches!(err, storage::Error::NotEmpty(_)), "{err:?}");
 }
 
 #[tokio::test]

@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT current_setting('default_transaction_read_only') AS \"setting!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "setting!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6ab0ba598bfd8c0e38771d320f4c963c27366a6b7ce0e4a607c88af67f0b31f8"
+}

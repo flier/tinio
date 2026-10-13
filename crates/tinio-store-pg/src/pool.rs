@@ -2,17 +2,35 @@
 //!
 //! PG9/PG10/PG26: the pool is `sqlx::PgPool`, sized by `[storage.pg] pool` with
 //! an acquire timeout and `test_before_acquire` as the health check; TLS uses
-//! the driver's rustls connector over the system trust store. Two mappings are
-//! the store's, not the driver's defaults: an omitted `sslmode` is treated as
-//! **require** (chain *and* hostname verified), and `require` itself is upgraded
-//! to the driver's `verify-full`, because the driver's own `Require` stops at
-//! the chain and never checks the hostname. Plaintext happens only with an
+//! the driver's rustls connector over the system trust store. The mode set is
+//! the store's own and has exactly two members: `disable`, and `require` — the
+//! driver's `verify-full`, so the chain **and** the hostname are checked. An
+//! omitted `sslmode` is `require` (PG10), and plaintext happens only with an
 //! explicit `sslmode=disable`.
+//!
+//! The driver's `prefer` is **refused**, not mapped (R1): sqlx sets
+//! `accept_invalid_certs` for every mode below `verify-ca` and disables the
+//! hostname check below `verify-full`, so a `prefer` session would install a
+//! verifier that accepts any certificate and would authenticate nobody. Every
+//! other spelling — `allow`, `verify-ca`, `verify-full`, an unknown value, or a
+//! key the driver's own parse would ignore — is refused with the two accepted
+//! modes named.
+//!
+//! The dsn's own text decides a session, and the read of it is held to the
+//! driver's parse rather than trusted on its own: the query text is read with
+//! the driver's key match (a case-sensitive `sslmode`/`ssl-mode`, the last
+//! occurrence winning), the resolved mode is written onto the driver's options
+//! explicitly, and a text the driver read differently is refused instead of
+//! being served as an omission. A `PG*` environment is therefore never the
+//! decider: `PGSSLMODE` is refused when it would weaken the mode the dsn
+//! resolved, and `PGAPPNAME` cannot rename a session (the store's own
+//! `application_name` is set unless the dsn names one), which is the name the
+//! ownership refusal and `doctor` report (PG12).
 //!
 //! The dsn carries the password; the parsed options hold it and nothing else
 //! does. Every rendering this module produces is the redacted form (PG5).
 
-use std::{ops::Deref, time::Duration};
+use std::{env, mem, ops::Deref, time::Duration};
 
 use derive_more::Debug;
 use futures::{future::BoxFuture, stream::BoxStream};
@@ -24,7 +42,10 @@ use sqlx::{
     },
 };
 
-use crate::error::{Error, redact_userinfo};
+use crate::{
+    Access,
+    error::{Error, redact_userinfo},
+};
 
 /// The default pool size (`[storage.pg] pool` overrides it).
 pub const DEFAULT_POOL_SIZE: u32 = 8;
@@ -35,7 +56,7 @@ pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The `application_name` every connection this crate opens reports, so
 /// `pg_stat_activity` can name the session that holds a lock: a lock's refusal
 /// and `doctor` both read it back (PG12).
-const APPLICATION_NAME: &str = "tinio-store-pg";
+pub(crate) const APPLICATION_NAME: &str = "tinio-store-pg";
 
 /// The session setting a read-only pool opens every connection with (PG6,
 /// PG26): the second of the three read-only layers, in place **before the first
@@ -44,11 +65,28 @@ const APPLICATION_NAME: &str = "tinio-store-pg";
 /// such a session even when the entry guard above was bypassed.
 const READ_ONLY_SESSION_OPTION: (&str, &str) = ("default_transaction_read_only", "on");
 
-/// The TLS mode the store serves under (PG10).
+/// A lookup for the libpq environment variables the driver seeds its options
+/// from (`PGSSLMODE`, `PGAPPNAME`, `PGOPTIONS`, …).
 ///
-/// The mode set is the client's own: `disable`, `prefer` and `require`
-/// (`verify-ca`/`verify-full` are not driver modes). `require` verifies the chain
-/// **and** the hostname.
+/// The store's own decisions read that environment through this, so a test can
+/// hand in the environment a deployment would have — mutating the process's own
+/// is not something a test in this crate may do (`unsafe_code` is forbidden, and
+/// `std::env::set_var` is unsafe in edition 2024).
+pub(crate) type Environment<'e> = &'e dyn Fn(&str) -> Option<String>;
+
+/// The process's own libpq environment: the one every parsed dsn reads unless a
+/// test has handed in another.
+pub(crate) fn process_environment(name: &str) -> Option<String> {
+    env::var(name).ok()
+}
+
+/// The TLS mode the store serves under (PG10, R1).
+///
+/// Two modes and no third: `disable` is plaintext, and only because the operator
+/// wrote it, while `require` verifies the chain **and** the hostname. The
+/// driver's `prefer` is deliberately absent — sqlx installs a verifier that
+/// accepts any certificate for it — and a dsn asking for it is refused rather
+/// than mapped onto something it does not mean.
 ///
 /// # Examples
 ///
@@ -56,43 +94,198 @@ const READ_ONLY_SESSION_OPTION: (&str, &str) = ("default_transaction_read_only",
 /// use tinio_store_pg::pool::SslMode;
 ///
 /// assert_eq!(SslMode::Require.to_string(), "require");
+/// assert_eq!(SslMode::Disable.to_string(), "disable");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
 #[display(style = "kebab-case")]
 pub enum SslMode {
     /// Plaintext, and only because the operator wrote `sslmode=disable`.
     Disable,
-    /// TLS when the server offers it, plaintext otherwise.
-    Prefer,
     /// TLS required, with the chain and the hostname verified.
     Require,
 }
 
 impl SslMode {
-    /// The mode a parsed dsn asks for. An omitted mode is `require` (PG10);
-    /// `allow` and `verify-ca`/`verify-full` fold onto the nearest mode in the
-    /// client's real set rather than being silently downgraded.
-    fn of(options: &PgConnectOptions, ssl_required: bool) -> Self {
-        match options.get_ssl_mode() {
-            PgSslMode::Disable => Self::Disable,
-            PgSslMode::Prefer if ssl_required => Self::Prefer,
-            PgSslMode::Allow
-            | PgSslMode::Prefer
-            | PgSslMode::Require
-            | PgSslMode::VerifyCa
-            | PgSslMode::VerifyFull => Self::Require,
-        }
-    }
-
-    /// The driver mode this store maps the mode onto: `require` becomes the
-    /// driver's `verify-full` so the chain and the hostname are both checked.
+    /// The driver mode a session is opened under: `require` becomes the driver's
+    /// `verify-full`, so the chain and the hostname are both checked.
     fn driver(self) -> PgSslMode {
         match self {
             Self::Disable => PgSslMode::Disable,
-            Self::Prefer => PgSslMode::Prefer,
             Self::Require => PgSslMode::VerifyFull,
         }
     }
+
+    /// The mode the **driver's own parse** of this store's spelling yields. The
+    /// driver's `require` stops at the chain, so it is not what a session is
+    /// opened with ([`Self::driver`] upgrades it); it is the form the store's
+    /// reading of the dsn text is checked against, so a dsn whose parse
+    /// disagrees with that reading is refused rather than served.
+    fn parsed(self) -> PgSslMode {
+        match self {
+            Self::Disable => PgSslMode::Disable,
+            Self::Require => PgSslMode::Require,
+        }
+    }
+}
+
+/// What a dsn's own query text says about one parameter.
+///
+/// The reading is the driver's: `sqlx` matches a URL's query keys
+/// case-sensitively and the last occurrence of a key wins, so a parameter
+/// spelled in another case is a token the driver never sees. That case is its
+/// own answer — [`NamedParameter::Ignored`] — rather than an omission, because
+/// serving it as one is how `?SSLMODE=require` became a plaintext-allowing
+/// `prefer` (the 2026-10-13 review's root cause, R1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedParameter<'d> {
+    /// The dsn names the parameter, with the last spelling's value.
+    Named(&'d str),
+    /// The dsn does not name it.
+    Absent,
+    /// The dsn names it in a case the driver's own parse ignores; the spelling
+    /// is carried so the refusal can quote it.
+    Ignored(&'d str),
+}
+
+/// Read one parameter out of a dsn's own query text, with the driver's rules
+/// (`sqlx`'s URL parse): the pairs after the first `?` up to any `#`, split on
+/// `&`, each split at its first `=`, matched by the exact key spelling.
+///
+/// The values are **not** percent-decoded here, which is deliberate: a key
+/// spelled with a percent-escape is a key this reading cannot see, and the
+/// driver's parse of the same text is required to agree with the reading
+/// ([`SslMode`]'s cross-check), so such a dsn is refused rather than guessed at.
+fn named_parameter<'d>(dsn: &'d str, name: &str) -> NamedParameter<'d> {
+    let query = dsn
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or_default();
+    let query = query.split('#').next().unwrap_or(query);
+    let mut found = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == name {
+            found = Some(value);
+        } else if key.eq_ignore_ascii_case(name) {
+            return NamedParameter::Ignored(key);
+        }
+    }
+    match found {
+        Some(value) => NamedParameter::Named(value),
+        None => NamedParameter::Absent,
+    }
+}
+
+/// Whether two driver modes are the same variant. The driver's `PgSslMode`
+/// carries no `PartialEq`, so the comparison is by discriminant — the variant is
+/// the whole of what a mode is.
+fn same_mode(left: PgSslMode, right: PgSslMode) -> bool {
+    mem::discriminant(&left) == mem::discriminant(&right)
+}
+
+/// The TLS mode a dsn's own text names, or the refusal that states the two this
+/// store serves (PG10, R1).
+///
+/// This runs **before** the driver's parse, because an unknown value fails that
+/// parse with a message naming no mode this store accepts, and an omitted mode
+/// is `require` — the store's policy rather than the driver's `prefer` default.
+fn named_ssl_mode(named: NamedParameter<'_>) -> Result<SslMode, Error> {
+    match named {
+        NamedParameter::Ignored(spelling) => Err(Error::SslMode {
+            reason: format!(
+                "the dsn spells `{spelling}` (`sslmode` in another case), which the driver's own \
+                 parse ignores — it would be served as an omitted mode and never as the mode it \
+                 says"
+            ),
+        }),
+        NamedParameter::Absent => Ok(SslMode::Require),
+        NamedParameter::Named(value) if value.eq_ignore_ascii_case("disable") => {
+            Ok(SslMode::Disable)
+        }
+        NamedParameter::Named(value) if value.eq_ignore_ascii_case("require") => {
+            Ok(SslMode::Require)
+        }
+        NamedParameter::Named(value) => Err(Error::SslMode {
+            reason: format!(
+                "the dsn asks for `{value}`, which is not a mode this store maps onto a session \
+                 it can vouch for: the driver's `prefer` installs a verifier that accepts any \
+                 certificate, and `allow` opens in plaintext first"
+            ),
+        }),
+    }
+}
+
+/// Check that the driver's own parse of the dsn agrees with the reading above
+/// (PG10, R1).
+///
+/// The two are one text read twice, so a disagreement means the mode the
+/// operator wrote is not the mode the session would open under — a key this
+/// reading cannot see (a percent-escaped spelling), or a later occurrence the
+/// driver read differently. Refusing is the only answer that cannot end in a
+/// session weaker than the dsn appears to ask for.
+fn check_driver_parse(
+    named: NamedParameter<'_>,
+    mode: SslMode,
+    parsed: &PgConnectOptions,
+    seeded: PgSslMode,
+) -> Result<(), Error> {
+    let spelling = match named {
+        NamedParameter::Named(value) => Some(value),
+        NamedParameter::Absent => None,
+        NamedParameter::Ignored(_) => return Ok(()),
+    };
+    // An omitted mode that the driver read as *something it would not have read
+    // on its own* is a spelling this reading cannot see; a named mode the driver
+    // read as another value is a text the two readings disagree about.
+    let read_otherwise = spelling.map_or(seeded, |_| mode.parsed());
+    if same_mode(parsed.get_ssl_mode(), read_otherwise) {
+        return Ok(());
+    }
+    Err(Error::SslMode {
+        reason: format!(
+            "the dsn's own `sslmode` text and the driver's parse of it disagree (the driver read \
+             {:?}, this store read {}): the mode a session opens under is not one both readings \
+             can see, so spell it plainly as `sslmode=require` or `sslmode=disable`",
+            parsed.get_ssl_mode(),
+            spelling.unwrap_or("an omission")
+        ),
+    })
+}
+
+/// Refuse an environment that would weaken the mode the dsn resolved (R1,
+/// PG10).
+///
+/// The store writes the resolved mode onto the driver's options, so the
+/// environment cannot decide a session — but a `PGSSLMODE` that says the
+/// session may fall back to plaintext is an operator's belief the dsn
+/// contradicts, and `sqlx` seeds the options from it before the dsn is applied.
+/// Naming it is the only thing that can tell them apart.
+fn refuse_a_weakening_environment(env: Environment<'_>, mode: SslMode) -> Result<(), Error> {
+    let Some(raw) = env("PGSSLMODE") else {
+        return Ok(());
+    };
+    let seeded = raw.parse::<PgSslMode>().unwrap_or_default();
+    let weakening = matches!(
+        seeded,
+        PgSslMode::Disable | PgSslMode::Allow | PgSslMode::Prefer
+    );
+    if mode == SslMode::Require && weakening {
+        return Err(Error::SslMode {
+            reason: format!(
+                "the environment sets PGSSLMODE={raw}, which would serve this dsn's `require` as \
+                 {seeded:?} (an omitted `sslmode` is `require`): the dsn's own text decides a \
+                 session's TLS, so unset PGSSLMODE or name the mode in the dsn"
+            ),
+        });
+    }
+    if mode == SslMode::Disable && raw != "disable" {
+        tracing::warn!(
+            variable = "PGSSLMODE",
+            value = %raw,
+            "the environment sets PGSSLMODE, which the dsn's own `sslmode=disable` overrides"
+        );
+    }
+    Ok(())
 }
 
 /// A connection string and what it says. Only the redacted text is kept — the
@@ -106,9 +299,9 @@ pub(crate) struct Dsn {
     host: String,
     database: String,
     mode: SslMode,
-    /// Whether the session is opened read-only (PG6): `default_transaction_read_only = on`
-    /// rides the connection's startup options.
-    read_only: bool,
+    /// The session mode (PG6): `Access::ReadOnly`'s connections carry
+    /// `default_transaction_read_only = on` as a startup option.
+    access: Access,
     #[debug(skip)]
     options: PgConnectOptions,
 }
@@ -117,7 +310,7 @@ impl Dsn {
     /// Parse a dsn. The password is written into the driver's options and
     /// nowhere else: every rendering this type produces is the redacted form.
     pub(crate) fn parse(dsn: &str) -> Result<Self, Error> {
-        Self::parse_with(dsn, false)
+        Self::parse_with(dsn, Access::ReadWrite, &process_environment)
     }
 
     /// Parse a dsn whose session is opened **read-only** (PG6, layer 2): the
@@ -125,45 +318,74 @@ impl Dsn {
     /// option, so the setting is in place before the first statement rather
     /// than established by one (PG26).
     pub(crate) fn parse_read_only(dsn: &str) -> Result<Self, Error> {
-        Self::parse_with(dsn, true)
+        Self::parse_with(dsn, Access::ReadOnly, &process_environment)
     }
 
-    fn parse_with(dsn: &str, read_only: bool) -> Result<Self, Error> {
-        let options: PgConnectOptions = dsn
+    fn parse_with(dsn: &str, access: Access, env: Environment<'_>) -> Result<Self, Error> {
+        // The single-line statement rule of docs/style.md §SQL reads the other
+        // way here: this is the dsn's own text, read by hand, and the driver's
+        // parse of the same text is what it is checked against. The mode is
+        // resolved from the text **first**: an unknown value fails the driver's
+        // own parse with a message naming no mode this store serves.
+        let named_mode = named_parameter(dsn, "sslmode");
+        let mode = named_ssl_mode(named_mode)?;
+        let parsed: PgConnectOptions = dsn
             .parse()
             .map_err(|err| Error::database(&format!("invalid dsn: {err}"), dsn))?;
-        let host = options.get_host().to_owned();
-        let database = options.get_database().unwrap_or_default().to_owned();
-        let mode = SslMode::of(&options, names_an_ssl_mode(dsn));
+        let seeded = PgConnectOptions::new_without_pgpass().get_ssl_mode();
+        check_driver_parse(named_mode, mode, &parsed, seeded)?;
+        refuse_a_weakening_environment(env, mode)?;
+        let host = parsed.get_host().to_owned();
+        // libpq's own default, which the driver's startup packet leaves to the
+        // server: a dsn that names no database connects to one named after the
+        // user. Reporting the empty string made `Pool::database`, `doctor` and
+        // every `Error::Connect { database }` name nothing while the driver
+        // connected somewhere real.
+        let database = parsed
+            .get_database()
+            .map(str::to_owned)
+            .unwrap_or_else(|| parsed.get_username().to_owned());
         // A session this crate opens is nameable in `pg_stat_activity`, which
         // is what lets a second writable instance name the owner of the lock it
-        // could not take (PG12). An `application_name` the dsn itself names is
-        // left alone.
-        let options = match options.get_application_name() {
-            Some(name) if !name.is_empty() => options,
-            _ => options.application_name(APPLICATION_NAME),
+        // could not take (PG12). The environment is not consulted: a dsn that
+        // names an `application_name` is the operator speaking and is kept —
+        // the driver has already decoded it — and everything else gets this
+        // crate's own name, so `PGAPPNAME` cannot rename the session a lock
+        // refusal reports.
+        let dsn_names_the_session = matches!(
+            named_parameter(dsn, "application_name"),
+            NamedParameter::Named(_)
+        ) && parsed
+            .get_application_name()
+            .is_some_and(|name| !name.is_empty());
+        let options = if dsn_names_the_session {
+            parsed
+        } else {
+            parsed.application_name(APPLICATION_NAME)
         };
         let options = options.ssl_mode(mode.driver());
         // Appended, never set: a dsn that already carries `options=` keeps its
-        // own settings, and the read-only one rides beside them.
-        let options = if read_only {
-            options.options([READ_ONLY_SESSION_OPTION])
-        } else {
+        // own settings, and the read-only one rides beside them — last, so a
+        // `default_transaction_read_only=off` from the dsn or from `PGOPTIONS`
+        // cannot outrank it.
+        let options = if access.is_writable() {
             options
+        } else {
+            options.options([READ_ONLY_SESSION_OPTION])
         };
         Ok(Self {
             dsn: redact_userinfo(dsn),
             host,
             database,
             mode,
-            read_only,
+            access,
             options,
         })
     }
 
-    /// Whether this dsn's session is opened read-only.
-    pub(crate) fn read_only(&self) -> bool {
-        self.read_only
+    /// The session mode this dsn opens under (PG6).
+    pub(crate) fn access(&self) -> Access {
+        self.access
     }
 
     /// The dsn with its userinfo password replaced.
@@ -176,7 +398,8 @@ impl Dsn {
         &self.host
     }
 
-    /// The database the dsn names (never a secret).
+    /// The database the session reaches (never a secret): the dsn's own, or the
+    /// user's when it names none.
     pub(crate) fn database(&self) -> &str {
         &self.database
     }
@@ -192,35 +415,9 @@ impl Dsn {
     }
 }
 
-/// Whether the dsn itself names an `sslmode`, as opposed to leaving the
-/// driver's `prefer` default in place.
-///
-/// The word has to be a parameter *name*, not an occurrence inside another
-/// value's text: only the start of the dsn or a separator ahead of it makes it
-/// the operator speaking, so `?application_name=sslmode=require` is an omitted
-/// mode — `require` — and never the driver's `prefer` (PG10).
-fn names_an_ssl_mode(dsn: &str) -> bool {
-    let lowered = dsn.to_ascii_lowercase();
-    let token = "sslmode";
-    let mut from = 0;
-    while let Some(index) = lowered[from..].find(token) {
-        let start = from + index;
-        let opens_a_parameter = start == 0
-            || matches!(
-                lowered.as_bytes()[start - 1],
-                b'?' | b'&' | b' ' | b'\t' | b'\n' | b'\r'
-            );
-        if opens_a_parameter && lowered[start + token.len()..].trim_start().starts_with('=') {
-            return true;
-        }
-        from = start + token.len();
-    }
-    false
-}
-
 /// The store's connection pool and the facts `doctor` reports about it.
 ///
-/// `Debug` renders the identity (`mode`, `host`, `database`, `read_only`) and
+/// `Debug` renders the identity (`mode`, `host`, `database`, `access`) and
 /// skips the driver's pool, the driver's options and the dsn, so a store's
 /// rendering carries no secret (PG5).
 ///
@@ -248,7 +445,10 @@ pub struct Pool {
     mode: SslMode,
     host: String,
     database: String,
-    read_only: bool,
+    /// The session mode every connection this pool opens is built for (PG6).
+    /// Carried rather than derived, because a store handed this pool has to be
+    /// able to tell whether the two agree ([`Pool::reopened_for`]).
+    access: Access,
     /// The driver's options **every** connection this pool opens is built from — the pooled ones
     /// and a dedicated out-of-pool one alike — so the read-only startup option reaches the
     /// dedicated connection too and a pool cannot hand out a session with more privilege than it
@@ -259,6 +459,22 @@ pub struct Pool {
     /// Skipped by `Debug` like the driver's pool and the raw dsn: the rendering is the identity.
     #[debug(skip)]
     redacted: String,
+}
+
+/// The lazy pool both constructors build: the size, the acquire timeout and the
+/// health check are the store's (PG9), and the connections are built from
+/// `options` — the same options a dedicated out-of-pool connection uses, so a
+/// re-opened session carries exactly what a fresh one would.
+fn lazy_pool(
+    options: &PgConnectOptions,
+    max_connections: u32,
+    acquire_timeout: Duration,
+) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(max_connections.max(1))
+        .acquire_timeout(acquire_timeout)
+        .test_before_acquire(true)
+        .connect_lazy_with(options.clone())
 }
 
 impl Pool {
@@ -340,7 +556,7 @@ impl Pool {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn open_for(dsn: &str, max_connections: u32, access: crate::Access) -> Result<Self, Error> {
+    pub fn open_for(dsn: &str, max_connections: u32, access: Access) -> Result<Self, Error> {
         if access.is_writable() {
             Self::open(dsn, max_connections)
         } else {
@@ -382,11 +598,7 @@ impl Pool {
     /// the access mode is decided in exactly one place — the parse (PG6).
     fn build(parsed: Dsn, max_connections: u32, acquire_timeout: Duration) -> Result<Self, Error> {
         let options = parsed.options();
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections.max(1))
-            .acquire_timeout(acquire_timeout)
-            .test_before_acquire(true)
-            .connect_lazy_with(options.clone());
+        let pool = lazy_pool(&options, max_connections, acquire_timeout);
         // PG10: the mode the connection is opened under is logged, and
         // [`Pool::ssl_mode`] reports the same value to `doctor`. The driver
         // exposes no post-handshake negotiation state, so this is the resolved
@@ -395,7 +607,7 @@ impl Pool {
             mode = %parsed.mode(),
             host = %parsed.host(),
             database = %parsed.database(),
-            read_only = parsed.read_only(),
+            read_only = !parsed.access().is_writable(),
             max_connections = max_connections.max(1),
             "postgres pool opened"
         );
@@ -404,9 +616,53 @@ impl Pool {
             mode: parsed.mode(),
             host: parsed.host().to_owned(),
             database: parsed.database().to_owned(),
-            read_only: parsed.read_only(),
+            access: parsed.access(),
             options,
             redacted: parsed.redacted().to_owned(),
+        })
+    }
+
+    /// This pool, re-opened in the session `access` names (PG6, layer 2).
+    ///
+    /// A store's `connect_with_pool` cannot tell what session the pool it was
+    /// handed opens, so it asks for the session it needs: a pool that already
+    /// carries the mode is returned as it is, and a **read-only** store over a
+    /// writable pool gets a pool whose connections are opened with
+    /// `default_transaction_read_only = on` (the size, the acquire timeout and
+    /// the options are this pool's own, with the read-only startup option
+    /// appended last, so nothing the source pool carried is loosened).
+    ///
+    /// The other direction is [`Error::ReadOnlyPoolForAWriter`]: a read-only
+    /// pool's options carry the startup option this crate appended and a pool
+    /// holds no un-redacted dsn to rebuild them from, so a writable store over
+    /// one is refused rather than repaired.
+    pub(crate) fn reopened_for(&self, access: Access) -> Result<Self, Error> {
+        if self.access == access {
+            return Ok(self.clone());
+        }
+        if access.is_writable() {
+            return Err(Error::ReadOnlyPoolForAWriter);
+        }
+        tracing::warn!(
+            host = %self.host,
+            database = %self.database,
+            "the pool handed to a read-only store opens writable sessions: re-opened with \
+             default_transaction_read_only = on (PG6, layer 2)"
+        );
+        let options = self.options.clone().options([READ_ONLY_SESSION_OPTION]);
+        let pool = lazy_pool(
+            &options,
+            self.max_connections(),
+            self.pool.options().get_acquire_timeout(),
+        );
+        Ok(Self {
+            pool,
+            mode: self.mode,
+            host: self.host.clone(),
+            database: self.database.clone(),
+            access,
+            options,
+            redacted: self.redacted.clone(),
         })
     }
 
@@ -415,9 +671,14 @@ impl Pool {
         self.mode
     }
 
+    /// The session mode every connection this pool opens carries (PG6).
+    pub fn access(&self) -> Access {
+        self.access
+    }
+
     /// Whether this pool's sessions are opened read-only (PG6).
     pub fn is_read_only(&self) -> bool {
-        self.read_only
+        !self.access.is_writable()
     }
 
     /// The host the dsn names.
@@ -425,7 +686,9 @@ impl Pool {
         &self.host
     }
 
-    /// The database the dsn names.
+    /// The database the session reaches: the dsn's own, or the user's when the
+    /// dsn names none (libpq's own default, which the driver leaves to the
+    /// server's startup packet).
     pub fn database(&self) -> &str {
         &self.database
     }
@@ -555,8 +818,37 @@ mod tests {
     // purpose: a shortened path would not prove the public one.
     #![allow(clippy::absolute_paths)]
 
-    use super::{DEFAULT_POOL_SIZE, Dsn, Pool, SslMode, names_an_ssl_mode};
-    use crate::error::{Error, redact_userinfo};
+    use super::{
+        DEFAULT_POOL_SIZE, Dsn, Environment, Pool, SslMode, named_parameter, process_environment,
+    };
+    use crate::{
+        Access,
+        error::{Error, redact_userinfo},
+    };
+
+    /// An environment with nothing in it: the dsn is then the only decider, which
+    /// is what most of these legs are about.
+    fn no_environment() -> impl Fn(&str) -> Option<String> {
+        |_| None
+    }
+
+    /// One variable, as a deployment would export it.
+    fn environment(variable: &'static str, value: &str) -> impl Fn(&str) -> Option<String> {
+        let value = value.to_owned();
+        move |name: &str| (name == variable).then(|| value.clone())
+    }
+
+    /// A parse with the libpq environment emptied, so a leg's answer is the
+    /// dsn's own: a `PGSSLMODE` on the developer's host must not decide whether
+    /// these legs pass.
+    fn parse(dsn: &str) -> Result<Dsn, Error> {
+        Dsn::parse_with(dsn, Access::ReadWrite, &no_environment())
+    }
+
+    /// The same, read-only (PG6, layer 2).
+    fn parse_read_only(dsn: &str) -> Result<Dsn, Error> {
+        Dsn::parse_with(dsn, Access::ReadOnly, &no_environment())
+    }
 
     #[tokio::test]
     async fn an_omitted_sslmode_is_require() {
@@ -576,7 +868,7 @@ mod tests {
 
     #[test]
     fn require_is_upgraded_to_verify_full() {
-        let dsn = Dsn::parse("postgres://user:password@db.example:5432/tinio?sslmode=require")
+        let dsn = parse("postgres://user:password@db.example:5432/tinio?sslmode=require")
             .expect("the dsn parses");
         assert_eq!(dsn.mode(), SslMode::Require);
         assert!(
@@ -588,9 +880,25 @@ mod tests {
         );
     }
 
+    /// An omitted mode resolves the same way a spelled `require` does, and the
+    /// session is opened under the driver's chain-and-hostname check — the
+    /// promise PG10 makes and the one `prefer` could never keep (R1).
+    #[test]
+    fn an_omitted_mode_resolves_to_verify_full() {
+        let dsn = parse("postgres://user:password@db.example:5432/tinio").expect("the dsn parses");
+        assert_eq!(dsn.mode(), SslMode::Require);
+        assert!(
+            matches!(
+                dsn.options().get_ssl_mode(),
+                sqlx::postgres::PgSslMode::VerifyFull
+            ),
+            "an omission verifies the chain and the hostname"
+        );
+    }
+
     #[test]
     fn an_explicit_disable_stays_plaintext() {
-        let dsn = Dsn::parse("postgres://user:password@db.example:5432/tinio?sslmode=disable")
+        let dsn = parse("postgres://user:password@db.example:5432/tinio?sslmode=disable")
             .expect("the dsn parses");
         assert_eq!(dsn.mode(), SslMode::Disable);
         assert!(matches!(
@@ -599,77 +907,50 @@ mod tests {
         ));
     }
 
+    /// Every spelling outside the store's two is refused, and the refusal names
+    /// both accepted modes and the one that gives up TLS (R1).
     #[test]
-    fn prefer_is_opt_in_and_kept() {
-        let dsn = Dsn::parse("postgres://user:password@db.example:5432/tinio?sslmode=prefer")
-            .expect("the dsn parses");
-        assert_eq!(dsn.mode(), SslMode::Prefer);
-    }
-
-    /// The modes this store does not model fold onto the nearest one it does,
-    /// never onto a weaker one: `allow` (the driver's "plaintext first" mode) and
-    /// both `verify-*` modes all land on `require`, and the connection is opened
-    /// under the driver's chain-and-hostname check.
-    #[test]
-    fn the_unmodelled_ssl_modes_fold_onto_require() {
-        for mode in ["allow", "verify-ca", "verify-full"] {
-            let parsed = Dsn::parse(&format!(
-                "postgres://user:password@db.example:5432/tinio?sslmode={mode}"
-            ))
-            .expect("the dsn parses");
-            assert_eq!(
-                parsed.mode(),
-                SslMode::Require,
-                "sslmode={mode} is not a mode this store serves below require"
-            );
+    fn every_other_mode_is_refused_with_the_two_that_are_served() {
+        for value in ["prefer", "allow", "verify-ca", "verify-full", "bogus"] {
+            let dsn = format!("postgres://user:password@db.example:5432/tinio?sslmode={value}");
+            let err = parse(&dsn).expect_err("a mode this store does not serve is refused");
+            let message = err.to_string();
             assert!(
-                matches!(
-                    parsed.options().get_ssl_mode(),
-                    sqlx::postgres::PgSslMode::VerifyFull
-                ),
-                "sslmode={mode} must not open a weaker connection than require"
+                matches!(&err, Error::SslMode { reason } if reason.contains(value)),
+                "the refusal quotes the spelling: {message}"
+            );
+            assert!(message.contains("`disable`"), "{message}");
+            assert!(message.contains("`require`"), "{message}");
+            assert!(
+                message.contains("only an explicit `disable` gives up TLS"),
+                "the remedy names the one plaintext mode: {message}"
             );
         }
     }
 
-    /// Whether the *operator* named a mode, which is what keeps the driver's own
-    /// `prefer` default from being read as an omission (PG10).
+    /// `?SSLMODE=require` is **refused**, not read as an omission: sqlx matches
+    /// query keys case-sensitively, so the driver would never see the mode the
+    /// operator wrote — the review's root cause, where the old dsn-text probe
+    /// lowercased the text and the dsn was then served at the driver's
+    /// plaintext-allowing default (R1).
     #[test]
-    fn the_ssl_mode_probe_reads_a_token_and_not_a_substring() {
-        assert!(!names_an_ssl_mode(
-            "postgres://user:password@db.example:5432/tinio"
-        ));
-        assert!(names_an_ssl_mode(
-            "postgres://user:password@db.example:5432/tinio?sslmode=require"
-        ));
-        assert!(
-            names_an_ssl_mode("postgres://user:password@db.example:5432/tinio?SSLMODE=require"),
-            "the probe compares case-insensitively"
-        );
-        assert!(
-            names_an_ssl_mode("host=db.example user=tinio sslmode = require"),
-            "a keyword dsn may space the `=`"
-        );
-        assert!(
-            !names_an_ssl_mode("postgres://user:password@db.example:5432/tinio?plansslmode"),
-            "an occurrence without `=` is not the operator speaking"
-        );
-        assert!(
-            !names_an_ssl_mode(
-                "postgres://user:password@db.example:5432/tinio?application_name=sslmode"
-            ),
-            "an occurrence inside another value is not the operator speaking"
-        );
-        assert!(
-            !names_an_ssl_mode(
-                "postgres://user:password@db.example:5432/tinio?application_name=sslmode=require"
-            ),
-            "another value's text may carry `sslmode=` without the operator naming a mode"
-        );
-        // What the last two are for: a dsn that only *mentions* a mode is still
-        // an omission, so it is served at `require` rather than falling back to
-        // the driver's `prefer`, which would take plaintext (PG10).
-        let mentioned = Dsn::parse(
+    fn a_key_the_drivers_parse_ignores_is_refused_rather_than_downgraded() {
+        let err = parse("postgres://user:password@db.example:5432/tinio?SSLMODE=require")
+            .expect_err("an uppercase key is refused");
+        let message = err.to_string();
+        assert!(message.contains("SSLMODE"), "{message}");
+        assert!(message.contains("another case"), "{message}");
+        // And the same for the lowercased-but-not-matching `ssl-mode` alias the
+        // driver does accept, spelled in another case.
+        assert!(parse("postgres://user:password@db.example:5432/tinio?SslMode=disable").is_err());
+    }
+
+    /// A dsn that only *mentions* a mode in another parameter's value is an
+    /// omission (and verifies), which is what makes the text read a parameter
+    /// read rather than a substring search.
+    #[test]
+    fn a_mention_inside_another_value_is_not_a_mode() {
+        let mentioned = parse(
             "postgres://user:password@db.example:5432/tinio?application_name=sslmode=require",
         )
         .expect("the dsn parses");
@@ -681,6 +962,44 @@ mod tests {
             ),
             "a dsn that mentions a mode is still an omission, and an omission verifies"
         );
+        assert_eq!(
+            named_parameter(
+                "postgres://db.example/tinio?application_name=sslmode=require",
+                "sslmode"
+            ),
+            super::NamedParameter::Absent
+        );
+    }
+
+    /// The last occurrence wins, as it does in the driver's own parse, and the
+    /// key must be a whole parameter name.
+    #[test]
+    fn a_parameter_is_read_with_the_drivers_own_rules() {
+        assert_eq!(
+            named_parameter("postgres://db.example/tinio?sslmode=require", "sslmode"),
+            super::NamedParameter::Named("require")
+        );
+        assert_eq!(
+            named_parameter(
+                "postgres://db.example/tinio?sslmode=require&sslmode=disable",
+                "sslmode"
+            ),
+            super::NamedParameter::Named("disable")
+        );
+        assert_eq!(
+            named_parameter("postgres://db.example/tinio?plansslmode=require", "sslmode"),
+            super::NamedParameter::Absent
+        );
+        assert_eq!(
+            named_parameter("postgres://db.example/tinio#sslmode=require", "sslmode"),
+            super::NamedParameter::Absent,
+            "a fragment is not a query"
+        );
+        // The store's reading and the driver's parse agree on both spellings of
+        // a value's case, because the driver lowercases what it parses.
+        let dsn = parse("postgres://user:password@db.example:5432/tinio?sslmode=REQUIRE")
+            .expect("the value's case is the driver's to fold");
+        assert_eq!(dsn.mode(), SslMode::Require);
     }
 
     /// A dsn this crate cannot even parse is the one failure that reaches the
@@ -698,27 +1017,115 @@ mod tests {
         assert!(!err.to_string().contains("sup3rsecret"), "{err}");
     }
 
-    /// A session this crate opens is nameable in `pg_stat_activity`, and a name
-    /// the dsn itself carries is the operator's and is left alone.
+    /// A session this crate opens is nameable in `pg_stat_activity`, a name the
+    /// dsn itself carries is the operator's and is left alone, and an
+    /// environment's `PGAPPNAME` never renames one: the name is what the
+    /// ownership refusal and `doctor` report (PG12).
     #[test]
-    fn a_session_is_named_unless_the_dsn_names_it() {
-        let dsn =
-            Dsn::parse("postgres://user:password@db.example:5432/tinio").expect("the dsn parses");
+    fn a_session_is_named_by_the_dsn_or_by_this_crate_never_by_the_environment() {
+        let dsn = parse("postgres://user:password@db.example:5432/tinio").expect("the dsn parses");
         assert_eq!(
             dsn.options().get_application_name(),
             Some("tinio-store-pg"),
             "the crate's own sessions are nameable"
         );
         let named =
-            Dsn::parse("postgres://user:password@db.example:5432/tinio?application_name=worker-7")
+            parse("postgres://user:password@db.example:5432/tinio?application_name=worker-7")
                 .expect("the dsn parses");
         assert_eq!(named.options().get_application_name(), Some("worker-7"));
-        let empty = Dsn::parse("postgres://user:password@db.example:5432/tinio?application_name=")
+        let empty = parse("postgres://user:password@db.example:5432/tinio?application_name=")
             .expect("the dsn parses");
         assert_eq!(
             empty.options().get_application_name(),
             Some("tinio-store-pg"),
             "an empty name is no name"
+        );
+        // The environment's own name would have been seeded into the options by
+        // the driver; the dsn's silence is what keeps it out.
+        let env = environment("PGAPPNAME", "someone-elses-worker");
+        let seeded = Dsn::parse_with(
+            "postgres://user:password@db.example:5432/tinio",
+            Access::ReadWrite,
+            &env,
+        )
+        .expect("the dsn parses");
+        assert_eq!(
+            seeded.options().get_application_name(),
+            Some("tinio-store-pg"),
+            "PGAPPNAME cannot rename a store's session"
+        );
+        // A dsn that does name one still wins over the environment.
+        let named_in_dsn = Dsn::parse_with(
+            "postgres://user:password@db.example:5432/tinio?application_name=worker-7",
+            Access::ReadWrite,
+            &env,
+        )
+        .expect("the dsn parses");
+        assert_eq!(
+            named_in_dsn.options().get_application_name(),
+            Some("worker-7")
+        );
+    }
+
+    /// The other half of finding 2: an environment that would serve the dsn's
+    /// `require` below it is refused by name, so `PGSSLMODE=disable` cannot turn
+    /// an omitted mode into plaintext (PG10, R1).
+    #[test]
+    fn a_weakening_environment_is_refused_by_name() {
+        for value in ["disable", "prefer", "allow", "bogus"] {
+            let env = environment("PGSSLMODE", value);
+            let err = Dsn::parse_with(
+                "postgres://user:password@db.example:5432/tinio",
+                Access::ReadWrite,
+                &env,
+            )
+            .expect_err("an environment below the dsn's require is refused");
+            let message = err.to_string();
+            assert!(message.contains("PGSSLMODE"), "{message}");
+            assert!(
+                message.contains("unset PGSSLMODE"),
+                "the refusal names the remedy: {message}"
+            );
+        }
+        // A spell `require` dsn under the same environment is still refused:
+        // the environment contradicts the dsn's own text.
+        let env = environment("PGSSLMODE", "prefer");
+        assert!(
+            Dsn::parse_with(
+                "postgres://user:password@db.example:5432/tinio?sslmode=require",
+                Access::ReadWrite,
+                &env,
+            )
+            .is_err()
+        );
+        // The modes that ask for as much as the store's `require` are not a
+        // weakening: the store writes its own resolved mode onto the session.
+        for value in ["require", "verify-ca", "verify-full"] {
+            let env = environment("PGSSLMODE", value);
+            let parsed = Dsn::parse_with(
+                "postgres://user:password@db.example:5432/tinio",
+                Access::ReadWrite,
+                &env,
+            )
+            .expect("an environment that does not weaken the dsn is not a refusal");
+            assert_eq!(parsed.mode(), SslMode::Require);
+            assert!(
+                matches!(
+                    parsed.options().get_ssl_mode(),
+                    sqlx::postgres::PgSslMode::VerifyFull
+                ),
+                "the dsn's remain resolves to the store's chain-and-hostname check"
+            );
+        }
+        // An explicit plaintext dsn is the operator's own decision, so an
+        // environment beside it is not a refusal.
+        assert!(
+            Dsn::parse_with(
+                "postgres://user:password@db.example:5432/tinio?sslmode=disable",
+                Access::ReadWrite,
+                &environment("PGSSLMODE", "require"),
+            )
+            .is_ok()
         );
     }
 
@@ -769,8 +1176,8 @@ mod tests {
 
     #[test]
     fn a_parsed_dsn_never_renders_the_password() {
-        let dsn = Dsn::parse("postgres://tinio:sup3rsecret@db.internal:5432/tinio")
-            .expect("the dsn parses");
+        let dsn =
+            parse("postgres://tinio:sup3rsecret@db.internal:5432/tinio").expect("the dsn parses");
         assert_eq!(
             dsn.redacted(),
             "postgres://tinio:***@db.internal:5432/tinio"
@@ -795,9 +1202,25 @@ mod tests {
         let rendered = format!("{pool:?}");
         assert_eq!(
             rendered,
-            r#"Pool { mode: Disable, host: "db.internal", database: "tinio", read_only: false, .. }"#
+            r#"Pool { mode: Disable, host: "db.internal", database: "tinio", access: ReadWrite, .. }"#
         );
         assert!(!rendered.contains("sup3rsecret"), "{rendered}");
+    }
+
+    /// A dsn that names no database connects to one named after the user — the
+    /// server's own default for a startup packet with no `database` — and that
+    /// is the name the pool, `doctor` and every connect failure report (PG5,
+    /// R9's reporting half).
+    #[tokio::test]
+    async fn a_dsn_with_no_database_names_the_users_own() {
+        let pool =
+            Pool::open("postgres://tinio:sup3rsecret@db.example:5432", 1).expect("the dsn parses");
+        assert_eq!(
+            pool.database(),
+            "tinio",
+            "the effective database is the user's, so nothing renders empty"
+        );
+        assert!(format!("{pool:?}").contains("database: \"tinio\""));
     }
 
     /// The read-only pool (PG6, layer 2) carries `default_transaction_read_only
@@ -807,15 +1230,15 @@ mod tests {
     #[test]
     fn a_read_only_pool_opens_its_session_read_only() {
         let dsn = "postgres://user:password@db.example:5432/tinio";
-        let writable = Dsn::parse(dsn).expect("the dsn parses");
-        assert!(!writable.read_only());
+        let writable = parse(dsn).expect("the dsn parses");
+        assert!(writable.access().is_writable());
         assert!(
             !format!("{:?}", writable.options()).contains("default_transaction_read_only"),
             "a writable session carries no read-only option"
         );
 
-        let read_only = Dsn::parse_read_only(dsn).expect("the dsn parses");
-        assert!(read_only.read_only());
+        let read_only = parse_read_only(dsn).expect("the dsn parses");
+        assert!(!read_only.access().is_writable());
         let rendered = format!("{:?}", read_only.options());
         assert!(
             rendered.contains("default_transaction_read_only=on"),
@@ -825,10 +1248,11 @@ mod tests {
     }
 
     /// A dsn that names its own `options` keeps them: the read-only setting is
-    /// appended, never substituted.
+    /// appended, never substituted — and appended **last**, so a dsn's own
+    /// `default_transaction_read_only=off` cannot outrank it.
     #[test]
     fn the_read_only_option_rides_beside_a_dsn_own_options() {
-        let parsed = Dsn::parse_read_only(
+        let parsed = parse_read_only(
             "postgres://user:password@db.example:5432/tinio?options=-c%20search_path%3Dtenant",
         )
         .expect("the dsn parses");
@@ -840,6 +1264,16 @@ mod tests {
         assert!(
             rendered.contains("default_transaction_read_only=on"),
             "and the read-only one joins it: {rendered}"
+        );
+        let overridden = parse_read_only(
+            "postgres://user:password@db.example:5432/tinio?options=-c%20default_transaction_read_only%3Doff",
+        )
+        .expect("the dsn parses");
+        let rendered = format!("{:?}", overridden.options());
+        assert!(
+            rendered.rfind("default_transaction_read_only=on")
+                > rendered.find("default_transaction_read_only=off"),
+            "the store's read-only option is last, so it wins: {rendered}"
         );
     }
 
@@ -884,6 +1318,45 @@ mod tests {
         );
     }
 
+    /// PG6, layer 2: a store that was handed a pool it did not build can still
+    /// tell what session that pool opens, and gets the one it asked for. A
+    /// read-only request is **re-opened** read-only (the read-only startup
+    /// option is appended to the pool's own options), and a writable request
+    /// over a read-only pool is refused because that direction cannot be
+    /// rebuilt.
+    #[tokio::test]
+    async fn a_store_re_opens_a_pool_whose_session_is_the_wrong_mode() {
+        let dsn = "postgres://user:password@db.example:5432/tinio";
+        let writable = Pool::open(dsn, 3).expect("the dsn parses");
+        let read_only = writable
+            .reopened_for(Access::ReadOnly)
+            .expect("a read-only store re-opens a writable pool");
+        assert!(read_only.is_read_only());
+        assert_eq!(read_only.max_connections(), 3, "the size is the source's");
+        assert_eq!(read_only.host(), writable.host());
+        assert_eq!(read_only.database(), writable.database());
+        assert_eq!(read_only.ssl_mode(), SslMode::Require);
+        let rendered = format!("{:?}", read_only.dedicated_options());
+        assert!(
+            rendered.contains("default_transaction_read_only=on"),
+            "every connection the re-opened pool opens is read-only: {rendered}"
+        );
+        // A pool that already carries the mode is returned as it is.
+        let same = read_only
+            .reopened_for(Access::ReadOnly)
+            .expect("a matching pool is used as it is");
+        assert!(same.is_read_only());
+        // The direction that cannot be rebuilt: the read-only option is
+        // appended to a pool's options and nothing holds the un-redacted dsn.
+        let err = read_only
+            .reopened_for(Access::ReadWrite)
+            .expect_err("a writable store over a read-only pool is refused");
+        assert!(
+            matches!(err, Error::ReadOnlyPoolForAWriter),
+            "the refusal is the store's own: {err}"
+        );
+    }
+
     /// The wrapper is itself the executor the query macros take by value: the
     /// statement the trait hands it is prepared and described on the driver's
     /// own pool, which is what lets `query_file_scalar!(...).fetch_one(&pool)`
@@ -912,6 +1385,19 @@ mod tests {
         );
         pool.close().await;
         db.drop_db().await;
+    }
+
+    /// The environment seam is the process's own unless a leg hands in another,
+    /// and the process's is what every ordinary parse reads.
+    #[test]
+    fn the_default_environment_is_the_process_own() {
+        let env: Environment<'_> = &process_environment;
+        assert_eq!(env("TINIO_PG_NO_SUCH_VARIABLE"), None);
+        assert_eq!(
+            process_environment("TINIO_PG_NO_SUCH_VARIABLE"),
+            None,
+            "an unset variable is absent, not empty"
+        );
     }
 
     #[test]

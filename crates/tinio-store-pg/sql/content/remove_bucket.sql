@@ -1,8 +1,13 @@
-WITH empty AS (
-    SELECT NOT EXISTS (
-        SELECT 1 FROM content_heads
-        WHERE bucket = $1 AND live_seq IS NOT NULL
-    ) AS ok
+WITH locked AS MATERIALIZED (
+    SELECT live_seq
+    FROM content_heads
+    WHERE bucket = $1
+    FOR UPDATE
+),
+
+empty AS (
+    SELECT coalesce(bool_and(live_seq IS NULL), TRUE) AS ok
+    FROM locked
 ),
 
 del_heads AS (

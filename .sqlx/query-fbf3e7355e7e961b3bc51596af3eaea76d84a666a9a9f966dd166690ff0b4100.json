@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO object_meta\n(bucket, key, etag, size, mtime, identity, tags, checksum, acl)\nSELECT bucket, $3, etag, size, mtime, identity, tags, checksum, acl\nFROM object_meta\nWHERE bucket = $1 AND key = $2\nON CONFLICT (bucket, key) DO UPDATE SET\n    etag = excluded.etag, size = excluded.size, mtime = excluded.mtime,\n    identity = excluded.identity, tags = excluded.tags,\n    checksum = excluded.checksum, acl = excluded.acl\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fbf3e7355e7e961b3bc51596af3eaea76d84a666a9a9f966dd166690ff0b4100"
+}

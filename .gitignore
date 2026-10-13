@@ -28,3 +28,9 @@ Thumbs.db
 piolium/
 # SDD workspace (per-plan ledger, briefs, reports)
 .superpowers/
+
+# Windows shell artifacts: a `> nul` redirect in a POSIX shell on Windows
+# creates a real file named `nul` in the working directory.
+nul
+Thumbs.db
+desktop.ini

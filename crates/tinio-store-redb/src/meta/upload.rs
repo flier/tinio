@@ -3,17 +3,29 @@
 //! Upload records live in the shared `uploads` table (the five-tuple
 //! `(key, initiated-at unix nanos, tags wire, owner wire, acl grants wire)`,
 //! the create-time checksum spec in the separate `upload_checksums` row, a
-//! part's ETag in `parts` and its checksum in `part_checksums`. The
-//! decode/encode rules are [`tinio_core::meta::upload`]'s, so this module
-//! cannot drift from the contract's row types.
+//! part's ETag in `parts`, its checksum in `part_checksums` and its own write
+//! stamp in `part_stamps` — the sibling tables the pinned shape of the `parts`
+//! value pushed the extra per-part data into). The decode/encode rules are
+//! [`tinio_core::meta::upload`]'s, so this module cannot drift from the
+//! contract's row types.
+//!
+//! **A listed part's write stamp is the store's own.** Every part write lands
+//! the `parts` row, its `part_checksums` row and its `part_stamps` row in one
+//! transaction, so the rows this module serves carry the instant this store
+//! wrote that part ([`PartRow::written_at`]) instead of `None`, and the
+//! projection answers it rather than the upload's creation time. The fallback
+//! that projection takes is reserved for a part with no stamp row — an older
+//! database, or a part written before the stamp existed.
 //!
 //! Every method is one read or one write transaction (design item 1): the
 //! identity check of `put_part` runs **inside** the transaction that writes
-//! the `parts` and `part_checksums` rows, so the two cannot disagree; `create`
-//! writes the upload row and its checksum row together (a `None` spec clears a
-//! stale checksum row); `part_records` is the completion-time join in one read
-//! transaction. A refused identity (`NoSuchUpload`) projects through
-//! [`Error::Refused`] (D22).
+//! the `parts`, `part_checksums` and `part_stamps` rows, so they cannot
+//! disagree; `create` writes the upload row and its checksum row together (a
+//! `None` spec clears a stale checksum row); `part_records` is the
+//! completion-time join in one read transaction. A refused identity
+//! (`NoSuchUpload`) projects through [`Error::Refused`] (D22).
+
+use std::time::SystemTime;
 
 use redb::{ReadTransaction, WriteTransaction};
 
@@ -30,6 +42,7 @@ use crate::{
     bucket::Table as BucketTable,
     part::Table as PartTable,
     part_checksum::Table as PartChecksumTable,
+    part_stamp::Table as PartStampTable,
     upload::Table as UploadTable,
     upload_checksum::Table as UploadChecksumTable,
 };
@@ -84,15 +97,19 @@ fn collect_uploads(
     Ok(uploads)
 }
 
-/// Attach the per-part checksum to each recorded `(number, hex)` row, skipping
-/// a part whose stored ETag the domain rejects (the `PartRow` self-heal) — the
-/// join the two part listings share. The checksum source is the caller's:
-/// `list_parts` reads the table per part, while `list_parts_page` passes `None`
-/// when its `has_upload` probe says the upload has no checksum rows, so the
-/// point reads are skipped entirely (F03).
+/// Attach the per-part checksum and write stamp to each recorded
+/// `(number, hex)` row, skipping a part whose stored ETag the domain rejects
+/// (the `PartRow` self-heal) — the join the two part listings share. Each
+/// source is the caller's: `list_parts` reads both tables per part, while
+/// `list_parts_page` passes `None` when its `has_upload` probe says the upload
+/// has no rows of that table, so the point reads are skipped entirely (F03).
+///
+/// A stamp row the store never wrote leaves the row's `written_at` `None`, and
+/// the projection then answers its fallback — the upload's creation instant.
 fn join_parts(
     recorded: Vec<(u32, String)>,
     mut checksum_of: impl FnMut(u32) -> Result<Option<checksum::Part>, Error>,
+    mut stamp_of: impl FnMut(u32) -> Result<Option<SystemTime>, Error>,
 ) -> Result<Vec<PartRow>, Error> {
     let mut rows = Vec::with_capacity(recorded.len());
     for (number, hex) in recorded {
@@ -103,6 +120,7 @@ fn join_parts(
             number,
             etag,
             checksum: checksum_of(number)?,
+            written_at: stamp_of(number)?,
         });
     }
     Ok(rows)
@@ -228,6 +246,10 @@ impl UploadMeta for RedbMetadata {
                 // write the tee's digest, or clear a stale row from a
                 // previous upload of this part number.
                 PartChecksumTable::open(txn)?.set(&bucket, &upload_id, number, digest.as_ref())?;
+                // The part's write stamp commits with them: this instant is
+                // what the part answers as its `LastModified`, and a re-upload
+                // of this number replaces it.
+                PartStampTable::open(txn)?.put(&bucket, &upload_id, number, SystemTime::now())?;
                 Ok(())
             })
             .await
@@ -249,7 +271,8 @@ impl UploadMeta for RedbMetadata {
             .read_blocking(move |txn| {
                 // Every part at or after `from`, in part-number order. A
                 // domain-invalid stored ETag reads as absent (the `PartRow`
-                // self-heal); the checksum table self-heals its own wire.
+                // self-heal); the checksum and stamp tables self-heal their
+                // own wire.
                 let (recorded, _) = PartTable::open_readonly(txn)?.list_from(
                     &bucket,
                     &upload_id,
@@ -257,9 +280,12 @@ impl UploadMeta for RedbMetadata {
                     usize::MAX,
                 )?;
                 let checksums = PartChecksumTable::open_readonly(txn)?;
-                join_parts(recorded, |number| {
-                    checksums.get(&bucket, &upload_id, number)
-                })
+                let stamps = PartStampTable::open_readonly(txn)?;
+                join_parts(
+                    recorded,
+                    |number| checksums.get(&bucket, &upload_id, number),
+                    |number| stamps.get(&bucket, &upload_id, number),
+                )
             })
             .await
     }
@@ -286,8 +312,8 @@ impl UploadMeta for RedbMetadata {
             }
             // One read transaction: the page's `PARTS` rows (`from`
             // inclusive, `max` rows, plus the one-lookahead flag) and the
-            // `PART_CHECKSUMS` join — the same join `list_parts` performs,
-            // capped at the page.
+            // `PART_CHECKSUMS` / `PART_STAMPS` joins — the same join
+            // `list_parts` performs, capped at the page.
             let (recorded, more) =
                 PartTable::open_readonly(txn)?.list_from(&bucket, &upload_id, from, max)?;
             // The raw read's last number, taken before the join drops a
@@ -295,20 +321,33 @@ impl UploadMeta for RedbMetadata {
             // that serves nothing (the empty-raw read is the `max == 0` arm
             // above and answers `None` there).
             let raw_last = recorded.last().map(|(number, _)| *number);
-            // Probed once per page: an upload with no checksum rows at all
-            // (the checksum feature off ⇒ the table holds none for it)
-            // skips the per-part point reads — one probe read instead of
-            // one read per part (F03).
+            // Probed once per page: an upload with no checksum (or no stamp)
+            // rows at all — the feature off ⇒ the table holds none for it, and
+            // a database written before the stamp existed for the stamp table
+            // — skips the per-part point reads: one probe read instead of one
+            // read per part (F03).
             let checksums = PartChecksumTable::open_readonly(txn)?;
             let checksums = PartChecksumTable::has_upload(&checksums, &bucket, &upload_id)?
                 .then(|| PartChecksumTable::open_readonly(txn))
                 .transpose()?;
+            let stamps = PartStampTable::open_readonly(txn)?;
+            let stamps = PartStampTable::has_upload(&stamps, &bucket, &upload_id)?
+                .then(|| PartStampTable::open_readonly(txn))
+                .transpose()?;
             // A domain-invalid stored ETag reads as absent (the `PartRow`
-            // self-heal); the checksum table self-heals its own wire.
-            let rows = join_parts(recorded, |number| match checksums.as_ref() {
-                Some(table) => table.get(&bucket, &upload_id, number),
-                None => Ok(None),
-            })?;
+            // self-heal); the checksum and stamp tables self-heal their own
+            // wire.
+            let rows = join_parts(
+                recorded,
+                |number| match checksums.as_ref() {
+                    Some(table) => table.get(&bucket, &upload_id, number),
+                    None => Ok(None),
+                },
+                |number| match stamps.as_ref() {
+                    Some(table) => table.get(&bucket, &upload_id, number),
+                    None => Ok(None),
+                },
+            )?;
             Ok(PartsPage {
                 rows,
                 more,
@@ -334,15 +373,18 @@ impl UploadMeta for RedbMetadata {
             }
             let parts = PartTable::open_readonly(txn)?;
             let checksums = PartChecksumTable::open_readonly(txn)?;
+            let stamps = PartStampTable::open_readonly(txn)?;
             let mut records = Vec::with_capacity(numbers.len());
             for number in numbers {
                 let row = match parts.get_hex(&bucket, &upload_id, number)? {
                     Some(hex) => {
                         let checksum = checksums.get(&bucket, &upload_id, number)?;
+                        let written_at = stamps.get(&bucket, &upload_id, number)?;
                         ETag::new(&hex).ok().map(|etag| PartRow {
                             number,
                             etag,
                             checksum,
+                            written_at,
                         })
                     }
                     None => None,
@@ -443,6 +485,7 @@ impl UploadMeta for RedbMetadata {
                 UploadChecksumTable::open(txn)?.remove(&bucket, &upload_id)?;
                 PartTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
                 PartChecksumTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
+                PartStampTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
                 Ok(())
             })
             .await
@@ -473,6 +516,7 @@ impl UploadMeta for RedbMetadata {
                 UploadChecksumTable::open(txn)?.remove(&bucket, &upload_id)?;
                 PartTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
                 PartChecksumTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
+                PartStampTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
                 Ok(())
             })
             .await
@@ -486,6 +530,7 @@ impl UploadMeta for RedbMetadata {
                 UploadChecksumTable::open(txn)?.drain_bucket(&bucket)?;
                 PartTable::open(txn)?.drain_bucket(&bucket)?;
                 PartChecksumTable::open(txn)?.drain_bucket(&bucket)?;
+                PartStampTable::open(txn)?.drain_bucket(&bucket)?;
                 Ok(())
             })
             .await
@@ -494,7 +539,10 @@ impl UploadMeta for RedbMetadata {
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
+    use std::{
+        thread,
+        time::{Duration, SystemTime},
+    };
 
     use tinio_util::testing::metadata::assert_upload_meta_conformance;
 
@@ -503,12 +551,16 @@ mod tests {
             ETag,
             acl::Acl,
             bucket,
-            meta::{UploadMeta, upload::Row},
+            meta::{
+                UploadMeta,
+                upload::{PartRow, Row},
+            },
             object, storage,
         },
         Error, RedbMetadata,
         part::Table as PartTable,
         part_checksum::Table as PartChecksumTable,
+        part_stamp::Table as PartStampTable,
         upload_checksum::Table as UploadChecksumTable,
     };
 
@@ -707,6 +759,151 @@ mod tests {
         );
     }
 
+    /// **The per-part write stamp, through the listing.** A listed part's
+    /// `LastModified` is its **own** write instant, never the upload's
+    /// creation time: two parts of one upload, written a second apart, are
+    /// served with the two distinct instants they were written at, and both
+    /// differ from the upload's `initiated_at`.
+    ///
+    /// The stamp is the store's own, kept in the `part_stamps` sibling table
+    /// (the `part_checksums` precedent) and written in the same transaction as
+    /// the part row. While the plane recorded none, `PartRow.written_at` was
+    /// `None` and both parts fell back to the upload's creation instant —
+    /// exactly what this leg turns red on.
+    #[tokio::test]
+    async fn each_listed_part_answers_its_own_write_stamp() {
+        let store = RedbMetadata::in_memory().unwrap();
+        let bucket = bucket::name("data").unwrap();
+        let key = object::key("big.bin").unwrap();
+        let upload_id = "conf-stamp-1";
+        let etag = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        // Created two seconds before its parts were written, so the creation
+        // instant a stamp-less part falls back to is unmistakably not a stamp.
+        let initiated_at = SystemTime::now() - Duration::from_secs(2);
+        store
+            .create(
+                &bucket,
+                upload_id,
+                &upload_row_at(upload_id, &key, initiated_at),
+            )
+            .await
+            .unwrap();
+
+        store
+            .put_part(&bucket, &key, upload_id, 1u32.into(), &etag, None)
+            .await
+            .unwrap();
+        thread::sleep(Duration::from_millis(1_100));
+        store
+            .put_part(&bucket, &key, upload_id, 2u32.into(), &etag, None)
+            .await
+            .unwrap();
+
+        let rows = store
+            .list_parts(&bucket, upload_id, 1u32.into())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.number).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let served = served_stamps(&rows, initiated_at);
+        for (number, stamp) in &served {
+            assert!(
+                *stamp > initiated_at,
+                "part {number} must answer its own write instant, not the upload's creation time: {served:?}"
+            );
+        }
+        assert!(
+            served[1].1 > served[0].1,
+            "each part answers the instant it was written at, never a shared one: {served:?}"
+        );
+        assert!(
+            served[1].1.duration_since(served[0].1).unwrap() >= Duration::from_secs(1),
+            "the two parts were written a second apart, so their stamps differ by at least that: {served:?}"
+        );
+
+        // The completion-time join reads the same rows and the same stamps:
+        // `part_records` answers the instants the listing just served.
+        let records = store
+            .part_records(&bucket, &key, upload_id, &[1u32.into(), 2u32.into()])
+            .await
+            .unwrap()
+            .expect("the upload matches the key");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.as_ref().and_then(|record| record.written_at))
+                .collect::<Vec<_>>(),
+            vec![Some(served[0].1), Some(served[1].1)],
+            "the completion join carries each part's own write stamp"
+        );
+    }
+
+    /// **A re-upload replaces this part number's stamp.** The part row is an
+    /// upsert, and its stamp is written in the same transaction: the listed
+    /// instant is the **last** write's, never the first's.
+    #[tokio::test]
+    async fn a_re_upload_replaces_the_part_numbers_stamp() {
+        let store = RedbMetadata::in_memory().unwrap();
+        let bucket = bucket::name("data").unwrap();
+        let key = object::key("big.bin").unwrap();
+        let upload_id = "conf-stamp-2";
+        let etag = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        let initiated_at = SystemTime::now() - Duration::from_secs(2);
+        store
+            .create(
+                &bucket,
+                upload_id,
+                &upload_row_at(upload_id, &key, initiated_at),
+            )
+            .await
+            .unwrap();
+
+        store
+            .put_part(&bucket, &key, upload_id, 1u32.into(), &etag, None)
+            .await
+            .unwrap();
+        let first = served_stamps(
+            &store
+                .list_parts(&bucket, upload_id, 1u32.into())
+                .await
+                .unwrap(),
+            initiated_at,
+        );
+        thread::sleep(Duration::from_millis(200));
+        store
+            .put_part(&bucket, &key, upload_id, 1u32.into(), &etag, None)
+            .await
+            .unwrap();
+
+        let rows = store
+            .list_parts(&bucket, upload_id, 1u32.into())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "a re-upload upserts the one part row");
+        let second = served_stamps(&rows, initiated_at);
+        assert_eq!(second[0].0, 1);
+        assert!(
+            second[0].1 > first[0].1,
+            "the served instant is the last write's, not the first's: {first:?} then {second:?}"
+        );
+    }
+
+    /// The `(part number, LastModified)` pairs a listing serves, projected the
+    /// way the engine projects them: [`PartRow::to_info`] with the upload's
+    /// own creation instant as the fallback a stamp-less row takes.
+    fn served_stamps(rows: &[PartRow], initiated_at: SystemTime) -> Vec<(u32, SystemTime)> {
+        rows.iter()
+            .map(|row| {
+                let info = row
+                    .to_info(0, initiated_at)
+                    .expect("a listed part number is one the S3 surface can carry");
+                (info.part_number.into(), info.last_modified)
+            })
+            .collect()
+    }
+
     /// Plant a raw ETag wire value for one part row — the corrupt-row seam of
     /// D43, bypassing the contract's validated `&ETag`.
     async fn plant_etag(
@@ -730,12 +927,13 @@ mod tests {
             .unwrap();
     }
 
-    /// One upload row, identified by `upload_id` and recording `key`.
-    fn upload_row(upload_id: &str, key: &object::Key) -> Row {
+    /// One upload row, identified by `upload_id`, created at `initiated_at`
+    /// and recording `key`.
+    fn upload_row_at(upload_id: &str, key: &object::Key, initiated_at: SystemTime) -> Row {
         Row {
             upload_id: upload_id.to_owned(),
             key: key.clone(),
-            initiated_at: SystemTime::UNIX_EPOCH,
+            initiated_at,
             checksum: None,
             tags: object::Tags::empty(),
             owner: None,
@@ -743,11 +941,76 @@ mod tests {
         }
     }
 
+    /// One upload row, identified by `upload_id` and recording `key`.
+    fn upload_row(upload_id: &str, key: &object::Key) -> Row {
+        upload_row_at(upload_id, key, SystemTime::UNIX_EPOCH)
+    }
+
+    /// The contract's **default** chunk read — the body a backend without a
+    /// keyset read answers with, which is this backend's own case — is the
+    /// cursor form of `list_uploads_page`: the composite orders after the
+    /// cursor, ascending, capped at `max`, with `more` set exactly when a row
+    /// follows the chunk and a prefix filtering the read. It is what the pg
+    /// store's bounded listing body falls back to everywhere else, so its
+    /// cursor arithmetic is pinned here.
+    #[tokio::test]
+    async fn the_default_chunk_read_is_the_cursor_form_of_the_uploads_page() {
+        let store = RedbMetadata::in_memory().unwrap();
+        let bucket = bucket::name("data").unwrap();
+        for (upload_id, target) in [("u1", "dir/a"), ("u2", "dir/b"), ("u3", "root")] {
+            let key = object::key(target).unwrap();
+            store
+                .create(&bucket, upload_id, &upload_row(upload_id, &key))
+                .await
+                .unwrap();
+        }
+        let first = store
+            .list_uploads_chunk(&bucket, "", None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .uploads
+                .iter()
+                .map(|upload| upload.upload_id.as_str())
+                .collect::<Vec<_>>(),
+            ["u1", "u2"]
+        );
+        assert!(first.more, "a row follows the chunk");
+        let cursor = storage::uploads_order(&first.uploads[1].key, &first.uploads[1].upload_id);
+        let rest = store
+            .list_uploads_chunk(&bucket, "", Some(&cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            rest.uploads
+                .iter()
+                .map(|upload| upload.upload_id.as_str())
+                .collect::<Vec<_>>(),
+            ["u3"]
+        );
+        assert!(!rest.more, "the last chunk reads as complete");
+        // The prefix bounds the read and `max == 0` answers nothing — never
+        // as more remaining, or the resume arithmetic would advance past
+        // uploads it never received.
+        let prefixed = store
+            .list_uploads_chunk(&bucket, "dir/", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(prefixed.uploads.len(), 2);
+        assert!(!prefixed.more);
+        let empty = store
+            .list_uploads_chunk(&bucket, "", None, 0)
+            .await
+            .unwrap();
+        assert!(empty.uploads.is_empty() && !empty.more);
+    }
+
     /// `drain_upload_checked` is the abort path's identity check and drain in
     /// **one write transaction**: it refuses (`NoSuchUpload`, D22) for an
     /// upload with no row and for one recorded under another key — draining
     /// nothing — and one success removes the `UPLOADS` row, its
-    /// `UPLOAD_CHECKSUMS` row and both part tables together. A second call
+    /// `UPLOAD_CHECKSUMS` row and all three part tables together. A second call
     /// on the drained upload refuses, exactly as HEAD's key check did.
     #[tokio::test]
     async fn drain_upload_checked_refuses_before_it_drains_and_drains_whole() {
@@ -805,7 +1068,7 @@ mod tests {
             "a refused check-and-drain removes no part"
         );
 
-        // The matching key: one write transaction drains all four tables.
+        // The matching key: one write transaction drains all five tables.
         let before = writes();
         store
             .drain_upload_checked(&bucket, &key, upload_id)
@@ -848,6 +1111,10 @@ mod tests {
                 assert!(
                     !PartChecksumTable::open_readonly(txn)?.has_upload(&name, &id)?,
                     "the part checksum rows are drained"
+                );
+                assert!(
+                    !PartStampTable::open_readonly(txn)?.has_upload(&name, &id)?,
+                    "the part stamp rows are drained with their parts"
                 );
                 Ok(())
             })

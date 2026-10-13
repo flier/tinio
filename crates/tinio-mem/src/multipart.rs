@@ -383,6 +383,14 @@ impl MultipartOps for MemoryStorage {
             let Some((size, mtime)) = stat else {
                 continue;
             };
+            // The listed part's own write stamp is mem's: the contract's part
+            // row carries it, read out of redb's `part_stamps` — the sibling
+            // table `put_part` writes in the part row's own transaction — so
+            // `to_info` answers that instant as `LastModified`, never the
+            // upload's creation time. The `part_meta` mtime rides the
+            // projection as the fallback, and stands only for a row that
+            // carries no stamp (an older database, or a part written before
+            // the stamp existed).
             parts.push(row.to_info(size, from_nanos(mtime)).map_err(Error::from)?);
         }
         Ok(PartsListing {

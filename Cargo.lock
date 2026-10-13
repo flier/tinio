@@ -4977,6 +4977,7 @@ dependencies = [
  "tinio-util",
  "tinio-version",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5152,13 +5153,16 @@ dependencies = [
  "futures",
  "hex",
  "parse-display",
+ "sha2 0.11.0",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.20",
  "time",
  "tinio-core",
  "tinio-util",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -1686,6 +1686,68 @@ async fn scratch_pg_database(world: &mut World) {
     cli.pg_scratch = Some(db);
 }
 
+/// **The same scratch database and configuration, but with no `dsn` in the document.** The run
+/// must take its dsn from `TINIO_PG_DSN` — the file the step below writes — so this is the
+/// env-only half of `resolve::pg::resolve_dsn` (PG5) that the unit legs could only reach without
+/// the process surface. The `[storage.pg]` section is present (so the backend is `pg` and the
+/// configuration names one) but its `dsn` key is omitted, which the schema's own
+/// `skip_serializing_if` makes an absent key rather than an empty one.
+#[cfg(feature = "pg")]
+#[given("a scratch pg database and a pg configuration with no dsn")]
+async fn scratch_pg_database_env_only(world: &mut World) {
+    let db = TestDb::create()
+        .await
+        .expect("the @pg pass needs TINIO_PG_DSN (the compose fixture's dsn, never spelled here)");
+
+    let cli = cli(world);
+    let config = Config {
+        storage: Some(storage::Config {
+            backend: storage::Backend::Pg,
+            pg: Some(storage::pg::Config {
+                dsn: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        auth: Some(auth::Config {
+            access_key: ACL_ROOT.0.to_owned(),
+            secret_key: auth::Secret::from(auth::SecretKey::from(ACL_ROOT.1.to_owned())),
+        }),
+        ..Default::default()
+    };
+    let text = toml::to_string(&config).expect("the pg configuration schema serializes");
+    let path = cli.root().join("pg.toml");
+    fs::write(&path, text)
+        .unwrap_or_else(|err| panic!("the pg configuration `{}`: {err}", path.display()));
+    cli.pg_scratch = Some(db);
+}
+
+/// **`TINIO_PG_DSN` written where the run reads it: `<state dir>/.env`** (FR-016). The file is the
+/// one channel that supplies a dsn the process environment does not carry — `Cli::command` scrubs
+/// every `TINIO_*` from a child, so the variable reaches this run only through the file — and the
+/// resolution loads it *before* it derives the pg root (`resolve::pg::env_file_state_dir`), which
+/// is what makes an env-only run reach `resolve_dsn` at all. The state directory is the run's own
+/// read-write one (`<root>/.tinio`), where `resolve::apply_env_file` looks.
+///
+/// **The dsn is the scenario's own scratch database**, not the shared `tinio` fixture, so the
+/// file names a database this scenario created and drops.
+#[cfg(feature = "pg")]
+#[given("the pg dsn is written to the state directory's environment file")]
+async fn pg_dsn_in_env_file(world: &mut World) {
+    let cli = cli(world);
+    let dsn = cli
+        .pg_scratch
+        .as_ref()
+        .expect("the pg configuration step created a scratch database")
+        .dsn
+        .clone();
+    let state_dir = cli.state_dir();
+    fs::create_dir_all(&state_dir).expect("the reserved directory");
+    let path = state_dir.join(ENV_FILE);
+    fs::write(&path, format!("TINIO_PG_DSN={dsn}\n"))
+        .unwrap_or_else(|err| panic!("the dotenv file `{}`: {err}", path.display()));
+}
+
 // --- When ---------------------------------------------------------------
 
 /// The operator's command line, run to whatever end it reaches: an exit, or a server that keeps

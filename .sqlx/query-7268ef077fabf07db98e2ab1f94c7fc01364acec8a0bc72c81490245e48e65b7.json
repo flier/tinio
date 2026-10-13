@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO parts (bucket, upload_id, number, etag, modified_at)\nVALUES (\n    $1, $2, $3, $4,\n    (extract(EPOCH FROM clock_timestamp()) * 1000)::bigint\n)\nON CONFLICT (bucket, upload_id, number) DO UPDATE SET\n    etag = excluded.etag, modified_at = excluded.modified_at\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7268ef077fabf07db98e2ab1f94c7fc01364acec8a0bc72c81490245e48e65b7"
+}

@@ -64,7 +64,9 @@ use crate::{
         object::{self},
         storage::{self, DEFAULT_MAX_CONCURRENT_UPLOADS, Error::NoSuchUpload},
     },
-    _store_redb::{RedbMetadata, object_part, part, part_checksum, upload, upload_checksum},
+    _store_redb::{
+        RedbMetadata, object_part, part, part_checksum, part_stamp, upload, upload_checksum,
+    },
     _util::lockmap::{Guard, Map},
     Error,
     database::{self, Driver},
@@ -91,8 +93,9 @@ type PartLocks = Map<(String, String)>;
 pub(crate) type CompletedPartRow = object_part::Stored;
 
 /// Delete one upload's `UPLOADS`/`UPLOAD_CHECKSUMS` + `PARTS`/
-/// `PART_CHECKSUMS` rows in the caller's write transaction (`complete`'s
-/// consume and the backend's `complete_object_state` share this).
+/// `PART_CHECKSUMS`/`PART_STAMPS` rows in the caller's write transaction
+/// (`complete`'s consume and the backend's `complete_object_state` share
+/// this).
 pub(crate) fn drain_upload(
     txn: &mut redb::WriteTransaction,
     bucket: &bucket::Name,
@@ -102,10 +105,10 @@ pub(crate) fn drain_upload(
     drain_upload_rest(txn, bucket, upload_id)
 }
 
-/// The checksum + PARTS half of the drain, after [`drain_upload`] removed
-/// the `UPLOADS` row.
+/// The checksum + PARTS + stamp half of the drain, after [`drain_upload`]
+/// removed the `UPLOADS` row.
 ///
-/// The four-table delete list has two homes on purpose: the contract's
+/// The five-table delete list has two homes on purpose: the contract's
 /// `drain_upload`/`drain_bucket` are the engine's and the facade's home,
 /// while this helper serves callers that must delete the rows inside the
 /// caller's own write transaction (the backend's completed-object state and
@@ -121,12 +124,14 @@ fn drain_upload_rest(
     upload_checksum::Table::open(txn)?.remove(bucket, upload_id)?;
     part::Table::open(txn)?.drain_upload(bucket, upload_id)?;
     part_checksum::Table::open(txn)?.drain_upload(bucket, upload_id)?;
+    part_stamp::Table::open(txn)?.drain_upload(bucket, upload_id)?;
     Ok(())
 }
 
-/// Delete every `UPLOADS`/`UPLOAD_CHECKSUMS` + `PARTS`/`PART_CHECKSUMS` row
-/// of a bucket in the caller's write transaction (bucket teardown —
-/// `remove_bucket_state`; the directory is removed by the caller).
+/// Delete every `UPLOADS`/`UPLOAD_CHECKSUMS` + `PARTS`/`PART_CHECKSUMS`/
+/// `PART_STAMPS` row of a bucket in the caller's write transaction (bucket
+/// teardown — `remove_bucket_state`; the directory is removed by the
+/// caller).
 pub(crate) fn drain_bucket_uploads(
     txn: &mut redb::WriteTransaction,
     bucket: &bucket::Name,
@@ -135,6 +140,7 @@ pub(crate) fn drain_bucket_uploads(
     upload_checksum::Table::open(txn)?.drain_bucket(bucket)?;
     part::Table::open(txn)?.drain_bucket(bucket)?;
     part_checksum::Table::open(txn)?.drain_bucket(bucket)?;
+    part_stamp::Table::open(txn)?.drain_bucket(bucket)?;
     Ok(())
 }
 
@@ -1156,8 +1162,15 @@ impl Store {
     /// mtime are its file's, never the engine's counted length or wall clock
     /// (the contract carries no part stat, D23).
     ///
-    /// A missing part file (`NotFound`) is the caller's to classify: the
-    /// listings skip such a part (it vanished between the row read and this
+    /// That mtime **is** the part's own write stamp, which is what a listed
+    /// part answers as `LastModified`
+    /// ([`tinio_core::meta::upload::PartRow::written_at`]'s rule): the part is
+    /// the file, so the instant the store last wrote it is the file's own, and
+    /// no upload-level instant stands in for it. The metadata plane records no
+    /// per-part stamp, so this join is the whole of the answer.
+    ///
+    /// A missing part file (`NotFound`) is the caller's to classify: a
+    /// listing skips such a part (it vanished between the row read and this
     /// join, and a stored number an S3 page cannot carry must not fail a
     /// listing whose rows are gone anyway), while the point paths, which just
     /// wrote the file, propagate the error.
@@ -1597,6 +1610,74 @@ mod tests {
             parts[0].checksum.as_ref().map(|c| c.algorithm),
             Some(Algorithm::Crc32),
             "the stored checksum joins"
+        );
+    }
+
+    /// The **served** part stamp is the part file's own write instant, never
+    /// the upload's creation time.
+    ///
+    /// The shared suite's `assert_own_part_stamps` pins the row's recorded
+    /// stamp, and it runs over `Metadata` implementations; fs serves a listed
+    /// part's `LastModified` from the **part file's** stat instead
+    /// ([`Store::stamped_part`]), so this half is only assertable here, against
+    /// the value the backend actually serves.
+    ///
+    /// The file's stamp is planted in 2023 — before the upload was created —
+    /// so an answer taken from the upload row's `initiated_at` cannot pass
+    /// (it would be ≥ the creation instant), and a fresh stat of the same file
+    /// pins **which** stamp was served rather than merely bounding it.
+    #[tokio::test]
+    async fn a_listed_part_serves_its_own_file_stamp_not_the_uploads_creation_time() {
+        // The std handle under the name the module already uses for it, so a
+        // reader never has to ask which `File` this is.
+        use std::{fs::File as StdFile, time::Duration};
+
+        let (_, store) = fixture();
+        let b = bucket::name("data").unwrap();
+        let k = object::key("big.bin").unwrap();
+        let created = SystemTime::now();
+        let upload = store
+            .create(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        store
+            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
+            .await
+            .unwrap();
+
+        let path = store.part_file(&b, &upload.upload_id, 1).unwrap();
+        let written = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        StdFile::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+        let on_disk = fs::metadata(&path).await.unwrap().modified().unwrap();
+        assert!(
+            on_disk < created,
+            "the planted stamp predates the upload, so the upload's instant cannot be the served one"
+        );
+
+        let (parts, _, _) = store
+            .list_parts(&b, &k, &upload.upload_id, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(parts.len(), 1, "the upload holds exactly one part");
+        assert_eq!(
+            parts[0].last_modified, on_disk,
+            "a listed part serves the part file's own write stamp"
+        );
+        assert!(
+            parts[0].last_modified < created,
+            "…and never the upload's creation instant"
         );
     }
 

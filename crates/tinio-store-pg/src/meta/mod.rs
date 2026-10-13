@@ -52,16 +52,24 @@ pub(crate) fn acl_composite(owner: Option<&OwnerId>, grants: &AclGrants) -> Acl 
     Acl::from_parts(owner.cloned(), grants.clone())
 }
 
-/// Project a lookup map back onto the caller's own order: one answer per
-/// requested key, `None` where the statement returned no row for it.
+/// Project a lookup map back onto the caller's own order: one answer **per
+/// occurrence** of a requested key, `None` where the statement returned no row
+/// for it.
 ///
 /// The four reads that answer in the caller's order -- buckets by name, owners
 /// by name, objects by key, part records by number -- all have the same shape:
 /// the statement returns the rows it found, unordered, and the contract's
-/// answer has one element per requested key. The map holds the answer's own
-/// row type, and a row that does not decode is simply not in it, so an absent
-/// row and a healed-away one answer the same `None`. The map is consumed: each
-/// answer moves its row out instead of cloning it.
+/// answer has one element per requested key, in the requested key's own value
+/// (the input's order, `load_many`'s two names or `part_records`' two numbers
+/// that repeat included). The map holds the answer's own row type, and a row
+/// that does not decode is simply not in it, so an absent row and a
+/// healed-away one answer the same `None`.
+///
+/// A key that occurs twice answers its row **twice**: the answer is per
+/// occurrence, so the map is only *drained*, not consumed by the first reader.
+/// The last occurrence moves the row out and an earlier one clones it, so a
+/// caller whose keys do not repeat -- every point-listing read -- keeps the
+/// move-only path.
 pub(crate) fn project<'a, Q, M, V>(
     wanted: impl Iterator<Item = &'a Q>,
     found: &mut HashMap<M, V>,
@@ -69,19 +77,40 @@ pub(crate) fn project<'a, Q, M, V>(
 where
     M: Borrow<Q> + Eq + Hash,
     Q: Eq + Hash + ?Sized + 'a,
+    V: Clone,
 {
-    wanted.map(|key| found.remove(key)).collect()
+    let wanted: Vec<&'a Q> = wanted.collect();
+    let mut left: HashMap<&'a Q, usize> = HashMap::with_capacity(wanted.len());
+    for key in &wanted {
+        *left.entry(key).or_default() += 1;
+    }
+    wanted
+        .into_iter()
+        .map(|key| {
+            // Every key was counted above, so a missing entry is unreachable;
+            // it answers `None` rather than panicking a read either way.
+            let remaining = left.get_mut(key).map_or(0, |left| {
+                *left = left.saturating_sub(1);
+                *left
+            });
+            if remaining == 0 {
+                found.remove(key)
+            } else {
+                found.get(key).cloned()
+            }
+        })
+        .collect()
 }
 
 /// Assert inside tx that bucket has a row, refusing with Error::NoSuchBucket
 /// when it does not.
 ///
-/// The read takes the row's lock (FOR UPDATE), so a concurrent
-/// remove_if_empty — which locks the same bucket row before it deletes —
-/// blocks behind this transaction and re-checks emptiness after the guarded
-/// write commits. That is what makes the guarded writers race-free rather
-/// than merely read-then-write: the refusal is decided against the row the
-/// writer later commits beside, not against a snapshot it has already left.
+/// The read takes the row's lock (FOR UPDATE). A concurrent
+/// `remove_if_empty` or the store's own bucket teardown (`teardown_bucket`)
+/// locks this same row, then checks emptiness in a later statement of that
+/// transaction. This writer blocks until that delete commits or rolls back. A
+/// delete that was waiting on the lock sees this writer's committed object or
+/// upload, because the check is not the statement that waited.
 pub(crate) async fn assert_bucket_row(tx: &mut PgTx, bucket: &BucketName) -> Result<(), Error> {
     let present = sqlx::query_scalar!("SELECT 1 FROM buckets WHERE name = $1 FOR UPDATE", bucket)
         .fetch_optional(&mut **tx)

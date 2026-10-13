@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO blocks (hash, seq, chunk, len, published)\nSELECT $1, u.seq, u.chunk, $4, $5\nFROM unnest($2::int4[], $3::bytea[]) AS u (seq, chunk)\nON CONFLICT (hash, seq) DO NOTHING\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4Array",
+        "ByteaArray",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f6af69afddfe9a35e2f5b933c30bd378ccf6570d42f1eee4877a89a3e0c49b7a"
+}

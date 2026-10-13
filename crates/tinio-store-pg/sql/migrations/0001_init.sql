@@ -78,6 +78,22 @@
 -- The cleanup predicates read the stamp beside the head gate. Its
 -- `DEFAULT now()` is volatile: an insert path that does not name the column
 -- reads as freshly stamped rather than as aged residue.
+--
+-- The indexes below are the three the measured plans needed (R5). Each one
+-- leads with the predicate its statement filters on, so the plan stops
+-- scanning the whole relation:
+--   content (published)      the orphan sweep's age predicate
+--   uploads (bucket, key)    the upload listing's bucket and prefix bound
+--   version_rows (bucket, seq)  every bucket's own seq order
+-- The three are the review's, not a speculative set: a fourth belongs here only
+-- with a plan of its own in hand.
+--
+-- parts.modified_at is the per-part write stamp, in unix **milliseconds**
+-- (the precision S3's ListParts LastModified carries), so a part reports the
+-- instant it was written rather than the upload's `initiated_at`. It is a
+-- bigint and not a timestamptz because the contract's part record carries a raw
+-- stamp; `DEFAULT 0` is the domain's epoch sentinel for a row an older writer
+-- left behind, and every write path names the column.
 
 -- The ACL composite: one grantee is its own composite and one grant pairs it
 -- with a permission, so the ACL adds its owner. grantee_kind tags the two
@@ -141,11 +157,17 @@ CREATE TABLE IF NOT EXISTS uploads (
     PRIMARY KEY (bucket, upload_id)
 );
 
+-- The listing filters on the bucket and bounds the key by prefix, so the index
+-- carries both: the bucket as the leading column and the key (the collation the
+-- order is read in) as the second, which is also the order the pager reads.
+CREATE INDEX IF NOT EXISTS uploads_bucket_key_idx ON uploads (bucket, key);
+
 CREATE TABLE IF NOT EXISTS parts (
     bucket text COLLATE "C" NOT NULL,
     upload_id text COLLATE "C" NOT NULL,
     number bigint NOT NULL,
     etag text NOT NULL,
+    modified_at bigint NOT NULL DEFAULT 0,
     PRIMARY KEY (bucket, upload_id, number)
 );
 
@@ -196,6 +218,13 @@ CREATE TABLE IF NOT EXISTS version_rows (
     checksum text NOT NULL,
     acl acl NOT NULL,
     PRIMARY KEY (bucket, key, seq)
+);
+
+-- A bucket's version listing reads the whole bucket ordered by seq, and the
+-- primary key's `(bucket, key, seq)` cannot serve that order: without this
+-- index every bucket's page external-merge-sorts.
+CREATE INDEX IF NOT EXISTS version_rows_bucket_seq_idx ON version_rows (
+    bucket, seq
 );
 
 CREATE TABLE IF NOT EXISTS version_index (
@@ -254,6 +283,12 @@ CREATE TABLE IF NOT EXISTS content (
 );
 
 ALTER TABLE content ALTER COLUMN chunk SET STORAGE EXTERNAL;
+
+-- The orphan sweep leads with the row's own write stamp (`published`), which no
+-- key column can serve: without this index the age predicate is a sequential
+-- scan of every chunk row in the database, and the anti-join against
+-- `content_heads` hashes the whole relation rather than a page of it.
+CREATE INDEX IF NOT EXISTS content_published_idx ON content (published);
 
 -- The block plane (PG14, PG19): a block's chunks are 8 MiB rows, and every row
 -- carries the block's declared length and the publish's comparable timestamp.

@@ -50,7 +50,13 @@
 //!    `NoSuchBucket` / [`storage::Error::NotEmpty`].
 //! 9. **Buckets are content-side too.** `create_bucket`/`remove_bucket` are the
 //!    content plane's bucket lifecycle, and `is_empty` sees everything the
-//!    backend counts as bucket content.
+//!    backend counts as bucket content. The emptiness **decision** is the
+//!    composition of `is_empty`, [`UploadMeta::has_uploads`] and
+//!    [`ObjectMeta::has_objects`], taken once in the ops engine's
+//!    `BucketOps::delete_bucket` for every backend rather than written into
+//!    each backend's own teardown: a bucket holding **only a delete marker**
+//!    answers `NotEmpty`, a **domain-invalid key row counts** as a row (the
+//!    probe decodes nothing), and version rows never block a teardown.
 
 use std::error::Error as StdError;
 

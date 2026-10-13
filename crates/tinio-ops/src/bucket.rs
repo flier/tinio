@@ -158,23 +158,32 @@ where
 
     /// Delete an empty bucket.
     ///
-    /// The two probes are the content plane's own authority — a folder-marker
-    /// directory is content, so a key-only scan would wrongly report an empty
-    /// bucket — and the upload rows; both are read-only and both answer before
+    /// The emptiness decision is the composition of **three** probes, one per
+    /// plane, taken for every backend here rather than written into each
+    /// backend's own teardown: the content plane's
+    /// [`is_empty`](tinio_core::content::ObjectContent::is_empty) — a
+    /// folder-marker directory is content, so a key-only scan would wrongly
+    /// report an empty bucket — the in-progress upload rows, and the object
+    /// rows ([`has_objects`](tinio_core::meta::ObjectMeta::has_objects), which
+    /// a **delete marker** is: a marker writes no content, so the tree alone
+    /// reads empty). All three are read-only and all three answer before
     /// the commit point. The backend's
     /// [`before_bucket_delete`](crate::hooks::Hooks::before_bucket_delete) then
     /// owns the whole teardown; the engine touches the bucket no further.
     ///
     /// # Errors
     ///
-    /// `NotEmpty` while the bucket holds content or an in-progress upload — and
-    /// whatever the backend's hook answers, including `NoSuchBucket` for a
-    /// store whose rows are the buckets.
+    /// `NotEmpty` while the bucket holds content, an object row or an
+    /// in-progress upload — and whatever the backend's hook answers, including
+    /// `NoSuchBucket` for a store whose rows are the buckets.
     pub async fn delete_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
         if !self.content.is_empty(name).await.map_err(projected)? {
             return Err(storage::not_empty(name));
         }
         if self.meta.has_uploads(name).await.map_err(projected)? {
+            return Err(storage::not_empty(name));
+        }
+        if self.meta.has_objects(name).await.map_err(projected)? {
             return Err(storage::not_empty(name));
         }
         self.hooks.before_bucket_delete(name).await
@@ -551,11 +560,14 @@ mod tests {
 
     use crate::{
         _core::{
+            ETag,
             acl::{Acl, AclGrants, Grant, Grantee, OwnerId, Permission},
             bucket,
             content::{ContentKey, ObjectContent, StagedObject},
             cors,
-            meta::{BucketMeta, UploadMeta, upload as upload_row},
+            meta::{
+                BucketMeta, ObjectMeta, UploadMeta, object as meta_object, upload as upload_row,
+            },
             object,
             storage::{Error as StorageError, ListBucketsParams},
         },
@@ -977,6 +989,64 @@ mod tests {
         let err: StorageError = ops.delete_bucket(&name).await.unwrap_err();
         assert!(matches!(err, StorageError::NotEmpty(_)), "{err:?}");
         assert!(base.hooks().calls().is_empty());
+    }
+
+    /// One object row for the emptiness legs — a **delete marker's** shape
+    /// (zero bytes behind it, no identity), without the recorded marker bit,
+    /// which is the backend's own and never crosses this contract.
+    fn object_row() -> meta_object::Row {
+        meta_object::Row {
+            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            size: 0,
+            mtime: SystemTime::now(),
+            identity: 0,
+            tags: object::Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: Acl::default_private(None),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_refuses_a_bucket_that_holds_only_an_object_row() {
+        // The **composition's third probe**, pinned at the ops layer, outside
+        // any single backend's own tests (dropping it reddens fs's legs too,
+        // which reach the composition through `FsStorage::delete_bucket`):
+        // an object row with no content behind it — a delete marker writes no
+        // bytes, so the content plane reads the bucket empty and there is no
+        // upload either. With `has_objects` dropped from `delete_bucket` this
+        // bucket passes both remaining probes, the hook runs and the delete
+        // answers `Ok`, which is exactly the fs↔pg divergence the shared
+        // composition exists to close. The folder-marker leg beside this one
+        // pins the content probe and the upload leg the upload probe, so the
+        // three together pin all three.
+        let base = Base::new();
+        let name = bucket::name("data").unwrap();
+        create(&base, BucketRow::Guaranteed, &name).await;
+        ObjectMeta::put(
+            &*base.meta,
+            &name,
+            &object::key("notes.txt").unwrap(),
+            &object_row(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            base.content.is_empty(&name).await.unwrap(),
+            "the row is the bucket's only state: the content plane holds nothing"
+        );
+
+        let ops = base.ops(BucketRow::Guaranteed);
+        let err: StorageError = ops.delete_bucket(&name).await.unwrap_err();
+        assert!(matches!(err, StorageError::NotEmpty(_)), "{err:?}");
+        assert!(
+            base.hooks().calls().is_empty(),
+            "the row probe refuses before the commit point"
+        );
+        assert!(
+            base.meta.row(&name).await.unwrap().is_some(),
+            "the refused delete left the bucket row in place"
+        );
     }
 
     #[tokio::test]

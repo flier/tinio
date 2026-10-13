@@ -2315,6 +2315,29 @@ where
     BucketMeta::remove(store, &other).await.unwrap();
 }
 
+/// Assert every row of a part read answers the part's **own** write stamp.
+///
+/// The rule ([`upload::PartRow::to_info`]): a listed part's `LastModified` is
+/// the instant the store wrote **that part**, never the upload's creation
+/// time. This leg pins the stamp itself, so the store the suite is run against
+/// must carry one: the projection is driven with `t0()` as the fallback — the
+/// instant this suite's upload row records ([`upload_legs`]) — and a backend
+/// that answers the fallback instead (no stamp on the row, or the upload's
+/// creation time) answers exactly `t0()` and turns the leg red. No sleep, no
+/// captured "now".
+fn assert_own_part_stamps(rows: &[upload::PartRow]) {
+    for row in rows {
+        let info = row
+            .to_info(0, t0())
+            .expect("a stored part number is representable");
+        assert!(
+            info.last_modified > t0(),
+            "a listed part answers its own write instant, not the upload's: part {}",
+            row.number
+        );
+    }
+}
+
 /// The upload rows: creation, the key check, part order, the completion join,
 /// the listings and both drains.
 async fn upload_legs<M>(store: &M)
@@ -2397,6 +2420,10 @@ where
         "list_parts honours its lower bound"
     );
 
+    // A listed part answers its **own** write stamp, never the upload's
+    // creation instant.
+    assert_own_part_stamps(&listed);
+
     // A bounded page over the same rows: at or after the **raw** `from`,
     // capped at `max`, with the one-lookahead "more rows" flag. `max = 0`
     // answers nothing and is *not* truncated (the resume arithmetic must not
@@ -2424,6 +2451,10 @@ where
         "the page that reaches the last row reports no more"
     );
     assert_eq!(page.raw_last, Some(10), "and still names its last raw row");
+    // The page path carries the same projection as the unbounded read: these
+    // are parts 2 and 10, so the two reads together pin all three rows both
+    // ways without a third read.
+    assert_own_part_stamps(&page.rows);
     let page = store.list_parts_page(&bucket, id, 11, 2).await.unwrap();
     assert!(
         page.rows.is_empty(),

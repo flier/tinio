@@ -15,7 +15,7 @@
 //! bucket in PostgreSQL is a row and nothing else. Both match `tinio-mem`'s pair; fs's
 //! `Warn`/`Lazy` is the shape of a store whose content is the truth, which pg is not (PG23).
 
-use std::sync::Arc;
+use std::{sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use derive_more::Debug;
@@ -23,14 +23,13 @@ use secrecy::ExposeSecret;
 #[cfg(feature = "versioning")]
 use tinio_core::storage::VersionOps;
 use tinio_core::{
-    ETag,
     acl::{Acl, AclGrants, OwnerId},
     bucket::{self, Bucket},
     checksum,
-    content::{ContentKey, ObjectContent},
+    content::ContentKey,
     cors,
-    meta::{BucketMeta, UploadMeta, VersionMeta, object::PartRow},
-    multipart::{self, CompletedPart, ObjectPart, PartNumber, check_part_minimum},
+    meta::{BucketMeta, UploadMeta, VersionMeta, bucket::Row as MetaBucket},
+    multipart::{self, CompletedPart, ObjectPart, PartNumber},
     object,
     storage::{
         self, BodyStream, BucketOps, BucketsListing, ByteRange, GetObjectResult, ListBucketsParams,
@@ -153,17 +152,23 @@ impl PgStorage {
     /// half, for a caller that built the pool itself (a test's scratch database, a doctor's
     /// inspection).
     ///
-    /// **The pool's session is the caller's, and the two can disagree.** `access` decides the
-    /// entry guard (PG6, layer 1) and the ownership lock (PG12), but the *session* — the
-    /// `default_transaction_read_only = on` startup option that is layer 2 — is a property of the
-    /// pool, which this call cannot change. So a caller who hands a **writable** pool
-    /// ([`Pool::open`]) with [`Access::ReadOnly`] gets the entry guard and no session layer: every
-    /// mutation this backend performs is refused, while a write that bypassed the entry guard (a
-    /// direct `tinio-store-pg` contract call) would reach a writable session. That is exactly the
-    /// shape the read-only role requirement covers, and the shape the conformance suite's
-    /// layer-3 leg exercises — a read-only deployment must pair [`Access::ReadOnly`] with a
-    /// read-only pool ([`Pool::open_read_only`], as [`PgStorage::connect`] does) and a role
-    /// without DML grants.
+    /// **The session the store serves on is `access`'s, whatever pool was handed in.** `access`
+    /// decides the entry guard (PG6, layer 1) and the ownership lock (PG12), and the store puts
+    /// the pool into that mode before it serves: a pool that already carries the mode is used as
+    /// it is, and an [`Access::ReadOnly`] store handed a writable pool gets one whose connections
+    /// are opened with `default_transaction_read_only = on` (the store's `Pool::reopened_for`) —
+    /// the session layer (PG6, layer 2) is therefore always on for a read-only instance, never
+    /// left to the caller's pool. The
+    /// opposite direction, a **writable** store over a read-only pool, is refused: that mode
+    /// cannot be rebuilt from the pool.
+    ///
+    /// So the layers line up as the deployment expects: a read-only instance is refused by the
+    /// entry guard, and by the session behind it; a **writable** session rejects nothing, which is
+    /// where the role's missing `INSERT`/`UPDATE`/`DELETE` grants (PG6, layer 3) become the one
+    /// layer still standing — the deployment contract, and the layer the conformance suite's
+    /// layer-3 leg exercises by driving `tinio-store-pg`'s contract directly over a restricted
+    /// role, past this backend's guard. A read-only deployment pairs [`Access::ReadOnly`] with a
+    /// role without DML grants either way.
     ///
     /// # Errors
     ///
@@ -248,10 +253,16 @@ impl PgStorage {
         EngineBucketOps {
             meta: Arc::clone(&self.store),
             content: Arc::clone(&self.store),
-            hooks: PgHooks,
+            hooks: self.hooks(),
             metadata_failure: MetadataFailure::Fail,
             bucket_row: BucketRow::Guaranteed,
         }
+    }
+
+    /// The engine's [`Hooks`](tinio_ops::Hooks) seam over this backend's store: the empty
+    /// bucket-delete action and the store's per-upload part lock.
+    fn hooks(&self) -> PgHooks {
+        PgHooks::new(Arc::clone(&self.store))
     }
 
     /// The object-group receiver over this backend's handles, with the same two policies.
@@ -265,12 +276,12 @@ impl PgStorage {
     }
 
     /// The multipart-group receiver: the same handles and the same bucket-row policy, plus the
-    /// seam whose part lock is [`NoGuard`](tinio_ops::NoGuard) (see [`PgHooks`](crate::hooks)).
+    /// seam whose part lock is the store's per-upload advisory lock (see [`PgHooks`](crate::hooks)).
     fn parts(&self) -> EngineMultipartOps<PgStore, PgStore, PgHooks> {
         EngineMultipartOps {
             meta: Arc::clone(&self.store),
             content: Arc::clone(&self.store),
-            hooks: PgHooks,
+            hooks: self.hooks(),
             bucket_row: BucketRow::Guaranteed,
         }
     }
@@ -312,42 +323,27 @@ impl PgStorage {
         Ok(())
     }
 
-    /// The bucket teardown: the content namespace, the version rows, then the bucket row.
-    /// The engine's `delete_bucket` runs its two probes and then the seam, which is empty for
-    /// pg ([`PgHooks`](crate::hooks)): a bucket here is rows, and the removal of them is a
-    /// row-plane action this backend's trait implementation takes rather than an arrangement
-    /// the seam could make. The three steps are the three planes a bucket owns:
+    /// The bucket teardown: one transaction that refuses a non-empty bucket and
+    /// otherwise removes the whole namespace together (R3).
     ///
-    /// - **the content namespace** — the chunks and heads of its object and part bytes, in one
-    ///   statement set that refuses a live generation (which the engine's own probe has already
-    ///   excluded) and removes residue;
-    /// - **the version rows** — their index entries with them, one transaction; their blocks
-    ///   stay for the sweep, because liveness is derived from the rows and the rows are now
-    ///   gone;
-    /// - **the bucket row last**, guarded: `remove_if_empty` asserts inside its own
-    ///   transaction that no object row and no upload row names the bucket, so a writer that
-    ///   raced the probes cannot have its work orphaned, and a bucket that is not there is the
-    ///   contract's `NoSuchBucket`.
+    /// The engine's `delete_bucket` runs its three probes (live content, upload
+    /// rows and object rows — a delete marker is one) and then the seam, which
+    /// is empty for pg ([`PgHooks`](crate::hooks)). Those probes refuse a
+    /// marker-only bucket up front, but they run before this teardown's
+    /// transaction and outside its lock, so the store re-probes the same rows
+    /// inside it: an object row, an upload or a live generation refuses the
+    /// delete before any version row is removed, and a refusal rolls everything
+    /// back. Blocks stay for the sweep, because liveness is derived from the
+    /// version rows.
     ///
     /// # Errors
     ///
-    /// `NoSuchBucket` for a bucket with no row, `NotEmpty` when a row appeared after the
-    /// engine's probes, and the planes' own failures.
+    /// `NoSuchBucket` for a bucket with no row, `NotEmpty` when an object row,
+    /// an upload or a live generation still names it.
     async fn teardown_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
-        // The content plane first: it is the only step that can refuse for a reason the
-        // engine's probe did not already answer (a generation published between the two),
-        // and it refuses before anything has left.
-        self.store
-            .remove_bucket(name)
-            .await
-            .map_err(storage::Error::from)?;
-        VersionMeta::drain_bucket(&*self.store, name)
-            .await
-            .map_err(storage::Error::from)?;
-        self.store
-            .remove_if_empty(name)
-            .await
-            .map_err(storage::Error::from)?;
+        // One transaction. A marker-only bucket is not empty, and a refusal
+        // must not already have committed the version deletes.
+        self.store.teardown_bucket(name).await?;
         Ok(())
     }
 }
@@ -365,18 +361,29 @@ impl BucketOps for PgStorage {
         acl: &Acl,
     ) -> Result<(), Error> {
         self.writable(Subject::Bucket(name))?;
-        self.buckets()
-            .create_bucket(name, owner, acl)
+        // The row is the namespace [`ObjectContent::stage`] locks. The engine
+        // records it after the content plane's create, and that create inserts
+        // the same row, so the engine's following insert would answer
+        // `AlreadyExists` on the first create. Write the caller's row here.
+        let mut row = MetaBucket::at(SystemTime::now());
+        row.owner = owner.cloned();
+        row.acl = Acl {
+            owner: None,
+            grants: acl.grants.clone(),
+        };
+        BucketMeta::create(&*self.store, name, &row)
             .await
-            .map_err(Error::from)
+            .map_err(storage::Error::from)?;
+        Ok(())
     }
 
     async fn delete_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
         self.writable(Subject::Bucket(name))?;
-        // The engine's probes (the content plane's emptiness and the upload rows, both before
-        // any write) then the empty seam; pg's own teardown follows — the trait
-        // implementation is where the store is in hand, and `teardown_bucket`'s doc is why the
-        // seam stays empty.
+        // The engine's three probes (live content, upload rows and object rows —
+        // a delete marker is one) run first and write nothing. The store's own
+        // statement then refuses a delete marker — an object row with no live
+        // bytes — and deletes the version rows only in the same statement that
+        // removes the bucket.
         self.buckets()
             .delete_bucket(name)
             .await
@@ -499,25 +506,7 @@ impl ObjectOps for PgStorage {
     ) -> Result<object::Info, Error> {
         self.writable(Subject::Key(key))?;
         Self::refuse_reserved(key)?;
-        // The engine's version-creating put when this build carries the version plane: its own
-        // body reads the bucket's state and takes the version-free path
-        // (`commit_object`'s one body, two shapes) when the bucket records none, so this call
-        // is the whole decision and the caller never spells it. A stripped build has no plane
-        // to hand over and takes the version-free body directly.
-        #[cfg(feature = "versioning")]
-        {
-            self.objects()
-                .put_object_versioned(&self.plane, bucket, key, staged, tags, owner, acl)
-                .await
-                .map_err(Error::from)
-        }
-        #[cfg(not(feature = "versioning"))]
-        {
-            self.objects()
-                .commit_object(bucket, key, staged, tags, owner, acl)
-                .await
-                .map_err(Error::from)
-        }
+        self.commit_put(bucket, key, staged, tags, owner, acl).await
     }
 
     async fn get_object(
@@ -634,13 +623,11 @@ impl ObjectOps for PgStorage {
         // class; a folder marker is deletable (it is how a marker is removed) and the
         // delete is idempotent either way.
         Self::refuse_reserved(key)?;
-        // A bucket that records versions creates a delete marker, and the engine has no
-        // version-creating delete (a marker written as a version row from a shared body would
-        // displace the one null version) — so the branch is the backend's, exactly as it is
-        // fs's and mem's. Everything else is the engine's idempotent delete.
-        #[cfg(feature = "versioning")]
-        if self.records_versions(bucket).await? {
-            return self.create_delete_marker(bucket, key).await;
+        // A bucket that records versions creates a delete marker. The branch
+        // lives with the version plane, so this body is the same call in every
+        // build; a stripped build's answer is `None` and the plain delete runs.
+        if let Some(marker) = self.delete_if_versioned(bucket, key).await? {
+            return Ok(marker);
         }
         self.objects()
             .delete_object(bucket, key)
@@ -794,16 +781,17 @@ impl MultipartOps for PgStorage {
     }
 
     async fn list_parts(&self, params: ListPartsParams) -> Result<PartsListing, Error> {
-        // The engine owns the upload's identity check, the marker arithmetic and the page's
-        // rows and truncation; the sizes and the mtimes are the backend's to join (the
-        // contract carries no part stat, D23).
+        // The engine owns the upload's identity check, the marker arithmetic and
+        // the page's rows and truncation; the sizes are the backend's to join
+        // (the contract carries no part stat, D23), and they are one read of the
+        // parts' content keys. A row whose generation is gone is skipped, the
+        // self-heal every backend's join applies.
         //
-        // The size is one point read of the part's **own content key** — the store's part half
-        // of the content probe, because a part has no row anywhere that records a length. A row
-        // whose generation is gone is skipped, the self-heal every backend's join applies. The
-        // mtime is the upload's own `initiated_at`: the only clock the store records for an
-        // upload's parts (the `parts` relation carries none, and the content relation keeps no
-        // timestamp, D42), served rather than invented.
+        // The mtime is **the part's own** write stamp, which the page's rows
+        // carry (`parts.modified_at`, the instant the part row was last
+        // written): the ruling fixes a listed part's `LastModified` as its own
+        // stamp rather than the upload's creation time, and the upload's
+        // `initiated_at` is only what a row recording none falls back to.
         let page = self
             .parts()
             .list_parts(
@@ -822,21 +810,25 @@ impl MultipartOps for PgStorage {
         else {
             return Err(storage::no_such_upload(&params.upload_id).into());
         };
-        let mut parts = Vec::with_capacity(page.rows.len());
-        for row in &page.rows {
-            let ckey = ContentKey::Part {
+        let keys: Vec<ContentKey> = page
+            .rows
+            .iter()
+            .map(|row| ContentKey::Part {
                 upload_id: params.upload_id.clone(),
                 number: row.number.into(),
-            };
-            let Some(len) = self
-                .store
-                .live_len(&params.bucket, &ckey)
-                .await
-                .map_err(storage::Error::from)?
-            else {
+            })
+            .collect();
+        let lens = self
+            .store
+            .live_lens(&params.bucket, &keys)
+            .await
+            .map_err(storage::Error::from)?;
+        let mut parts = Vec::with_capacity(page.rows.len());
+        for (row, span) in page.rows.iter().zip(lens) {
+            let Some(span) = span else {
                 continue;
             };
-            parts.push(row.to_info(len, upload.initiated_at)?);
+            parts.push(row.to_info(span.len, upload.initiated_at)?);
         }
         Ok(PartsListing {
             parts,
@@ -854,14 +846,16 @@ impl MultipartOps for PgStorage {
     /// 1. **Verify** — the parts are joined against the upload's stored rows in the requested
     ///    order and every rule the completion must enforce is checked before the first write:
     ///    the list is non-empty, the numbers strictly ascend, each ETag matches the stored one,
-    ///    and a non-final part meets the S3 minimum ([`check_part_minimum`], the shared rule).
+    ///    and a non-final part meets the S3 minimum ([`multipart::check_part_minimum`], the shared rule).
     ///    A refused completion therefore leaves the upload exactly as it was.
     /// 2. **Assemble** — the parts' bytes stream, in order, into one stage under the object's
-    ///    own key and the publish flips the key's head in one statement, so a partial assembly
-    ///    is invisible by construction (PG21): no reader can see a shorter object with a
-    ///    composed ETag, or a longer one with a shorter ETag. The version branch is opened
-    ///    **before** the publish, because the supersede has to move the outgoing version into
-    ///    the block plane while its bytes are still the key's — the publish overwrites them.
+    ///    own key. Each part is the generation the check measured, so an upload that lands
+    ///    during the copy does not change the bytes the ETag was computed from. The publish
+    ///    flips the key's head in one statement, so a partial assembly is invisible by
+    ///    construction (PG21): no reader can see a shorter object with a composed ETag, or a
+    ///    longer one with a shorter ETag. The version branch is opened **before** the publish,
+    ///    because the supersede has to move the outgoing version into the block plane while
+    ///    its bytes are still the key's — the publish overwrites them.
     /// 3. **Commit and consume** — the row and the retained part list land in one write (a
     ///    completion's purpose is to record what the object was composed of, which is exactly
     ///    what the engine's versioned put deliberately clears), the slot moves to the identity
@@ -869,11 +863,15 @@ impl MultipartOps for PgStorage {
     ///    after their rows — every stored part, the unlisted extras included, because the
     ///    contract's rule discards them.
     ///
-    /// A failure of the row write or the slot move after the publish takes the write back.
-    /// A bucket that records versions runs the engine's versioned undo. A bucket that does
-    /// not restores the content head to the generation that was live before this publish,
-    /// or clears it when this publish was the key's first. The caller sees the failure, and
-    /// the key is the object it was.
+    /// A failure of the row write, the slot move, or the upload drain after the publish
+    /// takes the write back while this publish still owns the head, so a retry still
+    /// completes this same upload. A newer writer who already replaced the head is left
+    /// alone, and the caller still sees the failure. A bucket that records versions runs
+    /// the engine's versioned undo and, when the slot already moved, puts the slot it
+    /// opened with back. A bucket that does not restores the content head to the
+    /// generation that was live before this publish, or clears it when this publish was
+    /// the key's first, and puts the previous object row back with the part list it
+    /// held. Part bytes deleted after a successful drain are best-effort.
     ///
     /// # Errors
     ///
@@ -890,105 +888,8 @@ impl MultipartOps for PgStorage {
         checksum: Option<checksum::Recorded>,
     ) -> Result<object::Info, Error> {
         self.writable(Subject::Key(key))?;
-        if parts.is_empty() {
-            return Err(storage::no_parts().into());
-        }
-        // The bucket's row before the upload's: an upload row cannot outlive its bucket, so a
-        // missing bucket would otherwise be reported as a missing upload.
-        if BucketMeta::row(&*self.store, bucket)
+        self.finish_multipart_upload(bucket, key, upload_id, parts, checksum)
             .await
-            .map_err(storage::Error::from)?
-            .is_none()
-        {
-            return Err(storage::no_such_bucket(bucket).into());
-        }
-        // The upload state: the stored-key check and the create-time tags, owner and ACL the
-        // completion applies — read from the row, never re-ferried through the interface.
-        let upload = UploadMeta::get(&*self.store, bucket, key, upload_id)
-            .await
-            .map_err(storage::Error::from)?
-            .ok_or_else(|| storage::no_such_upload(upload_id))?;
-        // The requested parts in the requested order: an inner `None` is a number the upload
-        // does not hold, the outer one an upload under another key.
-        let numbers: Vec<PartNumber> = parts.iter().map(|part| part.part_number).collect();
-        let records = UploadMeta::part_records(&*self.store, bucket, key, upload_id, &numbers)
-            .await
-            .map_err(storage::Error::from)?
-            .ok_or_else(|| storage::no_such_upload(upload_id))?;
-
-        let mut bodies: Vec<BodyStream> = Vec::with_capacity(parts.len());
-        let mut infos: Vec<multipart::PartInfo> = Vec::with_capacity(parts.len());
-        let mut retained: Vec<PartRow> = Vec::with_capacity(parts.len());
-        let mut prev = 0u32;
-        for (index, part) in parts.iter().enumerate() {
-            let n = u32::from(part.part_number);
-            if n <= prev {
-                return Err(storage::invalid_part(n).into());
-            }
-            prev = n;
-            let Some(record) = records.get(index).and_then(Option::as_ref) else {
-                return Err(storage::invalid_part(n).into());
-            };
-            let ckey = ContentKey::Part {
-                upload_id: upload_id.to_owned(),
-                number: part.part_number,
-            };
-            // The part's own length, from its content key: the size the minimum rule checks and
-            // the length the retained row records. A row whose generation is gone reads as
-            // absent — the same refusal a missing row gets (the bytes-first order makes it
-            // unreachable for a live row).
-            let Some(len) = self
-                .store
-                .live_len(bucket, &ckey)
-                .await
-                .map_err(storage::Error::from)?
-            else {
-                return Err(storage::invalid_part(n).into());
-            };
-            check_part_minimum(n, len, index + 1 == parts.len())?;
-            if record.etag != part.etag {
-                return Err(storage::invalid_part(n).into());
-            }
-            let body = self
-                .store
-                .open(bucket, &ckey, None)
-                .await
-                .map_err(storage::Error::from)?;
-            bodies.push(body);
-            retained.push(PartRow {
-                number: n,
-                size: len,
-                checksum: record.checksum.clone(),
-            });
-            infos.push(multipart::PartInfo {
-                part_number: part.part_number,
-                size: len,
-                etag: record.etag.clone(),
-                last_modified: upload.initiated_at,
-                checksum: record.checksum.clone(),
-            });
-        }
-        // The composed ETag (MD5-of-MD5s-N): the completion's answer and the object's recorded
-        // value. The list is non-empty (the refusal above) and every part pushed exactly one
-        // info, so the `None` arm is the impossible case — answered as the contract's own
-        // refusal rather than a panic.
-        let Some(etag) = ETag::composed_from_parts(&infos) else {
-            return Err(storage::no_parts().into());
-        };
-
-        self.commit_completed_upload(
-            bucket,
-            key,
-            upload_id,
-            bodies,
-            retained,
-            etag,
-            checksum,
-            upload.tags,
-            upload.owner,
-            upload.acl,
-        )
-        .await
     }
 
     async fn abort_multipart_upload(
@@ -1015,9 +916,11 @@ impl MultipartOps for PgStorage {
                 number: row.number.into(),
             })
             .collect();
-        ObjectContent::remove_many(&*self.store, bucket, &removed)
-            .await
-            .map_err(Error::from)
+        // The rows are gone. A byte-delete failure must not fail the abort:
+        // the client would retry against an upload that no longer exists, and
+        // the sweep reclaims the parts.
+        self.remove_part_bytes_best_effort(bucket, &removed).await;
+        Ok(())
     }
 
     async fn list_multipart_uploads(

@@ -22,10 +22,11 @@ use crate::{
         Bucket, BucketOps, BucketsListing, ListBucketsParams, acl,
         acl::{Acl, AclGrants},
         bucket::Name,
-        cors, object, storage,
+        cors,
+        meta::{ObjectMeta, UploadMeta},
+        object, storage,
     },
     _ops::Hooks,
-    _store_redb::{object_meta, scan::has_prefix_pair, upload},
     Error,
     storage::MemoryStorage,
 };
@@ -144,19 +145,19 @@ impl BucketOps for MemoryStorage {
 
 impl MemoryStorage {
     /// Whether mem's row planes hold neither an object row nor an upload row
-    /// for `name` — mem's emptiness authority (the row IS the object), the
-    /// probe the teardown re-runs inside its own transaction.
+    /// for `name` — mem's emptiness authority (the row IS the object), asked
+    /// only to tell the engine's `NotEmpty` apart from mem's own. Both halves
+    /// are the shared contract probes, so the rule has one home even here:
+    /// `ObjectMeta::has_objects` is the very predicate the engine's teardown
+    /// composition takes, and `UploadMeta::has_uploads` the one it takes
+    /// beside it.
+    ///
+    /// What the two answers differ on: a bucket whose row planes are empty
+    /// while byte rows linger — the part bytes a failed `remove_many`
+    /// orphaned. That is a state the engine's probes cannot see, which is why
+    /// mem's override keeps its own fallback instead of dropping it.
     async fn rows_are_empty(&self, name: &Name) -> Result<bool, Error> {
-        let b = name.as_ref().as_str().to_owned();
-        self.db.read(move |txn| -> Result<bool, Error> {
-            let objects = object_meta::Table::open_readonly(txn)?;
-            if has_prefix_pair::<_, _, Error>(&*objects, (b.as_str(), ""), |owner, _| {
-                owner == b.as_str()
-            })? {
-                return Ok(false);
-            }
-            Ok(!upload::Table::open_readonly(txn)?.has_bucket(&b)?)
-        })
+        Ok(!self.metadata.has_objects(name).await? && !self.metadata.has_uploads(name).await?)
     }
 }
 
@@ -215,7 +216,7 @@ mod tests {
             _core::{storage::VersionOps, version::State},
             _store_redb::{
                 bucket_versioning, object_meta, object_part, objects, part, part_checksum,
-                part_data, part_meta,
+                part_data, part_meta, part_stamp,
                 scan::{has_prefix_pair, has_prefix_triple},
                 upload as upload_row, upload_checksum, version as stored, version_index,
             },
@@ -287,7 +288,7 @@ mod tests {
             version_rows: u64,
             index_rows: u64,
             pair: [bool; 5],
-            triple: [bool; 5],
+            triple: [bool; 6],
         }
 
         #[tokio::test]
@@ -413,6 +414,7 @@ mod tests {
                         any_triple(&*object_part::Table::open_readonly(txn)?, &bucket),
                         any_triple(&*part::Table::open_readonly(txn)?, &bucket),
                         any_triple(&*part_checksum::Table::open_readonly(txn)?, &bucket),
+                        any_triple(&*part_stamp::Table::open_readonly(txn)?, &bucket),
                         any_triple(&*part_data::Table::open_readonly(txn)?, &bucket),
                         any_triple(&*part_meta::Table::open_readonly(txn)?, &bucket),
                     ];
@@ -444,6 +446,7 @@ mod tests {
                 "object_parts",
                 "parts",
                 "part_checksums",
+                "part_stamps",
                 "part_data",
                 "part_meta",
             ]) {

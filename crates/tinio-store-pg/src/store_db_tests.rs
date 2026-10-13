@@ -171,17 +171,186 @@ async fn a_newer_database_is_refused_with_the_pg_remedy() {
     db.drop_db().await;
 }
 
+/// **Finding 3.** A **read-only instance** pointed at a database ahead of the
+/// binary used to answer `SchemaMismatch` — whose advice is "run a writable
+/// instance", which then refuses the same database with `SchemaTooNew`. Both
+/// paths route an ahead-of-binary database through the pg remedy now, and the
+/// inspecting path still only reports.
+#[tokio::test]
+async fn a_read_only_instance_refuses_an_ahead_of_binary_database_with_the_pg_remedy() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    sqlx::query_file!(
+        "sql/tests/plant_future_version.sql",
+        (SCHEMA_VERSION + 1) as i32
+    )
+    .execute(store.as_driver())
+    .await
+    .expect("the plant");
+
+    // The serving read-only path: the pg remedy, not the writable-start advice.
+    let pool = Pool::open(&db.dsn, 1).expect("the dsn parses");
+    let err = PgStore::connect_with_pool(pool, Access::ReadOnly)
+        .await
+        .expect_err("a read-only instance refuses a database ahead of the binary");
+    assert!(
+        matches!(err, Error::SchemaTooNew { found, supported } if found == SCHEMA_VERSION + 1 && supported == SCHEMA_VERSION),
+        "{err}"
+    );
+    let message = err.to_string();
+    assert!(message.contains("pg_dump"), "{message}");
+    assert!(message.contains("never drop and rebuild"), "{message}");
+    assert!(
+        !message.contains("does not match"),
+        "the mismatch advice is not an ahead database's remedy: {message}"
+    );
+
+    // The inspecting path reports it (R3's other half keeps `inspect` reporting).
+    let inspected = PgStore::inspect(&db.dsn, 1, Access::ReadOnly)
+        .await
+        .expect("a read-only inspection only reports");
+    assert_eq!(inspected.schema().applied, SCHEMA_VERSION + 1);
+    db.drop_db().await;
+}
+
+/// **Finding 5.** `connect_with_pool` cannot see what session the pool it was
+/// handed opens, so a read-only store over a writable pool gets the session its
+/// mode asks for: the read-back is the server's own setting, not the flag.
+#[tokio::test]
+async fn a_read_only_store_over_a_writable_pool_is_re_opened_read_only() {
+    if !require_dsn() {
+        return;
+    }
+    let db = TestDb::create().await.expect("a scratch database");
+    // The schema has to exist first, which takes a writable instance.
+    let writer = db.store().await.expect("the writer migrates");
+    drop(writer);
+    let pool = Pool::open(&db.dsn, 2).expect("a writable pool");
+    assert!(!pool.is_read_only());
+    let read_only = PgStore::connect_with_pool(pool, Access::ReadOnly)
+        .await
+        .expect("a read-only store");
+    assert_eq!(read_only.access(), Access::ReadOnly);
+    assert!(read_only.pool().is_read_only());
+    // The session, not the flag: the server refuses a write on a connection this
+    // store opened, because the pool it serves over carries the read-only
+    // startup option (PG6, layer 2).
+    let setting: String = sqlx::query_scalar!(
+        "SELECT current_setting('default_transaction_read_only') AS \"setting!\""
+    )
+    .fetch_one(read_only.as_driver())
+    .await
+    .expect("the setting reads");
+    assert_eq!(setting, "on");
+    let refused = sqlx::query("SELECT 1 FROM buckets")
+        .fetch_optional(read_only.as_driver())
+        .await;
+    assert!(refused.is_ok(), "a read still works: {refused:?}");
+    db.drop_db().await;
+}
+
+/// **Finding 6, the recording half.** A fresh migration records the checksum of
+/// the file it applied, which is what the next open compares against.
+#[tokio::test]
+async fn a_fresh_migrate_records_the_migrations_checksum() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let recorded: String = sqlx::query_scalar!(
+        "SELECT checksum AS \"checksum!\" FROM schema_version WHERE id = $1",
+        SCHEMA_VERSION as i32
+    )
+    .fetch_one(store.as_driver())
+    .await
+    .expect("the recorded checksum");
+    assert_eq!(
+        recorded,
+        tinio_store_pg::migrations::applied_checksum(SCHEMA_VERSION)
+            .expect("this binary carries the version it applied"),
+        "the row records the embedded file's own digest"
+    );
+    assert_eq!(recorded.len(), 96, "sha-384 as hex: {recorded}");
+    db.drop_db().await;
+}
+
+/// **Finding 6, the refusal half.** An edit to a landed migration diverges a
+/// fresh database from an existing one; the recorded digest is the only thing
+/// that can tell, and a store refuses rather than serves it.
+#[tokio::test]
+async fn a_tampered_recorded_checksum_is_refused_with_the_pg_remedy() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    sqlx::query("UPDATE schema_version SET checksum = $1 WHERE id = $2")
+        .bind("0".repeat(96))
+        .bind(SCHEMA_VERSION as i32)
+        .execute(store.as_driver())
+        .await
+        .expect("the tamper");
+
+    let expected = tinio_store_pg::migrations::applied_checksum(SCHEMA_VERSION)
+        .expect("this binary carries the version");
+    for err in [
+        PgStore::connect(&db.dsn)
+            .await
+            .expect_err("a writable connect refuses"),
+        PgStore::inspect(&db.dsn, 1, Access::ReadOnly)
+            .await
+            .expect_err("the inspection path refuses too: a divergence is not an access mode"),
+    ] {
+        assert!(
+            matches!(&err, Error::SchemaChecksum { version, found, expected: want }
+                if *version == SCHEMA_VERSION && found == &"0".repeat(96) && want == &expected),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("pg_dump"), "{message}");
+        assert!(message.contains("never drop and rebuild"), "{message}");
+    }
+    db.drop_db().await;
+}
+
+/// A dsn that **omits** `sslmode` resolves to `require` (PG10), so the
+/// plaintext fixture it points at cannot answer it: the omission is not a
+/// licence to fall back, it is the same chain-and-hostname promise as an
+/// explicit `require`.
+#[tokio::test]
+async fn an_omitted_sslmode_never_downgrades_to_plaintext() {
+    if !require_dsn() {
+        return;
+    }
+    let db = TestDb::create().await.expect("a scratch database");
+    // The fixture's own dsn spells `sslmode=disable`; dropping the query is what
+    // makes the mode an omission.
+    let omitted = db
+        .dsn
+        .split_once('?')
+        .map(|(base, _)| base.to_owned())
+        .unwrap_or_else(|| db.dsn.clone());
+    let err = PgStore::inspect(&omitted, 1, Access::ReadOnly)
+        .await
+        .expect_err("a plaintext server cannot answer an omitted sslmode");
+    let message = err.to_string();
+    assert!(message.to_lowercase().contains("tls"), "{message}");
+    db.drop_db().await;
+}
+
 #[tokio::test]
 async fn only_one_writer_holds_the_ownership_lock() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let mut first = store
+    let first = store
         .hold_ownership()
         .await
         .expect("the first writer owns it");
     assert!(first.still_held().await.expect("the probe"));
-    let err = store
+    // The **store** holds the lock for its own life, so a second store is what
+    // is refused — not a second call on this one, which answers the lock it
+    // already holds (PG12, finding 4).
+    let second = db.store().await.expect("a second writable instance");
+    let err = second
         .hold_ownership()
         .await
         .expect_err("a second writer is refused");
@@ -205,12 +374,138 @@ async fn only_one_writer_holds_the_ownership_lock() {
         "the store reports the same holder: {named}"
     );
     assert_eq!(first.key(), tinio_store_pg::migrations::OWNERSHIP_LOCK_KEY);
+    assert_eq!(
+        store
+            .hold_ownership()
+            .await
+            .expect("the store answers the lock it holds")
+            .key(),
+        first.key(),
+        "a second call is the same lock, never a second attempt at it"
+    );
     drop(first);
-    // Releasing the first lets the second take it.
-    let _second = store
-        .hold_ownership()
+    drop(second);
+    db.drop_db().await;
+}
+
+/// **Finding 4.** A handle dropped and a task aborted are the two ways a caller
+/// could have released the lock while still serving: the store holds one handle
+/// of its own, so neither drops the session the lock lives on, and the store
+/// reports the same holder afterwards.
+#[tokio::test]
+async fn dropping_a_handle_cannot_leave_a_serving_store_without_a_lock() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let handle = store.hold_ownership().await.expect("the writer owns it");
+    let held = store
+        .ownership_holder()
         .await
-        .expect("the lock is free again");
+        .expect("the lookup")
+        .expect("the lock is held");
+    drop(handle);
+    // The lock is the store's, not the handle's.
+    assert_eq!(
+        store.ownership_holder().await.expect("the lookup"),
+        Some(held),
+        "dropping the handle left the store's own lock in place"
+    );
+    // And a task that took a handle and was aborted is the same shape: the
+    // handle it held was one of the store's, and aborting drops only that one.
+    let handle = store.hold_ownership().await.expect("a handle");
+    let task = tokio::spawn(async move {
+        let _ = handle.still_held().await;
+        std::future::pending::<()>().await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    task.abort();
+    let _ = task.await;
+    let owner = store
+        .ownership_holder()
+        .await
+        .expect("the lookup")
+        .expect("the lock is still held");
+    assert!(
+        owner.contains("tinio-store-pg"),
+        "the store still owns the lock after the task was aborted: {owner}"
+    );
+    // The lock can still be verified as this session's.
+    assert!(
+        store
+            .hold_ownership()
+            .await
+            .expect("the store's own handle")
+            .still_held()
+            .await
+            .expect("the probe")
+    );
+    db.drop_db().await;
+}
+
+/// **Finding 4, the loss path.** A dedicated connection that dies releases the
+/// session's advisory lock with it, and the re-verify has to notice: the action
+/// is injectable exactly so a test can watch it fire instead of taking the
+/// process down with `OWNERSHIP_LOST_EXIT`.
+#[tokio::test]
+async fn a_lost_ownership_lock_fires_the_re_verifys_action() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let guard = store.hold_ownership().await.expect("the writer owns it");
+    // The guard's connection is the only session this crate opened in this
+    // scratch database beyond the pool, and the pool's own idle connections
+    // are closed first so the termination below can only reach the guard.
+    store.pool().close().await;
+    let mut killer = sqlx::PgConnection::connect(&db.dsn)
+        .await
+        .expect("an admin session");
+    let terminated: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE datname = current_database() AND application_name = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind("tinio-store-pg")
+    .fetch_one(&mut killer)
+    .await
+    .expect("the session probe");
+    assert_eq!(
+        terminated, 1,
+        "the guard's dedicated session is the subject"
+    );
+    let killed = sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = current_database() AND application_name = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind("tinio-store-pg")
+    .execute(&mut killer)
+    .await
+    .expect("the guard's session is terminated");
+    assert_eq!(
+        killed.rows_affected(),
+        1,
+        "the guard's dedicated session is the one that died"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let recheck = tokio::spawn(guard.verify_with(
+        std::time::Duration::from_millis(20),
+        move |loss| {
+            let _ = tx.send(loss);
+        },
+    ));
+    let loss = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the loss path fires inside the bound")
+        .expect("the action is called once");
+    assert_eq!(loss.key, tinio_store_pg::migrations::OWNERSHIP_LOCK_KEY);
+    assert!(
+        loss.reason.is_some(),
+        "a dead connection is the probe's own failure: {loss:?}"
+    );
+    recheck
+        .await
+        .expect("the loop returns after its action")
+        .expect("the loop reports no error of its own");
+    drop(killer);
     db.drop_db().await;
 }
 
@@ -579,5 +874,35 @@ async fn a_require_dsn_never_downgrades_to_plaintext() {
     PgStore::inspect(&plaintext, 1, Access::ReadOnly)
         .await
         .expect("the same server answers a plaintext dsn");
+    db.drop_db().await;
+}
+
+/// A write the database refuses because the session is read-only reaches the
+/// caller as the read-only I/O error the engine's write-on-read rule keys on
+/// ([`storage::Error::is_read_only`]).
+///
+/// The path this exists for: a read-only instance's listing heals a cold entry
+/// through `ObjectMeta::put_preserving`, whose contract promises the
+/// in-transaction bucket-row assertion, and the `FOR UPDATE` that assertion
+/// takes is refused by the session (`25006`) before anything is written. Spelled
+/// as a plain database failure the refusal would propagate out of the listing;
+/// spelled read-only it degrades, and the listing serves (2026-10-13 round).
+#[tokio::test]
+async fn a_read_only_session_refusal_is_spelled_as_the_engines_read_only_error() {
+    use tinio_store_pg::_core::storage;
+
+    let Some((db, _writable)) = scratch().await else {
+        return;
+    };
+    let store = db.read_only().await.expect("a read-only store");
+    let refused = sqlx::query("DELETE FROM buckets")
+        .execute(store.as_driver())
+        .await
+        .expect_err("a read-only session refuses a write");
+    let projected: storage::Error = Error::from(refused).into();
+    assert!(
+        projected.is_read_only(),
+        "a 25006 refusal must reach the engine as the read-only kind, got {projected:?}"
+    );
     db.drop_db().await;
 }

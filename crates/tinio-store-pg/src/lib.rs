@@ -53,6 +53,7 @@ pub mod meta;
 pub mod migrations;
 pub mod pool;
 pub mod store;
+pub mod teardown;
 
 mod error;
 mod timestamp;

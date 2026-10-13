@@ -214,7 +214,9 @@ mod tests {
     use redb::{ReadableDatabase, TableHandle};
 
     use super::*;
-    use crate::{bucket, object_meta, object_part, part, part_checksum, upload, upload_checksum};
+    use crate::{
+        bucket, object_meta, object_part, part, part_checksum, part_stamp, upload, upload_checksum,
+    };
 
     fn open_db() -> (tempfile::TempDir, Database, Stats) {
         let dir = tempfile::tempdir().unwrap();
@@ -235,15 +237,16 @@ mod tests {
         part::Table::open_readonly(&txn).unwrap();
         upload_checksum::Table::open_readonly(&txn).unwrap();
         part_checksum::Table::open_readonly(&txn).unwrap();
+        part_stamp::Table::open_readonly(&txn).unwrap();
         object_part::Table::open_readonly(&txn).unwrap();
         state::Table::open_readonly(&txn).unwrap();
     }
 
     /// The on-disk byte-format contract: a freshly opened `meta.redb`
-    /// contains exactly the ten shared store tables plus the fs-local
+    /// contains exactly the eleven shared store tables plus the fs-local
     /// `state` table, and nothing else (shared-store-table-layer
     /// 2026-09-03 Goal 4 / spec §4 byte-format guard — this crate's own
-    /// `ensure_all` test pins the ten shared names; this pins the full
+    /// `ensure_all` test pins the eleven shared names; this pins the full
     /// schema the driver's open creates). Moved from tinio-fs's
     /// `database/open.rs`, 2026-10-01/2026-10-03.
     #[test]
@@ -265,6 +268,7 @@ mod tests {
                 "object_meta",
                 "object_parts",
                 "part_checksums",
+                "part_stamps",
                 "parts",
                 "state",
                 "upload_checksums",

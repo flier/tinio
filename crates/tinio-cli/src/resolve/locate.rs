@@ -497,9 +497,14 @@ fn locate_in(
     if let Some((config, _)) = file_mode.as_ref()
         && config.backend() == storage::Backend::Pg
     {
+        // The remedy names a channel **this run's command really has**: `--config` is the
+        // server arm's flag alone, and the clients (`doctor`, `status`, `stop`, the `service`
+        // verbs) build a discovery with none — their channels are the environment's
+        // (`pg::refuse`'s doc).
+        let names_config = discovery.config.is_some();
         return Err(match discovery.dir.as_deref() {
-            Some(dir) => pg::refuse_positional_dir(dir),
-            None => pg::refuse_discovered_root(&root),
+            Some(dir) => pg::refuse_positional_dir(dir, names_config),
+            None => pg::refuse_discovered_root(&root, names_config),
         });
     }
     let read_only = resolve_mode(
@@ -634,7 +639,9 @@ fn pg_located(
     config: &Config,
 ) -> Result<Located, Error> {
     if let Some(dir) = discovery.dir.as_deref() {
-        return Err(pg::refuse_positional_dir(dir));
+        // The operator named a `--config` — a flag only the server arm carries — so this run's
+        // remedy may name one too (`pg::refuse`).
+        return Err(pg::refuse_positional_dir(dir, discovery.config.is_some()));
     }
     let dsn = pg::resolve_dsn(config.pg_section(), discovery.pg_dsn.as_ref())?;
     let root = pg::resolve_root(&dsn, discovery.state_dir.as_deref())?;

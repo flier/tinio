@@ -114,11 +114,13 @@ pub struct EnvArgs {
 
 /// `--pg-dsn`'s parser: the material becomes a [`Secret`] at the parse, so the credential never
 /// travels as a `String`. **An empty value is read as unset, never refused**
-/// ([`pg::named`](crate::resolve::pg::named)): an empty dsn names nothing. The value is trimmed:
-/// a dsn's surrounding whitespace is never meaningful, while an environment file's CRLF line
-/// ending is.
+/// ([`pg::named`](crate::resolve::pg::named)): an empty dsn names nothing. The value's **one**
+/// normalization — the surrounding whitespace an environment file's CRLF line ending leaves, and
+/// the emptiness that then results — lives with that same reading, so the variable's dsn and
+/// `[storage.pg] dsn` cannot derive two different synthetic-root leaves for one connection
+/// string.
 fn parse_pg_dsn(raw: &str) -> Result<Secret, String> {
-    Ok(Secret::from(SecretKey::from(raw.trim().to_owned())))
+    Ok(Secret::from(SecretKey::from(raw.to_owned())))
 }
 
 /// The arguments `status`, `stop` and `doctor` share: a root and the mode.

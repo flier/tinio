@@ -453,6 +453,20 @@ impl ObjectMeta for Fake {
         unimplemented!("the engine's double implements only the calls the engine makes")
     }
 
+    async fn has_objects(&self, bucket: &bucket::Name) -> Result<bool, <Self as Metadata>::Error> {
+        // The double's row map is its whole object plane, so the teardown
+        // probe is answerable here rather than `unimplemented!`: the double
+        // stores no delete-marker bit, so a recorded row is what it counts.
+        let name = bucket.to_string();
+        Ok(self
+            .inner
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(b, _)| *b == name))
+    }
+
     async fn put_preserving(
         &self,
         bucket: &bucket::Name,

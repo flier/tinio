@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE parts SET number = 4294967296 WHERE bucket = $1 AND upload_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2f61958000bde817e2e22fc8fccb7d42c7f8c0d749c37f6b05de6b1189c8d40f"
+}

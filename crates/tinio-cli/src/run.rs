@@ -160,6 +160,22 @@ fn try_run() -> Result<ExitCode, Error> {
 /// file, and the second pass is the authoritative one: every value and [`Provenance`] the
 /// resolution reads is that parse's.
 ///
+/// **One shape reverses those two steps, and it is the pg run's** (ruling R8's sibling
+/// finding): a pg run's `<state dir>/.env` is loaded *before*
+/// [`locate`](resolve::locate) derives its root, when the discovery answers can already name
+/// that directory (`resolve::pg::env_file_state_dir`) — the root's derivation needs the dsn,
+/// and a dsn the file supplies must reach it or the root and the store would resolve two
+/// different databases. The refreshed `TINIO_PG_DSN` travels on the [`Discovery`] the
+/// resolution consumes, and only that field is refreshed: `DIR`, `--config`, the mode and
+/// `TINIO_STATE_DIR` stay the discovery parse's, which is what keeps decision 4's rule (the
+/// file cannot select the mode) true for the early load too.
+///
+/// **The dsn the store opens is the dsn the root was derived from, and the second resolution
+/// below is what makes that hold in the other direction**: a `<state dir>/.env` that overrides
+/// `[storage.pg] dsn` is read *after* the first root derivation (its own path is a function of
+/// that root), so the pg arm is re-run on the authoritative answer whenever the file moved the
+/// dsn. Bounded at one re-derivation, and only when the effective dsn actually changed.
+///
 /// **`service` is answered here, and by the discovery pass alone** — it is the one command that
 /// reaches no resolution: it reads no configuration file (the unit it installs is what will
 /// read one), so `.env` is not part of its chain and no value from that file may decide a
@@ -183,16 +199,60 @@ pub(crate) fn command_line(
     adopted: Option<&str>,
 ) -> Result<Either<Box<Resolved>, service::Args>, Error> {
     let (discovery, matches) = cli::parse(argv)?;
-    let provenance = cli::provenance(&matches);
+    // **The discovery parse's provenance is the one [`locate`](resolve::locate) gets**, whatever
+    // happens below: the mode is resolved from those two channels and the config file alone
+    // (decision 4), so a `TINIO_READ_ONLY` line an early `.env` load puts in the environment
+    // cannot start selecting the mode. The *returned* provenance is the authoritative parse's.
+    let discovery_provenance = cli::provenance(&matches);
     match discovery.command {
         Command::Service(args) => Ok(Right(args)),
         command => {
-            let located = match adopted {
-                Some(text) => resolve::locate_confined(command.discovery(), &provenance, text)?,
-                None => resolve::locate(command.discovery(), &provenance)?,
+            let mut discovery = command.discovery();
+            // **A pg run's `<state dir>/.env` is loaded before its root is derived**, when the
+            // discovery answers can already name that directory (ruling R8's sibling finding):
+            // `TINIO_STATE_DIR` names a pg run's root verbatim, so `<that dir>/.tinio` does not
+            // depend on the dsn — and a `TINIO_PG_DSN` the file supplies has to reach
+            // `pg::resolve_dsn`, or the root would come from one dsn and the store from another,
+            // and an env-only run would die naming a variable the operator did set. The value is
+            // read back through the parser that owns every `TINIO_*` channel (clap), never from
+            // the environment beside it.
+            let early = resolve::pg::env_file_state_dir(&discovery)
+                .filter(|state_dir| state_dir.join(ENV_FILE).is_file());
+            if let Some(state_dir) = early.as_deref() {
+                resolve::apply_env_file(state_dir)?;
+                discovery.pg_dsn = cli::parse(argv)?.0.command.discovery().pg_dsn;
+            }
+            // The dsn this resolution derives the root from, kept so the re-derivation below can
+            // tell whether the authoritative parse moved it: the section is the same document in
+            // both parses, so the two answers differ exactly when the environment answered
+            // differently.
+            let located_dsn = discovery.pg_dsn.clone();
+            let mut located = match adopted {
+                Some(text) => {
+                    resolve::locate_confined(discovery.clone(), &discovery_provenance, text)?
+                }
+                None => resolve::locate(discovery.clone(), &discovery_provenance)?,
             };
-            resolve::apply_env_file(&located.state_dir)?;
+            // §1's step e, for every shape the early load could not name: the located directory's
+            // own file is the one this run reads.
+            if early.as_deref() != Some(located.state_dir.as_path()) {
+                resolve::apply_env_file(&located.state_dir)?;
+            }
             let (cli, matches) = cli::parse(argv)?;
+            // **One resolved dsn feeds both.** When the file just loaded moved the dsn away from
+            // the one the root was derived from (`TINIO_PG_DSN` overriding `[storage.pg] dsn`),
+            // the root is derived again from the effective dsn — and the store opens that one,
+            // because it is the answer of this very parse. The moved directory's own `.env` is
+            // deliberately not read: the file a pg run reads is the one its **configured** root
+            // holds, which is where the operator put it.
+            let authoritative = cli.command.discovery().pg_dsn;
+            if located.pg_root.is_some() && authoritative != located_dsn {
+                discovery.pg_dsn = authoritative;
+                located = match adopted {
+                    Some(text) => resolve::locate_confined(discovery, &discovery_provenance, text)?,
+                    None => resolve::locate(discovery, &discovery_provenance)?,
+                };
+            }
             let provenance = cli::provenance(&matches);
             Ok(Left(Box::new(Resolved {
                 cli,
@@ -202,6 +262,11 @@ pub(crate) fn command_line(
         }
     }
 }
+
+/// The environment file's name inside a state directory (`sources::load_env_file`'s), spelled
+/// once here for the early load's existence probe — the load itself is that function's, never a
+/// second reader of the file's format.
+const ENV_FILE: &str = ".env";
 
 /// The three answers a resolving command needs: the **authoritative** parse, the provenance
 /// that says which channel answered each key, and the discovery answers the resolution is

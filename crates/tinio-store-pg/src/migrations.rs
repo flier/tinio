@@ -13,7 +13,9 @@
 //! the migrations. The runner in `store` still applies them with this crate's
 //! own bookkeeping -- the `schema_version` table -- rather than sqlx's
 //! `_sqlx_migrations`: the schema, and the refusal a newer database gets, are
-//! the store's contract, not the driver's.
+//! the store's contract, not the driver's. That bookkeeping records each
+//! migration's **checksum** beside its version (R5), which is what a later
+//! binary compares a database against before it serves it.
 
 use sqlx::migrate::{Migration, Migrator};
 
@@ -43,6 +45,20 @@ pub const MIGRATION_TABLE: &str = "schema_version";
 /// migration list so version 1 can record itself.
 pub(crate) const VERSION_TABLE_SQL: &str = include_str!("../sql/store/version_table.sql");
 
+/// The checksum this binary records for the migration at `version`, as hex, or
+/// `None` when this binary carries no migration at that version (an empty
+/// database, or one ahead of this binary, whose own refusal states its version).
+///
+/// The digest is `sqlx`'s own over the migration's text, taken from the
+/// **embedded** file, so the comparison a store makes ([`crate::store`]) is
+/// between the database's record and the bytes this binary was built from (R5).
+pub fn applied_checksum(version: i64) -> Option<String> {
+    MIGRATOR
+        .iter()
+        .find(|migration| migration.version == version)
+        .map(|migration| hex::encode(&*migration.checksum))
+}
+
 /// The migrations a database at `applied` still needs, in version order.
 ///
 /// # Examples
@@ -63,7 +79,7 @@ pub fn pending(applied: i64) -> impl Iterator<Item = &'static Migration> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIGRATOR, SCHEMA_VERSION, pending};
+    use super::{MIGRATOR, SCHEMA_VERSION, applied_checksum, pending};
 
     #[test]
     fn the_schema_version_is_the_newest_embedded_migration() {
@@ -78,6 +94,38 @@ mod tests {
         for (index, migration) in MIGRATOR.iter().enumerate() {
             assert_eq!(migration.version, index as i64 + 1);
         }
+    }
+
+    /// Every embedded migration has a recorded checksum to compare a database
+    /// against, and a version this binary does not carry has none: the two
+    /// answers a store's checksum gate can get (R5).
+    #[test]
+    fn a_checksum_is_offered_for_every_embedded_version_and_no_other() {
+        assert_eq!(applied_checksum(0), None, "nothing applied has no digest");
+        assert_eq!(
+            applied_checksum(SCHEMA_VERSION + 1),
+            None,
+            "a version ahead of the binary is the newer-database refusal's"
+        );
+        let mut digests = Vec::new();
+        for migration in MIGRATOR.iter() {
+            let digest = applied_checksum(migration.version).expect("an embedded version has one");
+            assert_eq!(
+                digest.len(),
+                96,
+                "sha-384 renders as 96 hex characters: {digest}"
+            );
+            assert!(
+                digest.chars().all(|c| c.is_ascii_hexdigit()),
+                "the recorded digest is hex: {digest}"
+            );
+            assert!(
+                !digests.contains(&digest),
+                "two migrations carry one digest: {digest}"
+            );
+            digests.push(digest);
+        }
+        assert_eq!(digests.len(), MIGRATOR.iter().count());
     }
 
     /// A database at the binary's version, or ahead of it, pends nothing; the

@@ -22,7 +22,7 @@ use tinio_util::testing::metadata::{
 };
 
 use crate::tests::{
-    db::{TestDb, require_dsn},
+    db::{TestDb, base_dsn, require_dsn},
     fixtures::scratch,
 };
 
@@ -67,64 +67,156 @@ async fn content_conforms() {
 /// (`data` vs `data-2` vs `data/`), plus the byte-order pair that a locale
 /// collation would flip (`0`, `B`, `_`, `a`).
 ///
-/// **Known limit (2026-10-09 review).** On this musl image the cluster's
-/// `en_US.utf8` orders bytes exactly as `"C"` does (the pg design's finding
-/// F9), so two databases under those two collations cannot disagree: this leg
-/// guards that the pin is *present*, not that it is load-bearing. A
-/// discriminating leg would need the second database created with
-/// `LOCALE_PROVIDER icu`, whose `en-US-x-icu` order the spike measured to
-/// differ; the design's collation bullet records the same limit.
+/// **Three databases, one property.** The cluster's own `en_US.utf8` and a
+/// `BUILTIN_LOCALE 'C.UTF-8'` database both order bytes exactly as `"C"` does on
+/// this musl image (the pg design's finding F9), so neither can tell the pinned
+/// `COLLATE "C"` from the database's default. The third, an ICU `en-US-x-icu`
+/// database, orders them differently (see
+/// [`the_icu_locale_would_move_the_order_without_the_pinned_collation`]), which
+/// is what makes this a real guard rather than a decorative one: dropping
+/// `COLLATE "C"` from a key column's `ORDER BY` turns the ICU database's walk
+/// red.
 #[tokio::test]
 async fn the_order_does_not_move_with_the_database_locale() {
     if !require_dsn() {
         return;
     }
-    const BYTE_ORDER: [&str; 4] = ["0", "B", "_", "a"];
     let default_locale = TestDb::create().await.expect("a scratch database");
     let builtin_c = TestDb::create_builtin_locale()
         .await
         .expect("a scratch database with a non-locale default collation");
-    for (n, db) in [&default_locale, &builtin_c].into_iter().enumerate() {
+    let icu = TestDb::create_icu_locale()
+        .await
+        .expect("a scratch database with an ICU collation");
+    for (n, db) in [&default_locale, &builtin_c, &icu].into_iter().enumerate() {
         let store = db.store().await.expect("the store connects and migrates");
-        let bucket = tinio_core::bucket::name(format!("order-{n}")).unwrap();
-        tinio_core::meta::BucketMeta::record(&store, &bucket, std::time::SystemTime::UNIX_EPOCH)
-            .await
-            .expect("the bucket row");
-        let mut keys: Vec<tinio_core::object::Key> = Vec::new();
-        for raw in ["data", "data-2", "data/", "data/leaf", "0", "B", "_", "a"] {
-            let key = tinio_core::object::key(raw).unwrap();
-            let row = tinio_core::meta::object::Row::from_values(
-                &tinio_core::ETag::from_content(raw.as_bytes()).as_str(),
-                raw.len() as u64,
-                std::time::SystemTime::UNIX_EPOCH,
-                0,
-                tinio_core::object::Tags::empty(),
-                "",
-                tinio_core::acl::Acl::default_private(None),
-            )
-            .expect("a decodable row");
-            tinio_core::meta::ObjectMeta::put(&store, &bucket, &key, &row)
-                .await
-                .expect("the object row");
-            keys.push(key);
-        }
-        let walked: Vec<String> = tinio_core::meta::ObjectMeta::walk(&store, &bucket)
-            .await
-            .expect("the traversal")
-            .into_iter()
-            .map(|(key, _)| key.to_string())
-            .collect();
-        let mut expected = keys.iter().map(|key| key.to_string()).collect::<Vec<_>>();
+        let walked = walked_collation_keys(&store, &format!("order-{n}")).await;
+        let mut expected = COLLATION_KEYS
+            .iter()
+            .map(|key| (*key).to_owned())
+            .collect::<Vec<_>>();
         expected.sort();
-        assert_eq!(walked, expected, "the traversal is byte-ordered");
+        assert_eq!(
+            walked, expected,
+            "the traversal is byte-ordered on database {n}"
+        );
         let byte_keys = walked
             .iter()
             .filter(|key| BYTE_ORDER.contains(&key.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(byte_keys, BYTE_ORDER, "COLLATE \"C\" orders the bytes");
+        assert_eq!(
+            byte_keys, BYTE_ORDER,
+            "COLLATE \"C\" orders the bytes on database {n}"
+        );
         db.drop_db().await;
     }
+}
+
+/// The discriminating collation leg (2026-10-13 review, finding 3).
+///
+/// The two databases in the leg above cannot disagree with `"C"` on this image,
+/// so the pin could be dropped anywhere and nothing turned red. An ICU-locale
+/// database does disagree: the spike measured its own order of the adversarial
+/// pair as `_,0,a,B` against `"C"`'s `0,B,_,a`. This leg first proves the ICU
+/// database's default order really is a *different* order — if it ever matched
+/// `"C"`'s, the guard above would be decorative again and this assertion says so
+/// loudly — and then walks the same keys, which the pinned `COLLATE "C"` still
+/// answers in byte order.
+///
+/// The fixture image can create this database (`postgres:18-alpine` ships ICU;
+/// re-measured 2026-10-13 against the compose fixture). If an image could not,
+/// [`TestDb::create_icu_locale`] would fail naming the `CREATE DATABASE` error
+/// rather than skip, and the alternative would be a `COLLATE` on the columns
+/// from a provider the image does ship.
+#[tokio::test]
+async fn the_icu_locale_would_move_the_order_without_the_pinned_collation() {
+    if !require_dsn() {
+        return;
+    }
+    let db = TestDb::create_icu_locale()
+        .await
+        .expect("an ICU scratch database");
+    let store = db.store().await.expect("the store connects and migrates");
+    let own_order = database_default_order(&store).await;
+    let byte_order = BYTE_ORDER
+        .iter()
+        .map(|key| (*key).to_owned())
+        .collect::<Vec<_>>();
+    assert_ne!(
+        own_order, byte_order,
+        "the ICU database orders the byte pair the same as \"C\", so this leg \
+         discriminates nothing — pick a locale the image orders differently"
+    );
+    let walked = walked_collation_keys(&store, "icu-order").await;
+    let byte_keys = walked
+        .iter()
+        .filter(|key| BYTE_ORDER.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        byte_keys, BYTE_ORDER,
+        "COLLATE \"C\" still orders the bytes on an ICU-locale database"
+    );
+    db.drop_db().await;
+}
+
+/// The collation legs' adversarial keys: the suite's traversal triple
+/// (`data`/`data-2`/`data/…`) plus the byte-order pair a locale collation would
+/// flip.
+const COLLATION_KEYS: [&str; 8] = ["data", "data-2", "data/", "data/leaf", "0", "B", "_", "a"];
+
+/// The byte-order pair alone, in `"C"`'s order: a locale collation that is not
+/// `"C"`'s orders these four differently (the ICU fixture measured `_,0,a,B`).
+const BYTE_ORDER: [&str; 4] = ["0", "B", "_", "a"];
+
+/// Seed `bucket_name` with [`COLLATION_KEYS`] and answer the walked key order —
+/// the store's own [`tinio_core::meta::ObjectMeta::walk`], whose `ORDER BY`
+/// carries the pinned `COLLATE "C"`.
+async fn walked_collation_keys(store: &PgStore, bucket_name: &str) -> Vec<String> {
+    let bucket = tinio_core::bucket::name(bucket_name.to_owned()).unwrap();
+    tinio_core::meta::BucketMeta::record(store, &bucket, std::time::SystemTime::UNIX_EPOCH)
+        .await
+        .expect("the bucket row");
+    for raw in COLLATION_KEYS {
+        let key = tinio_core::object::key(raw).unwrap();
+        let row = tinio_core::meta::object::Row::from_values(
+            &tinio_core::ETag::from_content(raw.as_bytes()).as_str(),
+            raw.len() as u64,
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+            tinio_core::object::Tags::empty(),
+            "",
+            tinio_core::acl::Acl::default_private(None),
+        )
+        .expect("a decodable row");
+        tinio_core::meta::ObjectMeta::put(store, &bucket, &key, &row)
+            .await
+            .expect("the object row");
+    }
+    tinio_core::meta::ObjectMeta::walk(store, &bucket)
+        .await
+        .expect("the traversal")
+        .into_iter()
+        .map(|(key, _)| key.to_string())
+        .collect()
+}
+
+/// The database's **own** default-collation order of [`BYTE_ORDER`] — the order
+/// the pinned `COLLATE "C"` must override.
+///
+/// A runtime query rather than a `query!` macro, so no `.sqlx` entry is owed
+/// (the cache is not this round's to regenerate), and spelled inline rather
+/// than as a `sql/tests/` file for the same reason the ICU `CREATE DATABASE`
+/// shape is: this round's ownership leaves `crates/tinio-store-pg/sql/**` to
+/// another lane. That file is the doctrine's home for it.
+async fn database_default_order(store: &PgStore) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT c FROM (VALUES ('0'), ('B'), ('_'), ('a')) AS t(c) ORDER BY c::text",
+    )
+    .fetch_all(store.as_driver())
+    .await
+    .expect("the database's own order")
 }
 
 /// The migration path: an empty database reaches the current version one step
@@ -170,6 +262,32 @@ async fn migrations_advance_an_empty_database_and_are_idempotent() {
         .expect("the migration table");
     assert_eq!(applied, SCHEMA_VERSION);
     db.drop_db().await;
+}
+
+/// The CI drift check's database prerequisite: **migrate the base database**
+/// (`TINIO_PG_DSN`'s own, not a scratch one).
+///
+/// `cargo xtask sqlx check` describes every statement against the database the
+/// dsn names, and an unmigrated database cannot answer that: the driver cannot
+/// infer a column's type (`relation "…" does not exist`) and the check reports
+/// that instead of the drift it exists for. The `@pg` cucumber pass happens to
+/// migrate the base database as its first connect, so the check used to depend
+/// on that pass having run; this leg is the explicit migration the CI job runs
+/// in its own step, so the check reports drift whatever ran before it. It is
+/// idempotent — a second connect sees the landed version and runs nothing — so
+/// running it inside the ordinary suite as well is harmless.
+#[tokio::test]
+async fn the_base_database_is_migrated_for_the_sqlx_drift_check() {
+    let Some(dsn) = base_dsn() else {
+        return;
+    };
+    let store = PgStore::connect(&dsn)
+        .await
+        .expect("the base database migrates");
+    assert!(
+        store.schema().matches(),
+        "the base database is at the binary's schema version"
+    );
 }
 
 /// The read-only role never migrates and never takes the ownership lock, while

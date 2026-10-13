@@ -36,14 +36,16 @@ pub(crate) use tinio_util::testing::blocks::MemBlocks as BlockMem;
 use crate::{
     _blob::Store,
     _core::{
-        ByteRange, ETag, MultipartUpload, acl, bucket, checksum,
+        ByteRange, ETag, MultipartUpload, acl,
+        blob::BlobRef,
+        bucket, checksum,
         content::{ContentEntry, ContentKey, ObjectContent, PublishId, StagedObject},
         cors, meta, multipart, object,
         storage::{self, BodyStream},
         version::{Id, State},
     },
     _store_redb::{RedbContent, RedbMetadata},
-    _version::{Current, CurrentRows, Versions},
+    _version::{Current, CurrentRows, MarkerWrite, Versions},
     BucketOps, BucketRow, Guard, Hooks, MetadataFailure, MultipartOps, ObjectOps, VersionPlane,
     object::row_matches,
 };
@@ -224,6 +226,17 @@ pub(crate) struct TestMeta {
     /// Refuse the next slot advance once. The row write has already landed;
     /// the undo puts the outgoing version back without advancing again.
     refuse_next_advance_slot: Arc<AtomicBool>,
+    /// Refuse the next marker-port write once, before it changes a row. A
+    /// versioned delete has already superseded and removed the key; the
+    /// engine puts that version back.
+    refuse_next_marker: Arc<AtomicBool>,
+    /// The next `version_seq_of` answer, once: a stale index entry the store
+    /// itself will not produce, so a delete can be shown refusing it.
+    next_version_seq: Arc<Mutex<Option<u64>>>,
+    /// The next `latest` answers `None`, once. The contract's corrupt-newest
+    /// row does that while older rows stay readable; the store will not plant
+    /// a corrupt row through its public writes.
+    hide_latest: Arc<AtomicBool>,
     /// The base's shared timeline: the events a *window* spans land here
     /// beside the hook's own calls (see [`Call`]).
     timeline: Arc<Mutex<Vec<Call>>>,
@@ -249,6 +262,9 @@ impl TestMeta {
             refused_writes: Arc::default(),
             refuse_next_put_with_parts: Arc::default(),
             refuse_next_advance_slot: Arc::default(),
+            refuse_next_marker: Arc::default(),
+            next_version_seq: Arc::default(),
+            hide_latest: Arc::default(),
             timeline,
             vanish_after_get: Arc::default(),
         }
@@ -290,6 +306,22 @@ impl TestMeta {
     pub(crate) fn refuse_next_advance_slot(&self) {
         self.refuse_next_advance_slot
             .store(true, AtomicOrdering::Relaxed);
+    }
+
+    /// Refuse the next marker-port write, once, before it changes a row.
+    pub(crate) fn refuse_next_marker(&self) {
+        self.refuse_next_marker.store(true, AtomicOrdering::Relaxed);
+    }
+
+    /// Answer the next `version_seq_of` with `seq`, once. The row at that
+    /// sequence keeps its own identity, so the index and the row disagree.
+    pub(crate) fn answer_next_version_seq(&self, seq: u64) {
+        *self.next_version_seq.lock().expect("the seq alias") = Some(seq);
+    }
+
+    /// Answer the next `latest` with `None`, once.
+    pub(crate) fn hide_next_latest(&self) {
+        self.hide_latest.store(true, AtomicOrdering::Relaxed);
     }
 
     /// The refusal this double owes a row write for `(bucket, key)`.
@@ -402,6 +434,10 @@ impl meta::ObjectMeta for TestMeta {
         }
         <RedbMetadata as meta::ObjectMeta>::put_with_parts(&self.inner, bucket, key, row, parts)
             .await
+    }
+
+    async fn has_objects(&self, bucket: &bucket::Name) -> Result<bool, RowError> {
+        <RedbMetadata as meta::ObjectMeta>::has_objects(&self.inner, bucket).await
     }
 
     async fn parts(
@@ -788,6 +824,9 @@ impl meta::VersionMeta for TestMeta {
         bucket: &bucket::Name,
         key: &object::Key,
     ) -> Result<Option<(u64, meta::version::Stored)>, RowError> {
+        if self.hide_latest.swap(false, AtomicOrdering::Relaxed) {
+            return Ok(None);
+        }
         <RedbMetadata as meta::VersionMeta>::latest(&self.inner, bucket, key).await
     }
 
@@ -834,7 +873,90 @@ impl meta::VersionMeta for TestMeta {
         key: &object::Key,
         id: Option<&Id>,
     ) -> Result<Option<u64>, RowError> {
+        if let Some(seq) = self.next_version_seq.lock().expect("the seq alias").take() {
+            return Ok(Some(seq));
+        }
         <RedbMetadata as meta::VersionMeta>::version_seq_of(&self.inner, bucket, key, id).await
+    }
+}
+
+/// The marker port over the reference rows.
+///
+/// A current marker is a slot with no version row. The reference `advance_slot`
+/// derives the marker bit from a version row, so this plants one at `seq`,
+/// advances, then expires that scaffold. `moved_off` is stamped by rewriting
+/// the history row: the object row is already gone when the delete calls this,
+/// and `advance_slot` only stamps the sequence the object row still records.
+#[async_trait]
+impl MarkerWrite for TestMeta {
+    async fn mark_current_marker(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        id: Option<Id>,
+        seq: u64,
+        moved_off: Option<u64>,
+    ) -> Result<(), storage::Error> {
+        if self.refuse_next_marker.swap(false, AtomicOrdering::Relaxed) {
+            return Err(storage::io(io::Error::other(
+                "the marker port refused this key",
+            )));
+        }
+        if let Some(moved_off) = moved_off.filter(|moved_off| *moved_off != seq) {
+            self.stamp_moved_off(bucket, key, moved_off).await?;
+        }
+        let marker = meta::version::Stored {
+            id: id.clone(),
+            size: 0,
+            blob: BlobRef::empty(),
+            etag: ETag::EMPTY,
+            created: SystemTime::now(),
+            became_noncurrent: 0,
+            kind: meta::version::Kind::Marker,
+            tags: object::Tags::empty(),
+            checksum: None,
+            owner: None,
+            acl: acl::Acl::default_private(None),
+            seq,
+        };
+        meta::VersionMeta::put_version(self, bucket, key, &marker)
+            .await
+            .map_err(|err| -> storage::Error { err.into() })?;
+        meta::VersionMeta::advance_slot(self, bucket, key, id, seq)
+            .await
+            .map_err(|err| -> storage::Error { err.into() })?;
+        meta::VersionMeta::expire(self, bucket, key, seq)
+            .await
+            .map_err(|err| -> storage::Error { err.into() })
+    }
+}
+
+impl TestMeta {
+    /// Stamp the history row at `seq`. The reference store keeps an existing
+    /// row's stamp, including `0`, so the row is dropped and written back with
+    /// the stamp this move owes it.
+    async fn stamp_moved_off(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seq: u64,
+    ) -> Result<(), storage::Error> {
+        let Some(mut stored) = meta::VersionMeta::get_version(self, bucket, key, seq)
+            .await
+            .map_err(|err| -> storage::Error { err.into() })?
+        else {
+            return Ok(());
+        };
+        if stored.became_noncurrent != 0 {
+            return Ok(());
+        }
+        meta::VersionMeta::expire(self, bucket, key, seq)
+            .await
+            .map_err(|err| -> storage::Error { err.into() })?;
+        stored.became_noncurrent = storage::to_nanos(SystemTime::now());
+        meta::VersionMeta::put_version(self, bucket, key, &stored)
+            .await
+            .map_err(|err| -> storage::Error { err.into() })
     }
 }
 

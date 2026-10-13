@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE object_parts SET number = 1, size = -1 WHERE bucket = $1 AND key = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e69ae117be54c159c20df6b66d7418cd64f28d5e3c3307c6ae4f9707e9a03f15"
+}

@@ -1,15 +1,27 @@
 //! The database-backed tests' harness: one scratch database per test.
 //!
 //! Every db-backed test is a distinct database, so the suite is safe under
-//! `cargo test`'s parallelism (the migration table, the ownership lock and the
-//! conformance buckets never collide). The base dsn comes from `TINIO_PG_DSN`;
-//! a missing variable skips the test rather than failing the workspace gate,
-//! and no credential is ever printed (PG5).
+//! `cargo test`'s *per-leg* state (the migration table, the ownership lock and
+//! the conformance buckets never collide). Its *connection* total is not
+//! bounded by that alone: each leg opens a 4-connection pool, so a host whose
+//! test-thread count outruns the fixture's `max_connections` fails the suite
+//! with `sorry, too many clients already` — the thread count is pinned at the
+//! invocation (`.config/nextest.toml` for nextest, `--test-threads` for the CI
+//! step and local `cargo test`; `docs/tests.md`, "Rust"). The base dsn comes
+//! from `TINIO_PG_DSN`; a missing variable skips the test rather than failing
+//! the workspace gate, **unless** `TINIO_PG_REQUIRED` says the legs are
+//! mandatory, in which case a missing dsn aborts the run rather than skipping
+//! every leg (the fail-closed gate the CI job that owns the database sets). No
+//! credential is ever printed (PG5).
 //!
 //! The harness addresses the crate and the standard library by absolute path:
 //! a shortened path would not prove the path an external caller uses.
 #![allow(clippy::absolute_paths)]
 #![allow(dead_code)]
+#![allow(
+    clippy::panic,
+    reason = "test support: the fail-closed `TINIO_PG_REQUIRED` gate must abort a run that would otherwise skip every database leg (docs/style.md §Panics)"
+)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -20,15 +32,47 @@ use tinio_store_pg::{Access, Error, PgStore, pool::Pool};
 /// Trimmed, with an all-whitespace value read as unset: the variable's one reader is here, so
 /// a trailing newline from a `.env` file or a shell export is normalized once rather than
 /// reaching the driver as part of the dsn on some legs and not on others.
+///
+/// **The one reader also enforces `TINIO_PG_REQUIRED`**, because it is the single place a
+/// leg's skip decision is taken: when the switch is set and `TINIO_PG_DSN` is unset (or
+/// blank), this **panics** rather than answering `None`. A leg that answered `None` would
+/// return green having run nothing, so a mis-set, renamed or empty dsn in a job that believes
+/// it runs the database legs could pass with zero of them executed — the fail-open shape the
+/// 2026-10-13 review found (`docs/tests.md`, "Platform-gated verification": confinement
+/// "fails, never skips"). The `pg` CI job sets it, so that job cannot pass without the legs.
 pub fn base_dsn() -> Option<String> {
-    std::env::var("TINIO_PG_DSN")
+    let dsn = std::env::var("TINIO_PG_DSN")
         .ok()
         .map(|dsn| dsn.trim().to_owned())
-        .filter(|dsn| !dsn.is_empty())
+        .filter(|dsn| !dsn.is_empty());
+    if dsn.is_none() && pg_required() {
+        panic!(
+            "TINIO_PG_REQUIRED is set but TINIO_PG_DSN is unset (or blank): the \
+             database-backed legs must run, not skip"
+        );
+    }
+    dsn
+}
+
+/// The variable that makes the database-backed legs mandatory: `TINIO_PG_REQUIRED`.
+///
+/// A **presence** test (any non-empty value), not the `tinio-util` switch grammar: the
+/// variable decides optional-versus-mandatory rather than on-versus-off, and this module
+/// compiles for external consumers (`tinio-store-pg/testing`) where `tinio-util` is a
+/// dev-dependency and so unavailable. A value nobody recognizes is still "set", which is the
+/// fail-closed direction: a run that meant to require a database but typo'd the value is
+/// refused rather than quietly made optional.
+fn pg_required() -> bool {
+    std::env::var("TINIO_PG_REQUIRED")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Whether the database-backed legs can run: `false`, with the skip notice,
 /// when `TINIO_PG_DSN` is unset, so a leg returns instead of failing.
+///
+/// The `None` arm is reached only when `TINIO_PG_REQUIRED` is unset:
+/// [`base_dsn`] panics instead of answering `None` when the legs are mandatory.
 pub fn require_dsn() -> bool {
     if base_dsn().is_none() {
         eprintln!("skipping: TINIO_PG_DSN is not set");
@@ -59,7 +103,8 @@ impl TestDb {
     }
 
     /// Create a fresh scratch database with one of the harness's `CREATE DATABASE`
-    /// shapes (the plain one, the latin-1 fixture, or the builtin-locale one).
+    /// shapes (the plain one, the latin-1 fixture, the builtin-locale one, or the
+    /// ICU-locale one).
     pub async fn create_with(statement: CreateStatement) -> Result<Self, String> {
         let base = base_dsn().ok_or("TINIO_PG_DSN is not set")?;
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -100,8 +145,29 @@ impl TestDb {
     /// because it lints without `--parsing-errors`. The corpus is otherwise
     /// unchecked nowhere, and the fixture is exercised by
     /// `the_order_does_not_move_with_the_database_locale`.
+    ///
+    /// **This `C.UTF-8` database cannot discriminate the pin.** On this musl
+    /// image `C.UTF-8` orders bytes exactly as `"C"` does, so a dropped
+    /// `COLLATE "C"` turns nothing red here; the discriminating fixture is
+    /// [`CreateStatement::IcuLocale`].
     pub async fn create_builtin_locale() -> Result<Self, String> {
         Self::create_with(CreateStatement::BuiltinLocale).await
+    }
+
+    /// Create a fresh scratch database whose default collation is the **ICU
+    /// locale `en-US-x-icu`** (`LOCALE_PROVIDER icu`): the discriminating half
+    /// of the collation leg.
+    ///
+    /// The spike measured this database's own order of the adversarial byte set
+    /// as `_,0,a,B`, against `"C"`'s `0,B,_,a`, so a dropped `COLLATE "C"` on
+    /// the key columns moves the listing and the leg goes red — the property the
+    /// `C.UTF-8` database (which orders identically to `"C"` here) could not
+    /// test. `LOCALE_PROVIDER`/`ICU_LOCALE` is the same sqruff dialect gap the
+    /// builtin-locale shape records, and the statement is the inline
+    /// `ICU_LOCALE_STATEMENT` (see its comment for why it is not a fourth
+    /// `sql/tests/` file).
+    pub async fn create_icu_locale() -> Result<Self, String> {
+        Self::create_with(CreateStatement::IcuLocale).await
     }
 
     /// Connect a writable store to this database (migrating it).
@@ -238,19 +304,37 @@ fn scratch_statement(template: &str, name: &str) -> String {
 }
 
 /// A scratch database's `CREATE DATABASE` shape: the plain one (the cluster's own
-/// locale), the latin-1 fixture, and the builtin-locale fixture. The three are the
-/// whole set the harness ever creates, so the statement each names is a literal
-/// file rather than a clause spliced into one — the shape that made the two
-/// fixtures parsable and the ignore list empty.
+/// locale), the latin-1 fixture, the builtin-locale fixture and the ICU-locale
+/// fixture. The four are the whole set the harness ever creates, so the
+/// statement each names is a literal rather than a clause spliced into one — the
+/// shape that made the fixtures parsable and the ignore list empty. Three are
+/// `sql/tests/` files; `ICU_LOCALE_STATEMENT` is the fourth shape's literal,
+/// carried here rather than in that corpus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateStatement {
     /// The cluster's own locale: the statement every ordinary leg uses.
     Plain,
     /// `LATIN1` with the `C` locales (the non-UTF-8 server leg).
     Latin1,
-    /// The builtin `C.UTF-8` locale (the collation leg).
+    /// The builtin `C.UTF-8` locale (the collation leg's non-discriminating half).
     BuiltinLocale,
+    /// The ICU `en-US-x-icu` locale (the collation leg's discriminating half).
+    IcuLocale,
 }
+
+/// The ICU-locale `CREATE DATABASE` shape, inline rather than a fourth
+/// `sql/tests/create_database_icu_locale.sql` beside the other three.
+///
+/// The home the crate's own SQL doctrine gives it is that file (one directory
+/// per owner, one text one home); it is spelled here because this review round's
+/// file ownership leaves `crates/tinio-store-pg/sql/**` to another lane, and a
+/// test fixture is not worth a cross-lane edit. It has the file shapes' form —
+/// a plain literal with one `{name}` placeholder spliced by
+/// [`scratch_statement`] — so moving it into the corpus later is a cut and
+/// paste. `LOCALE_PROVIDER icu` / `ICU_LOCALE` is the same sqruff postgres
+/// dialect gap `create_database_builtin_locale.sql` records.
+const ICU_LOCALE_STATEMENT: &str =
+    "CREATE DATABASE \"{name}\" TEMPLATE template0\nLOCALE_PROVIDER icu ICU_LOCALE 'en-US-x-icu'\n";
 
 impl CreateStatement {
     /// The statement text this shape renders, with `{name}` still to be spliced.
@@ -261,6 +345,7 @@ impl CreateStatement {
             Self::BuiltinLocale => {
                 include_str!("../../sql/tests/create_database_builtin_locale.sql")
             }
+            Self::IcuLocale => ICU_LOCALE_STATEMENT,
         }
     }
 }
@@ -307,7 +392,7 @@ async fn drop_database(maintenance: &str, name: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{scratch_statement, swap_database};
+    use super::{CreateStatement, ICU_LOCALE_STATEMENT, scratch_statement, swap_database};
 
     #[test]
     fn swapping_keeps_the_userinfo_and_the_query() {
@@ -335,43 +420,36 @@ mod tests {
     }
 
     /// Every `CREATE DATABASE` shape the harness renders takes the name and
-    /// nothing else: the two fixtures the collation and encoding legs create
-    /// with spelled their clauses out when the ignore list was emptied, so the
-    /// only placeholder left in any of the three files is `{name}`.
+    /// nothing else: the fixtures the collation and encoding legs create
+    /// spelled their clauses out (or, for the ICU shape, carry the literal in
+    /// `ICU_LOCALE_STATEMENT`), so the only placeholder left in any of them
+    /// is `{name}`.
     #[test]
     fn each_create_statement_splices_only_the_name() {
-        for (file, text) in [
-            (
-                "create_database.sql",
-                include_str!("../../sql/tests/create_database.sql"),
-            ),
-            (
-                "create_database_latin1.sql",
-                include_str!("../../sql/tests/create_database_latin1.sql"),
-            ),
-            (
-                "create_database_builtin_locale.sql",
-                include_str!("../../sql/tests/create_database_builtin_locale.sql"),
-            ),
+        for statement in [
+            CreateStatement::Plain,
+            CreateStatement::Latin1,
+            CreateStatement::BuiltinLocale,
+            CreateStatement::IcuLocale,
         ] {
-            let rendered = scratch_statement(text, "tinio_p3_1_2_3");
+            let rendered = scratch_statement(statement.text(), "tinio_p3_1_2_3");
             assert!(
                 rendered.contains("CREATE DATABASE \"tinio_p3_1_2_3\" TEMPLATE template0"),
-                "{file}: {rendered}"
+                "{statement:?}: {rendered}"
             );
             assert!(
                 !rendered.contains('{'),
-                "{file} keeps a placeholder: {rendered}"
+                "{statement:?} keeps a placeholder: {rendered}"
             );
         }
     }
 
-    /// The builtin-locale shape is the one statement sqruff's postgres dialect
-    /// cannot parse, and the clauses are why: the file spells them out rather
-    /// than splicing them, so the statement is its own fixture and the ignore
-    /// list has no entry to hold it.
+    /// The two locale shapes carry their own clauses rather than splicing them,
+    /// so each statement is its own fixture: the builtin `C.UTF-8` half and the
+    /// discriminating ICU half (`en-US-x-icu`). Both clause sets are the ones a
+    /// sqruff postgres dialect cannot parse.
     #[test]
-    fn the_builtin_locale_shape_carries_its_clauses() {
+    fn the_locale_shapes_carry_their_clauses() {
         let rendered = scratch_statement(
             include_str!("../../sql/tests/create_database_builtin_locale.sql"),
             "tinio_p3_1_2_3",
@@ -379,6 +457,11 @@ mod tests {
         assert!(
             rendered.contains("LOCALE_PROVIDER builtin BUILTIN_LOCALE 'C.UTF-8'"),
             "{rendered}"
+        );
+        let icu = scratch_statement(ICU_LOCALE_STATEMENT, "tinio_p3_1_2_3");
+        assert!(
+            icu.contains("LOCALE_PROVIDER icu ICU_LOCALE 'en-US-x-icu'"),
+            "{icu}"
         );
         let latin1 = scratch_statement(
             include_str!("../../sql/tests/create_database_latin1.sql"),

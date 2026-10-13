@@ -181,6 +181,19 @@ fn assert_denied(outcome: Option<Error>) {
     );
 }
 
+/// [`assert_denied`]'s twin for an entry whose error type is the **contract's** own
+/// ([`tinio_core::storage::Error`]) rather than the backend's: `tinio_version::MarkerWrite`
+/// fixes its method's error to the contract's type, so the refusal cannot go through the
+/// backend's `Error`.
+#[track_caller]
+fn assert_contract_denied(outcome: Option<storage::Error>) {
+    let err = outcome.expect("a mutating operation must be refused on a read-only instance");
+    assert!(
+        matches!(err, storage::Error::AccessDenied(_)),
+        "the refusal is the contract's AccessDenied class: {err}"
+    );
+}
+
 /// PG6, layer 1 (FR-023): the entry guard. **Every** mutating operation of `BucketOps`,
 /// `ObjectOps`, `MultipartOps` and `VersionOps` answers the contract's `AccessDenied` before any
 /// SQL, and every read is served unchanged.
@@ -511,6 +524,16 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
             .await
             .err(),
     );
+    // The marker-write port is the versioned delete's slot step. The engine reaches it through
+    // `delete_object`, whose own guard fires first, but the port is a **separate public entry**
+    // (`tinio_version::MarkerWrite`), so a direct call must answer the same refusal rather than
+    // reaching SQL on a read-only instance.
+    #[cfg(feature = "versioning")]
+    assert_contract_denied(
+        tinio_version::MarkerWrite::mark_current_marker(&reader, &bucket, &key, None, 1, None)
+            .await
+            .err(),
+    );
 
     // The refusal is the guard's and not an argument that failed later: a bucket that does not
     // exist still answers the read-only class, never `NoSuchBucket` — the guard precedes every
@@ -610,6 +633,14 @@ async fn a_read_only_instance_opens_its_session_read_only_before_any_statement()
 /// past `readonly.rs` — is refused by the **database**, because the role the test creates carries
 /// no `INSERT`/`UPDATE`/`DELETE` grants. The same write through the privileged role succeeds, so
 /// the refusal is the privilege and not the statement.
+///
+/// **The store is built `Access::ReadWrite` on purpose.** A store opened `Access::ReadOnly` gets
+/// its pool re-opened read-only ([`Pool::reopened_for`]), so the *session* layer (PG6, layer 2)
+/// would refuse first and the role's grant would never be exercised — the leg would then prove
+/// nothing about layer 3. A writable session is what this leg needs: the entry guard does not sit
+/// over a direct `PgStore` call, and with the session layer absent the role's missing DML grant is
+/// the one layer still standing. That is exactly the deployment requirement
+/// `crates/tinio-pg/README.md` states.
 #[tokio::test]
 async fn a_write_that_bypasses_the_entry_guard_is_refused_by_the_role() {
     if !require_dsn() {
@@ -657,10 +688,11 @@ async fn a_write_that_bypasses_the_entry_guard_is_refused_by_the_role() {
     admin.close().await;
 
     // A store over the restricted role, reached **without** `PgStorage`: this is the path a
-    // helper that bypassed the entry guard would take.
+    // helper that bypassed the entry guard would take. Built writable so the session layer is
+    // absent and the role's grant is the only layer left to refuse the write.
     let role_dsn = with_role(&db.dsn, &role, &password);
     let pool = Pool::open(&role_dsn, 2).expect("the role's dsn parses");
-    let store = PgStore::connect_with_pool(pool, Access::ReadOnly)
+    let store = PgStore::connect_with_pool(pool, Access::ReadWrite)
         .await
         .expect("the store verifies the schema through the role's SELECT grant");
 

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE upload_checksums SET algorithm = 'BLAKE3' WHERE bucket = $1 AND upload_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "94efc49eda29af093a5d70b1946de2dee9c540ced8111ed6d0506c1e87752e49"
+}

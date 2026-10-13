@@ -58,7 +58,7 @@ impl<'txn, D: TableDef, T> Table<'txn, D, T> {
     /// missing-table case itself, which [`Table::open_readonly`]'s
     /// per-definition tolerance cannot express: the content plane's two
     /// tables are the backend's own (they are not among the shared schema's
-    /// ten), so their absence means "no content", not "this root cannot be
+    /// eleven), so their absence means "no content", not "this root cannot be
     /// read" — while a *metadata* base table's absence stays the error it is.
     pub(crate) fn from_table(table: T) -> Self {
         Self(table, PhantomData, PhantomData)

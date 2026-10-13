@@ -179,9 +179,9 @@ pub async fn diagnose(config: &Config, access: Access) -> Vec<Check> {
         pool.max_connections(),
         pool.num_idle(),
     ));
-    // PG10: the row reports what the server negotiated, not the dsn's intention — under `prefer`
-    // the dsn cannot say whether the session ended up encrypted, so the authority is `pg_stat_ssl`
-    // for the connection this pool hands out. The probe runs after the pool is open, and its own
+    // PG10: the row reports what the server negotiated, not the dsn's intention — a `disable` dsn
+    // is plaintext whatever the server would have accepted, so the authority is `pg_stat_ssl` for
+    // the connection this pool hands out. The probe runs after the pool is open, and its own
     // failure falls back to the policy-only row, so a dsn the pool could not open still renders
     // what was asked for.
     let tls = tls_state(&pool).await;
@@ -284,13 +284,13 @@ fn encoding_check(encoding: &str) -> Check {
     )
 }
 
-/// The TLS row (PG10): what the server negotiated, beside the policy the dsn asked for.
+/// The TLS row (PG10): what the server negotiated, beside the policy the dsn resolved.
 ///
-/// The authority is the server (`pg_stat_ssl`, through [`tls_state`]), not the dsn: the same
-/// `sslmode=prefer` dsn is encrypted against one server and plaintext against another, and only
-/// the server can say which happened. The policy stays on the row because it is what the operator
-/// configured *and* what explains the negotiation: `require` and `disable` are promises, `prefer`
-/// is permission to fall back.
+/// The authority is the server (`pg_stat_ssl`, through [`tls_state`]), not the dsn: a `disable`
+/// dsn is plaintext whatever the server would have accepted, and only the server can say what was
+/// actually negotiated. The policy stays on the row because it is what the operator configured
+/// *and* what explains the negotiation: `require` is a promise, `disable` the one way to give TLS
+/// up.
 ///
 /// `negotiated` is the probe's own answer — `Err` when the state could not be read at all (a
 /// server that never answered), in which case the row falls back to the policy alone, so a down
@@ -300,8 +300,7 @@ fn encoding_check(encoding: &str) -> Check {
 /// maps `require` — and an omitted `sslmode` — onto the driver's verify-full, which checks the
 /// chain *and* the hostname and never downgrades, so the combination cannot come from a correct
 /// dsn: it means the guarantee the policy makes did not hold, and it is exactly the finding this
-/// row exists to surface. `prefer` over plaintext is the downgrade `prefer` permits, so it stays a
-/// warn.
+/// row exists to surface.
 fn tls_check(mode: SslMode, negotiated: Result<&TlsState, String>) -> Check {
     match negotiated {
         Err(reason) => tls_without_state(mode, &reason),
@@ -319,14 +318,6 @@ fn tls_encrypted_check(mode: SslMode, state: &TlsState) -> Check {
             Severity::Ok,
             format!(
                 "negotiated {what}; policy sslmode require verifies the chain and the hostname"
-            ),
-        ),
-        SslMode::Prefer => Check::new(
-            TLS,
-            Severity::Warn,
-            format!(
-                "negotiated {what}, but policy sslmode prefer permits a future plaintext \
-                 downgrade — write sslmode=require (or omit it) to refuse it"
             ),
         ),
         SslMode::Disable => Check::new(
@@ -347,13 +338,6 @@ fn tls_plaintext_check(mode: SslMode) -> Check {
             "policy sslmode require, but the server negotiated plaintext: a require dsn verifies \
              the chain and the hostname and never downgrades, so this is a guarantee that did not \
              hold — check the dsn and the server's TLS configuration",
-        ),
-        SslMode::Prefer => Check::new(
-            TLS,
-            Severity::Warn,
-            "policy sslmode prefer and the server negotiated plaintext — prefer permits exactly \
-             this downgrade, so the session is in the clear; write sslmode=require (or omit it) to \
-             refuse it",
         ),
         SslMode::Disable => Check::new(
             TLS,
@@ -389,10 +373,6 @@ fn tls_without_state(mode: SslMode, reason: &str) -> Check {
             Severity::Ok,
             "policy sslmode disable (plaintext, and only because the dsn says so)",
         ),
-        SslMode::Prefer => (
-            Severity::Warn,
-            "policy sslmode prefer (permits a plaintext downgrade)",
-        ),
     };
     Check::new(
         TLS,
@@ -405,12 +385,26 @@ fn tls_without_state(mode: SslMode, reason: &str) -> Check {
 /// refusals ([`StoreError::SchemaBehind`] and [`StoreError::SchemaTooNew`]) carry both versions, so
 /// the row renders the pg remedy without a second read; anything else is "not inspected" with the
 /// store's message.
+///
+/// **A database ahead of the binary takes the pg remedy on every path**, including the version a
+/// read-only inspection *reports* rather than refuses: "migrate it forward with a writable start"
+/// is advice a writable start answers with the refusal itself, so the row that reports an
+/// ahead-of-binary state states what actually remedies it — a binary carrying that schema, or a
+/// dump/restore.
 fn schema_check(state: Result<SchemaState, StoreError>) -> Check {
     match state {
         Ok(state) if state.matches() => Check::new(
             SCHEMA,
             Severity::Ok,
             format!("schema version {} is current", state.applied),
+        ),
+        Ok(state) if state.applied > state.supported => Check::new(
+            SCHEMA,
+            Severity::Error,
+            format!(
+                "the database records schema {}, newer than this binary's {}: {PG_REMEDY}",
+                state.applied, state.supported
+            ),
         ),
         Ok(state) => Check::new(
             SCHEMA,
@@ -447,6 +441,19 @@ fn schema_check(state: Result<SchemaState, StoreError>) -> Check {
                  {PG_REMEDY}"
             ),
         ),
+        Err(StoreError::SchemaChecksum {
+            version,
+            found,
+            expected,
+        }) => Check::new(
+            SCHEMA,
+            Severity::Error,
+            format!(
+                "the database's recorded checksum for schema version {version} ({found}) is not \
+                 this binary's ({expected}): the schema it was built from is not the schema this \
+                 binary serves, so nothing may be read through it — {PG_REMEDY}"
+            ),
+        ),
         Err(err) => Check::not_inspected(SCHEMA, &err.to_string()),
     }
 }
@@ -454,6 +461,12 @@ fn schema_check(state: Result<SchemaState, StoreError>) -> Check {
 /// The access row (PG6): the inspecting mode, and whether the role carries the DML grants that
 /// are the privilege layer beneath the read-only entry guard. The role facts are the store's own
 /// [`RolePrivileges`], taken as they come.
+///
+/// **A probe that checked no schema is not the green row.** An empty `schemas` means the database
+/// holds none of the store's own relations — a wrong dsn, or a session whose `search_path` names
+/// another schema — and "the role does not hold DML grants" would then certify a role nothing was
+/// looked at (the 2026-10-13 review). The row says so instead, and names the schemas it did check
+/// when it checked any.
 fn access_check(access: Access, privileges: Option<&RolePrivileges>) -> Check {
     match privileges {
         None => access_check_without_role(access, "the role's privileges could not be read"),
@@ -463,6 +476,18 @@ fn access_check(access: Access, privileges: Option<&RolePrivileges>) -> Check {
             } else {
                 "read-only"
             };
+            if privileges.schemas.is_empty() {
+                return Check::new(
+                    ACCESS,
+                    Severity::Warn,
+                    format!(
+                        "the inspecting session is {mode}, and the role's DML grants were not \
+                         checked: this database holds none of the store's own relations (no schema \
+                         carries its `schema_version` table), so there was nothing to check — a \
+                         wrong database, or a store that has never been migrated (PG6, PG11)"
+                    ),
+                );
+            }
             if !access.is_writable() && privileges.can_write {
                 return Check::new(
                     ACCESS,
@@ -473,7 +498,7 @@ fn access_check(access: Access, privileges: Option<&RolePrivileges>) -> Check {
                          carry none (PG6), so the entry guard is the only layer standing. REVOKE \
                          INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA \"{}\" FROM \"{}\", or \
                          connect read-only with a role that has only SELECT",
-                        privileges.role, privileges.schema, privileges.schema, privileges.role
+                        privileges.role, privileges.schemas, privileges.schemas, privileges.role
                     ),
                 );
             }
@@ -488,7 +513,7 @@ fn access_check(access: Access, privileges: Option<&RolePrivileges>) -> Check {
                     } else {
                         "does not hold"
                     },
-                    privileges.schema
+                    privileges.schemas
                 ),
             )
         }
@@ -610,10 +635,15 @@ mod tests {
         assert_eq!(off.severity, Severity::Ok);
         assert!(off.detail.contains("plaintext"), "{}", off.detail);
 
-        // Plaintext under `prefer` is the downgrade prefer permits, so the warn and the remedy.
-        let preferred = tls_check(SslMode::Prefer, Ok(&tls(false)));
-        assert_eq!(preferred.severity, Severity::Warn);
-        assert!(preferred.detail.contains("require"), "{}", preferred.detail);
+        // An encrypted session under `disable` is still ok: the dsn gave TLS up, and the
+        // server having accepted it anyway is not a finding.
+        let encrypted_by_chance = tls_check(SslMode::Disable, Ok(&tls(true)));
+        assert_eq!(encrypted_by_chance.severity, Severity::Ok);
+        assert!(
+            encrypted_by_chance.detail.contains("TLSv1.3"),
+            "{}",
+            encrypted_by_chance.detail
+        );
     }
 
     #[test]
@@ -638,9 +668,12 @@ mod tests {
             "{}",
             down.detail
         );
-        assert_eq!(
-            tls_check(SslMode::Prefer, Err("connection refused".to_owned())).severity,
-            Severity::Warn
+        let plaintext = tls_check(SslMode::Disable, Err("connection refused".to_owned()));
+        assert_eq!(plaintext.severity, Severity::Ok);
+        assert!(
+            plaintext.detail.contains("sslmode disable"),
+            "{}",
+            plaintext.detail
         );
     }
 
@@ -666,6 +699,61 @@ mod tests {
         }));
         assert_eq!(refused.severity, Severity::Warn);
         assert!(refused.detail.contains('3'), "{}", refused.detail);
+    }
+
+    /// An ahead-of-binary database a read-only inspection **reports** (the store's non-migrating
+    /// path answers it rather than refusing it, so `doctor` can say what it found) takes the pg
+    /// remedy: "migrate it forward with a writable start" is advice the writable start answers
+    /// with this very refusal.
+    #[test]
+    fn a_reported_ahead_of_binary_schema_takes_the_pg_remedy() {
+        let row = schema_check(Ok(SchemaState {
+            applied: 4,
+            supported: 2,
+        }));
+        assert_eq!(row.severity, Severity::Error, "{}", row.detail);
+        assert!(
+            row.detail.contains("newer than this binary's 2"),
+            "{}",
+            row.detail
+        );
+        assert!(
+            !row.detail
+                .contains("migrate it forward with a writable start"),
+            "the pending-migration advice is not an ahead database's remedy: {}",
+            row.detail
+        );
+        assert!(row.detail.contains("pg_dump"), "{}", row.detail);
+        assert!(
+            row.detail.contains("never drop and rebuild"),
+            "{}",
+            row.detail
+        );
+    }
+
+    /// R5's refusal, rendered: the recorded checksum is not the binary's, which is the one state
+    /// that says the database was built from a different schema.
+    #[test]
+    fn a_checksum_divergence_names_both_digests_and_the_remedy() {
+        let row = schema_check(Err(StoreError::SchemaChecksum {
+            version: 1,
+            found: "aa".repeat(48),
+            expected: "bb".repeat(48),
+        }));
+        assert_eq!(row.severity, Severity::Error);
+        assert!(row.detail.contains(&"aa".repeat(48)), "{}", row.detail);
+        assert!(row.detail.contains(&"bb".repeat(48)), "{}", row.detail);
+        assert!(
+            row.detail.contains("schema version 1"),
+            "the row names the version: {}",
+            row.detail
+        );
+        assert!(row.detail.contains("pg_dump"), "{}", row.detail);
+        assert!(
+            row.detail.contains("never drop and rebuild"),
+            "{}",
+            row.detail
+        );
     }
 
     #[test]
@@ -711,7 +799,7 @@ mod tests {
     fn a_read_only_session_over_a_writable_role_is_the_broken_guarantee() {
         let writer = RolePrivileges {
             role: "tinio".into(),
-            schema: "public".into(),
+            schemas: "public".into(),
             can_write: true,
         };
         let read_only = access_check(Access::ReadOnly, Some(&writer));
@@ -732,6 +820,41 @@ mod tests {
         let row = access_check(Access::ReadOnly, Some(&reader));
         assert_eq!(row.severity, Severity::Ok);
         assert!(row.detail.contains("does not hold"), "{}", row.detail);
+        assert!(
+            row.detail.contains("in `public`"),
+            "the row names the schema it checked: {}",
+            row.detail
+        );
+    }
+
+    /// **The mis-scoped probe.** A probe that checked no schema answers "no grants" the same way a
+    /// role that holds none does, and the green row would then certify a role nothing was looked
+    /// at — the 2026-10-13 review's finding, where a session whose `search_path` named no schema
+    /// with the store's tables printed "no DML grants" beside that schema's name.
+    #[test]
+    fn a_probe_that_checked_no_schema_is_not_the_green_row() {
+        let unchecked = RolePrivileges {
+            role: "tinio".into(),
+            schemas: String::new(),
+            can_write: false,
+        };
+        let row = access_check(Access::ReadOnly, Some(&unchecked));
+        assert_eq!(row.severity, Severity::Warn);
+        assert!(row.detail.contains("not checked"), "{}", row.detail);
+        assert!(row.detail.contains("schema_version"), "{}", row.detail);
+        assert!(
+            !row.detail.contains("does not hold"),
+            "the row must not certify what it did not look at: {}",
+            row.detail
+        );
+        // Every schema the probe did check is named, so a reader can see the scope.
+        let multi = RolePrivileges {
+            role: "tinio".into(),
+            schemas: "audit, public".into(),
+            can_write: false,
+        };
+        let row = access_check(Access::ReadOnly, Some(&multi));
+        assert!(row.detail.contains("audit, public"), "{}", row.detail);
     }
 
     #[test]

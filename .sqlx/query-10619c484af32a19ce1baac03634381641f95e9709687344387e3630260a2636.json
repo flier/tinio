@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH locked AS MATERIALIZED (\n    SELECT live_seq\n    FROM content_heads\n    WHERE bucket = $1\n    FOR UPDATE\n),\n\nempty AS (\n    SELECT coalesce(bool_and(live_seq IS NULL), TRUE) AS ok\n    FROM locked\n),\n\ndel_heads AS (\n    DELETE FROM content_heads\n    WHERE bucket = $1 AND (SELECT ok FROM empty)\n    RETURNING 1\n),\n\ndel_chunks AS (\n    DELETE FROM content\n    WHERE bucket = $1 AND (SELECT ok FROM empty)\n    RETURNING 1\n)\n\nSELECT ok AS \"empty!\" FROM empty\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "empty!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "10619c484af32a19ce1baac03634381641f95e9709687344387e3630260a2636"
+}

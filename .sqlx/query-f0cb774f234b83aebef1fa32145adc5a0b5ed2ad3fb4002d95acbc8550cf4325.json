@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH locked AS MATERIALIZED (\n    SELECT name FROM buckets WHERE name = $1 FOR UPDATE\n),\n\nallocated AS (\n    INSERT INTO content_heads (\n        bucket, kind, ckey, next_seq, live_seq, live_len\n    )\n    SELECT $1, $2, $3, 1, NULL, 0\n    WHERE EXISTS (SELECT 1 FROM locked)\n    ON CONFLICT (bucket, kind, ckey) DO UPDATE\n        SET\n            next_seq = content_heads.next_seq + 1,\n            allocated_at = now()\n    RETURNING next_seq\n)\n\nSELECT next_seq\nFROM allocated\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "next_seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "content_heads",
+            "name": "next_seq"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "content_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "part"
+              ]
+            }
+          }
+        },
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f0cb774f234b83aebef1fa32145adc5a0b5ed2ad3fb4002d95acbc8550cf4325"
+}

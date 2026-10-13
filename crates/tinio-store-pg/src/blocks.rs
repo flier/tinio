@@ -8,36 +8,75 @@
 //!
 //! # Staging and publishing
 //!
-//! [`stage`](BlockStore::stage) buffers the block's bytes in memory and nothing
-//! reaches the database before the publish, so an interrupted write is never
-//! served -- the trait's headline guarantee, and the one a sweep can rely on.
-//! [`publish`](BlockStore::publish) checks the bytes hash to the address, then
-//! writes every chunk row in **one statement**. The insert runs only when the
-//! address has no row yet, so a later publish cannot fill the missing `seq`
-//! values of a partial block and splice the two. `ON CONFLICT DO NOTHING`
-//! covers two publishes of the same address racing the empty check.
+//! [`stage`](BlockStore::stage) files the block's bytes into a **temp file** as
+//! they arrive, so the stage's resident memory is one write buffer whatever the
+//! block's size. The trait hands `stage` no address and the address is only
+//! known at `publish`, so the rows cannot be written to the database during
+//! `write`; a temp file is what keeps a 1 GiB block from costing 1 GiB of RSS
+//! for the whole PUT. Nothing reaches the database before the publish, so an
+//! interrupted write is never served -- the trait's headline guarantee, and the
+//! one a sweep can rely on.
 //!
-//! `rows_affected` counts only the rows this publish actually inserted. No rows
-//! inserted means the address already had a row and the staged bytes are
-//! discarded ([`Published::Existing`]); any insert means this call stored it
-//! ([`Published::Stored`]). A block whose stored length does not match its
-//! rows still fails at [`open`](BlockStore::open) rather than being repaired
-//! by a second publish.
+//! The temp lives in the plane's own stage directory ([`PgBlocks::temp_dir`]),
+//! one file per stage named by a UUID. [`Drop`] unlinks it, so a published, a
+//! refused and an abandoned stage all remove their own temp; the directory is
+//! created `0700` by the serving user (the `tinio-util` `ensure_dir` primitive
+//! `tinio-blob`'s `LocalBlocks` shares), and a temp a **crashed** stage left
+//! behind is reaped by the next [`stage`](BlockStore::stage) -- an age-gated
+//! sweep of the directory, the same rule the fs sweeper applies to its `tmp/`.
+//!
+//! [`publish`](BlockStore::publish) hashes the staged bytes to the address --
+//! the digest accumulated as the bytes arrived, so there is no second read for
+//! it -- then **reads the temp back** and writes the rows in bounded batches:
+//! one statement carries at most [`PUBLISH_BATCH_ROWS`] 8 MiB rows, so neither
+//! the parameter list nor the read window ever holds the whole block, which one
+//! `bytea[]` argument could not do above the driver's ~1 GiB single-value cap
+//! (PG14). Each batch is its own transaction, so the statement count follows
+//! from the block's own rows rather than from the body.
+//!
+//! `ON CONFLICT (hash, seq) DO NOTHING` covers every row a publish finds: a
+//! repeat writes the rows that are missing and never rewrites the ones that are
+//! there. A repeat of a whole block therefore inserts nothing and answers
+//! [`Published::Existing`] with the staged bytes dropped, while a repeat that
+//! fills the gap left by a publish interrupted earlier inserts those rows and
+//! answers [`Published::Stored`]. A filled gap cannot splice two bodies
+//! together: the address *is* the hash of the bytes, so every row this store
+//! writes under an address holds content that hashes to it, and `publish`
+//! checks that before it writes anything. A row a publish finds is never
+//! rewritten, so a block whose *stored* rows disagree with its declared length
+//! is refused at [`open`](BlockStore::open) rather than corrected by a
+//! publish.
 //!
 //! A zero-byte block -- the empty blob the engine stores as one block -- is a
 //! single row with an empty chunk, so it is listed as a block of zero bytes
 //! rather than read as an absent block.
 //!
+//! # Completeness
+//!
+//! [`contains`](BlockStore::contains) is one point read of the primary key and
+//! answers whether **any** row of the address exists -- the dedup lookup, not a
+//! promise that the block is whole, so a partial block answers present. The
+//! read is what enforces completeness (PG19): a block is served only when every
+//! row its declared length needs is present, which is
+//! `(len - 1) / BLOCK_CHUNK_BYTES + 1` rows, a zero-byte block being one empty
+//! row. [`open`](BlockStore::open) checks that before it serves a byte, so a
+//! block missing a row is an error for a full read and for a range lying inside
+//! the rows that survived alike, rather than a body that is not the block's
+//! bytes.
+//!
 //! # Reads
 //!
-//! [`contains`](BlockStore::contains) is one point read of the primary key.
-//! [`open`](BlockStore::open) reads the block's length, resolves the optional
-//! [`ByteRange`] against it, selects **only the chunk rows the range touches**,
-//! and slices the first and the last. A missing block is the contract's
-//! `NotFound` I/O error, whose message names the block's hash; a range that
-//! cannot be satisfied is [`crate::Error::InvalidRange`]
-//! and is never clamped; a stored block shorter than its declared length is an
-//! `UnexpectedEof` I/O error, never a short body.
+//! [`open`](BlockStore::open) reads the block's declared length, resolves the
+//! optional [`ByteRange`] against it, and streams **only the chunk rows the
+//! range touches**, slicing the first and the last. It fetches them a window of
+//! `READ_WINDOW_ROWS` rows at a time and gives the pooled connection back
+//! before a window's bytes are yielded, so a read's resident bytes are bounded
+//! by a window rather than by the block and no connection is held for the whole
+//! of a client's read (R4). A missing block is the contract's `NotFound` I/O
+//! error, whose message names the block's hash; a range that cannot be
+//! satisfied is [`crate::Error::InvalidRange`] and is never clamped; a stored
+//! block whose chunk bytes do not add up to the window is an `UnexpectedEof` on
+//! the body stream, never a silently short body.
 //!
 //! # Ordering
 //!
@@ -51,13 +90,28 @@
 //! Values are always bound parameters and every identifier is a fixed literal
 //! (PG26); no statement is assembled from a value.
 
-use std::{io, time::SystemTime, vec::IntoIter};
+use std::{
+    env, io, mem,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
+    vec::IntoIter,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use derive_more::Debug;
 use futures::stream;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, query, query_file_as, query_scalar};
 use time::OffsetDateTime;
+use tinio_util::fsutil::{DirOwnerUid, ensure_dir, entries_of, remove_staged_temp};
+use tokio::{
+    fs,
+    fs::File,
+    io::{AsyncReadExt, AsyncWriteExt, BufWriter},
+    sync::mpsc,
+};
+use uuid::Uuid;
 
 use crate::{
     _core::{
@@ -67,14 +121,37 @@ use crate::{
     },
     Error, PgStore,
     timestamp::{from_timestamp, to_timestamp},
-    window::clip_chunk,
+    window::{ChunkFault, ChunkWindow, chunk_windows},
 };
 
 /// The size of one `blocks` row's chunk (PG14): 8 MiB of the block's bytes.
 pub const BLOCK_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 
+/// How many of a block's rows one publish statement carries (PG14, PG22): two
+/// 8 MiB rows, so a publish's parameter list is bounded well below the driver's
+/// single-value cap however large the block is, and a 1 GiB block is 64
+/// statements.
+pub const PUBLISH_BATCH_ROWS: usize = 2;
+
 /// How many addresses one keyset page of a walk reads.
 const WALK_PAGE: i64 = 256;
+
+/// How many of a block's rows one read fetches at a time: two 8 MiB rows, so a
+/// read's resident bytes are bounded by this window rather than by the block,
+/// and the pooled connection it fetches them with goes back to the pool between
+/// windows (R4).
+const READ_WINDOW_ROWS: i32 = 2;
+
+/// How long an unpublished stage temp is left before the ingest path reaps it:
+/// ten minutes, the fs backend's block-staging grace (`block_grace`). A stage
+/// that stalls past it -- a client that stopped sending -- is residue rather
+/// than a live upload, so a crashed stage's temp cannot accumulate; a temp being
+/// written is younger than the grace, so a live stage is never swept.
+const STALE_TEMP_GRACE: Duration = Duration::from_secs(600);
+
+/// The stage directory's leaf under the OS temp directory:
+/// `<temp dir>/tinio-store-pg`.
+const TEMP_DIR_LEAF: &str = "tinio-store-pg";
 
 /// The PostgreSQL block store: one `blocks` relation, 8 MiB chunk rows.
 ///
@@ -105,6 +182,10 @@ const WALK_PAGE: i64 = 256;
 #[derive(Clone)]
 pub struct PgBlocks {
     store: PgStore,
+    /// The directory the stage's temp files are created in: the plane's own
+    /// stage directory, defaulting to `<temp dir>/tinio-store-pg` and settable
+    /// through [`PgBlocks::with_temp_dir`].
+    temp: PathBuf,
 }
 
 impl PgBlocks {
@@ -128,7 +209,69 @@ impl PgBlocks {
     /// # }
     /// ```
     pub fn new(store: PgStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            temp: default_temp_dir(),
+        }
+    }
+
+    /// Serve blocks over the store's pool, staging temp files under `temp`
+    /// instead of the default directory.
+    ///
+    /// The default is the OS temp dir's `tinio-store-pg` leaf (see
+    /// [`Self::temp_dir`]); a serving caller that keeps its own state directory
+    /// — the pg run's synthetic root (`R8`) holds one — points this at a
+    /// `tmp/` beneath it, so a run's stage residue lives in the same
+    /// per-root tree as the rest of its state rather than in the shared temp
+    /// directory.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tinio_store_pg::{PgStore, blocks::PgBlocks};
+    ///
+    /// # async fn example() -> Result<(), tinio_store_pg::Error> {
+    /// let store = PgStore::connect("postgres://user:password@db.example:5432/tinio").await?;
+    /// let blocks = PgBlocks::with_temp_dir(store, "/var/lib/tinio/.tinio/tmp");
+    /// assert_eq!(
+    ///     blocks.temp_dir().to_str(),
+    ///     Some("/var/lib/tinio/.tinio/tmp")
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_temp_dir(store: PgStore, temp: impl Into<PathBuf>) -> Self {
+        Self {
+            store,
+            temp: temp.into(),
+        }
+    }
+
+    /// The directory this plane stages temp files in.
+    ///
+    /// **Where a stage's bytes live, and who owns the directory.** The default
+    /// is `<OS temp dir>/tinio-store-pg` — the OS temp dir is per-user on
+    /// Windows, while on a shared unix `/tmp` the leaf is created `0700` by the
+    /// serving user, so a second *user* there is refused the create and must
+    /// name a directory of its own with [`Self::with_temp_dir`]. The store
+    /// carries no filesystem root of its own (it is the database), which is why
+    /// the plane stages here rather than under a run's state directory unless a
+    /// caller hands it one.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use tinio_store_pg::{PgStore, blocks::PgBlocks};
+    ///
+    /// # async fn example() -> Result<(), tinio_store_pg::Error> {
+    /// let store = PgStore::connect("postgres://user:password@db.example:5432/tinio").await?;
+    /// let blocks = PgBlocks::new(store);
+    /// println!("staging under {}", blocks.temp_dir().display());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn temp_dir(&self) -> &Path {
+        &self.temp
     }
 
     /// Borrow the store whose pool this plane runs on.
@@ -137,37 +280,138 @@ impl PgBlocks {
     }
 }
 
-/// A block staged in memory for a later [`BlockStore::publish`].
+/// The plane's default stage directory: `<OS temp dir>/tinio-store-pg`.
+fn default_temp_dir() -> PathBuf {
+    env::temp_dir().join(TEMP_DIR_LEAF)
+}
+
+/// Remove the temps in `dir` older than [`STALE_TEMP_GRACE`], best-effort: the
+/// residue of a stage whose process died, or one that stalled past the grace.
+///
+/// The sweep runs before each [`stage`](BlockStore::stage) creates its own temp,
+/// so the file it is about to write is never a candidate, and a temp a live
+/// stage holds is younger than the grace. A missing directory (nothing staged
+/// yet) and a directory entry that vanishes underfoot are both no-ops: this is
+/// housekeeping on the ingest path, never a reason to refuse a stage.
+async fn sweep_stale_temps(dir: &Path) {
+    let Ok(entries) = entries_of(dir).await else {
+        return;
+    };
+    let now = SystemTime::now();
+    for (path, name) in entries {
+        let Ok(metadata) = fs::metadata(&path).await else {
+            continue;
+        };
+        if metadata.is_dir() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= STALE_TEMP_GRACE);
+        if stale && let Err(err) = fs::remove_file(&path).await {
+            tracing::warn!(error = %err, temp = %name, "a stale block stage temp could not be removed");
+        }
+    }
+}
+
+/// A block staged in a temp file for a later [`BlockStore::publish`].
 ///
 /// The engine writes the block's bytes here, and they reach the database only
-/// when the publish commits; an abandoned stage is simply dropped. Version 1
-/// stores a whole blob as one block, so the buffer holds the whole block (the
-/// 8 MiB unit is the `blocks` row, not the stage).
+/// when the publish commits; the bytes are filed straight to disk, so the stage
+/// holds one write buffer, never the block. [`Drop`] unlinks the temp, so an
+/// abandoned stage leaves nothing behind; only a process that dies mid-stage
+/// leaves residue, which the next [`stage`](BlockStore::stage) reaps.
+///
+/// A stage's own digest is accumulated as the bytes arrive, so
+/// [`publish`](BlockStore::publish) checks the address without a second pass
+/// over the file.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use bytes::Bytes;
-/// use tinio_core::blob::StagedBlock;
-/// use tinio_store_pg::blocks::Staged;
+/// use tinio_core::blob::{BlockStore, StagedBlock};
+/// use tinio_store_pg::{
+///     PgStore,
+///     blocks::{PgBlocks, Staged},
+/// };
 ///
-/// # async fn example() -> std::io::Result<()> {
-/// let mut staged = Staged::default();
+/// # async fn example() -> Result<(), tinio_store_pg::Error> {
+/// # let store = PgStore::connect("postgres://user:password@db.example:5432/tinio").await?;
+/// # let blocks = PgBlocks::new(store);
+/// let mut staged: Staged = blocks.stage().await?;
 /// staged.write(Bytes::from_static(b"hello")).await?;
 /// // Nothing has reached the database yet: `PgBlocks::publish` is what turns
-/// // the buffer into the block's rows.
+/// // the staged bytes into the block's rows.
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Staged {
-    bytes: Vec<u8>,
+    /// The temp file the block's bytes are filed in, with the handle
+    /// [`BlockStore::publish`] takes so the file is closed before it is read
+    /// back.
+    #[debug(skip)]
+    file: Option<BufWriter<File>>,
+    /// The temp's path, unlinked by [`Drop`] on every path out.
+    temp: PathBuf,
+    /// The bytes written so far: the block's declared length.
+    len: u64,
+    /// The running hash of those bytes.
+    #[debug(skip)]
+    hasher: Sha256,
+}
+
+impl Staged {
+    /// Flush and close the write handle, so the temp's bytes are on disk and the
+    /// file can be reopened for the read-back.
+    async fn close(&mut self) -> io::Result<()> {
+        if let Some(mut file) = self.file.take() {
+            file.flush().await?;
+            drop(file);
+        }
+        Ok(())
+    }
+
+    /// The temp's path, for the read-back.
+    fn path(&self) -> &Path {
+        &self.temp
+    }
+
+    /// The staged bytes' address digest, for the publish's check.
+    fn digest(&self) -> [u8; 32] {
+        self.hasher.clone().finalize().into()
+    }
+}
+
+impl Drop for Staged {
+    /// Best-effort: a stage that is abandoned, published or refused removes its
+    /// own temp, so the only residue the directory ever holds is a process that
+    /// died mid-stage (the next `stage` reaps it). The unlink is the shared
+    /// [`tinio_util::fsutil::remove_staged_temp`] discipline: a drop can land on
+    /// a runtime worker, so the removal runs on the blocking pool and never
+    /// waits for it.
+    fn drop(&mut self) {
+        drop(self.file.take());
+        remove_staged_temp(mem::take(&mut self.temp));
+    }
 }
 
 #[async_trait]
 impl StagedBlock for Staged {
+    /// Append one chunk to the stage's temp file, hashing it as it goes. Nothing
+    /// is buffered beyond the file's own write buffer, so the bytes of a block
+    /// of any size are filed as they arrive.
     async fn write(&mut self, chunk: Bytes) -> io::Result<()> {
-        self.bytes.extend_from_slice(&chunk);
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("the stage's file was already taken"))?;
+        file.write_all(&chunk).await?;
+        self.len += chunk.len() as u64;
+        self.hasher.update(&chunk);
         Ok(())
     }
 }
@@ -178,45 +422,102 @@ impl BlockStore for PgBlocks {
     type Staged = Staged;
 
     async fn stage(&self) -> Result<Self::Staged, Error> {
-        Ok(Staged::default())
+        let dir = self.temp_dir();
+        // The residue of a crashed or stalled stage is reaped here, before this
+        // stage's own (fresh) temp exists, so the sweep never touches a live
+        // stage's file.
+        sweep_stale_temps(dir).await;
+        let path = dir.join(Uuid::new_v4().to_string());
+        // The directory exists after the first stage, so the file creation is
+        // attempted first and only a missing directory pays for the create and
+        // the retry. `ensure_dir` hardens a new component `0700`, so a staged
+        // body is not readable by another user.
+        let file = match File::create(&path).await {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                ensure_dir(dir, DirOwnerUid::new(None))
+                    .await
+                    .map_err(storage::io)?;
+                File::create(&path).await.map_err(storage::io)?
+            }
+            Err(err) => return Err(storage::io(err).into()),
+        };
+        Ok(Staged {
+            file: Some(BufWriter::new(file)),
+            temp: path,
+            len: 0,
+            hasher: Sha256::new(),
+        })
     }
 
-    async fn publish(&self, staged: Self::Staged, hash: &BlockHash) -> Result<Published, Error> {
-        let actual = BlockHash::of(&staged.bytes);
-        if &actual != hash {
+    async fn publish(
+        &self,
+        mut staged: Self::Staged,
+        hash: &BlockHash,
+    ) -> Result<Published, Error> {
+        // The write handle closes before the temp is read back: the file's own
+        // bytes are what the rows are assembled from.
+        staged.close().await.map_err(storage::io)?;
+        // The address check, on the digest the stage accumulated as the bytes
+        // arrived: these bytes hash to the address they are published under.
+        // That is what makes a gap a later publish fills safe -- every row under
+        // an address holds content that hashes to it, so a filled gap cannot
+        // splice two bodies. A mismatch leaves the temp for `staged`'s `Drop` to
+        // unlink.
+        if BlockHash::from_digest(staged.digest()) != *hash {
             return Err(address_mismatch(hash));
         }
         let hash = hash.to_hex();
-        let len = staged.bytes.len() as u64;
+        let len = staged.len;
         // One clock reading for the whole block: every row of it carries the
         // same publication time, which is what list and walk report.
         let published = to_timestamp(SystemTime::now());
-        let chunks = chunk_count(len);
-        let mut seqs = Vec::with_capacity(chunks as usize);
-        let mut pieces: Vec<&[u8]> = Vec::with_capacity(chunks as usize);
-        for seq in 0..chunks {
-            let start = seq as usize * BLOCK_CHUNK_BYTES;
-            let end = (start + BLOCK_CHUNK_BYTES).min(staged.bytes.len());
-            seqs.push(seq as i32);
-            pieces.push(&staged.bytes[start..end]);
+        // Bounded batches of rows, one statement each and one transaction each:
+        // the temp is read back one batch of [`PUBLISH_BATCH_ROWS`] rows at a
+        // time, so neither the parameter list nor the read window holds the
+        // whole block whatever the block's size. A failure between batches is
+        // residue, never a served block: the rows that landed are refused until
+        // a re-publish fills the gaps.
+        let mut file = File::open(staged.path()).await.map_err(storage::io)?;
+        let rows = chunk_count(len);
+        let mut inserted = 0;
+        let mut seq = 0u64;
+        while seq < rows {
+            let batch = (rows - seq).min(PUBLISH_BATCH_ROWS as u64);
+            // The bytes this batch's rows need: `batch` chunks, the block's last
+            // possibly short.
+            let start = seq * BLOCK_CHUNK_BYTES as u64;
+            let end = ((seq + batch) * BLOCK_CHUNK_BYTES as u64).min(len);
+            let mut buf = vec![0u8; (end - start) as usize];
+            file.read_exact(&mut buf).await.map_err(storage::io)?;
+            // The rows the batch writes, in order: every row one chunk but the
+            // block's last, which may be short (a zero-byte block is one empty
+            // row). `&pieces as _` skips BYTEA[]'s `&[Vec<u8>]` check and binds
+            // the borrowed slices; copying each row to satisfy that mapping is
+            // not acceptable.
+            let mut pieces: Vec<&[u8]> = Vec::with_capacity(batch as usize);
+            let mut offset = 0usize;
+            for _ in 0..batch {
+                let take = (buf.len() - offset).min(BLOCK_CHUNK_BYTES);
+                pieces.push(&buf[offset..offset + take]);
+                offset += take;
+            }
+            let seqs: Vec<i32> = (0..batch as i32).map(|index| seq as i32 + index).collect();
+            inserted += sqlx::query_file!(
+                "sql/blocks/publish.sql",
+                hash.as_str(),
+                &seqs,
+                &pieces as _,
+                len as i64,
+                published
+            )
+            .execute(self.store.as_driver())
+            .await?
+            .rows_affected();
+            seq += batch;
         }
-        // One statement, and only when this address has no row yet. Appending
-        // the missing seqs of a partial block would splice two publishes.
-        // rows_affected counts only what this publish inserted. `&pieces as _`
-        // skips BYTEA[]'s `&[Vec<u8>]` check and binds the borrowed slices.
-        let inserted = sqlx::query_file!(
-            "sql/blocks/publish.sql",
-            hash.as_str(),
-            &seqs,
-            &pieces as _,
-            len as i64,
-            published
-        )
-        .execute(self.store.as_driver())
-        .await?
-        .rows_affected();
         // No row inserted means every chunk row of this address was already
-        // there: the dedup hit, and the staged bytes are dropped with `staged`.
+        // there: the dedup hit, and the staged temp is dropped with `staged`.
         Ok(if inserted == 0 {
             Published::Existing
         } else {
@@ -225,7 +526,9 @@ impl BlockStore for PgBlocks {
     }
 
     async fn contains(&self, hash: &BlockHash) -> Result<bool, Error> {
-        // The dedup lookup: one point read of the primary key.
+        // The dedup lookup: one point read of the primary key. It answers
+        // whether a row of this address exists -- whether the block is *whole*
+        // for its declared length is `open`'s rule, not this one's.
         let present = query_scalar!(
             "SELECT exists(SELECT 1 FROM blocks WHERE hash = $1) AS \"present!\"",
             hash.to_hex()
@@ -237,13 +540,23 @@ impl BlockStore for PgBlocks {
 
     async fn open(&self, hash: &BlockHash, range: Option<ByteRange>) -> Result<BodyStream, Error> {
         let pool = self.store.as_driver();
-        // One encoding of the address for both statements of this read.
+        // One encoding of the address for every statement of this read.
         let hex = hash.to_hex();
-        // The length is the block's declared one; a hash with no row is the
-        // contract's NotFound, named with the address the caller asked for.
-        let Some(len) = load_len(pool, &hex).await? else {
+        // The declared length and the rows that carry it, in one statement: a
+        // hash with no row is the contract's NotFound, named with the address
+        // the caller asked for.
+        let state = load_state(pool, &hex).await?;
+        if state.rows == 0 {
             return Err(not_found(hash));
-        };
+        }
+        // The completeness rule (PG19): the rows the declared length needs are
+        // all present, or the block is refused before a byte of it is served --
+        // a full read and a range inside the surviving rows alike, so a partial
+        // block can never answer with bytes that are not the block's.
+        if !state.complete() {
+            return Err(incomplete(hash, &state));
+        }
+        let len = state.len as u64;
         let (start, end) = match range {
             // `resolve` clamps an inclusive end to the last byte and rejects a
             // start past it; a zero-byte block rejects every range.
@@ -257,32 +570,18 @@ impl BlockStore for PgBlocks {
         // may be sliced, everything between is whole.
         let first = (start / BLOCK_CHUNK_BYTES as u64) as i32;
         let last = (end / BLOCK_CHUNK_BYTES as u64) as i32;
-        // The chunk rows of the window `[first, last]`, in sequence order.
-        let rows = query_file_as!(Chunk, "sql/blocks/open.sql", &hex, first, last)
-            .fetch_all(pool)
-            .await?;
-        let mut served = 0u64;
-        let mut out: Vec<Bytes> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let Some((range, n)) = clip_chunk(
-                row.chunk.len(),
-                row.seq as u64,
-                BLOCK_CHUNK_BYTES as u64,
-                start,
-                end,
-            ) else {
-                continue;
-            };
-            served += n;
-            out.push(Bytes::from(row.chunk).slice(range));
-        }
-        // A gap in the sequence (a row removed behind the store's back) would
-        // otherwise be served as a short body; the engine's UnexpectedEof rule
-        // starts here.
-        if served != end - start + 1 {
-            return Err(short(hash, len, served));
-        }
-        Ok(Box::pin(stream::iter(out.into_iter().map(Ok))))
+        // One chunk in flight. A row short of its chunk is `UnexpectedEof` on
+        // the stream, after earlier chunks of the window may already have been
+        // yielded.
+        let label = hex.clone();
+        Ok(body(
+            PgPool::clone(pool),
+            hex,
+            first,
+            last,
+            ChunkWindow::new(start, end, BLOCK_CHUNK_BYTES as u64, false),
+            label,
+        ))
     }
 
     async fn remove(&self, hash: &BlockHash) -> Result<(), Error> {
@@ -369,6 +668,31 @@ struct Page {
     published: OffsetDateTime,
 }
 
+/// One row of `sql/blocks/state.sql`: the block's declared length with the
+/// count and the last sequence of the rows that carry it.
+struct State {
+    rows: i64,
+    last: i32,
+    len: i64,
+}
+
+impl State {
+    /// The rows the declared length needs: every byte of the block falls in a
+    /// row, so a `len`-byte block is `(len - 1) / BLOCK_CHUNK_BYTES + 1` rows,
+    /// and a zero-byte block is its own one empty row.
+    fn chunks(&self) -> i64 {
+        chunk_count(self.len as u64) as i64
+    }
+
+    /// Whether every row the declared length needs is present. The primary key
+    /// makes the sequences distinct, so a count that matches *and* a last row
+    /// that is the one the length implies pin the run to `0..chunks`, and both
+    /// a gap in the middle and a missing tail are incomplete.
+    fn complete(&self) -> bool {
+        self.rows == self.chunks() && i64::from(self.last) == self.chunks() - 1
+    }
+}
+
 /// One keyset page: up to `limit` addresses strictly after `after`, ascending.
 ///
 /// The empty cursor is below every 64-character address, so one statement
@@ -394,23 +718,89 @@ async fn page(pool: &PgPool, after: Option<&str>, limit: i64) -> Result<Vec<Entr
     Ok(out)
 }
 
-/// The block's declared length, or `None` when the address has no row. The
-/// address arrives already hex-encoded: the read's two statements share it.
-async fn load_len(pool: &PgPool, hash: &str) -> Result<Option<u64>, Error> {
-    // The block's declared length, carried by every one of its rows.
-    let len = query_scalar!(
-        "SELECT len FROM blocks WHERE hash = $1 ORDER BY seq LIMIT 1",
-        hash
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(len.map(|len| len as u64))
+/// The block's declared length with the shape of the rows that carry it. A
+/// block with no row reads as `rows == 0`, which is what tells `open` that the
+/// address is absent rather than incomplete.
+async fn load_state(pool: &PgPool, hash: &str) -> Result<State, Error> {
+    // The address arrives already hex-encoded: the read's statements share it.
+    let state = query_file_as!(State, "sql/blocks/state.sql", hash)
+        .fetch_one(pool)
+        .await?;
+    Ok(state)
 }
 
-/// How many 8 MiB rows a block of `len` bytes occupies. A zero-byte block is
-/// still one row, or it would be indistinguishable from an absent block.
+/// Stream a block's rows as a body, one window of `READ_WINDOW_ROWS` rows at
+/// a time.
+///
+/// Each window is one `fetch_all`, which borrows a pooled connection, reads its
+/// rows and gives the connection back before the window's bytes are yielded: a
+/// read holds a connection for one fetch, never for the whole of a client's
+/// read, and its resident bytes are bounded by one window (R4). `first` and
+/// `last` are the chunk rows the range touches, in `seq` order.
+fn body(
+    pool: PgPool,
+    hash: String,
+    first: i32,
+    last: i32,
+    mut window: ChunkWindow,
+    label: String,
+) -> BodyStream {
+    let (tx, rx) = mpsc::channel(1);
+    tokio::spawn(async move {
+        for (from, to) in chunk_windows(first, last, READ_WINDOW_ROWS) {
+            let rows = query_file_as!(Chunk, "sql/blocks/open.sql", &hash, from, to)
+                .fetch_all(&pool)
+                .await;
+            let rows = match rows {
+                Ok(rows) => rows,
+                Err(err) => {
+                    let _ = tx.send(Err(io::Error::other(err))).await;
+                    return;
+                }
+            };
+            for row in rows {
+                match window.push(row.seq, row.chunk) {
+                    Err(fault) => {
+                        let _ = tx.send(Err(short(&label, fault))).await;
+                        return;
+                    }
+                    Ok(Some(bytes)) => {
+                        if tx.send(Ok(bytes)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                }
+            }
+        }
+        if let Err(fault) = window.finish() {
+            let _ = tx.send(Err(short(&label, fault))).await;
+        }
+    });
+    Box::pin(stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }))
+}
+
+/// The body error for a window whose bytes do not add up: the block's name with
+/// what its rows served against what the window asked for.
+fn short(label: &str, fault: ChunkFault) -> io::Error {
+    let (served, expect) = fault.counts();
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("block {label} holds {served} of its {expect} bytes"),
+    )
+}
+
+/// How many 8 MiB rows a block of `len` bytes occupies: the row the block's
+/// last byte falls in, plus one. A zero-byte block is still one row, or it
+/// would be indistinguishable from an absent block.
 fn chunk_count(len: u64) -> u64 {
-    len.div_ceil(BLOCK_CHUNK_BYTES as u64).max(1)
+    if len == 0 {
+        1
+    } else {
+        (len - 1) / BLOCK_CHUNK_BYTES as u64 + 1
+    }
 }
 
 /// A listing limit as the statement's `LIMIT` argument.
@@ -440,17 +830,24 @@ fn address_mismatch(hash: &BlockHash) -> Error {
     )))
 }
 
-fn not_found(hash: &BlockHash) -> Error {
-    Error::NoSuchBlock(hash.to_hex())
-}
-
-/// A stored block that holds fewer bytes than its declared length: served as an
-/// error, never as a short body.
-fn short(hash: &BlockHash, len: u64, served: u64) -> Error {
+/// The rows a block's declared length needs are not all present, so the read
+/// refuses the block rather than serving the bytes that survived (PG19). The
+/// projection keeps the stored-block corruption's own kind, `UnexpectedEof`,
+/// which is also what the short-*bytes* path answers: the block promises more
+/// than it holds.
+fn incomplete(hash: &BlockHash, state: &State) -> Error {
     Error::Storage(storage::io(io::Error::new(
         io::ErrorKind::UnexpectedEof,
-        format!("block {hash} holds {served} of its {len} bytes"),
+        format!(
+            "block {hash} holds {} of its {} chunk rows",
+            state.rows,
+            state.chunks()
+        ),
     )))
+}
+
+fn not_found(hash: &BlockHash) -> Error {
+    Error::NoSuchBlock(hash.to_hex())
 }
 
 #[cfg(test)]
@@ -460,20 +857,63 @@ mod tests {
     #![allow(clippy::absolute_paths)]
     use std::{
         io,
+        path::Path,
         time::{Duration, SystemTime},
     };
 
     use bytes::Bytes;
     use futures::StreamExt;
     use sqlx::query_scalar;
+    use tempfile::TempDir;
     use tinio_util::testing::read_body;
 
-    use super::{BLOCK_CHUNK_BYTES, PgBlocks, WALK_PAGE, chunk_count};
-    use crate::_core::{
-        ByteRange,
-        blob::{BlockHash, BlockStore, Published, StagedBlock},
-        storage::{self, collect_body},
+    use super::{
+        BLOCK_CHUNK_BYTES, PUBLISH_BATCH_ROWS, PgBlocks, READ_WINDOW_ROWS, STALE_TEMP_GRACE,
+        WALK_PAGE, chunk_count,
     };
+    use crate::{
+        _core::{
+            ByteRange,
+            blob::{BlockHash, BlockStore, Published, StagedBlock},
+            storage::{self, collect_body},
+        },
+        Access, PgStore,
+        pool::Pool,
+    };
+
+    /// A scratch stage directory: the legs never write the shared temp dir.
+    fn stage_dir() -> TempDir {
+        tempfile::tempdir().expect("a scratch stage directory")
+    }
+
+    /// A block plane over `store`, staging under `dir`'s own `blocks/` subtree.
+    fn blocks_in(store: PgStore, dir: &TempDir) -> PgBlocks {
+        PgBlocks::with_temp_dir(store, dir.path().join("blocks"))
+    }
+
+    /// Poll until `path` is gone: a stage's unlink runs off the worker
+    /// ([`tinio_util::fsutil::remove_staged_temp`]), so the assertion waits for
+    /// it rather than reading the directory at the instant the call returns.
+    async fn wait_gone(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stage's temp is removed");
+    }
+
+    /// Set a file's modified time, so a leg can plant residue older than the
+    /// sweep's grace without waiting for it.
+    fn age(path: &Path, by: Duration) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("the residue opens");
+        file.set_modified(SystemTime::now() - by)
+            .expect("the residue's time moves");
+    }
 
     /// Stage `bytes` and publish them under their own address.
     async fn publish(blocks: &PgBlocks, bytes: &[u8]) -> BlockHash {
@@ -490,12 +930,30 @@ mod tests {
         hash
     }
 
+    /// Read `open` until the body yields an error.
+    async fn stream_end(
+        blocks: &PgBlocks,
+        hash: &BlockHash,
+        range: Option<ByteRange>,
+    ) -> io::Error {
+        let mut body = blocks.open(hash, range).await.expect("the block opens");
+        let mut refused = None;
+        while let Some(chunk) = body.next().await {
+            if let Err(err) = chunk {
+                refused = Some(err);
+                break;
+            }
+        }
+        refused.expect("the body ends in an error")
+    }
+
     #[tokio::test]
     async fn the_contract_round_trips_over_the_blocks_table() {
         let Some((db, store)) = crate::tests::fixtures::scratch().await else {
             return;
         };
-        let blocks = PgBlocks::new(store);
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
 
         let hash = BlockHash::of(b"conformance");
         assert!(!blocks.contains(&hash).await.expect("contains"));
@@ -593,7 +1051,8 @@ mod tests {
         let Some((db, store)) = crate::tests::fixtures::scratch().await else {
             return;
         };
-        let blocks = PgBlocks::new(store);
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
 
         // Two chunks and a short tail: the boundary is where a mis-sliced or
         // mis-sequenced chunk would show.
@@ -634,14 +1093,68 @@ mod tests {
         db.drop_db().await;
     }
 
-    /// The chunk arithmetic above the `bytea` cap, without materializing a
-    /// gigabyte: PG14 chunks a block precisely because one field cannot hold
-    /// one that large, so the plan for a >1 GiB block has to be right on its
-    /// own.
+    /// A body several publish batches long goes out in several statements --
+    /// each carrying at most [`PUBLISH_BATCH_ROWS`] rows -- and reads back byte
+    /// for byte: the statement boundary is where a batch that forgot its row
+    /// offset would double a row or drop one.
+    #[tokio::test]
+    async fn a_block_several_publish_batches_long_round_trips() {
+        let Some((db, store)) = crate::tests::fixtures::scratch().await else {
+            return;
+        };
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
+
+        // Five full chunks and a short tail: three batch statements, the last
+        // of them short, so the statement boundary is where a publish that
+        // forgot its row offset would double a row or drop one.
+        let chunks = PUBLISH_BATCH_ROWS * 2 + 2;
+        let len = (chunks - 1) * BLOCK_CHUNK_BYTES + 17;
+        let payload: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
+        let hash = publish(&blocks, &payload).await;
+
+        assert_eq!(
+            row_count(&blocks, &hash).await,
+            chunks as i64,
+            "a batched publish writes one row per 8 MiB chunk, the short tail included"
+        );
+        assert_eq!(
+            collect_body(blocks.open(&hash, None).await.expect("open"))
+                .await
+                .expect("read"),
+            payload,
+            "a block written by several batch statements reads back byte for byte"
+        );
+        // A window boundary and a batch boundary are different places: the read
+        // serves the seam either way.
+        let start = BLOCK_CHUNK_BYTES - 5;
+        let end = BLOCK_CHUNK_BYTES + 5;
+        let body = blocks
+            .open(&hash, Some(ByteRange::Inclusive(start as u64, end as u64)))
+            .await
+            .expect("open");
+        assert_eq!(
+            collect_body(body).await.expect("read"),
+            &payload[start..=end],
+            "a range across a batch's own boundary serves exactly its own bytes"
+        );
+
+        db.drop_db().await;
+    }
+
+    /// The row, statement and batch arithmetic above the `bytea` cap, without
+    /// materializing a gigabyte: PG14 chunks a block into 8 MiB rows precisely
+    /// because one field cannot hold one that large, and `publish` writes those
+    /// rows in bounded batches, so no statement's parameter list ever carries
+    /// the block whole.
     ///
-    /// The materialized leg is deliberately not run — writing 1 GiB through a
+    /// This is the arithmetic only, and it is deliberately not the >1 GiB
+    /// coverage: the materialized leg is not run — writing 1 GiB through a
     /// scratch database costs far more than the arithmetic it would re-check —
-    /// and the plan's coverage row records that choice.
+    /// so what the real publish does for a body of several batches and for the
+    /// row count a large block plans is the DB-backed leg's
+    /// (`a_block_several_publish_batches_long_round_trips`), and the plan's
+    /// coverage row records that choice.
     #[test]
     fn a_block_larger_than_the_bytea_cap_is_planned_in_whole_chunks() {
         const GIB: u64 = 1 << 30;
@@ -669,6 +1182,200 @@ mod tests {
             (len - 1) / unit + 1,
             "the last row `open` addresses is the last row the plan writes"
         );
+
+        // And the statement bound that keeps every parameter list inside the
+        // cap the chunking exists to escape: a 1 GiB block is its 128 rows in
+        // 64 statements, each carrying `PUBLISH_BATCH_ROWS` 8 MiB chunks.
+        assert_eq!(chunk_count(GIB).div_ceil(PUBLISH_BATCH_ROWS as u64), 64);
+        assert!(
+            PUBLISH_BATCH_ROWS * BLOCK_CHUNK_BYTES < GIB as usize,
+            "one statement's chunks are far below the cap a single value hits"
+        );
+    }
+
+    /// The default stage directory is the OS temp dir's own leaf, so the plane
+    /// stages under the shared temp space unless a caller points it elsewhere
+    /// with [`PgBlocks::with_temp_dir`].
+    #[test]
+    fn the_default_stage_dir_is_the_os_temp_dirs_leaf() {
+        assert_eq!(
+            super::default_temp_dir(),
+            std::env::temp_dir().join(super::TEMP_DIR_LEAF)
+        );
+    }
+
+    /// A read holds a pooled connection for the window it is fetching, not for
+    /// the whole of a client's read (R4): with a pool of exactly one
+    /// connection, a body that is open and half-consumed must not keep another
+    /// query from running.
+    ///
+    /// A read that held its connection to the end of the stream — the shape
+    /// every row fetched through one driver stream has — deadlocks the second
+    /// query here until the timeout, which is what makes this leg the property
+    /// and not the byte count.
+    #[tokio::test]
+    async fn an_open_body_releases_its_pooled_connection_between_windows() {
+        if !crate::tests::db::require_dsn() {
+            return;
+        }
+        let db = crate::tests::db::TestDb::create()
+            .await
+            .expect("a scratch database");
+        let pool = Pool::open(&db.dsn, 1).expect("a one-connection pool");
+        let store = PgStore::connect_with_pool(pool, Access::ReadWrite)
+            .await
+            .expect("a writable store");
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
+
+        // More rows than one read window, so the body has a fetch to make while
+        // the client is still reading it.
+        let len = READ_WINDOW_ROWS as usize * BLOCK_CHUNK_BYTES + 17;
+        let payload: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
+        let hash = publish(&blocks, &payload).await;
+
+        let mut body = blocks.open(&hash, None).await.expect("open");
+        let first = body.next().await.expect("the first chunk").expect("bytes");
+        assert_eq!(first.len(), BLOCK_CHUNK_BYTES, "the first row is whole");
+
+        // The pool's one connection has to be free: the read borrows it for a
+        // window fetch and gives it back before the window's bytes are yielded.
+        let present = tokio::time::timeout(Duration::from_secs(5), blocks.contains(&hash))
+            .await
+            .expect("the read held the pool's only connection past its window fetch")
+            .expect("contains");
+        assert!(present);
+
+        // And the rest of the body still reads back, window by window, over the
+        // connection the query just handed back.
+        let rest = read_body(body).await.expect("the rest of the body");
+        assert_eq!(
+            rest,
+            payload[BLOCK_CHUNK_BYTES..],
+            "the body serves every row it has left, byte for byte"
+        );
+
+        db.drop_db().await;
+    }
+
+    /// **The stage writes its bytes to a temp file, not into resident rows.** A
+    /// body of two chunks and a tail, written in 64 KiB steps, is on disk as it
+    /// arrives -- the file's length is the block's own -- and publishing it
+    /// stores the block and removes the temp. The temp's size grows with the
+    /// block, but the stage's *memory* stays one write buffer: no `Vec` of
+    /// finished rows is ever held.
+    #[tokio::test]
+    async fn a_stage_files_its_bytes_to_a_temp_file_that_publish_removes() {
+        let Some((db, store)) = crate::tests::fixtures::scratch().await else {
+            return;
+        };
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
+
+        const TAIL: usize = 17;
+        const STEP: usize = 64 * 1024;
+        let len = BLOCK_CHUNK_BYTES * 2 + TAIL;
+        let payload: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
+        let hash = BlockHash::of(&payload);
+
+        let mut staged = blocks.stage().await.expect("stage");
+        let path = staged.path().to_path_buf();
+        let mut written = 0;
+        while written < len {
+            let take = (len - written).min(STEP);
+            staged
+                .write(Bytes::copy_from_slice(&payload[written..written + take]))
+                .await
+                .expect("write");
+            written += take;
+        }
+        // The bytes are on disk as they arrive (a write buffer, not the whole
+        // block, is what the stage holds), so the temp has grown well past one
+        // chunk while the stage is still open.
+        assert!(
+            std::fs::metadata(&path).expect("the temp exists").len() >= BLOCK_CHUNK_BYTES as u64,
+            "the bytes are filed to the temp as they arrive, not held in memory"
+        );
+
+        assert_eq!(
+            blocks.publish(staged, &hash).await.expect("publish"),
+            Published::Stored
+        );
+        assert_eq!(
+            collect_body(blocks.open(&hash, None).await.expect("open"))
+                .await
+                .expect("read"),
+            payload,
+            "a block staged to a temp file reads back byte for byte"
+        );
+        wait_gone(&path).await;
+        assert!(!path.exists(), "a published stage removes its temp");
+
+        db.drop_db().await;
+    }
+
+    /// **A refused publish removes its temp too.** The staged bytes do not hash
+    /// to the address, so the publish refuses -- and the temp the stage filed
+    /// them in goes with the stage, leaving no residue.
+    #[tokio::test]
+    async fn a_refused_publish_removes_its_temp() {
+        let Some((db, store)) = crate::tests::fixtures::scratch().await else {
+            return;
+        };
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
+
+        let hash = BlockHash::of(b"the real block");
+        let mut staged = blocks.stage().await.expect("stage");
+        let path = staged.path().to_path_buf();
+        staged
+            .write(Bytes::from_static(b"garbage that is not the address"))
+            .await
+            .expect("write");
+        assert!(
+            blocks.publish(staged, &hash).await.is_err(),
+            "bytes that do not hash to the address are refused"
+        );
+
+        wait_gone(&path).await;
+        assert!(!path.exists(), "a refused publish removes its temp");
+
+        db.drop_db().await;
+    }
+
+    /// **A residue temp left by a crashed stage is reclaimed by the next
+    /// stage.** A temp older than [`STALE_TEMP_GRACE`] is swept; a temp younger
+    /// than the grace -- what a live stage holds -- is left alone.
+    #[tokio::test]
+    async fn a_residue_temp_is_reclaimed_by_the_next_stage() {
+        let Some((db, store)) = crate::tests::fixtures::scratch().await else {
+            return;
+        };
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
+
+        let stage_dir = blocks.temp_dir().to_path_buf();
+        std::fs::create_dir_all(&stage_dir).expect("the stage directory");
+        // The residue of a stage whose process died: older than the grace.
+        let stale = stage_dir.join("stale-residue");
+        std::fs::write(&stale, b"half a block").expect("the residue");
+        age(&stale, STALE_TEMP_GRACE + Duration::from_secs(60));
+        // A temp a live stage would hold: younger than the grace.
+        let fresh = stage_dir.join("fresh");
+        std::fs::write(&fresh, b"a live stage").expect("the live temp");
+
+        let staged = blocks.stage().await.expect("a stage opens and sweeps");
+        let staged_path = staged.path().to_path_buf();
+
+        assert!(!stale.exists(), "the stale residue is reclaimed");
+        assert!(
+            fresh.exists(),
+            "a temp younger than the grace is never swept"
+        );
+        assert!(staged_path.exists(), "the new stage's own temp is its own");
+
+        drop(staged);
+        db.drop_db().await;
     }
 
     #[tokio::test]
@@ -676,7 +1383,8 @@ mod tests {
         let Some((db, store)) = crate::tests::fixtures::scratch().await else {
             return;
         };
-        let blocks = PgBlocks::new(store);
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
 
         // The empty blob's block: one row of no bytes, not an absent block.
         let zero = BlockHash::of(b"");
@@ -717,56 +1425,177 @@ mod tests {
         db.drop_db().await;
     }
 
-    /// A stored block that holds fewer bytes than its declared length is an
-    /// `UnexpectedEof` I/O error, never a short body: the row a reader is served
-    /// from can be gone even though the block's own length row is not.
+    /// A stored block whose rows are the complete set its length needs, but
+    /// whose chunk *bytes* are short, is an `UnexpectedEof` on the body stream:
+    /// the window counts what the rows served against what it asked for, rather
+    /// than ending the body early.
     #[tokio::test]
-    async fn a_block_missing_one_of_its_rows_is_a_short_body_error() {
+    async fn a_chunk_row_shorter_than_its_chunk_is_a_short_body_error() {
         let Some((db, store)) = crate::tests::fixtures::scratch().await else {
             return;
         };
-        let blocks = PgBlocks::new(store);
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
 
         let payload: Vec<u8> = (0..BLOCK_CHUNK_BYTES + 17)
             .map(|index| (index % 251) as u8)
             .collect();
         let hash = publish(&blocks, &payload).await;
-        // The tail row goes behind the store's back.
-        sqlx::query_file!(
-            "sql/tests/plant_blocks_missing_tail_row.sql",
+        // The head row keeps its place and loses its bytes, behind the store's
+        // back, so the row set stays complete and only the bytes do not add up.
+        const SERVED: usize = 1024;
+        sqlx::query!(
+            "UPDATE blocks SET chunk = $2 WHERE hash = $1 AND seq = 0",
             hash.to_hex(),
-            1i32
+            &payload[..SERVED]
         )
         .execute(blocks.store().as_driver())
         .await
         .expect("the plant");
 
-        let err = blocks
-            .open(&hash, None)
-            .await
-            .err()
-            .expect("a block holding fewer bytes than it declares is refused");
+        let err = stream_end(&blocks, &hash, None).await;
         let message = err.to_string();
         assert!(
             message.contains(&hash.to_hex()),
             "the failure names the block: {message}"
         );
         assert!(
-            message.contains(&format!("{BLOCK_CHUNK_BYTES} of its {}", payload.len())),
+            message.contains(&format!("{} of its {}", SERVED + 17, payload.len())),
             "the failure counts what was served against the declared length: {message}"
         );
-        let storage::Error::Io(io) = err.into() else {
-            panic!("a short block must project onto an I/O error");
-        };
-        assert_eq!(io.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
 
-        // A reader asking for a window inside the surviving row still gets its
-        // error rather than a body sliced out of the wrong run of the block.
+        db.drop_db().await;
+    }
+
+    /// PG19's completeness rule is a property of the *block*, not of the window
+    /// a reader asked for: a block whose declared `len` needs more rows than it
+    /// holds must not answer even a range that lies entirely inside the rows
+    /// that survived. `contains` answers whether a row exists, so it stays true
+    /// here — the read is what refuses the block.
+    #[tokio::test]
+    async fn a_block_missing_a_row_is_refused_even_for_a_range_inside_the_survivors() {
+        let Some((db, store)) = crate::tests::fixtures::scratch().await else {
+            return;
+        };
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
+
+        let payload: Vec<u8> = (0..BLOCK_CHUNK_BYTES + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let hash = publish(&blocks, &payload).await;
+        drop_row(&blocks, &hash, 1).await;
+
         assert!(
-            blocks.open(&hash, Some(ByteRange::From(0))).await.is_err(),
-            "the whole block is refused, not just the tail"
+            blocks.contains(&hash).await.expect("contains"),
+            "a row exists, so the dedup lookup answers present"
+        );
+        assert!(
+            blocks
+                .open(&hash, Some(ByteRange::Inclusive(0, 100)))
+                .await
+                .is_err(),
+            "a range inside the surviving head is refused while a row is missing: \
+             101 bytes of a block that needs two rows is not the block"
+        );
+
+        let Err(err) = blocks.open(&hash, None).await else {
+            panic!("a block missing a row is refused, not served short");
+        };
+        assert!(
+            err.to_string().contains(&hash.to_hex()),
+            "{err} must name the block it could not serve"
+        );
+
+        db.drop_db().await;
+    }
+
+    /// A publish that dies part-way leaves rows behind, and a re-publish of the
+    /// same address fills the gaps rather than answering `Existing` on a
+    /// partial block. The seam is safe because the address *is* the hash of the
+    /// bytes: every row of it holds the same content, and the rows already
+    /// there are never rewritten (`ON CONFLICT ... DO NOTHING` per row).
+    #[tokio::test]
+    async fn a_republish_fills_the_gap_of_a_partial_block() {
+        let Some((db, store)) = crate::tests::fixtures::scratch().await else {
+            return;
+        };
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
+
+        let payload: Vec<u8> = (0..BLOCK_CHUNK_BYTES + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let hash = publish(&blocks, &payload).await;
+        // The interrupted publish's residue: the head row landed, the tail did
+        // not.
+        drop_row(&blocks, &hash, 1).await;
+        assert!(
+            blocks.open(&hash, None).await.is_err(),
+            "the partial block is refused before the gap is filled"
+        );
+
+        // The re-publish writes the missing row and leaves the found one alone.
+        let mut staged = blocks.stage().await.expect("stage");
+        staged
+            .write(Bytes::copy_from_slice(&payload))
+            .await
+            .expect("write");
+        assert_eq!(
+            blocks.publish(staged, &hash).await.expect("publish"),
+            Published::Stored,
+            "a publish that fills a gap inserted a row, so it stored the block"
+        );
+
+        assert_eq!(row_count(&blocks, &hash).await, 2, "the gap is filled");
+        assert_eq!(
+            collect_body(blocks.open(&hash, None).await.expect("open"))
+                .await
+                .expect("read"),
+            payload,
+            "the whole block reads back byte for byte after the gap is filled"
+        );
+        let body = blocks
+            .open(
+                &hash,
+                Some(ByteRange::Inclusive(
+                    BLOCK_CHUNK_BYTES as u64 - 5,
+                    BLOCK_CHUNK_BYTES as u64 + 5,
+                )),
+            )
+            .await
+            .expect("open");
+        assert_eq!(
+            collect_body(body).await.expect("read"),
+            &payload[BLOCK_CHUNK_BYTES - 5..=BLOCK_CHUNK_BYTES + 5],
+            "the range across the seam serves exactly its own bytes"
         );
         db.drop_db().await;
+    }
+
+    /// Drop one chunk row behind the store's back: the block's declared length
+    /// survives, so it promises a row that is no longer there.
+    async fn drop_row(blocks: &PgBlocks, hash: &BlockHash, seq: i32) {
+        sqlx::query_file!(
+            "sql/tests/plant_blocks_missing_tail_row.sql",
+            hash.to_hex(),
+            seq
+        )
+        .execute(blocks.store().as_driver())
+        .await
+        .expect("the plant");
+    }
+
+    /// How many chunk rows the block holds.
+    async fn row_count(blocks: &PgBlocks, hash: &BlockHash) -> i64 {
+        query_scalar!(
+            "SELECT count(*) AS \"rows!\" FROM blocks WHERE hash = $1",
+            hash.to_hex()
+        )
+        .fetch_one(blocks.store().as_driver())
+        .await
+        .expect("count the chunk rows")
     }
 
     /// An address the store never wrote fails the page it is read with, and an
@@ -777,7 +1606,8 @@ mod tests {
         let Some((db, store)) = crate::tests::fixtures::scratch().await else {
             return;
         };
-        let blocks = PgBlocks::new(store);
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
         let hash = publish(&blocks, b"a real block").await;
         sqlx::query_file!("sql/tests/plant_blocks_undecodable_address.sql")
             .execute(blocks.store().as_driver())
@@ -812,7 +1642,8 @@ mod tests {
         let Some((db, store)) = crate::tests::fixtures::scratch().await else {
             return;
         };
-        let blocks = PgBlocks::new(store);
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
 
         // One page and a tail: the boundary is where a walk that forgot to move
         // its cursor would repeat or skip an address.
@@ -868,7 +1699,8 @@ mod tests {
         let Some((db, store)) = crate::tests::fixtures::scratch().await else {
             return;
         };
-        let blocks = PgBlocks::new(store);
+        let dir = stage_dir();
+        let blocks = blocks_in(store, &dir);
 
         let mut published = Vec::new();
         for payload in [

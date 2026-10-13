@@ -458,10 +458,14 @@ pub trait VersionMeta: Send + Sync + 'static {
     ///
     /// - `exists` is `true` (a slot is recorded);
     /// - `version` is the recorded identity (`None` is the null version);
-    /// - `is_delete_marker` is `true` exactly when the row at the slot's
-    ///   sequence is a marker, **or** the slot's own record carries the bit a
-    ///   restore wrote ([`VersionMeta::restore_slot`] consumes the row it
-    ///   derived the bit from, so that row alone cannot answer it).
+    /// - `is_delete_marker` answers from the row at the slot's sequence when
+    ///   there is one — `true` for a marker row, `false` for any other row of
+    ///   the closed set — and from the slot's own recorded bit only when the row
+    ///   is absent (the bit a restore wrote: [`VersionMeta::restore_slot`]
+    ///   consumes the row it derived the bit from, so that row alone cannot
+    ///   answer it). **A present row decides**: the recorded bit is never OR-ed
+    ///   over a row's kind (the 2026-10-13 ruling; pg always answered this way
+    ///   and the redb store followed it).
     ///
     /// A slot advanced to a sequence with no version row — no foreign key binds
     /// the two, so a row can be expired out of band — is still `Some`: its
@@ -725,9 +729,12 @@ pub trait VersionMeta: Send + Sync + 'static {
     /// nothing — and a bucket that holds no version row answers `Ok`, never an
     /// error.
     ///
-    /// Only the version rows are this call's: the bucket's versioning state is
-    /// [`Self::bucket_state`]'s own row, which the caller that tears a bucket
-    /// down retires separately.
+    /// Only the version rows and their index entries are this call's: the
+    /// bucket's versioning state is [`Self::bucket_state`]'s own row and a key's
+    /// slot is [`Self::current_slot`]'s, both of which the caller that tears a
+    /// bucket down retires separately — this call leaves `current_slots`
+    /// recorded, as the fs and redb stores do (the 2026-10-13 ruling; pg's
+    /// drain cleared slots and no longer does).
     async fn drain_bucket(&self, bucket: &bucket::Name) -> Result<(), Self::Error>;
 
     /// The sequence the version `id` names under `key` — the point-lookup

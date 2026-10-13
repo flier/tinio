@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\r\n    ckey COLLATE \"C\" AS \"ckey!\",\r\n    live_seq AS \"seq!\",\r\n    live_len AS \"len!\"\r\nFROM content_heads\r\nWHERE\r\n    bucket = $1\r\n    AND ckey = ANY ($2)\r\n    AND live_seq IS NOT NULL\r\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ckey!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "seq!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "content_heads",
+            "name": "live_seq"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "len!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "content_heads",
+            "name": "live_len"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null,
+      true,
+      false
+    ]
+  },
+  "hash": "cd772f791f80bf3c9ec66a54072c763db5ece04be214d3e2527c052bd0eb4c74"
+}

@@ -15,6 +15,7 @@ derive_more = { workspace = true, features = ["debug", "display"] }
 futures.workspace = true
 hex.workspace = true
 parse-display.workspace = true
+sha2.workspace = true
 sqlx = { workspace = true, features = [
     "macros",
     "migrate",
@@ -25,12 +26,15 @@ sqlx = { workspace = true, features = [
 ] }
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
 tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 
 tinio-core = { workspace = true, features = ["sqlx"] }
+tinio-util.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tinio-util = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = [
     "macros",

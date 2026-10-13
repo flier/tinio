@@ -13,7 +13,8 @@ use crate::{
     },
     _sqlx::query,
     Error, PgStore,
-    tests::fixtures::scratch,
+    cleanup::OrphanChunk,
+    tests::fixtures::{bucket_row, scratch},
 };
 
 const MIB: usize = 1024 * 1024;
@@ -49,6 +50,13 @@ async fn put(store: &PgStore, bucket: &bucket::Name, key: &ContentKey, bytes: &[
         .expect("the publish lands");
 }
 
+/// A bucket name whose row exists. [`ObjectContent::stage`] locks that row.
+async fn named(store: &PgStore, raw: &str) -> bucket::Name {
+    let name = bucket::name(raw).expect("a valid bucket name");
+    bucket_row(store, &name).await;
+    name
+}
+
 /// The walked object keys of one `scan`.
 async fn walked(
     store: &PgStore,
@@ -81,7 +89,7 @@ async fn a_staged_write_is_invisible_until_publish_and_residue_is_never_content(
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-visibility").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-visibility").await;
     let key = object::key("live.bin").expect("a valid object key");
     let content = ContentKey::Object(key.clone());
 
@@ -192,7 +200,7 @@ async fn a_hundred_megabyte_stream_publishes_in_bounded_batches_and_round_trips(
     const TAIL: usize = 7;
     const SIZE: usize = CHUNKS * CHUNK + TAIL;
 
-    let bucket = bucket::name("conf-content-big").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-big").await;
     let key = object::key("big/stream.bin").expect("a valid object key");
     let content = ContentKey::Object(key.clone());
 
@@ -222,12 +230,36 @@ async fn a_hundred_megabyte_stream_publishes_in_bounded_batches_and_round_trips(
     assert_eq!(entry.len, SIZE as u64);
 
     let plan = publish_plan(SIZE as u64);
-    assert_eq!(plan.chunks, CHUNKS + 1, "1 MiB rows, the tail included");
+    assert_eq!(
+        plan.chunks,
+        CHUNKS as u64 + 1,
+        "1 MiB rows, the tail included"
+    );
     assert_eq!(
         plan.batches,
-        plan.chunks.div_ceil(PUBLISH_BATCH_CHUNKS),
+        plan.chunks.div_ceil(PUBLISH_BATCH_CHUNKS as u64),
         "the plan bounds each statement at PUBLISH_BATCH_BYTES"
     );
+
+    // The read of that whole body is cut into bounded windows, in order, each
+    // one statement: the arithmetic a read's resident bytes follow (R4).
+    let windows = super::chunk_windows(
+        0,
+        (SIZE / super::CONTENT_CHUNK_BYTES) as i32,
+        super::READ_WINDOW_CHUNKS as i32,
+    );
+    assert_eq!(
+        windows.len(),
+        (CHUNKS + 1).div_ceil(super::READ_WINDOW_CHUNKS),
+        "one window per READ_WINDOW_CHUNKS chunks"
+    );
+    assert!(
+        windows
+            .iter()
+            .all(|(first, last)| last - first < super::READ_WINDOW_CHUNKS as i32),
+        "no window is wider than the bound, whatever the body's size"
+    );
+    assert_eq!(windows.first().copied(), Some((0, 7)));
 
     let mut body = store
         .open(&bucket, &content, None)
@@ -263,7 +295,7 @@ async fn a_ranged_read_serves_only_the_live_generation() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-range").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-range").await;
     let key = object::key("shrink.bin").expect("a valid object key");
     let content = ContentKey::Object(key.clone());
 
@@ -335,7 +367,7 @@ async fn a_zero_length_object_is_live_and_refuses_a_range() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-empty").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-empty").await;
     let key = object::key("empty.bin").expect("a valid object key");
     let content = ContentKey::Object(key.clone());
 
@@ -398,7 +430,7 @@ async fn a_superseded_publish_re_homes_and_flips_instead_of_erroring() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-race").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-race").await;
     let key = object::key("raced.bin").expect("a valid object key");
     let content = ContentKey::Object(key.clone());
 
@@ -463,7 +495,7 @@ async fn a_same_key_race_never_tears_the_object() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-no-tear").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-no-tear").await;
     let key = object::key("raced.bin").expect("a valid object key");
     let content = ContentKey::Object(key.clone());
 
@@ -531,7 +563,7 @@ async fn a_superseded_generation_survives_a_sweep_in_its_window() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-race-sweep").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-race-sweep").await;
     let key = object::key("raced.bin").expect("a valid object key");
     let content = ContentKey::Object(key.clone());
 
@@ -564,7 +596,7 @@ async fn a_superseded_generation_survives_a_sweep_in_its_window() {
         .await
         .expect("the scan runs");
     let reclaimed = store
-        .reclaim_orphan_chunks(&orphans)
+        .reclaim_orphan_chunks(&orphans, Duration::from_secs(3600))
         .await
         .expect("the sweep runs");
     assert_eq!(reclaimed, 0, "a fresh superseded generation is not residue");
@@ -602,7 +634,7 @@ async fn an_in_flight_generation_survives_while_a_chunk_is_fresh() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-inflight").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-inflight").await;
     let key = object::key("inflight.bin").expect("a valid object key");
     let content = ContentKey::Object(key);
 
@@ -641,7 +673,7 @@ async fn an_in_flight_generation_survives_while_a_chunk_is_fresh() {
         .await
         .expect("the scan runs");
     let reclaimed = store
-        .reclaim_orphan_chunks(&orphans)
+        .reclaim_orphan_chunks(&orphans, Duration::from_secs(600))
         .await
         .expect("the sweep runs");
     assert_eq!(
@@ -663,7 +695,7 @@ async fn an_in_flight_generation_survives_while_a_chunk_is_fresh() {
         .await
         .expect("the scan runs");
     let reclaimed = store
-        .reclaim_orphan_chunks(&orphans)
+        .reclaim_orphan_chunks(&orphans, Duration::from_secs(600))
         .await
         .expect("the sweep runs");
     assert!(
@@ -709,7 +741,7 @@ async fn a_key_with_no_live_generation_is_missing_content() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-missing").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-missing").await;
     let key = object::key("absent.bin").expect("a valid object key");
     let content = ContentKey::Object(key.clone());
 
@@ -744,29 +776,36 @@ async fn a_key_with_no_live_generation_is_missing_content() {
     db.drop_db().await;
 }
 
-/// A live generation whose rows are not a contiguous run from zero is a corrupt
-/// stored row, never a short body: both a gap at the head of the run and a run
-/// that stops early are the same answer.
+/// A live generation whose rows are not a contiguous run from zero is refused: a
+/// gap inside the read's **first** window — the one `open` resolves with the
+/// head — is the crate's `Corrupt`, because nothing has been served from it yet;
+/// a gap in a later window is `UnexpectedEof` on the body stream, after the
+/// earlier windows may already have been yielded. A run that stops early and one
+/// that loses its first chunk are the same answer.
 #[tokio::test]
 async fn a_generation_that_is_not_a_contiguous_run_is_corrupt() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-corrupt").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-corrupt").await;
     let body: Vec<u8> = (0..MIB + 10).map(|offset| (offset % 251) as u8).collect();
     let head = object::key("gap/head.bin").expect("a valid object key");
     let tail = object::key("gap/tail.bin").expect("a valid object key");
+    let late = object::key("gap/late.bin").expect("a valid object key");
     put(&store, &bucket, &ContentKey::Object(head.clone()), &body).await;
     put(&store, &bucket, &ContentKey::Object(tail.clone()), &body).await;
+    let long = vec![b'x'; (super::READ_WINDOW_CHUNKS + 2) * MIB];
+    put(&store, &bucket, &ContentKey::Object(late.clone()), &long).await;
 
-    // One generation loses its first row, the other its last.
-    for (key, chunk_no) in [(&head, 0), (&tail, 1)] {
+    // One generation loses its first row, one its last, one a row past the
+    // first window.
+    for (key, chunk_no) in [(&head, 0), (&tail, 1), (&late, super::READ_WINDOW_CHUNKS)] {
         sqlx::query_file!(
             "sql/tests/plant_content_gap.sql",
             &bucket,
             format!("o:{key}"),
             1i64,
-            chunk_no
+            chunk_no as i32
         )
         .execute(store.as_driver())
         .await
@@ -774,17 +813,159 @@ async fn a_generation_that_is_not_a_contiguous_run_is_corrupt() {
     }
 
     for key in [&head, &tail] {
-        let err = store
+        let Err(err) = store
             .open(&bucket, &ContentKey::Object(key.clone()), None)
             .await
-            .err()
-            .expect("a generation that is not a contiguous run is refused");
-        assert!(matches!(err, Error::Corrupt { .. }), "{err}");
+        else {
+            panic!("a gap in the first window is refused before the first byte");
+        };
+        assert!(
+            matches!(&err, Error::Corrupt { key: row, .. } if row == &format!("o:{key}")),
+            "{err}"
+        );
         assert!(
             err.to_string().contains(&format!("{bucket}/o:{key}")),
             "the failure names the row it read: {err}"
         );
     }
+
+    let mut body = store
+        .open(&bucket, &ContentKey::Object(late.clone()), None)
+        .await
+        .expect("the head and its first window are whole");
+    let mut refused = None;
+    while let Some(chunk) = body.next().await {
+        if let Err(err) = chunk {
+            refused = Some(err);
+            break;
+        }
+    }
+    let err = refused.expect("a gap past the first window is an error on the body stream");
+    assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    assert!(
+        err.to_string().contains(&format!("{bucket}/o:{late}")),
+        "the failure names the row it read: {err}"
+    );
+    db.drop_db().await;
+}
+
+/// A read is served one bounded window at a time, in order, whatever the
+/// object's size: the whole body round-trips and each window is fetched as its
+/// own statement. A ranged read crossing window boundaries serves exactly the
+/// bytes asked for, and a one-byte read is one byte.
+#[tokio::test]
+async fn a_read_is_served_in_bounded_windows_and_a_range_crosses_them() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = named(&store, "conf-content-window").await;
+    let key = object::key("windowed.bin").expect("a valid object key");
+    let content = ContentKey::Object(key.clone());
+
+    // Three windows and a tail: the read is four statements, not one.
+    let chunks = super::READ_WINDOW_CHUNKS + 2;
+    let body: Vec<u8> = (0..chunks * MIB + 3)
+        .map(|offset| (offset % 251) as u8)
+        .collect();
+    put(&store, &bucket, &content, &body).await;
+    assert_eq!(read(&store, &bucket, &content, None).await, body);
+
+    // A range that starts inside the second window and ends inside the last
+    // chunk of the third: both edges are sliced, and the windows between are
+    // whole.
+    let start = MIB + 17;
+    let end = 2 * MIB + 5;
+    assert_eq!(
+        read(
+            &store,
+            &bucket,
+            &content,
+            Some(ByteRange::Inclusive(start as u64, end as u64))
+        )
+        .await,
+        body[start..=end],
+        "a range crossing window boundaries is served exactly"
+    );
+    assert_eq!(
+        read(
+            &store,
+            &bucket,
+            &content,
+            Some(ByteRange::From((body.len() - 1) as u64))
+        )
+        .await,
+        body[body.len() - 1..],
+        "a one-byte read is the last byte, not a window's worth"
+    );
+    assert_eq!(
+        read(&store, &bucket, &content, Some(ByteRange::Inclusive(0, 0))).await,
+        body[..1],
+        "a one-byte read from the head is one byte"
+    );
+    assert_eq!(
+        read(
+            &store,
+            &bucket,
+            &content,
+            Some(ByteRange::Suffix((2 * MIB + 1) as u64))
+        )
+        .await,
+        body[body.len() - (2 * MIB + 1)..],
+        "a suffix spans two windows"
+    );
+
+    store
+        .remove(&bucket, &content)
+        .await
+        .expect("the removal lands");
+    store
+        .remove_bucket(&bucket)
+        .await
+        .expect("the bucket drains");
+    db.drop_db().await;
+}
+
+/// A removal that races a read answers not-found, never corruption: the reader
+/// that has already resolved its head and its first window serves those bytes,
+/// and the deleted key's next read is the contract's missing-content answer.
+/// The alternative is the 5xx this closes: a head read on one connection and a
+/// chunk read on another, with the delete committed between them.
+#[tokio::test]
+async fn a_removal_racing_a_read_is_missing_content_never_corruption() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = named(&store, "conf-content-race-remove").await;
+    let key = object::key("raced-read.bin").expect("a valid object key");
+    let content = ContentKey::Object(key.clone());
+
+    // One window's worth: the bytes are resolved with the head, so the delete
+    // that lands next cannot shorten the read the caller already holds.
+    let body: Vec<u8> = (0..2 * MIB).map(|offset| (offset % 251) as u8).collect();
+    put(&store, &bucket, &content, &body).await;
+
+    let mut open = store
+        .open(&bucket, &content, None)
+        .await
+        .expect("the head is live");
+    store
+        .remove(&bucket, &content)
+        .await
+        .expect("the racing removal lands");
+
+    let mut served = Vec::new();
+    while let Some(chunk) = open.next().await {
+        served.extend_from_slice(&chunk.expect("the bytes the head resolved are served"));
+    }
+    assert_eq!(served, body, "the read in flight is never reported corrupt");
+
+    let Err(err) = store.open(&bucket, &content, None).await else {
+        panic!("a deleted key is an error, never an empty body");
+    };
+    assert!(
+        matches!(&err, Error::MissingContent(ContentKey::Object(named)) if named == &key),
+        "a delete racing a read is not-found, never corruption: {err}"
+    );
     db.drop_db().await;
 }
 
@@ -796,7 +977,7 @@ async fn a_head_whose_encoded_key_is_not_an_object_key_is_corrupt() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-badkey").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-badkey").await;
     // The empty key: it starts with the object prefix, so the walk selects it,
     // and nothing can decode back into a valid object key.
     sqlx::query_file!("sql/tests/plant_content_head_undecodable_key.sql", &bucket)
@@ -829,7 +1010,7 @@ async fn rename_and_copy_move_the_bytes_and_the_head() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-move").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-move").await;
     let a = object::key("a.bin").expect("a valid object key");
     let b = object::key("b.bin").expect("a valid object key");
     let c = object::key("c.bin").expect("a valid object key");
@@ -907,6 +1088,86 @@ async fn rename_and_copy_move_the_bytes_and_the_head() {
     db.drop_db().await;
 }
 
+/// **A copy (and a rename) of a multi-batch object is written one bounded
+/// statement a window, and reads back byte for byte.** The source generation
+/// spans more than one [`super::MOVE_BATCH_CHUNKS`]-row window, so the statement
+/// boundary is where a copy that mis-ordered its windows -- or flipped before
+/// the last one landed -- would show: the windows cover `0..chunks` in order and
+/// the flip's guard counts the run, so a body that is not the source's own bytes
+/// cannot go live.
+#[tokio::test]
+async fn a_copy_of_a_multi_batch_object_round_trips_in_bounded_windows() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = named(&store, "conf-content-copy-batches").await;
+    let from = object::key("copy-src/big.bin").expect("a valid object key");
+    let to = object::key("copy-dst/big.bin").expect("a valid object key");
+
+    // Three copy windows' worth of chunks: a boundary falls inside the body.
+    let chunks = super::MOVE_BATCH_CHUNKS as usize * 2 + 1;
+    let body: Vec<u8> = (0..chunks * MIB)
+        .map(|offset| (offset % 251) as u8)
+        .collect();
+    put(&store, &bucket, &ContentKey::Object(from.clone()), &body).await;
+
+    // The copy's plan is the re-home's own: one bounded statement per window,
+    // covering the run in order. A single statement over the whole generation --
+    // the shape PG22 excludes -- would be one window here.
+    assert_eq!(
+        super::copy_batches(super::publish_plan(body.len() as u64).chunks),
+        vec![(0, 7), (8, 15), (16, 16)],
+        "the copy's windows cover the run in `0..chunks` order"
+    );
+
+    store
+        .copy(&bucket, &from, &to)
+        .await
+        .expect("the copy lands");
+    assert_eq!(
+        read(&store, &bucket, &ContentKey::Object(to.clone()), None).await,
+        body,
+        "a multi-batch copy reads back byte for byte"
+    );
+    assert_eq!(
+        read(&store, &bucket, &ContentKey::Object(from.clone()), None).await,
+        body,
+        "the copy leaves the source where it was"
+    );
+
+    // Rename is the same bounded copy followed by a source drain: the bytes move.
+    let moved = object::key("copy-moved/big.bin").expect("a valid object key");
+    store
+        .rename(&bucket, &to, &moved)
+        .await
+        .expect("the rename lands");
+    assert_eq!(
+        read(&store, &bucket, &ContentKey::Object(moved.clone()), None).await,
+        body,
+        "a multi-batch rename reads back byte for byte"
+    );
+    assert!(
+        store
+            .open(&bucket, &ContentKey::Object(to), None)
+            .await
+            .is_err(),
+        "the rename drains its source"
+    );
+
+    store
+        .remove_many(
+            &bucket,
+            &[ContentKey::Object(from), ContentKey::Object(moved)],
+        )
+        .await
+        .expect("the objects drain");
+    store
+        .remove_bucket(&bucket)
+        .await
+        .expect("the bucket drains");
+    db.drop_db().await;
+}
+
 /// The walk is byte-ordered, prefix-bounded, exclusive on `after`, capped, and over
 /// live object keys only.
 #[tokio::test]
@@ -914,7 +1175,7 @@ async fn scan_is_byte_ordered_over_live_object_keys_only() {
     let Some((db, store)) = scratch().await else {
         return;
     };
-    let bucket = bucket::name("conf-content-scan").expect("a valid bucket name");
+    let bucket = named(&store, "conf-content-scan").await;
     let names = ["alpha", "alpha-1", "alpine", "beta"];
     for name in names {
         let key = object::key(name).expect("a valid object key");
@@ -970,6 +1231,15 @@ async fn scan_is_byte_ordered_over_live_object_keys_only() {
             .is_empty(),
         "a zero limit is an empty page"
     );
+    assert_eq!(
+        store
+            .scan(&bucket, "", None, usize::MAX)
+            .await
+            .expect("a limit that does not fit an i64 reads as no bound")
+            .len(),
+        4,
+        "an unrepresentable limit is never a negative count"
+    );
     let below = object::key("a").expect("a valid object key");
     assert_eq!(
         walked(&store, &bucket, "alpha", Some(&below), 100).await,
@@ -1014,5 +1284,433 @@ async fn scan_is_byte_ordered_over_live_object_keys_only() {
         .remove_bucket(&bucket)
         .await
         .expect("the bucket drains");
+    db.drop_db().await;
+}
+
+/// Naming a live generation in a reclaim list does not delete it. An in-place
+/// publish keeps the sequence, so the scanned key is not proof of residue.
+#[tokio::test]
+async fn reclaim_leaves_a_live_generation_named_in_the_list() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = named(&store, "conf-content-reclaim-live").await;
+    let object_key = object::key("live.bin").expect("a valid object key");
+    let content = ContentKey::Object(object_key);
+    let body = b"live-body";
+    put(&store, &bucket, &content, body).await;
+    let head = store
+        .live_generation(&bucket, &content)
+        .await
+        .expect("the head reads")
+        .expect("the generation is live");
+    let (_, ckey) = super::content_key(&content);
+    let gone = store
+        .reclaim_orphan_chunks(
+            &[OrphanChunk {
+                bucket: bucket.clone(),
+                kind: super::ContentKind::Object,
+                ckey,
+                seq: head.seq,
+            }],
+            Duration::from_secs(0),
+        )
+        .await
+        .expect("the reclaim runs");
+    assert_eq!(gone, 0, "a live generation is not residue");
+    assert_eq!(read(&store, &bucket, &content, None).await, body);
+    db.drop_db().await;
+}
+
+/// A drain keeps the head and moves its sequence past the drained generation
+/// (R2), so a stage that outlived the drain can never reuse the generation id:
+/// its rows land at its own sequence, not over another writer's, and a body the
+/// drain has taken rows from cannot flip at all — a short generation would be
+/// served as `Corrupt` on a `live_len` the head reports whole. The key still
+/// publishes after the drain.
+#[tokio::test]
+async fn a_drain_keeps_the_generation_id_out_of_reach() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = named(&store, "conf-content-drained-stage").await;
+    let object_key = object::key("drained.bin").expect("a valid object key");
+    let content = ContentKey::Object(object_key.clone());
+
+    // A body past one publish batch, so the stage has already committed rows of
+    // its own before the drain runs — the generation the drain takes apart.
+    let body: Vec<u8> = (0..(super::PUBLISH_BATCH_CHUNKS + 1) * MIB)
+        .map(|offset| (offset % 251) as u8)
+        .collect();
+    let mut stale = store
+        .stage(&bucket, &content)
+        .await
+        .expect("the stage opens");
+    stale
+        .write(Bytes::from(body.clone()))
+        .await
+        .expect("the bytes stage");
+    let stale_seq = stale.seq;
+
+    // The drain, then another writer's publish over the same key.
+    store
+        .remove(&bucket, &content)
+        .await
+        .expect("the removal lands");
+    put(&store, &bucket, &content, b"live").await;
+    let live = store
+        .live_generation(&bucket, &content)
+        .await
+        .expect("the head reads")
+        .expect("the generation is live");
+    assert!(
+        live.seq != stale_seq,
+        "the drained generation's id is never handed out again: {stale_seq} then {}",
+        live.seq
+    );
+
+    // The stage that outlived the drain cannot go live: its first batch went
+    // with the drain, so its own row-count check refuses the flip rather than
+    // splicing a tail into the live writer's generation.
+    let err = store
+        .publish(&bucket, stale, &content)
+        .await
+        .expect_err("a drained stage holds only a tail");
+    assert!(
+        matches!(err, Error::PublishRaced),
+        "the refusal is the publish race, got {err}"
+    );
+    assert_eq!(
+        read(&store, &bucket, &content, None).await,
+        b"live",
+        "the live writer's bytes stay whole"
+    );
+
+    // And the key still publishes after the drain.
+    put(&store, &bucket, &content, b"after").await;
+    assert_eq!(read(&store, &bucket, &content, None).await, b"after");
+
+    store
+        .remove(&bucket, &content)
+        .await
+        .expect("the removal lands");
+    store
+        .remove_bucket(&bucket)
+        .await
+        .expect("the bucket drains");
+    db.drop_db().await;
+}
+
+/// A superseded publish's re-home is bounded: the re-keyed rows are moved in
+/// windows of [`super::MOVE_BATCH_CHUNKS`], each its own statement and its own
+/// transaction, and the flip still lands with the body whole.
+#[tokio::test]
+async fn a_superseded_publish_re_homes_in_bounded_batches() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = named(&store, "conf-content-rehome-batches").await;
+    let key = object::key("raced/big.bin").expect("a valid object key");
+    let content = ContentKey::Object(key.clone());
+
+    // Three move windows' worth of chunks.
+    let chunks = super::MOVE_BATCH_CHUNKS as usize * 2 + 1;
+    let body: Vec<u8> = (0..chunks * MIB)
+        .map(|offset| (offset % 251) as u8)
+        .collect();
+    let mut first = store
+        .stage(&bucket, &content)
+        .await
+        .expect("the first stage opens");
+    first
+        .write(Bytes::from(body.clone()))
+        .await
+        .expect("the bytes stage");
+    let mut second = store
+        .stage(&bucket, &content)
+        .await
+        .expect("the second stage opens");
+    second
+        .write(Bytes::from_static(b"second"))
+        .await
+        .expect("the bytes stage");
+
+    // The plan the re-home rewrites that generation with: one bounded statement
+    // per window, covering the whole run. A single statement over the
+    // generation — the shape PG22 excludes — would be one window here.
+    let plan = super::move_batches(super::publish_plan(body.len() as u64).chunks);
+    assert_eq!(
+        plan.len(),
+        chunks.div_ceil(super::MOVE_BATCH_CHUNKS as usize),
+        "one statement per MOVE_BATCH_CHUNKS rows"
+    );
+    assert!(
+        plan.iter()
+            .all(|(from, to)| to - from < super::MOVE_BATCH_CHUNKS as i32),
+        "no statement moves more than the bound, whatever the body's size"
+    );
+    assert_eq!(
+        plan,
+        vec![(0, 7), (8, 15), (16, 16)],
+        "the windows cover the run in order"
+    );
+
+    // The flip still lands on the re-keyed generation, whole.
+    store
+        .publish(&bucket, first, &content)
+        .await
+        .expect("the superseded publish converges");
+    assert_eq!(read(&store, &bucket, &content, None).await, body);
+
+    store
+        .publish(&bucket, second, &content)
+        .await
+        .expect("the later publish lands");
+    assert_eq!(read(&store, &bucket, &content, None).await, b"second");
+
+    store
+        .remove(&bucket, &content)
+        .await
+        .expect("the removal lands");
+    store
+        .remove_bucket(&bucket)
+        .await
+        .expect("the bucket drains");
+    db.drop_db().await;
+}
+
+/// A guarded byte compare reads a multi-window generation one window at a time
+/// under the head's lock: a difference inside a later window is still seen, and a
+/// refused compare leaves the bytes where they are.
+#[tokio::test]
+async fn a_guarded_removal_compares_a_multi_window_generation() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = named(&store, "conf-content-guard-window").await;
+    let key = object::key("guarded.bin").expect("a valid object key");
+    let content = ContentKey::Object(key.clone());
+
+    let windows = super::READ_WINDOW_CHUNKS + 1;
+    let body: Vec<u8> = (0..windows * MIB)
+        .map(|offset| (offset % 251) as u8)
+        .collect();
+    put(&store, &bucket, &content, &body).await;
+
+    // A difference past the first window: the compare has to read on to see it.
+    let mut other = body.clone();
+    other[super::READ_WINDOW_CHUNKS * MIB] ^= 0xFF;
+    assert!(
+        !store
+            .remove_if_matches(&bucket, &content, &other)
+            .await
+            .expect("the compare runs"),
+        "a difference in a later window is seen"
+    );
+    assert_eq!(
+        read(&store, &bucket, &content, None).await,
+        body,
+        "a refused compare leaves the bytes"
+    );
+    assert!(
+        store
+            .remove_if_matches(&bucket, &content, &body)
+            .await
+            .expect("the compare runs"),
+        "the whole generation matches"
+    );
+    assert!(store.open(&bucket, &content, None).await.is_err());
+    db.drop_db().await;
+}
+
+/// The live object heads `starts_with` selects for `prefix`, in collation
+/// order: the definer the walk's byte range has to reproduce row for row. The
+/// cursor is `after`'s encoded key, exclusive, or no bound at all.
+async fn defined_by_starts_with(
+    store: &PgStore,
+    bucket: &bucket::Name,
+    prefix: &str,
+    after: Option<&object::Key>,
+) -> Vec<String> {
+    crate::_sqlx::query_scalar!(
+        "SELECT ckey AS \"ckey!\" FROM content_heads \
+         WHERE bucket = $1 AND kind = 'object'::content_kind AND live_seq IS NOT NULL \
+         AND starts_with(ckey, $2) \
+         AND ($3::text IS NULL OR ckey COLLATE \"C\" > $3) \
+         ORDER BY ckey COLLATE \"C\"",
+        bucket.as_ref(),
+        format!("{}{prefix}", super::OBJECT_CKEY_PREFIX),
+        after.map(super::object_ckey)
+    )
+    .fetch_all(store.as_driver())
+    .await
+    .expect("the definer reads")
+}
+
+/// The walked page as the encoded keys the definer answers with.
+async fn walked_ckeys(
+    store: &PgStore,
+    bucket: &bucket::Name,
+    prefix: &str,
+    after: Option<&object::Key>,
+) -> Vec<String> {
+    walked(store, bucket, prefix, after, 100)
+        .await
+        .iter()
+        .map(super::object_ckey)
+        .collect()
+}
+
+/// The walk's byte range is the `starts_with` definer exactly, over the keys a
+/// coarser upper bound drops: a key whose first character past the prefix is
+/// `U+10FFFF` — the last code point, a legal object key — and keys carrying
+/// more after it. Parity is checked row for row against the definer, for a
+/// plain prefix, for that noncharacter, for the empty prefix, with and without
+/// a cursor.
+#[tokio::test]
+async fn scan_lists_every_key_the_prefix_definer_selects() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = named(&store, "conf-content-scan-edge").await;
+    let names = [
+        "x",
+        "x\u{10FFFF}",
+        "x\u{10FFFF}a",
+        "x\u{10FFFF}\u{10FFFF}",
+        "x\u{10FFFF}/y",
+        "x/a",
+        "xπ",
+        "xÿ",
+        "xĀ",
+        "xy",
+        "y",
+    ];
+    for name in names {
+        let key = object::key(name).expect("a valid object key");
+        put(&store, &bucket, &ContentKey::Object(key), b"x").await;
+    }
+    // A part inside the walked key space, so the kind discriminator is real here
+    // too: it is never listed, and the definer query agrees.
+    let part = ContentKey::Part {
+        upload_id: "5c1f2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f".to_owned(),
+        number: 1.into(),
+    };
+    put(&store, &bucket, &part, b"part").await;
+
+    let last = object::key("x\u{10FFFF}").expect("a valid object key");
+    for (prefix, after) in [
+        ("", None),
+        ("x", None),
+        ("x", Some(&last)),
+        ("x\u{10FFFF}", None),
+        ("x\u{10FFFF}a", None),
+        ("xπ", None),
+        ("x/", None),
+        ("xy", None),
+        ("z", None),
+    ] {
+        let listed = walked_ckeys(&store, &bucket, prefix, after).await;
+        assert_eq!(
+            listed,
+            defined_by_starts_with(&store, &bucket, prefix, after).await,
+            "the walk and the definer agree for prefix {prefix:?}, after {after:?}"
+        );
+    }
+
+    // The page is not vacuously empty: the noncharacter keys are listed, and the
+    // cursor only takes what it should.
+    let page = walked_ckeys(&store, &bucket, "x", None).await;
+    assert_eq!(
+        page.len(),
+        10,
+        "every `x` object, the noncharacters included"
+    );
+    assert!(
+        page.contains(&"o:x\u{10FFFF}a".to_owned()),
+        "a key past the noncharacter is listed: {page:?}"
+    );
+    let after = walked_ckeys(&store, &bucket, "x", Some(&last)).await;
+    assert!(
+        !after.contains(&"o:x\u{10FFFF}".to_owned())
+            && after.contains(&"o:x\u{10FFFF}a".to_owned()),
+        "the cursor is exclusive and still spans the noncharacter: {after:?}"
+    );
+
+    for name in names {
+        let key = object::key(name).expect("a valid object key");
+        store
+            .remove(&bucket, &ContentKey::Object(key))
+            .await
+            .expect("the removal lands");
+    }
+    store
+        .remove(&bucket, &part)
+        .await
+        .expect("the removal lands");
+    assert!(store.is_empty(&bucket).await.expect("the probe runs"));
+    store
+        .remove_bucket(&bucket)
+        .await
+        .expect("the bucket drains");
+    db.drop_db().await;
+}
+
+/// The prefix bound is the prefix set's own successor: the last character
+/// incremented, with a trailing `U+10FFFF` (or a lone surrogate) dropped
+/// instead, and the object key space's `o:` as the floor the strip stops at.
+#[test]
+fn the_prefix_bound_is_the_prefix_sets_own_successor() {
+    assert_eq!(super::prefix_upper("o:x"), "o:y");
+    assert_eq!(super::prefix_upper("o:"), "o;");
+    assert_eq!(super::prefix_upper("o:x/"), "o:x0");
+    assert_eq!(super::prefix_upper("o:xπ"), "o:xρ");
+    assert_eq!(
+        super::prefix_upper("o:x\u{10FFFF}"),
+        "o:y",
+        "the last code point has no successor: the character before it carries the bound"
+    );
+    assert_eq!(super::prefix_upper("o:x\u{10FFFF}\u{10FFFF}"), "o:y");
+    assert_eq!(super::prefix_upper("o:x\u{D7FF}"), "o:y", "a surrogate too");
+    assert_eq!(
+        super::prefix_upper(""),
+        "o;",
+        "an empty prefix still bounds the object key space it belongs to"
+    );
+}
+
+/// A removal clears the live generation and keeps the head, so the next
+/// allocation continues the sequence instead of starting again at 1.
+#[tokio::test]
+async fn remove_keeps_the_head_sequence() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let bucket = named(&store, "conf-content-seq").await;
+    let object_key = object::key("seq.bin").expect("a valid object key");
+    let content = ContentKey::Object(object_key);
+    put(&store, &bucket, &content, b"one").await;
+    let first = store
+        .live_generation(&bucket, &content)
+        .await
+        .expect("the head reads")
+        .expect("the generation is live")
+        .seq;
+    store
+        .remove(&bucket, &content)
+        .await
+        .expect("the removal lands");
+    put(&store, &bucket, &content, b"two").await;
+    let second = store
+        .live_generation(&bucket, &content)
+        .await
+        .expect("the head reads")
+        .expect("the generation is live")
+        .seq;
+    assert!(
+        second > first,
+        "the head kept its sequence: {first} then {second}"
+    );
+    assert_eq!(read(&store, &bucket, &content, None).await, b"two");
     db.drop_db().await;
 }

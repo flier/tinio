@@ -404,7 +404,7 @@ mod enabled {
         _store_redb::{
             bucket_versioning, object_meta, object_part, version as rows, version_index,
         },
-        _version::{Current, Identity, Intent, Seqs, plan_write as write_plan},
+        _version::{Current, Identity, Intent, MarkerWrite, Seqs, plan_write as write_plan},
         Error, FsStorage,
         backend::objects::{prune_parents, remove_object_file},
         error::projected,
@@ -1276,6 +1276,46 @@ mod enabled {
                 .set_version_acl(&self.version_plane(bucket), bucket, key, version, acl)
                 .await
                 .map_err(Error::from)
+        }
+    }
+
+    /// The engine's marker port: a current marker is a slot and an empty object
+    /// row, not a version row. The undo of a versioned put that superseded a
+    /// marker calls this to put that marker back.
+    #[async_trait]
+    impl MarkerWrite for FsStorage {
+        async fn mark_current_marker(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            id: Option<Id>,
+            seq: u64,
+            moved_off: Option<u64>,
+        ) -> Result<(), storage::Error> {
+            let stored = object_meta::Stored {
+                version_id: id,
+                version_seq: seq,
+                is_delete_marker: true,
+                etag: ETag::EMPTY,
+                size: 0,
+                mtime: to_nanos(SystemTime::now()),
+                file_identity: 0,
+                tags: Tags::empty(),
+                checksum: None,
+                owner: None,
+                acl: Acl::default_private(None),
+            };
+            let bucket = bucket.clone();
+            let key = key.clone();
+            self.handle()
+                .write(move |txn| {
+                    object_meta::Table::open(txn)?.put(&bucket, &key, &stored)?;
+                    stamp_superseded(txn, &bucket, &key, moved_off)?;
+                    Ok(())
+                })
+                .await
+                .map_err(Error::from)
+                .map_err(storage::Error::from)
         }
     }
 }

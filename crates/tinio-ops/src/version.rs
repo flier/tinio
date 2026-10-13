@@ -11,16 +11,19 @@
 //! content elements, the slot, the dropped version row, its index entry and the
 //! cleared retained part list. The successor itself is the key's newest
 //! remaining row ([`VersionMeta::latest`] — the one-row read, never a walk of
-//! the history), the removed version's bytes go through
-//! `ObjectContent::remove` and the no-successor arm's object row through
-//! `ObjectMeta::remove`. The **marker-creating** delete a versioned `DELETE`
+//! the history). The removed version's bytes go through
+//! `ObjectContent::remove` when nothing replaces them — no successor, or a
+//! successor that is itself a marker — and an object successor's
+//! `materialize` overwrites them. The no-successor arm's object row goes
+//! through `ObjectMeta::remove`. The **marker-creating** delete a versioned `DELETE`
 //! takes is [`ObjectOps::create_delete_marker`], a body beside the nine: its
 //! ordering (supersede, remove the bytes and the row, write the marker's slot,
 //! materialize the marker's object row) is shared here, while the slot write
 //! itself is the backend's [`MarkerWrite`] port — a marker is a recorded slot
 //! with **no version row**, a state no contract write expresses, and the
 //! null-identity marker a suspended delete makes must not displace the null
-//! version the same delete leaves in history.
+//! version the same delete leaves in history. A marker-port failure after a
+//! supersede puts that version back through [`VersionMeta::restore_slot`].
 //! `list_object_versions` is the backend's own (E14), because it needs the
 //! backend's "what is the current object" truth beside the F01/F04 gate — and
 //! so are the two methods the trait keeps outside the group: `current_version`
@@ -82,14 +85,10 @@
 //!
 //! # The marker's stamp
 //!
-//! The current marker's `last_modified` is read where the model records it:
-//! the version row at the slot's sequence first — that row is the marker's own
-//! record, and it is what a marker write records and what
-//! `advance_slot` resolves the marker bit from — and the **object row**
-//! second, which is fs's home for it (its D37 row-slot model keeps a current
-//! version in the object row, so a live marker has no version-table row at
-//! all). A store where both exist answers from the version row: the object row
-//! `advance_slot` materializes carries no stamp of its own.
+//! The current marker's `last_modified` is the object row's `mtime`: a current
+//! marker is a slot with no version row, and the marker port materializes that
+//! row. A version row at the slot's sequence wins when an earlier shape left
+//! one. A superseded marker is a history row; the slot move stamps it.
 
 use std::time::SystemTime;
 
@@ -99,10 +98,10 @@ use crate::{
         acl::{self, Acl},
         blob::BlockStore,
         bucket,
-        content::{ContentKey, ObjectContent},
+        content::{ContentKey, ObjectContent, PublishId},
         meta::{
             Metadata, ObjectMeta, VersionMeta,
-            object::Row,
+            object::{PartRow, Row},
             version::{Kind, Stored},
         },
         object,
@@ -110,10 +109,11 @@ use crate::{
         version::{self, HeadResult, Id, Marker, ReadResult, State, wire_of},
     },
     _version::{
-        Current, CurrentRows, Identity as WriteIdentity, Intent, MarkerWrite, Seqs, Versions,
+        Current, CurrentRows, Identity as WriteIdentity, Intent, MarkerWrite, Plan, Seqs, Versions,
         plan_write,
     },
     ObjectOps, StagedBody,
+    object::mint_publish_id,
     ops::{VersionPlane, projected},
 };
 
@@ -568,20 +568,17 @@ where
             VersionMeta::expire(&*plane.version_rows, bucket, key, current.seq)
                 .await
                 .map_err(projected)?;
-            match VersionMeta::latest(&*plane.version_rows, bucket, key)
-                .await
-                .map_err(projected)?
-            {
-                Some((seq, row)) => self.restore_version(plane, bucket, key, seq, row).await?,
-                None => {
-                    self.content
-                        .remove(bucket, &ContentKey::Object(key.clone()))
-                        .await
-                        .map_err(projected)?;
-                    let _ = ObjectMeta::remove(&*self.meta, bucket, key)
-                        .await
-                        .map_err(projected)?;
-                }
+            if let Some(row) = Self::successor(plane, bucket, key).await? {
+                self.restore_version(plane, bucket, key, row.seq, row)
+                    .await?;
+            } else {
+                self.content
+                    .remove(bucket, &ContentKey::Object(key.clone()))
+                    .await
+                    .map_err(projected)?;
+                let _ = ObjectMeta::remove(&*self.meta, bucket, key)
+                    .await
+                    .map_err(projected)?;
             }
             return Ok(removed);
         }
@@ -598,6 +595,12 @@ where
         else {
             return Err(storage::no_such_version(wire));
         };
+        // The index can name a sequence whose row carries another identity.
+        // Expiring it would drop that other version; the read path already
+        // answers `NoSuchVersion` for the same disagreement.
+        if row.id.as_ref() != version {
+            return Err(storage::no_such_version(wire));
+        }
         VersionMeta::expire(&*plane.version_rows, bucket, key, seq)
             .await
             .map_err(projected)?;
@@ -605,6 +608,37 @@ where
             id: row.id.clone(),
             is_delete_marker: row.kind == Kind::Marker,
         })
+    }
+
+    /// The version that becomes current after the current one is removed.
+    ///
+    /// `latest` is the one-row read. It fails closed when the newest row is
+    /// corrupt, answering `None` rather than an older row. `list_versions`
+    /// skips that corrupt row, so the newest row it still returns is the
+    /// successor. No decodable row means the key has no version left.
+    async fn successor<R, B, G>(
+        plane: &Plane<R, C, B, G>,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<Option<Stored>, Error>
+    where
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
+        B: BlockStore,
+    {
+        if let Some((_, row)) = VersionMeta::latest(&*plane.version_rows, bucket, key)
+            .await
+            .map_err(projected)?
+        {
+            return Ok(Some(row));
+        }
+        Ok(
+            VersionMeta::list_versions(&*plane.version_rows, bucket, key)
+                .await
+                .map_err(projected)?
+                .into_iter()
+                .max_by_key(|row| row.seq),
+        )
     }
 
     /// Make one version current again: its content back onto the key path, then
@@ -632,6 +666,15 @@ where
             grants: row.acl.grants.clone(),
         };
         let elements = if row.kind == Kind::Marker {
+            // The key still holds the deleted version's bytes. A marker
+            // publishes nothing over them, so a plain read would keep serving
+            // the deleted object. Remove them before the slot moves: a crash
+            // between the two leaves the successor's row, and the key reads
+            // as gone.
+            self.content
+                .remove(bucket, &ContentKey::Object(key.clone()))
+                .await
+                .map_err(projected)?;
             Row {
                 etag: ETag::EMPTY,
                 size: 0,
@@ -678,10 +721,61 @@ where
         .map_err(projected)
     }
 
+    /// The slot, the sequence facts and the write plan one versioned write reads.
+    ///
+    /// Both versioned writes take this same triple. The caller has already
+    /// read `state`; an unversioned put returns before this, so the extra
+    /// reads stay on the versioned path.
+    async fn load_plan<R, B, G>(
+        plane: &Plane<R, C, B, G>,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        intent: Intent,
+        state: State,
+    ) -> Result<(Current, Plan), Error>
+    where
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
+        B: BlockStore,
+    {
+        let current = plane
+            .versions
+            .current(bucket, key)
+            .await
+            .map_err(projected)?;
+        // `latest` fails closed on a corrupt newest row and answers `None`,
+        // which is not the same as no history. The highest decodable row
+        // still occupies its sequence, so the next write starts past that
+        // one. A key with nothing current has no history to walk.
+        let recorded = VersionMeta::latest(&*plane.version_rows, bucket, key)
+            .await
+            .map_err(projected)?
+            .map(|(seq, _)| seq);
+        let latest = match recorded {
+            Some(seq) => seq,
+            None if current.exists => VersionMeta::list_versions(&*plane.version_rows, bucket, key)
+                .await
+                .map_err(projected)?
+                .into_iter()
+                .map(|row| row.seq)
+                .max()
+                .unwrap_or(0),
+            None => 0,
+        };
+        let seqs = Seqs {
+            latest,
+            null_at_zero: VersionMeta::version_seq_of(&*plane.version_rows, bucket, key, None)
+                .await
+                .map_err(projected)?
+                == Some(0),
+        };
+        let plan = plan_write(intent, state, &current, &seqs);
+        Ok((current, plan))
+    }
+
     /// Create the delete marker a versioned `DELETE` makes current.
     ///
-    /// The ordering is the engine's, and it is the engine's own test scaffold
-    /// (`plant_delete_marker`) in production order, over the contracts:
+    /// The ordering is the engine's, over the contracts:
     ///
     /// 1. the plan ([`plan_write`] with [`Intent::Delete`]): whether the
     ///    outgoing version turns noncurrent, the marker's identity and its
@@ -696,9 +790,16 @@ where
     /// 4. the marker becomes current **without a version row**, through the
     ///    backend's [`MarkerWrite`] port: the port records the marker bit,
     ///    materializes the key's (empty) object row and stamps the version the
-    ///    slot moves off, and a current marker's own row, if an earlier shape
-    ///    left one, expires first so repeated suspended deletes cannot grow a
-    ///    phantom history.
+    ///    slot moves off. A current marker this call did **not** supersede —
+    ///    the null marker a repeated suspended delete replaces — expires any
+    ///    row an earlier shape left at its sequence, so that residue cannot
+    ///    grow a phantom history. A marker this call **did** supersede stays:
+    ///    that row is the history the next delete restores.
+    ///
+    /// A marker-port failure after a supersede puts that version back — its
+    /// bytes, its object row and its retained parts — and drops the history
+    /// row this call wrote. The slot never moved, so the restore is
+    /// [`VersionMeta::restore_slot`].
     ///
     /// A bucket that records no versions takes the version-free delete instead
     /// ([`delete_object`](Self::delete_object)): the state can flip between the
@@ -723,29 +824,31 @@ where
         W: MarkerWrite,
     {
         let state = plane.versions.state(bucket).await.map_err(projected)?;
-        let current = plane
-            .versions
-            .current(bucket, key)
-            .await
-            .map_err(projected)?;
-        let seqs = Seqs {
-            latest: VersionMeta::latest(&*plane.version_rows, bucket, key)
-                .await
-                .map_err(projected)?
-                .map(|(seq, _)| seq)
-                .unwrap_or(0),
-            null_at_zero: VersionMeta::version_seq_of(&*plane.version_rows, bucket, key, None)
-                .await
-                .map_err(projected)?
-                == Some(0),
-        };
-        let plan = plan_write(Intent::Delete, state, &current, &seqs);
+        let (current, plan) = Self::load_plan(plane, bucket, key, Intent::Delete, state).await?;
         if !plan.marker {
             // The state is not recording versions, so the version-free delete
             // is the answer.
             return self.delete_object(bucket, key).await;
         }
-        if plan.supersede {
+        // A live current version the plan does not supersede — the suspended
+        // null version, and the null marker a repeated suspended delete
+        // replaces — is held in history for this call only. The marker's
+        // success drops that row; a failure puts the version back. A crash
+        // between the two leaves the row.
+        let hold = !plan.supersede && current.exists && !current.degraded;
+        let superseded = plan.supersede || hold;
+        // Read before the supersede, so a parts-read failure leaves no history
+        // row behind. `remove` and `restore_slot` both clear this list.
+        let parts = if superseded {
+            Some(
+                ObjectMeta::parts(&*self.meta, bucket, key)
+                    .await
+                    .map_err(projected)?,
+            )
+        } else {
+            None
+        };
+        if superseded {
             plane
                 .versions
                 .supersede_with(bucket, key, &current)
@@ -763,19 +866,17 @@ where
         let _ = ObjectMeta::remove(&*self.meta, bucket, key)
             .await
             .map_err(projected)?;
-        // A **current marker's** own row, if an earlier shape left one, expires
-        // before the new slot names the new one: repeated suspended deletes
-        // must not grow a phantom history, and the sequence this body is about
-        // to leave would otherwise read as the slot's own record. The branch is
-        // the marker bit's — a content version's sequence holds no row of its
-        // own, and the one the supersede has just written there is the history
-        // the successor scan must find.
-        if current.is_delete_marker {
+        // A current marker this call did not hold can still carry a row an
+        // earlier shape left at its sequence. Expire that residue so a
+        // repeated suspended delete cannot grow a phantom history. A version
+        // this call did supersede — the plan's own, or the held null version —
+        // is the row at `current.seq`, and a failure still has to find it.
+        if current.is_delete_marker && !superseded {
             VersionMeta::expire(&*plane.version_rows, bucket, key, current.seq)
                 .await
                 .map_err(projected)?;
         }
-        markers
+        match markers
             .mark_current_marker(
                 bucket,
                 key,
@@ -784,17 +885,88 @@ where
                 // The row the marker's slot moves off: the version the supersede
                 // above committed into history, stamped noncurrent in the
                 // marker's own transaction (RG5 — the rule `advance_slot` and
-                // `restore_slot` apply). Available only when a real version was
-                // superseded: when `current` is a marker, the row at its
-                // sequence is expired just above, so there is nothing to stamp.
-                plan.supersede.then_some(current.seq),
+                // `restore_slot` apply). Present only when a version was
+                // superseded, a content version and a delete marker alike.
+                superseded.then_some(current.seq),
             )
             .await
-            .map_err(projected)?;
-        Ok(Marker {
-            id,
-            is_delete_marker: true,
-        })
+            .map_err(projected)
+        {
+            Ok(()) => {
+                if hold {
+                    // The held row is not history. Drop it now that the marker
+                    // is current; a failure puts the held version back, so the
+                    // delete does not land either.
+                    if let Err(err) =
+                        VersionMeta::expire(&*plane.version_rows, bucket, key, current.seq)
+                            .await
+                            .map_err(projected)
+                    {
+                        self.restore_held(
+                            plane,
+                            bucket,
+                            key,
+                            current.seq,
+                            &parts.unwrap_or_default(),
+                        )
+                        .await?;
+                        return Err(err);
+                    }
+                }
+                Ok(Marker {
+                    id,
+                    is_delete_marker: true,
+                })
+            }
+            Err(err) => {
+                // The slot did not move. The supersede's history row is that
+                // version, and `restore_slot` makes it current again — the
+                // object row this call already removed is the slot's home, so
+                // a plain row write would record it with no identity.
+                if superseded {
+                    self.restore_held(plane, bucket, key, current.seq, &parts.unwrap_or_default())
+                        .await?;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Put back the version a delete held at `seq`, including the retained
+    /// parts `restore_slot` clears.
+    async fn restore_held<R, B, G>(
+        &self,
+        plane: &Plane<R, C, B, G>,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seq: u64,
+        parts: &[PartRow],
+    ) -> Result<(), Error>
+    where
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
+        B: BlockStore,
+    {
+        let Some(stored) = VersionMeta::get_version(&*plane.version_rows, bucket, key, seq)
+            .await
+            .map_err(projected)?
+        else {
+            return Ok(());
+        };
+        let kind = stored.kind;
+        self.restore_version(plane, bucket, key, seq, stored)
+            .await?;
+        if kind == Kind::Object
+            && !parts.is_empty()
+            && let Some(row) = ObjectMeta::get(&*self.meta, bucket, key)
+                .await
+                .map_err(projected)?
+        {
+            ObjectMeta::put_with_parts(&*self.meta, bucket, key, &row, parts)
+                .await
+                .map_err(projected)?;
+        }
+        Ok(())
     }
 
     /// The tags of one version (S3 GetObjectTagging with a `versionId`).
@@ -944,71 +1116,171 @@ where
     ///
     /// `history_seq` is the outgoing version's row when this call moved one
     /// into history. That row's bytes go back onto the key and the row itself
-    /// is dropped, so the version stays current. A first write has no outgoing
-    /// version: the published bytes stay, and a read that finds no row serves
-    /// them as the null version.
-    pub async fn undo_versioned_put<R, B, G>(
+    /// is dropped, so the version stays current. `parts` is the retained list
+    /// that object held: the row write records it again, because a plain row
+    /// write clears the list. `publish` is the identity the failed publish
+    /// carried.
+    ///
+    /// A plane that records that identity removes the published bytes only
+    /// while the head still names it, and answers `false` when a newer publish
+    /// owns the key — the row and the slot stay that writer's. A first write
+    /// on such a plane, with no object to put back, clears the bytes and the
+    /// row. A plane that records no identity leaves a first write's bytes in
+    /// place: the next read serves them as the null version. Answers whether
+    /// this call still owned the publish and compensated it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the versioned undo's field set — plane, marker port, bucket, key, the row it replaces, the history sequence, the retained parts and the publish — is the operation's own"
+    )]
+    pub async fn undo_versioned_put<R, B, G, W>(
         &self,
         plane: &Plane<R, C, B, G>,
+        markers: &W,
         bucket: &bucket::Name,
         key: &object::Key,
         before: Option<&Row>,
         history_seq: Option<u64>,
-    ) -> Result<(), Error>
+        parts: &[PartRow],
+        publish: PublishId,
+    ) -> Result<bool, Error>
     where
         R: Metadata + VersionMeta,
         G: CurrentRows,
         B: BlockStore,
+        W: MarkerWrite,
     {
         let content_key = ContentKey::Object(key.clone());
-        if let Some(seq) = history_seq {
-            match VersionMeta::get_version(&*plane.version_rows, bucket, key, seq)
+        let Some(seq) = history_seq else {
+            return self
+                .clear_first_publish(bucket, key, before, &content_key, publish)
+                .await;
+        };
+        // A matching tag deletes every generation of the key. The outgoing
+        // version's bytes are already in the block plane, and materialize
+        // writes them back. A tag that does not match is a newer publish:
+        // leave it, and leave the row and the slot.
+        let cleared = if self.content.records_publish_identity() {
+            let owned = self
+                .content
+                .remove_if_tagged(bucket, &content_key, &[], publish)
                 .await
-                .map_err(projected)?
-            {
-                Some(stored) if stored.kind == Kind::Object => {
-                    plane
-                        .versions
-                        .materialize(bucket, key, &stored)
+                .map_err(projected)?;
+            if !owned {
+                return Ok(false);
+            }
+            true
+        } else {
+            false
+        };
+        match VersionMeta::get_version(&*plane.version_rows, bucket, key, seq)
+            .await
+            .map_err(projected)?
+        {
+            Some(stored) if stored.kind == Kind::Marker => {
+                // The failed put's bytes and row are not the marker. Drop
+                // both, then the port writes the marker's slot and its
+                // empty row. The history row is that marker's own record;
+                // a current marker has none, so it expires after the slot
+                // names it. A tagged clear already dropped the bytes.
+                if !cleared {
+                    self.content
+                        .remove(bucket, &content_key)
                         .await
                         .map_err(projected)?;
-                    if let Some(old) = before {
-                        let entry = self.require_content(bucket, key).await?;
-                        self.write_row(
-                            bucket,
-                            key,
-                            &Row {
-                                etag: old.etag.clone(),
-                                size: entry.len,
-                                mtime: entry.mtime.unwrap_or(old.mtime),
-                                identity: entry.identity,
-                                tags: old.tags.clone(),
-                                checksum: old.checksum.clone(),
-                                owner: old.owner.clone(),
-                                acl: old.acl.clone(),
-                            },
-                        )
-                        .await?;
-                    }
                 }
-                _ => {
+                let _ = ObjectMeta::remove(&*self.meta, bucket, key)
+                    .await
+                    .map_err(projected)?;
+                markers
+                    .mark_current_marker(bucket, key, stored.id.clone(), seq, None)
+                    .await
+                    .map_err(projected)?;
+                plane
+                    .versions
+                    .expire(bucket, key, seq)
+                    .await
+                    .map_err(projected)?;
+                return Ok(true);
+            }
+            Some(stored) if stored.kind == Kind::Object => {
+                plane
+                    .versions
+                    .materialize(bucket, key, &stored)
+                    .await
+                    .map_err(projected)?;
+                if let Some(old) = before {
+                    let entry = self.require_content(bucket, key).await?;
+                    // The list the outgoing object held. `put` and
+                    // `put_guarded` clear it; this write puts it back
+                    // with the row.
+                    ObjectMeta::put_with_parts(
+                        &*self.meta,
+                        bucket,
+                        key,
+                        &Row {
+                            etag: old.etag.clone(),
+                            size: entry.len,
+                            mtime: entry.mtime.unwrap_or(old.mtime),
+                            identity: entry.identity,
+                            tags: old.tags.clone(),
+                            checksum: old.checksum.clone(),
+                            owner: old.owner.clone(),
+                            acl: old.acl.clone(),
+                        },
+                        parts,
+                    )
+                    .await
+                    .map_err(projected)?;
+                }
+            }
+            _ => {
+                if !cleared {
                     self.content
                         .remove(bucket, &content_key)
                         .await
                         .map_err(projected)?;
                 }
             }
-            plane
-                .versions
-                .expire(bucket, key, seq)
-                .await
-                .map_err(projected)?;
-            return Ok(());
         }
-        // A first write superseded nothing. The published bytes stay: the
-        // row plane may be unable to record an identity (a read-only store),
-        // and the next read serves them as the null version.
-        Ok(())
+        plane
+            .versions
+            .expire(bucket, key, seq)
+            .await
+            .map_err(projected)?;
+        Ok(true)
+    }
+
+    /// Clear a first versioned publish that has no outgoing version to restore.
+    ///
+    /// A plane that records the publish identity does so only while the head
+    /// still names this publish, and only when there is no object row to put
+    /// back. A row without a restorable slot stays: deleting the bytes would
+    /// drop content the next read cannot rebuild. A plane that records no
+    /// identity leaves the bytes, and the next read serves them as the null
+    /// version.
+    async fn clear_first_publish(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        before: Option<&Row>,
+        content_key: &ContentKey,
+        publish: PublishId,
+    ) -> Result<bool, Error> {
+        if !self.content.records_publish_identity() || before.is_some() {
+            return Ok(false);
+        }
+        let owned = self
+            .content
+            .remove_if_tagged(bucket, content_key, &[], publish)
+            .await
+            .map_err(projected)?;
+        if !owned {
+            return Ok(false);
+        }
+        let _ = ObjectMeta::remove(&*self.meta, bucket, key)
+            .await
+            .map_err(projected)?;
+        Ok(true)
     }
 
     /// The version-creating `put_object`: the write that moves the outgoing
@@ -1054,9 +1326,9 @@ where
     /// plane's, and the content plane's.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the versioned put's field set — plane, bucket, key, staged body, tags, owner and ACL — is the operation's own, forwarded once into the version engine"
+        reason = "the versioned put's field set — plane, bucket, key, staged body, tags, owner, ACL and the marker port — is the operation's own, forwarded once into the version engine"
     )]
-    pub async fn put_object_versioned<R, B, G>(
+    pub async fn put_object_versioned<R, B, G, W>(
         &self,
         plane: &VersionPlane<Versions<R, C, B, G>, R, B>,
         bucket: &bucket::Name,
@@ -1065,11 +1337,13 @@ where
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        markers: &W,
     ) -> Result<object::Info, Error>
     where
         R: Metadata + VersionMeta,
         G: CurrentRows,
         B: BlockStore,
+        W: MarkerWrite,
     {
         let state = plane.versions.state(bucket).await.map_err(projected)?;
         if !state.records_versions() {
@@ -1077,45 +1351,54 @@ where
                 .commit_object(bucket, key, staged, tags, owner, acl)
                 .await;
         }
-        let current = plane
-            .versions
-            .current(bucket, key)
-            .await
-            .map_err(projected)?;
-        let seqs = Seqs {
-            latest: VersionMeta::latest(&*plane.version_rows, bucket, key)
-                .await
-                .map_err(projected)?
-                .map(|(seq, _)| seq)
-                .unwrap_or(0),
-            null_at_zero: VersionMeta::version_seq_of(&*plane.version_rows, bucket, key, None)
-                .await
-                .map_err(projected)?
-                == Some(0),
-        };
-        let plan = plan_write(Intent::Put, state, &current, &seqs);
+        let (current, plan) = Self::load_plan(plane, bucket, key, Intent::Put, state).await?;
         let before_row = ObjectMeta::get(&*self.meta, bucket, key)
             .await
             .map_err(projected)?;
-        if plan.supersede {
+        // An in-place null replacement supersedes nothing in the plan: the
+        // sequence stays and no history row survives a success. Hold the
+        // outgoing bytes anyway, so a returned error can put them back, and
+        // drop that row once the write has landed. A crash between the two
+        // leaves it.
+        let hold = !plan.supersede && current.exists && !current.degraded;
+        let parts = ObjectMeta::parts(&*self.meta, bucket, key)
+            .await
+            .map_err(projected)?;
+        if plan.supersede || hold {
             plane
                 .versions
                 .supersede_with(bucket, key, &current)
                 .await
                 .map_err(projected)?;
         }
-        // The history row this call just wrote, when the supersede had a
-        // current version to move. A later failure takes that row back: the
-        // version stays current instead of living only in history.
-        let history_seq = (plan.supersede && current.exists).then_some(current.seq);
+        // The history row this call just wrote, when it moved a current
+        // version. A later failure takes that row back: the version stays
+        // current instead of living only in history.
+        let history_seq = (plan.supersede || hold).then_some(current.seq);
         let (staged, _staged_key, _len, etag, checksum) = staged.into_parts();
+        let publish = mint_publish_id();
         self.content
-            .publish(bucket, staged, &ContentKey::Object(key.clone()))
+            .publish_tagged(bucket, staged, &ContentKey::Object(key.clone()), publish)
             .await
             .map_err(projected)?;
         let Some(entry) = self.content.stat(bucket, key).await.map_err(projected)? else {
             // A publish that left no content behind is a folder marker: no
-            // row, no version — markers stay outside the version model.
+            // row, no version. The supersede already moved the outgoing
+            // version into history, so take that back before answering the
+            // marker — otherwise the history row outlives a write that
+            // recorded nothing.
+            let _owned = self
+                .undo_versioned_put(
+                    plane,
+                    markers,
+                    bucket,
+                    key,
+                    before_row.as_ref(),
+                    history_seq,
+                    &parts,
+                    publish,
+                )
+                .await?;
             return Ok(Self::marker_info(key));
         };
         let id = match plan.identity {
@@ -1144,7 +1427,17 @@ where
             .await
             .map_err(projected)
         {
-            self.undo_versioned_put(plane, bucket, key, before_row.as_ref(), history_seq)
+            let _owned = self
+                .undo_versioned_put(
+                    plane,
+                    markers,
+                    bucket,
+                    key,
+                    before_row.as_ref(),
+                    history_seq,
+                    &parts,
+                    publish,
+                )
                 .await?;
             return Err(err);
         }
@@ -1154,9 +1447,41 @@ where
             .await
             .map_err(projected)
         {
-            self.undo_versioned_put(plane, bucket, key, before_row.as_ref(), history_seq)
+            let _owned = self
+                .undo_versioned_put(
+                    plane,
+                    markers,
+                    bucket,
+                    key,
+                    before_row.as_ref(),
+                    history_seq,
+                    &parts,
+                    publish,
+                )
                 .await?;
             return Err(err);
+        }
+        if hold {
+            // The held row is the outgoing null version, not history. Drop it
+            // now that the replacement is current.
+            if let Err(err) = VersionMeta::expire(&*plane.version_rows, bucket, key, current.seq)
+                .await
+                .map_err(projected)
+            {
+                let _owned = self
+                    .undo_versioned_put(
+                        plane,
+                        markers,
+                        bucket,
+                        key,
+                        before_row.as_ref(),
+                        Some(current.seq),
+                        &parts,
+                        publish,
+                    )
+                    .await?;
+                return Err(err);
+            }
         }
         Ok(object::Info {
             key: key.clone(),
@@ -1174,1026 +1499,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-        time::SystemTime,
-    };
-
-    use async_trait::async_trait;
-
-    use super::*;
-    use crate::{
-        _core::{
-            ETag,
-            acl::{AclGrants, Grant, Grantee, OwnerId, Permission},
-            content::{ContentEntry, ContentKey},
-            storage::{BodyStream, Error as StorageError, collect_body},
-            version::State,
-        },
-        _store_redb::RedbContent,
-        BucketRow, MetadataFailure,
-        testutil::{Base, BlockMem, TestMeta, body},
-    };
-
-    /// The group's receiver over the test base — the row-backed store's
-    /// policies, so a row write is the operation's answer.
-    fn ops(base: &Base) -> ObjectOps<TestMeta, RedbContent> {
-        base.objects(BucketRow::Guaranteed, MetadataFailure::Fail)
-    }
-
-    /// The content plane that makes the race the label rule exists for
-    /// deterministic: the first `stat` it serves moves the key's slot to a
-    /// fresh identity — the concurrent overwrite landing **inside** the
-    /// version-addressed read, after its resolution and before the plain read
-    /// it delegates to has finished. Every other call, and every `stat` once
-    /// the move has happened (or when the test pre-fires it), is the real
-    /// in-memory plane's.
-    #[derive(Clone)]
-    struct MovesOnFirstStat {
-        inner: RedbContent,
-        rows: Arc<TestMeta>,
-        bucket: bucket::Name,
-        key: object::Key,
-        fresh: Id,
-        moved: Arc<AtomicBool>,
-    }
-
-    #[async_trait]
-    impl ObjectContent for MovesOnFirstStat {
-        type Error = <RedbContent as ObjectContent>::Error;
-        type Staged = <RedbContent as ObjectContent>::Staged;
-
-        async fn stat(
-            &self,
-            bucket: &bucket::Name,
-            key: &object::Key,
-        ) -> Result<Option<ContentEntry>, Self::Error> {
-            if !self.moved.swap(true, Ordering::SeqCst) {
-                <TestMeta as VersionMeta>::advance_slot(
-                    &self.rows,
-                    &self.bucket,
-                    &self.key,
-                    Some(self.fresh.clone()),
-                    9,
-                )
-                .await?;
-            }
-            self.inner.stat(bucket, key).await
-        }
-
-        async fn stage(
-            &self,
-            bucket: &bucket::Name,
-            key: &ContentKey,
-        ) -> Result<Self::Staged, Self::Error> {
-            self.inner.stage(bucket, key).await
-        }
-
-        async fn publish(
-            &self,
-            bucket: &bucket::Name,
-            staged: Self::Staged,
-            key: &ContentKey,
-        ) -> Result<(), Self::Error> {
-            self.inner.publish(bucket, staged, key).await
-        }
-
-        async fn open(
-            &self,
-            bucket: &bucket::Name,
-            key: &ContentKey,
-            range: Option<ByteRange>,
-        ) -> Result<BodyStream, Self::Error> {
-            self.inner.open(bucket, key, range).await
-        }
-
-        async fn remove(&self, bucket: &bucket::Name, key: &ContentKey) -> Result<(), Self::Error> {
-            self.inner.remove(bucket, key).await
-        }
-
-        async fn rename(
-            &self,
-            bucket: &bucket::Name,
-            from: &object::Key,
-            to: &object::Key,
-        ) -> Result<(), Self::Error> {
-            self.inner.rename(bucket, from, to).await
-        }
-
-        async fn copy(
-            &self,
-            bucket: &bucket::Name,
-            from: &object::Key,
-            to: &object::Key,
-        ) -> Result<(), Self::Error> {
-            self.inner.copy(bucket, from, to).await
-        }
-
-        async fn scan(
-            &self,
-            bucket: &bucket::Name,
-            prefix: &str,
-            after: Option<&object::Key>,
-            limit: usize,
-        ) -> Result<Vec<ContentEntry>, Self::Error> {
-            self.inner.scan(bucket, prefix, after, limit).await
-        }
-
-        async fn create_bucket(&self, bucket: &bucket::Name) -> Result<(), Self::Error> {
-            self.inner.create_bucket(bucket).await
-        }
-
-        async fn remove_bucket(&self, bucket: &bucket::Name) -> Result<(), Self::Error> {
-            self.inner.remove_bucket(bucket).await
-        }
-
-        async fn is_empty(&self, bucket: &bucket::Name) -> Result<bool, Self::Error> {
-            self.inner.is_empty(bucket).await
-        }
-    }
-
-    /// A bucket with a recorded row — the guarded policy's requirement.
-    async fn bucket(base: &Base, name: &str) -> bucket::Name {
-        let name = bucket::name(name).unwrap();
-        base.ops(BucketRow::Guaranteed)
-            .create_bucket(&name, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        name
-    }
-
-    /// One versioned write through the version-creating object body.
-    async fn put_versioned(
-        base: &Base,
-        plane: &Plane<TestMeta, RedbContent, BlockMem>,
-        name: &bucket::Name,
-        key: &object::Key,
-        bytes: &'static [u8],
-        owner: Option<&OwnerId>,
-    ) -> object::Info {
-        let staged = ops(base)
-            .stage_body(name, key, body(&[bytes]), None, None)
-            .await
-            .unwrap();
-        ops(base)
-            .put_object_versioned(
-                plane,
-                name,
-                key,
-                staged,
-                object::Tags::empty(),
-                owner,
-                &Acl::default_private(None),
-            )
-            .await
-            .unwrap()
-    }
-
-    /// Plant a current delete marker the way a backend's versioned delete does.
-    ///
-    /// The engine has no version-creating delete: a marker written as a version
-    /// row from the shared body would displace the one null version. The read
-    /// tests still need a marker in place, so they build one here.
-    async fn plant_delete_marker(
-        base: &Base,
-        plane: &Plane<TestMeta, RedbContent, BlockMem>,
-        name: &bucket::Name,
-        key: &object::Key,
-    ) -> version::Marker {
-        use crate::_core::blob::BlobRef;
-
-        let state = plane.versions.state(name).await.unwrap();
-        let current = plane.versions.current(name, key).await.unwrap();
-        let seqs = Seqs {
-            latest: VersionMeta::latest(&*plane.version_rows, name, key)
-                .await
-                .unwrap()
-                .map(|(seq, _)| seq)
-                .unwrap_or(0),
-            null_at_zero: VersionMeta::version_seq_of(&*plane.version_rows, name, key, None)
-                .await
-                .unwrap()
-                == Some(0),
-        };
-        let plan = plan_write(Intent::Delete, state, &current, &seqs);
-        if plan.supersede {
-            plane
-                .versions
-                .supersede_with(name, key, &current)
-                .await
-                .unwrap();
-        }
-        let id = match plan.identity {
-            WriteIdentity::Fresh => Some(version::mint()),
-            WriteIdentity::Null | WriteIdentity::Unversioned => None,
-        };
-        let marker = Stored {
-            id: id.clone(),
-            size: 0,
-            blob: BlobRef::empty(),
-            etag: ETag::EMPTY,
-            created: SystemTime::now(),
-            became_noncurrent: 0,
-            kind: Kind::Marker,
-            tags: object::Tags::empty(),
-            checksum: None,
-            owner: None,
-            acl: Acl::default_private(None),
-            seq: plan.seq,
-        };
-        VersionMeta::put_version(&*plane.version_rows, name, key, &marker)
-            .await
-            .unwrap();
-        plane
-            .version_rows
-            .advance_slot(name, key, id.clone(), plan.seq)
-            .await
-            .unwrap();
-        ops(base)
-            .content
-            .remove(name, &ContentKey::Object(key.clone()))
-            .await
-            .unwrap();
-        version::Marker {
-            id,
-            is_delete_marker: plan.marker,
-        }
-    }
-
-    /// A versioned bucket whose key holds one enabled version.
-    async fn versioned(
-        base: &Base,
-        key: &object::Key,
-        bytes: &'static [u8],
-    ) -> (
-        bucket::Name,
-        Plane<TestMeta, RedbContent, BlockMem>,
-        object::Info,
-    ) {
-        let name = bucket(base, "data").await;
-        let plane = base.version_plane();
-        plane
-            .versions
-            .set_state(&name, State::Enabled)
-            .await
-            .unwrap();
-        let info = put_versioned(base, &plane, &name, key, bytes, None).await;
-        (name, plane, info)
-    }
-
-    /// A served body's bytes.
-    async fn read(stream: BodyStream) -> Vec<u8> {
-        collect_body(stream).await.unwrap().to_vec()
-    }
-
-    /// A canonical owner id.
-    fn owner() -> OwnerId {
-        OwnerId::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap()
-    }
-
-    /// A grant set a write replaces the version's with.
-    fn grants() -> AclGrants {
-        vec![Grant {
-            grantee: Grantee::Canonical(owner()),
-            permission: Permission::Read,
-        }]
-    }
-
-    #[tokio::test]
-    async fn a_version_addressed_read_serves_the_version_it_names() {
-        let base = Base::new();
-        let key = object::key("notes.txt").unwrap();
-        let (name, plane, first) = versioned(&base, &key, b"first").await;
-        let first_id = first
-            .version_id
-            .clone()
-            .expect("an enabled write mints an identity");
-        let second = put_versioned(&base, &plane, &name, &key, b"second", None).await;
-        let second_id = second
-            .version_id
-            .clone()
-            .expect("the overwrite mints its own identity");
-        assert_ne!(first_id, second_id);
-
-        // The superseded version: its own row and the block plane, never the
-        // current object.
-        match ops(&base)
-            .get_object_version(&plane, &name, &key, Some(&first_id), None)
-            .await
-            .unwrap()
-        {
-            ReadResult::Object(got) => {
-                assert_eq!(read(got.body).await, b"first");
-                assert_eq!(got.info.version_id.as_ref(), Some(&first_id));
-                assert_eq!(got.info.etag, ETag::from_content(b"first"));
-                assert_eq!(got.info.size, 5);
-                assert!(got.info.bucket_records_versions);
-                assert_eq!(got.served_range, None);
-            }
-            ReadResult::Marker { .. } => panic!("the superseded version is content"),
-        }
-        // The current version: the plain read's own serve, labelled with the
-        // identity the gated slot resolved.
-        match ops(&base)
-            .get_object_version(&plane, &name, &key, Some(&second_id), None)
-            .await
-            .unwrap()
-        {
-            ReadResult::Object(got) => {
-                assert_eq!(read(got.body).await, b"second");
-                assert_eq!(got.info.version_id.as_ref(), Some(&second_id));
-                assert_eq!(got.info.etag, ETag::from_content(b"second"));
-            }
-            ReadResult::Marker { .. } => panic!("the current version is content"),
-        }
-        // The head agrees with the get, on every element it answers.
-        match ops(&base)
-            .head_object_version(&plane, &name, &key, Some(&first_id))
-            .await
-            .unwrap()
-        {
-            HeadResult::Object(info) => {
-                assert_eq!(info.version_id.as_ref(), Some(&first_id));
-                assert_eq!(info.size, 5);
-                assert_eq!(info.etag, ETag::from_content(b"first"));
-                assert!(info.bucket_records_versions);
-            }
-            HeadResult::Marker { .. } => panic!("the superseded version is content"),
-        }
-        // A range resolves against the version's own length and names the
-        // window it served.
-        match ops(&base)
-            .get_object_version(
-                &plane,
-                &name,
-                &key,
-                Some(&first_id),
-                Some(ByteRange::Inclusive(1, 3)),
-            )
-            .await
-            .unwrap()
-        {
-            ReadResult::Object(got) => {
-                assert_eq!(read(got.body).await, b"irs");
-                assert_eq!(got.served_range, Some((1, 3)));
-            }
-            ReadResult::Marker { .. } => panic!("the superseded version is content"),
-        }
-        // An identity that names no version is the contract's own refusal.
-        let unknown = Id::new("no-such-version").unwrap();
-        let err = ops(&base)
-            .get_object_version(&plane, &name, &key, Some(&unknown), None)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, StorageError::NoSuchVersion(ref named) if named == "no-such-version"),
-            "{err:?}"
-        );
-        let err = ops(&base)
-            .head_object_version(&plane, &name, &key, Some(&unknown))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, StorageError::NoSuchVersion(_)), "{err:?}");
-    }
-
-    #[tokio::test]
-    async fn a_version_addressed_read_of_a_delete_marker_answers_the_marker() {
-        let base = Base::new();
-        let key = object::key("notes.txt").unwrap();
-        let (name, plane, first) = versioned(&base, &key, b"first").await;
-        let first_id = first.version_id.clone().unwrap();
-        let marker = plant_delete_marker(&base, &plane, &name, &key).await;
-        let marker_id = marker
-            .id
-            .clone()
-            .expect("an enabled bucket's marker carries an identity");
-        assert!(marker.is_delete_marker);
-
-        // The marker's stamp is its own row's creation — the version row the
-        // version-creating delete records.
-        let (seq, row) = plane
-            .versions
-            .latest(&name, &key)
-            .await
-            .unwrap()
-            .expect("the marker's row");
-        assert_eq!(row.kind, Kind::Marker);
-        assert_eq!(row.id.as_ref(), Some(&marker_id));
-
-        // A marker is a **success**, never an error, for the reads.
-        match ops(&base)
-            .get_object_version(&plane, &name, &key, Some(&marker_id), None)
-            .await
-            .unwrap()
-        {
-            ReadResult::Marker { id, last_modified } => {
-                assert_eq!(id.as_ref(), Some(&marker_id));
-                assert_eq!(last_modified, row.created, "the marker's own stamp");
-            }
-            ReadResult::Object(_) => panic!("the current version is a marker, not content"),
-        }
-        match ops(&base)
-            .head_object_version(&plane, &name, &key, Some(&marker_id))
-            .await
-            .unwrap()
-        {
-            HeadResult::Marker { id, last_modified } => {
-                assert_eq!(id.as_ref(), Some(&marker_id));
-                assert_eq!(last_modified, row.created);
-            }
-            HeadResult::Object(_) => panic!("the current version is a marker, not content"),
-        }
-        // The version the marker hid is still served by its own identity.
-        match ops(&base)
-            .get_object_version(&plane, &name, &key, Some(&first_id), None)
-            .await
-            .unwrap()
-        {
-            ReadResult::Object(got) => {
-                assert_eq!(read(got.body).await, b"first");
-                assert_eq!(got.info.version_id.as_ref(), Some(&first_id));
-            }
-            ReadResult::Marker { .. } => panic!("the superseded version is content"),
-        }
-        // A marker holds no metadata: every pair refuses, naming the marker.
-        let refusals = [
-            ops(&base)
-                .version_tags(&plane, &name, &key, Some(&marker_id))
-                .await
-                .unwrap_err(),
-            ops(&base)
-                .set_version_tags(&plane, &name, &key, Some(&marker_id), object::Tags::empty())
-                .await
-                .unwrap_err(),
-            ops(&base)
-                .version_acl(&plane, &name, &key, Some(&marker_id))
-                .await
-                .unwrap_err(),
-            ops(&base)
-                .set_version_acl(
-                    &plane,
-                    &name,
-                    &key,
-                    Some(&marker_id),
-                    &Acl::default_private(None),
-                )
-                .await
-                .unwrap_err(),
-        ];
-        for err in refusals {
-            assert!(
-                matches!(&err, StorageError::NoSuchVersion(named) if named == marker_id.as_str()),
-                "a marker must refuse metadata with its own identity: {err:?}"
-            );
-        }
-        assert_eq!(seq, 2, "the marker takes the key's next sequence");
-    }
-
-    #[tokio::test]
-    async fn a_null_identity_marker_answers_the_null_version_id() {
-        let base = Base::new();
-        let name = bucket(&base, "data").await;
-        let key = object::key("notes.txt").unwrap();
-        let plane = base.version_plane();
-        plane
-            .versions
-            .set_state(&name, State::Suspended)
-            .await
-            .unwrap();
-        let null = put_versioned(&base, &plane, &name, &key, b"null", None).await;
-        assert_eq!(
-            null.version_id, None,
-            "a suspended write records the null version"
-        );
-        let marker = plant_delete_marker(&base, &plane, &name, &key).await;
-        assert!(
-            marker.is_delete_marker && marker.id.is_none(),
-            "a suspended delete makes a null-identity marker current"
-        );
-
-        // `versionId=null` addresses the marker: a successful marker answer
-        // carrying the null identity and the marker row's own stamp — never the
-        // object version's identity, and never an error.
-        let (_, row) = plane
-            .versions
-            .latest(&name, &key)
-            .await
-            .unwrap()
-            .expect("the marker's row");
-        assert_eq!(row.kind, Kind::Marker);
-        assert_eq!(row.id, None);
-        match ops(&base)
-            .get_object_version(&plane, &name, &key, None, None)
-            .await
-            .unwrap()
-        {
-            ReadResult::Marker { id, last_modified } => {
-                assert_eq!(id, None, "the null-identity marker carries the null id");
-                assert_eq!(last_modified, row.created, "the marker row's own stamp");
-            }
-            ReadResult::Object(_) => panic!("the null-identity marker is not content"),
-        }
-        match ops(&base)
-            .head_object_version(&plane, &name, &key, None)
-            .await
-            .unwrap()
-        {
-            HeadResult::Marker { id, .. } => assert_eq!(id, None),
-            HeadResult::Object(_) => panic!("the null-identity marker is not content"),
-        }
-        // The per-version metadata pairs refuse it, naming the null identity.
-        for err in [
-            ops(&base)
-                .version_tags(&plane, &name, &key, None)
-                .await
-                .unwrap_err(),
-            ops(&base)
-                .version_acl(&plane, &name, &key, None)
-                .await
-                .unwrap_err(),
-        ] {
-            assert!(
-                matches!(&err, StorageError::NoSuchVersion(named) if named == "null"),
-                "a marker must refuse metadata as the null version: {err:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn the_current_slot_is_the_gated_one_not_the_rows_recorded_identity() {
-        let base = Base::new();
-        let key = object::key("notes.txt").unwrap();
-        let (name, plane, first) = versioned(&base, &key, b"first").await;
-        let first_id = first.version_id.clone().unwrap();
-
-        // The content drifts from the row — an out-of-band edit's shape,
-        // written with the contract's own row writer (the version columns
-        // ride the write untouched, so the recorded identity survives while
-        // the content-derived elements no longer describe the key).
-        let stored = base.meta.get(&name, &key).await.unwrap().expect("the row");
-        base.meta
-            .put(
-                &name,
-                &key,
-                &Row {
-                    etag: ETag::from_content(b"drifted"),
-                    size: 7,
-                    mtime: SystemTime::now(),
-                    identity: 0,
-                    tags: stored.tags.clone(),
-                    checksum: stored.checksum.clone(),
-                    owner: stored.owner.clone(),
-                    acl: stored.acl.clone(),
-                },
-            )
-            .await
-            .unwrap();
-
-        // The recorded identity is not the current version any more: the gate
-        // degraded the slot, so the address resolves nothing — a body that
-        // reached for the row's recorded identity (an ungated `Metadata::get`)
-        // would serve the drift under it.
-        let err = ops(&base)
-            .get_object_version(&plane, &name, &key, Some(&first_id), None)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, StorageError::NoSuchVersion(_)), "{err:?}");
-        assert!(
-            ops(&base)
-                .head_object_version(&plane, &name, &key, Some(&first_id))
-                .await
-                .is_err(),
-            "the head takes the same gate verdict"
-        );
-        // The null version is the gated truth, and it serves the current
-        // bytes without an identity.
-        match ops(&base)
-            .get_object_version(&plane, &name, &key, None, None)
-            .await
-            .unwrap()
-        {
-            ReadResult::Object(got) => {
-                assert_eq!(read(got.body).await, b"first");
-                assert_eq!(
-                    got.info.version_id, None,
-                    "the degraded slot carries no identity"
-                );
-                assert_eq!(got.info.size, 5, "the served size is the content's");
-            }
-            ReadResult::Marker { .. } => panic!("the drift is content, not a marker"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_current_version_read_labels_the_content_it_served() {
-        let base = Base::new();
-        let name = bucket(&base, "data").await;
-        let plane = base.version_plane();
-        plane
-            .versions
-            .set_state(&name, State::Enabled)
-            .await
-            .unwrap();
-        // The read's plane and receiver over the moving content: `fires` puts
-        // the slot move on the read's own first content probe (the concurrent
-        // overwrite landing inside the read), `!fires` leaves the plane still.
-        let reader = |key: &object::Key, fires: bool| {
-            let meta = Arc::clone(&ops(&base).meta);
-            let content = MovesOnFirstStat {
-                inner: (*base.content).clone(),
-                rows: Arc::clone(&meta),
-                bucket: name.clone(),
-                key: key.clone(),
-                fresh: Id::new("moved-on").unwrap(),
-                moved: Arc::new(AtomicBool::new(!fires)),
-            };
-            let plane = base.plane_with(content.clone());
-            let ops = ObjectOps {
-                meta,
-                content: Arc::new(content),
-                metadata_failure: MetadataFailure::Fail,
-                bucket_row: BucketRow::Guaranteed,
-            };
-            (plane, ops)
-        };
-
-        // The control: the slot stands still, and the answer carries the
-        // identity the request named.
-        let still = object::key("still.txt").unwrap();
-        let first = put_versioned(&base, &plane, &name, &still, b"still", None).await;
-        let still_id = first
-            .version_id
-            .clone()
-            .expect("an enabled write mints an identity");
-        let (still_plane, still_ops) = reader(&still, false);
-        match still_ops
-            .get_object_version(&still_plane, &name, &still, Some(&still_id), None)
-            .await
-            .unwrap()
-        {
-            ReadResult::Object(got) => {
-                assert_eq!(read(got.body).await, b"still");
-                assert_eq!(
-                    got.info.version_id.as_ref(),
-                    Some(&still_id),
-                    "the version the request named is still the current one"
-                );
-            }
-            ReadResult::Marker { .. } => panic!("the current version is content"),
-        }
-
-        // The race: the resolution sees `moving` current, the read's own
-        // content probe then takes the slot to a fresh identity, and the plain
-        // read serves the bytes it was about to serve — so those bytes are no
-        // longer the version the request named, and the answer says the null
-        // version instead of stamping them with the identifier that moved off.
-        let moving = object::key("moving.txt").unwrap();
-        let first = put_versioned(&base, &plane, &name, &moving, b"moving", None).await;
-        let moving_id = first
-            .version_id
-            .clone()
-            .expect("an enabled write mints an identity");
-        let (moving_plane, moving_ops) = reader(&moving, true);
-        match moving_ops
-            .get_object_version(&moving_plane, &name, &moving, Some(&moving_id), None)
-            .await
-            .unwrap()
-        {
-            ReadResult::Object(got) => {
-                assert_eq!(read(got.body).await, b"moving");
-                assert_eq!(
-                    got.info.version_id, None,
-                    "the served bytes are not the named version any more"
-                );
-            }
-            ReadResult::Marker { .. } => panic!("the current version is content"),
-        }
-        // The head takes the same rule, from its own resolution.
-        let head_key = object::key("moving-head.txt").unwrap();
-        let first = put_versioned(&base, &plane, &name, &head_key, b"head", None).await;
-        let head_id = first
-            .version_id
-            .clone()
-            .expect("an enabled write mints an identity");
-        let (head_plane, head_ops) = reader(&head_key, true);
-        match head_ops
-            .head_object_version(&head_plane, &name, &head_key, Some(&head_id))
-            .await
-            .unwrap()
-        {
-            HeadResult::Object(info) => assert_eq!(
-                info.version_id, None,
-                "the head labels what its own resolution served"
-            ),
-            HeadResult::Marker { .. } => panic!("the current version is content"),
-        }
-    }
-
-    #[tokio::test]
-    async fn the_per_version_tag_and_acl_pairs_answer_from_the_versions_own_row() {
-        let base = Base::new();
-        let key = object::key("notes.txt").unwrap();
-        let name = bucket(&base, "data").await;
-        let plane = base.version_plane();
-        plane
-            .versions
-            .set_state(&name, State::Enabled)
-            .await
-            .unwrap();
-        let first = put_versioned(&base, &plane, &name, &key, b"first", Some(&owner())).await;
-        let first_id = first.version_id.clone().unwrap();
-        let second = put_versioned(&base, &plane, &name, &key, b"second", None).await;
-        let second_id = second.version_id.clone().unwrap();
-
-        // The history version's tags and ACL are its version row's, and the
-        // write lands on that row alone — the row's own stamp survives it.
-        let before = plane
-            .version_rows
-            .get_version(&name, &key, 1)
-            .await
-            .unwrap()
-            .expect("the superseded version's row");
-        assert_ne!(before.became_noncurrent, 0, "the row is history");
-        let tags = object::Tags::from_pairs([("env".to_owned(), "prod".to_owned())]).unwrap();
-        ops(&base)
-            .set_version_tags(&plane, &name, &key, Some(&first_id), tags.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            ops(&base)
-                .version_tags(&plane, &name, &key, Some(&first_id))
-                .await
-                .unwrap(),
-            tags
-        );
-        let after = plane
-            .version_rows
-            .get_version(&name, &key, 1)
-            .await
-            .unwrap()
-            .expect("the superseded version's row");
-        assert_eq!(after.tags, tags);
-        assert_eq!(
-            after.became_noncurrent, before.became_noncurrent,
-            "the rewrite preserves the row's noncurrent stamp"
-        );
-        ops(&base)
-            .set_version_acl(
-                &plane,
-                &name,
-                &key,
-                Some(&first_id),
-                &Acl {
-                    owner: None,
-                    grants: grants(),
-                },
-            )
-            .await
-            .unwrap();
-        let acl = ops(&base)
-            .version_acl(&plane, &name, &key, Some(&first_id))
-            .await
-            .unwrap();
-        assert_eq!(acl.grants, grants());
-        assert_eq!(
-            acl.owner.as_ref(),
-            Some(&owner()),
-            "the row's owner element is its own"
-        );
-
-        // The current version's tags and ACL are the object row's — the same
-        // elements the plain tag/ACL bodies read, which is the cross-check
-        // that the two paths answer one row.
-        ops(&base)
-            .set_version_tags(&plane, &name, &key, Some(&second_id), tags.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            ops(&base)
-                .version_tags(&plane, &name, &key, Some(&second_id))
-                .await
-                .unwrap(),
-            tags
-        );
-        assert_eq!(
-            ops(&base).get_object_tags(&name, &key).await.unwrap(),
-            tags,
-            "the version-addressed write landed on the object row"
-        );
-        ops(&base)
-            .set_version_acl(
-                &plane,
-                &name,
-                &key,
-                Some(&second_id),
-                &Acl {
-                    owner: Some(owner()),
-                    grants: grants(),
-                },
-            )
-            .await
-            .unwrap();
-        let current_acl = ops(&base)
-            .version_acl(&plane, &name, &key, Some(&second_id))
-            .await
-            .unwrap();
-        assert_eq!(current_acl.grants, grants());
-        // The current version's row records no owner (the overwrite wrote
-        // none), and the ACL put never changes it.
-        assert_eq!(current_acl.owner, None);
-        // The slot still names the same version: the element writes touch
-        // neither the version columns nor the content.
-        let slot = plane
-            .version_rows
-            .current_slot(&name, &key)
-            .await
-            .unwrap()
-            .expect("a slot");
-        assert_eq!(slot.version.as_ref(), Some(&second_id));
-        match ops(&base)
-            .get_object_version(&plane, &name, &key, Some(&second_id), None)
-            .await
-            .unwrap()
-        {
-            ReadResult::Object(got) => assert_eq!(read(got.body).await, b"second"),
-            ReadResult::Marker { .. } => panic!("the current version is content"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_suspended_replacement_leaves_no_history_row_and_serves_the_null_version() {
-        let base = Base::new();
-        let name = bucket(&base, "data").await;
-        let key = object::key("notes.txt").unwrap();
-        let plane = base.version_plane();
-        plane
-            .versions
-            .set_state(&name, State::Suspended)
-            .await
-            .unwrap();
-        let first = put_versioned(&base, &plane, &name, &key, b"first", None).await;
-        assert_eq!(
-            first.version_id, None,
-            "a suspended write records the null version"
-        );
-        let second = put_versioned(&base, &plane, &name, &key, b"second", None).await;
-        assert_eq!(second.version_id, None);
-        assert!(
-            plane.versions.latest(&name, &key).await.unwrap().is_none(),
-            "the in-place replacement leaves no history row"
-        );
-        // `versionId=null` is the current null version, serving the newest
-        // bytes under no identity.
-        match ops(&base)
-            .get_object_version(&plane, &name, &key, None, None)
-            .await
-            .unwrap()
-        {
-            ReadResult::Object(got) => {
-                assert_eq!(read(got.body).await, b"second");
-                assert_eq!(got.info.version_id, None);
-                assert!(
-                    got.info.bucket_records_versions,
-                    "a suspended bucket records them"
-                );
-            }
-            ReadResult::Marker { .. } => panic!("the replacement is content, not a marker"),
-        }
-        // The per-version pairs address the same null version.
-        assert_eq!(
-            ops(&base)
-                .version_tags(&plane, &name, &key, None)
-                .await
-                .unwrap(),
-            object::Tags::empty()
-        );
-        assert!(
-            ops(&base)
-                .version_tags(&plane, &name, &key, Some(&Id::new("gone").unwrap()))
-                .await
-                .is_err(),
-            "an identity naming no version is refused"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unversioned_bucket_serves_the_null_version_and_reports_no_recording() {
-        let base = Base::new();
-        let name = bucket(&base, "data").await;
-        let key = object::key("notes.txt").unwrap();
-        let plane = base.version_plane();
-        let info = put_versioned(&base, &plane, &name, &key, b"plain", None).await;
-        assert_eq!(info.version_id, None);
-
-        assert_eq!(
-            ops(&base).bucket_versioning(&plane, &name).await.unwrap(),
-            State::Unversioned
-        );
-        match ops(&base)
-            .get_object_version(&plane, &name, &key, None, None)
-            .await
-            .unwrap()
-        {
-            ReadResult::Object(got) => {
-                assert_eq!(read(got.body).await, b"plain");
-                assert_eq!(got.info.version_id, None);
-                assert!(
-                    !got.info.bucket_records_versions,
-                    "an unversioned bucket records no versions"
-                );
-            }
-            ReadResult::Marker { .. } => panic!("an unversioned write is content, not a marker"),
-        }
-        // The state pair's write is visible, and the version pairs then answer
-        // the null version's own row.
-        ops(&base)
-            .set_bucket_versioning(&plane, &name, State::Enabled)
-            .await
-            .unwrap();
-        assert_eq!(
-            ops(&base).bucket_versioning(&plane, &name).await.unwrap(),
-            State::Enabled
-        );
-        match ops(&base)
-            .head_object_version(&plane, &name, &key, None)
-            .await
-            .unwrap()
-        {
-            HeadResult::Object(info) => {
-                assert!(info.bucket_records_versions);
-                assert_eq!(info.version_id, None);
-            }
-            HeadResult::Marker { .. } => panic!("the null version is content"),
-        }
-    }
-
-    /// The engine's versioned write stamps the row it supersedes.
-    ///
-    /// The mechanism is the store's (`advance_slot` records when the row it
-    /// moved off stopped being current, in the same commit that records the
-    /// incoming identity — pinned in redb's own suite), and the close-out
-    /// filed the missing half: nothing asserted it **through the engine
-    /// body**, so a composition that superseded without stamping, or stamped
-    /// in a second transaction, would have gone unnoticed at this level.
-    ///
-    /// The ordering is the point: the stamp and the slot move are one commit,
-    /// so a reader that sees the incoming current version has already seen the
-    /// outgoing one stamped as history.
-    #[tokio::test]
-    async fn a_versioned_write_stamps_the_row_it_supersedes() {
-        let base = Base::new();
-        let name = bucket(&base, "data").await;
-        let key = object::key("stamped.txt").unwrap();
-        let plane = base.version_plane();
-        plane
-            .versions
-            .set_state(&name, State::Enabled)
-            .await
-            .unwrap();
-
-        let first = put_versioned(&base, &plane, &name, &key, b"first", None).await;
-        let first_id = first
-            .version_id
-            .clone()
-            .expect("an enabled write mints an identity");
-        let second = put_versioned(&base, &plane, &name, &key, b"second", None).await;
-        assert_ne!(second.version_id, first.version_id);
-
-        // The write moved the first version into history: its row is at the
-        // sequence the slot left, and it says when it stopped being current.
-        let (history_seq, history) = plane
-            .versions
-            .latest(&name, &key)
-            .await
-            .unwrap()
-            .expect("the superseded version's history row");
-        assert_eq!(
-            history.id.as_ref(),
-            Some(&first_id),
-            "the history row is the version the write moved off"
-        );
-        assert_ne!(
-            history.became_noncurrent, 0,
-            "the engine's write stamps the row it supersedes"
-        );
-
-        // The same advance recorded the incoming identity: the engine's own
-        // view of the slot names the version the write minted, at a sequence
-        // the stamped row does not hold — the two halves of one commit cannot
-        // be seen apart.
-        let slot = plane.versions.current(&name, &key).await.unwrap();
-        assert_eq!(
-            slot.version.as_ref(),
-            second.version_id.as_ref(),
-            "the slot names the version the write minted"
-        );
-        assert_ne!(
-            slot.seq, history_seq,
-            "the slot moved off the sequence the stamped row sits at"
-        );
-    }
-}
+#[path = "version_tests.rs"]
+mod tests;

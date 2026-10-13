@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO object_parts (bucket, key, number, size, algorithm, value) VALUES ($1, $2, 1, 1, '', '')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1da7ec406bb1d50253efecb2d3f17bdb9fe1f4c8f7714a2fef882733ffc40faa"
+}

@@ -33,7 +33,7 @@ use crate::{
     _config::{
         self, Config,
         log::{AccessFormat, Format, Verbosity},
-        state::prepare_home_derived,
+        state::{prepare_home_derived, prepare_synthetic_root},
         storage::Backend,
     },
     _fs::{Error as FsError, FsStorage},
@@ -123,7 +123,7 @@ pub fn run(
 ) -> Result<Server, Error> {
     // **A synthetic pg root is served as pg only when the configuration selects pg** (ruling R8,
     // restated now that the backend is servable). `resolve::locate`'s pg arm derives the root
-    // `~/.tinio/pg/<hash of the dsn>/` in two cases: a configuration that says
+    // `~/.local/state/tinio/pg/<dsn identity>/` in two cases: a configuration that says
     // `[storage] type = "pg"`, and the fallback a bare `TINIO_PG_DSN=… tinio server` with no `DIR`
     // reaches. Only the first is a pg run; the second carries no `[storage]` section, so the chain
     // below would answer `fs` — and would **create** `<synthetic>/.tinio/.tinio.toml` on the way —
@@ -227,12 +227,13 @@ pub fn run(
     // control channel both bind below — and the storage opens under the root, so a missing state
     // dir is refused here rather than surfacing as an unresolved-path failure later. Read-only
     // mode creates the state dir and never the root: creating the root would write the one thing
-    // the mode promises to leave alone. When the served dir is the home-derived leaf, harden
-    // `<home>/.tinio`/`roots` first: resolve left them unmade so clients create nothing, and a
-    // bare `create_dir_all` would inherit the umask and follow a planted symlink.
+    // the mode promises to leave alone. Hardening the state tree comes first in both of the
+    // shapes that need it: a home-derived leaf's parents (resolve left them unmade so clients
+    // create nothing) and a pg run's synthetic root (no backend opens that leaf), so the
+    // `create_dir_all`s below can neither inherit the umask nor follow a planted symlink.
     //
-    // **The hardening call is the read-only branch's, and the function's own body is why.** In a
-    // read-write run the state directory is `<root>/.tinio`, so
+    // **Only the read-only filesystem branch needs `prepare_home_derived`, and the function's own
+    // body is why.** In a read-write filesystem run the state directory is `<root>/.tinio`, so
     // `prepare_home_derived_in`'s first check — `state_dir != home_state_dir_path(root, home)?` —
     // returns `Ok` before it can do anything: the call is a no-op whose only cost is a
     // `dirs::home_dir()` lookup and a `canonicalize` of the root, and on macOS that cost is paid
@@ -246,7 +247,20 @@ pub fn run(
     // above the read-write state-directory exposure `sandbox_request` adds, and there the remedy is
     // an explicit writable `TINIO_STATE_DIR`
     // (`docs/superpowers/specs/2026-09-18-sandbox-design.md` §5, its `home` paragraph).
-    if resolution.read_only {
+    //
+    // **A pg run takes the first shape, in either mode**: its root is not a served directory, so
+    // nothing else in this crate opens (or hardens) `<root>/.tinio` — the filesystem backend's
+    // 0700 state-database open is exactly what a pg run has not got.
+    if synthetic {
+        // **A pg run's synthetic root is the tool's own state tree, and nothing else hardens
+        // it.** `prepare_home_derived` is the read-only *filesystem* leaf's hardening, and a
+        // pg run's state directory is not that leaf, so before this call the `create_dir_all`
+        // below minted `<root>/.tinio` with the process umask — 0755 on a 022 umask, listing
+        // the tool's state and its access log to every local user. The filesystem backend
+        // creates its own leaf 0700 (`tinio-fs`'s state-database open); a pg run opens no such
+        // database, so the hardening is this call's (`tinio_config::state`).
+        prepare_synthetic_root(&resolution.root)?;
+    } else if resolution.read_only {
         prepare_home_derived(&resolution.root, &resolution.state_dir)?;
     }
     // **A confined child's permission refusal is the confinement's own answer, and the four

@@ -1,14 +1,19 @@
+use std::{slice::from_ref, time::Duration};
+
+use tokio::time::sleep;
+
 use crate::{
     _core::{
         ETag,
         acl::Acl,
         meta::{
-            BucketMeta, ObjectMeta,
+            BucketMeta, ObjectMeta, VersionMeta,
             object::{Identity, PartRow, Row as ObjectRow},
         },
         object,
+        version::Id,
     },
-    Error,
+    Error, PgStore, begin,
     tests::fixtures::{ETAG_A, bucket_row, key, name, owner, scratch, tags},
     timestamp::{unix_micros, unix_seconds as at},
 };
@@ -94,6 +99,24 @@ async fn object_rows_round_trip_and_walk_in_byte_order() {
         .unwrap();
     assert_eq!(loaded[0].as_ref().map(|row| row.size), Some(6));
     assert!(loaded[1].is_none());
+    // An answer is per **occurrence**: a key asked for twice is answered
+    // twice, not `None` on its second read (a repeated key is not a missing
+    // one).
+    let repeated = ObjectMeta::load(
+        &store,
+        &data,
+        &[key("data-2"), key("data-2"), key("missing")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repeated
+            .iter()
+            .map(|row| row.as_ref().map(|row| row.size))
+            .collect::<Vec<_>>(),
+        vec![Some(6), Some(6), None],
+        "a duplicated key answers its row per occurrence"
+    );
     assert!(
         ObjectMeta::get(&store, &data, &key("missing"))
             .await
@@ -258,6 +281,27 @@ async fn put_with_parts_retains_the_list_and_every_overwrite_clears_it() {
             .is_empty(),
         "put_batch clears the retained parts too"
     );
+    // A part number that appears twice keeps its **last** row, which is what
+    // the reference store's part table answers; the unnest insert would
+    // otherwise abort the whole write on the relation's primary key.
+    let doubled = vec![
+        PartRow::from_raw(1, 5, "", ""),
+        PartRow::from_raw(2, 6, "", ""),
+        PartRow::from_raw(1, 9, "", ""),
+    ];
+    ObjectMeta::put_with_parts(&store, &data, &target, &row(17, ETAG_A), &doubled)
+        .await
+        .unwrap();
+    assert_eq!(
+        ObjectMeta::parts(&store, &data, &target)
+            .await
+            .unwrap()
+            .iter()
+            .map(|part| (part.number, part.size))
+            .collect::<Vec<_>>(),
+        vec![(1, 9), (2, 6)],
+        "a duplicated part number keeps the last write"
+    );
     db.drop_db().await;
 }
 
@@ -345,6 +389,12 @@ async fn the_guarded_writers_refuse_an_absent_bucket_and_put_preserving_carries_
         ObjectMeta::put_preserving(&store, &absent, &target, &identity(1, ETAG_A)).await,
         Err(Error::NoSuchBucket(_))
     ));
+    // The batch writer is a guarded writer too: a bucket with no row refuses
+    // the whole batch rather than planting object rows under it.
+    assert!(matches!(
+        ObjectMeta::put_batch(&store, &absent, &[(target.clone(), row(1, ETAG_A))]).await,
+        Err(Error::NoSuchBucket(_))
+    ));
     let data = name("plane-object-preserving");
     bucket_row(&store, &data).await;
     let mut recorded = row(5, ETAG_A);
@@ -398,6 +448,17 @@ async fn a_corrupt_row_reads_absent_fails_the_walk_and_heals() {
         .execute(store.pool())
         .await
         .unwrap();
+    // A retained part list with no row it belongs to: the heal must take it
+    // with the row, or the next object written at the key inherits a part list
+    // that is not its own.
+    sqlx::query!(
+        "INSERT INTO object_parts (bucket, key, number, size, algorithm, value) VALUES ($1, $2, 1, 1, '', '')",
+        &data,
+        &corrupt
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
     assert!(
         ObjectMeta::get(&store, &data, &corrupt)
             .await
@@ -424,5 +485,263 @@ async fn a_corrupt_row_reads_absent_fails_the_walk_and_heals() {
     .await
     .unwrap();
     assert_eq!(remaining, 1, "the heal write removed the corrupt row");
+    let parts = sqlx::query_scalar!(
+        r#"SELECT count(*) AS "rows!" FROM object_parts WHERE bucket = $1"#,
+        &data
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(parts, 0, "…and the part list that belonged to it");
     db.drop_db().await;
+}
+
+/// A stored `bigint` the contract cannot name refuses the read instead of
+/// being served as the value an `as` cast would invent: part 0 for 2^32, a
+/// length near `u64::MAX` for a negative size.
+#[tokio::test]
+async fn a_stored_value_outside_the_contract_refuses_the_read_it_cannot_serve() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let data = name("plane-object-truncated");
+    bucket_row(&store, &data).await;
+    let target = key("stored.bin");
+    let parts = vec![PartRow::from_raw(1, 5, "", "")];
+    ObjectMeta::put_with_parts(&store, &data, &target, &row(5, ETAG_A), &parts)
+        .await
+        .unwrap();
+    // 2^32 is a part number the contract's `u32` cannot name: the read refuses
+    // rather than answering part 0, which no client ever wrote.
+    sqlx::query!(
+        "UPDATE object_parts SET number = 4294967296 WHERE bucket = $1 AND key = $2",
+        &data,
+        &target
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        ObjectMeta::parts(&store, &data, &target).await,
+        Err(Error::Corrupt { .. })
+    ));
+    sqlx::query!(
+        "UPDATE object_parts SET number = 1, size = -1 WHERE bucket = $1 AND key = $2",
+        &data,
+        &target
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        ObjectMeta::parts(&store, &data, &target).await,
+        Err(Error::Corrupt { .. })
+    ));
+    // An object row whose stored size or identity is outside the contract
+    // reads as absent, exactly as a domain-invalid ETag does, so a length is
+    // never served from a value the contract cannot hold.
+    sqlx::query!(
+        "UPDATE object_meta SET size = -1 WHERE bucket = $1 AND key = $2",
+        &data,
+        &target
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert!(
+        ObjectMeta::get(&store, &data, &target)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ObjectMeta::load(&store, &data, from_ref(&target))
+            .await
+            .unwrap()[0]
+            .is_none()
+    );
+    db.drop_db().await;
+}
+
+/// The version slot is not the object plane's (the 2026-10-13 ruling):
+/// `remove` takes the row and its retained parts and leaves the key's slot
+/// recorded, because a slot with no object row is a state the contract admits
+/// and only the version plane's own calls or the bucket teardown retire one.
+#[tokio::test]
+async fn a_row_removal_leaves_the_keys_version_slot_alone() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let data = name("plane-object-slot");
+    bucket_row(&store, &data).await;
+    let target = key("versioned.bin");
+    ObjectMeta::put(&store, &data, &target, &row(5, ETAG_A))
+        .await
+        .unwrap();
+    let id = Id::new("01234567-89ab-cdef-0123-456789abcdef").expect("a valid version id");
+    VersionMeta::advance_slot(&store, &data, &target, Some(id), 3)
+        .await
+        .unwrap();
+    assert!(ObjectMeta::remove(&store, &data, &target).await.unwrap());
+    assert!(
+        ObjectMeta::get(&store, &data, &target)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        VersionMeta::current_slot(&store, &data, &target)
+            .await
+            .unwrap()
+            .is_some(),
+        "the slot outlives the row: only the version plane retires one"
+    );
+    db.drop_db().await;
+}
+
+/// A valid row a concurrent writer commits between the healing traversal's
+/// read and its heal write survives: the heal reaches only the rows a locked
+/// re-read still cannot decode.
+#[tokio::test]
+async fn a_valid_row_written_after_the_heal_read_survives() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let data = name("plane-object-heal-race");
+    bucket_row(&store, &data).await;
+    let corrupt = key("heal-race.bin");
+    sqlx::query_file!("sql/meta/object/plant_corrupt_row.sql", &data, &corrupt)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    // The writer holds the row as a valid one, uncommitted: the traversal's
+    // own read still sees the corrupt version, and the heal's locked re-read
+    // waits on this transaction.
+    let mut writer = begin(store.pool()).await.unwrap();
+    sqlx::query!(
+        "UPDATE object_meta SET etag = $3, size = 4 WHERE bucket = $1 AND key = $2",
+        &data,
+        &corrupt,
+        ETAG_A
+    )
+    .execute(&mut *writer)
+    .await
+    .unwrap();
+    let racing = store.clone();
+    let bucket = data.clone();
+    let task = tokio::spawn(async move { ObjectMeta::walk_healing(&racing, &bucket).await });
+    assert!(
+        wait_for_a_waiter(&store).await,
+        "the heal never waited on the row's lock"
+    );
+    writer.commit().await.unwrap();
+    let walked = task.await.expect("the heal task").unwrap();
+    assert_eq!(walked.len(), 1, "the traversal reports the key it read");
+    assert!(
+        ObjectMeta::get(&store, &data, &corrupt)
+            .await
+            .unwrap()
+            .is_some(),
+        "the row the concurrent writer committed is not the heal's to delete"
+    );
+    db.drop_db().await;
+}
+
+/// A move whose destination a concurrent writer materializes while the move is
+/// in flight must not fail it: the moved row stands, which is what the
+/// reference store's last-writer-wins move answers.
+#[tokio::test]
+async fn a_move_onto_a_key_a_concurrent_writer_materializes_still_lands() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let data = name("plane-object-move-race");
+    bucket_row(&store, &data).await;
+    let source = key("race-source.bin");
+    let destination = key("race-destination.bin");
+    ObjectMeta::put(&store, &data, &source, &row(11, ETAG_A))
+        .await
+        .unwrap();
+    // A part list at the destination with no row of its own, held by this
+    // transaction: the move's destination clear is a statement a lock can
+    // park it on, so the test can put a concurrent write exactly between the
+    // move's destination clear and its own row write — the window an
+    // unconditional `UPDATE … SET key` answers with a unique violation.
+    sqlx::query!(
+        "INSERT INTO object_parts (bucket, key, number, size, algorithm, value) VALUES ($1, $2, 1, 1, '', '')",
+        &data,
+        &destination
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let mut parked = begin(store.pool()).await.unwrap();
+    sqlx::query!(
+        "DELETE FROM object_parts WHERE bucket = $1 AND key = $2",
+        &data,
+        &destination
+    )
+    .execute(&mut *parked)
+    .await
+    .unwrap();
+    let racing = store.clone();
+    let bucket = data.clone();
+    let from = source.clone();
+    let to = destination.clone();
+    let task = tokio::spawn(async move { ObjectMeta::move_(&racing, &bucket, &from, &to).await });
+    assert!(
+        wait_for_a_waiter(&store).await,
+        "the move never waited on the destination clear"
+    );
+    // The concurrent writer materializes the destination while the move waits.
+    sqlx::query!(
+        "INSERT INTO object_meta (bucket, key, etag, size, mtime, identity, tags, checksum, acl) VALUES ($1, $2, $3, 3, to_timestamp(10), 7, '{}', '', row(NULL, ARRAY[]::acl_grant[])::acl)",
+        &data,
+        &destination,
+        ETAG_B
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    parked.commit().await.unwrap();
+    task.await
+        .expect("the move task")
+        .expect("a concurrent write to the destination is not a move failure");
+    assert!(
+        ObjectMeta::get(&store, &data, &source)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        ObjectMeta::get(&store, &data, &destination)
+            .await
+            .unwrap()
+            .map(|row| (row.size, row.etag.to_string())),
+        Some((11, ETAG_A.to_owned())),
+        "the move's own row is the one that stands"
+    );
+    db.drop_db().await;
+}
+
+/// Wait until a call is blocked on a lock inside this test's own scratch
+/// database — the signal that it has reached the statement the test parked it
+/// on. `pg_locks` is cluster-wide and a row wait is recorded as a
+/// `transactionid` lock (which carries no database), so the probe joins it to
+/// the waiting session and keeps only the sessions in this database; a
+/// neighbour's waiter must not release this test early.
+async fn wait_for_a_waiter(store: &PgStore) -> bool {
+    for _ in 0..100 {
+        let waiting: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) AS "waiting!" FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE NOT l.granted AND a.datname = current_database()"#,
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("the lock probe");
+        if waiting > 0 {
+            return true;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    false
 }

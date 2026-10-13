@@ -427,6 +427,15 @@ impl ObjectMeta for Rows {
             .map_err(Into::into)
     }
 
+    async fn has_objects(&self, bucket: &bucket::Name) -> Result<bool, <Self as Metadata>::Error> {
+        // The row plane is the shared redb one (fs's rows are the state
+        // database's), so the teardown probe is its own — one home for the
+        // rule, and no fs-local emptiness authority beside it.
+        <RedbMetadata as ObjectMeta>::has_objects(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn put_preserving(
         &self,
         bucket: &bucket::Name,

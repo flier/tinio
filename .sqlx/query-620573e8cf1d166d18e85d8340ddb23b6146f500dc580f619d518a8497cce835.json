@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO object_parts (bucket, key, number, size, algorithm, value)\nSELECT bucket, $3, number, size, algorithm, value\nFROM object_parts\nWHERE bucket = $1 AND key = $2\nON CONFLICT (bucket, key, number) DO UPDATE SET\n    size = excluded.size, algorithm = excluded.algorithm,\n    value = excluded.value\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "620573e8cf1d166d18e85d8340ddb23b6146f500dc580f619d518a8497cce835"
+}

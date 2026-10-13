@@ -26,12 +26,35 @@
 //! default impl, which is why [`PgStorage`]'s version surface then refuses by contract rather
 //! than by accident.
 
+/// How far a multipart completion got before its record failed.
+///
+/// [`Landed::Slot`] includes the row. A moved slot whose row did not land is
+/// not a state this undo sees.
+#[derive(Clone, Copy)]
+pub(crate) enum Landed {
+    /// The publish landed. The row write did not.
+    Publish,
+    /// The row landed. The slot did not.
+    Row,
+    /// The row landed and the slot moved.
+    Slot,
+}
+
 #[cfg(not(feature = "versioning"))]
 use tinio_core::{
+    acl::{Acl, OwnerId},
     bucket::Name,
+    content::{ContentKey, PublishId},
+    meta::object::{PartRow, Row as ObjectRow},
     object,
     storage::{TagWriteResult, VersionOps},
+    version::{Id, Marker},
 };
+#[cfg(not(feature = "versioning"))]
+use tinio_ops::StagedBody;
+
+#[cfg(not(feature = "versioning"))]
+use crate::_store_pg::content::{LiveGeneration, PgStaged};
 
 #[cfg(not(feature = "versioning"))]
 impl VersionOps for crate::PgStorage {}
@@ -63,10 +86,106 @@ impl crate::PgStorage {
     ) -> Result<(), crate::Error> {
         Ok(())
     }
+
+    /// No version plane: the write is the engine's version-free commit.
+    pub(crate) async fn commit_put(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        staged: StagedBody<PgStaged>,
+        tags: object::Tags,
+        owner: Option<&OwnerId>,
+        acl: &Acl,
+    ) -> Result<object::Info, crate::Error> {
+        self.objects()
+            .commit_object(bucket, key, staged, tags, owner, acl)
+            .await
+            .map_err(crate::Error::from)
+    }
+
+    /// No version plane: a delete is never a marker. The bucket's state row may
+    /// still say it records versions; this build cannot act on that.
+    pub(crate) async fn delete_if_versioned(
+        &self,
+        _bucket: &Name,
+        _key: &object::Key,
+    ) -> Result<Option<Marker>, crate::Error> {
+        Ok(None)
+    }
+
+    pub(crate) async fn open_put_write(
+        &self,
+        _bucket: &Name,
+        _key: &object::Key,
+    ) -> Result<OpenedWrite, crate::Error> {
+        Ok(OpenedWrite)
+    }
+
+    pub(crate) async fn close_put_write(
+        &self,
+        _bucket: &Name,
+        _key: &object::Key,
+        _write: &OpenedWrite,
+    ) -> Result<(), crate::Error> {
+        Ok(())
+    }
+
+    /// The publish is undone by putting the live generation back, and only
+    /// while that generation is still the head. A newer writer keeps the key.
+    /// A landed row is put back with the part list it held. This build has no
+    /// slot to rewind.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the undo takes the published generation, the one it replaces, the versioned write and the object it replaces"
+    )]
+    pub(crate) async fn take_back(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        content_key: &ContentKey,
+        published: LiveGeneration,
+        previous: Option<LiveGeneration>,
+        _write: &OpenedWrite,
+        before: Option<&ObjectRow>,
+        before_parts: &[PartRow],
+        _publish: PublishId,
+        landed: Landed,
+    ) -> Result<(), crate::Error> {
+        let row_landed = matches!(landed, Landed::Row | Landed::Slot);
+        let _owned = self
+            .restore_unversioned(
+                bucket,
+                key,
+                content_key,
+                published,
+                previous,
+                before,
+                before_parts,
+                row_landed,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+/// A write with no version plane. The methods exist so completion calls one
+/// signature in every build.
+#[cfg(not(feature = "versioning"))]
+pub(crate) struct OpenedWrite;
+
+#[cfg(not(feature = "versioning"))]
+impl OpenedWrite {
+    pub(crate) fn identity(&self) -> Option<Id> {
+        None
+    }
+
+    pub(crate) fn records(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(feature = "versioning")]
-pub(crate) use self::enabled::{OpenedWrite, Plane, plane};
+pub(crate) use self::enabled::{Plane, plane};
 
 #[cfg(feature = "versioning")]
 mod enabled {
@@ -75,10 +194,14 @@ mod enabled {
     use async_trait::async_trait;
     use tinio_blob::Store;
     use tinio_core::{
-        acl::Acl,
+        acl::{Acl, OwnerId},
         bucket::Name,
-        content::ContentKey,
-        meta::{BucketMeta, ObjectMeta, VersionMeta, object::Row as ObjectRow, version::Kind},
+        content::{ContentKey, PublishId},
+        meta::{
+            BucketMeta, ObjectMeta, VersionMeta,
+            object::{PartRow, Row as ObjectRow},
+            version::Kind,
+        },
         object,
         storage::{self, ByteRange, TagWriteResult, VersionOps},
         version::{
@@ -86,16 +209,21 @@ mod enabled {
             State,
         },
     };
-    use tinio_ops::VersionPlane;
+    use tinio_ops::{StagedBody, VersionPlane};
     use tinio_version::{
         Current, CurrentRows, Identity, Intent, MarkerWrite, Plan, Seqs, Versions, plan_write,
     };
 
     use crate::{
-        _store_pg::{PgStore, blocks::PgBlocks, content::LiveGeneration},
+        _store_pg::{
+            PgStore,
+            blocks::PgBlocks,
+            content::{LiveGeneration, PgStaged},
+        },
         Error,
         readonly::Subject,
         storage::PgStorage,
+        version::Landed,
     };
 
     /// The version plane every body takes: `tinio-version`'s state engine over the store's
@@ -347,6 +475,11 @@ mod enabled {
     /// with no version row, and the store's `mark_current_marker` is the one statement that
     /// writes that state (the slot's marker bit, the key's materialized object row and the
     /// stamp the move owes the version it supersedes, in one transaction).
+    ///
+    /// The entry guard is the crate's, like every other mutating entry's
+    /// (`PgStorage::create_delete_marker` above guards the operation that normally reaches
+    /// this port, but a direct call must answer the same refusal rather than reaching SQL on
+    /// a read-only instance).
     #[async_trait]
     impl MarkerWrite for PgStorage {
         async fn mark_current_marker(
@@ -357,6 +490,7 @@ mod enabled {
             seq: u64,
             moved_off: Option<u64>,
         ) -> Result<(), storage::Error> {
+            self.writable(Subject::Key(key))?;
             self.store
                 .mark_current_marker(bucket, key, id, seq, moved_off)
                 .await
@@ -371,6 +505,13 @@ mod enabled {
     /// part list, which the engine's versioned put deliberately clears), so it cannot call that
     /// body; everything else — the state read, the gated slot, the sequences, the supersede and
     /// the identity — is the shared policy, taken here rather than re-spelled.
+    /// The slot a write opened on, so a failure after `advance_slot` can put it back.
+    struct PreviousSlot {
+        seq: u64,
+        id: Option<Id>,
+        is_delete_marker: bool,
+    }
+
     pub(crate) struct OpenedWrite {
         /// The version plan, or `None` on a bucket that records no versions.
         plan: Option<Plan>,
@@ -380,6 +521,8 @@ mod enabled {
         records: bool,
         /// The outgoing version's sequence when this open moved one into history.
         history_seq: Option<u64>,
+        /// The slot this open found, before it superseded anything. `None` when the key had none.
+        previous_slot: Option<PreviousSlot>,
     }
 
     impl OpenedWrite {
@@ -442,8 +585,21 @@ mod enabled {
                     id: None,
                     records: false,
                     history_seq: None,
+                    previous_slot: None,
                 });
             }
+            // Read before the supersede. A failure after the slot moves puts this
+            // value back; `advance_slot` itself will not move backwards.
+            let previous_slot = self
+                .store
+                .slot_record(bucket, key)
+                .await
+                .map_err(storage::Error::from)?
+                .map(|(seq, current)| PreviousSlot {
+                    seq,
+                    id: current.version,
+                    is_delete_marker: current.is_delete_marker,
+                });
             let current = self.plane().versions.current(bucket, key).await?;
             let seqs = self.write_seqs(bucket, key).await?;
             let plan = plan_write(Intent::Put, state, &current, &seqs);
@@ -463,6 +619,7 @@ mod enabled {
                 id,
                 records: true,
                 history_seq,
+                previous_slot,
             })
         }
 
@@ -482,16 +639,53 @@ mod enabled {
             Ok(())
         }
 
-        /// Take a completion's publish back when its record did not land: a recording bucket
-        /// goes through the engine's versioned undo, and any other bucket restores the content
-        /// head to the generation that was live before the publish.
+        /// The version-creating put when this build has the plane. The engine
+        /// reads the bucket's state and takes the version-free body when the
+        /// bucket records none, so the caller does not spell the branch.
+        pub(crate) async fn commit_put(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            staged: StagedBody<PgStaged>,
+            tags: object::Tags,
+            owner: Option<&OwnerId>,
+            acl: &Acl,
+        ) -> Result<object::Info, Error> {
+            self.objects()
+                .put_object_versioned(&self.plane, bucket, key, staged, tags, owner, acl, self)
+                .await
+                .map_err(Error::from)
+        }
+
+        /// A versioned delete is a marker. A bucket that records none is `None`,
+        /// and the caller runs the engine's plain delete.
+        pub(crate) async fn delete_if_versioned(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+        ) -> Result<Option<Marker>, Error> {
+            let state = VersionMeta::bucket_state(&*self.store, bucket)
+                .await
+                .map_err(storage::Error::from)?;
+            if !state.records_versions() {
+                return Ok(None);
+            }
+            Ok(Some(self.create_delete_marker(bucket, key).await?))
+        }
+
+        /// Take a completion's publish back when its record did not land.
         ///
-        /// This is the version plane's half of the rollback — the unversioned restore lives in
-        /// `complete.rs`, where a build without the plane can reach it — so the completion body
-        /// holds no `#[cfg]` parameters and no suppression.
+        /// A recording bucket whose outgoing version is an object or a marker
+        /// goes through the engine's versioned undo, and only while this
+        /// publish still owns the head. Every other write restores the content
+        /// head the same way. A row that landed is put back with the part list
+        /// it held, and a slot that moved is written back to the slot this
+        /// open found — `advance_slot` itself will not move backwards. A newer
+        /// writer keeps the key: this call then changes neither the row nor
+        /// the slot, and the caller still returns the original error.
         #[expect(
             clippy::too_many_arguments,
-            reason = "the undo takes the published generation, the one it replaces, and the versioned write's before-image"
+            reason = "the undo takes the published generation, the one it replaces, the versioned write and the object it replaces"
         )]
         pub(crate) async fn take_back(
             &self,
@@ -502,16 +696,83 @@ mod enabled {
             previous: Option<LiveGeneration>,
             write: &OpenedWrite,
             before: Option<&ObjectRow>,
+            before_parts: &[PartRow],
+            publish: PublishId,
+            landed: Landed,
         ) -> Result<(), Error> {
-            if write.records() {
-                return self
-                    .objects()
-                    .undo_versioned_put(self.plane(), bucket, key, before, write.history_seq())
+            let row_landed = matches!(landed, Landed::Row | Landed::Slot);
+            let slot_landed = matches!(landed, Landed::Slot);
+            let owned = if write.records()
+                && let Some(seq) = write.history_seq()
+            {
+                let kind = VersionMeta::get_version(&*self.store, bucket, key, seq)
                     .await
-                    .map_err(Error::from);
+                    .map_err(storage::Error::from)?
+                    .map(|row| row.kind);
+                if matches!(kind, Some(Kind::Object | Kind::Marker)) {
+                    self.objects()
+                        .undo_versioned_put(
+                            self.plane(),
+                            self,
+                            bucket,
+                            key,
+                            before,
+                            write.history_seq(),
+                            before_parts,
+                            publish,
+                        )
+                        .await
+                        .map_err(Error::from)?
+                } else {
+                    self.restore_unversioned(
+                        bucket,
+                        key,
+                        content_key,
+                        published,
+                        previous,
+                        before,
+                        before_parts,
+                        row_landed,
+                    )
+                    .await?
+                }
+            } else {
+                self.restore_unversioned(
+                    bucket,
+                    key,
+                    content_key,
+                    published,
+                    previous,
+                    before,
+                    before_parts,
+                    row_landed,
+                )
+                .await?
+            };
+            if !owned || !slot_landed {
+                return Ok(());
             }
-            self.restore_published_live(bucket, content_key, published, previous)
-                .await
+            match &write.previous_slot {
+                Some(slot) => {
+                    self.store
+                        .write_slot(
+                            bucket,
+                            key,
+                            slot.id.as_ref(),
+                            slot.seq,
+                            slot.is_delete_marker,
+                        )
+                        .await
+                        .map_err(storage::Error::from)?;
+                }
+                None => {
+                    self.store
+                        .delete_slot(bucket, key)
+                        .await
+                        .map_err(storage::Error::from)?;
+                }
+            }
+            Ok(())
         }
 
         /// Fill the version facts an engine read cannot (G3): the key's current identity and
@@ -608,10 +869,16 @@ mod enabled {
         /// which a marker is not), so this body reads the bucket's rows — key, gated slot and
         /// version rows joined into one answer per key, one statement for the whole bucket —
         /// then hands the entries to `version::paginate`. That is correct on every page and
-        /// unbounded in cost — a bucket-wide read per listing page — which is a finding about
+        /// unbounded in cost — a bucket-wide read per listing page, measured at 380 k rows and
+        /// 182 ms for one 1000-key page on a 200 k-object bucket — which is a finding about
         /// the store's surface rather than a licence to guess: the bounded walk belongs with a
-        /// statement that can express it, and this note is where a reader finds out. What the
-        /// join does settle is the round trips: one per page rather than one per key.
+        /// statement that can express it, and this note is where a reader finds out. The
+        /// statement is `sql/meta/version/bucket_listing.sql` (through
+        /// [`PgStore::bucket_versions`](crate::_store_pg::PgStore::bucket_versions)): it has no
+        /// `LIMIT` and no key bound today, and R6's bounded keyset form replaces it together
+        /// with the shared pager — this body drives whatever the store's statement is and
+        /// spells no paging interface of its own. What the join does settle is the round
+        /// trips: one per page rather than one per key.
         async fn list_all_versions(
             &self,
             bucket: &Name,
@@ -626,7 +893,7 @@ mod enabled {
             }
             let listed = self
                 .store
-                .bucket_versions(bucket)
+                .bucket_versions_page(bucket, &params)
                 .await
                 .map_err(storage::Error::from)?;
             let mut entries: Vec<Entry> = Vec::new();
@@ -698,7 +965,12 @@ mod tests {
     /// moved off never said it was history, so its retention clock never started.
     #[tokio::test]
     async fn a_versioned_delete_stamps_the_version_it_supersedes() {
-        let Ok(_) = std::env::var("TINIO_PG_DSN") else {
+        // A blank value reads as unset, the same rule the store crate's own
+        // database legs apply.
+        let Some(_dsn) = std::env::var("TINIO_PG_DSN")
+            .ok()
+            .filter(|dsn| !dsn.trim().is_empty())
+        else {
             eprintln!("skipping: TINIO_PG_DSN is not set");
             return;
         };

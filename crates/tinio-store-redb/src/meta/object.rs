@@ -672,6 +672,15 @@ impl ObjectMeta for RedbMetadata {
             .await
     }
 
+    async fn has_objects(&self, bucket: &bucket::Name) -> Result<bool, <Self as Metadata>::Error> {
+        let bucket = bucket.to_string();
+        // One key-range seek over the bucket's own row range, on the same
+        // table probe the bucket teardown's `remove_if_empty` takes: the two
+        // answers cannot drift.
+        self.driver
+            .read(move |txn| MetaTable::open_readonly(txn)?.has_bucket(&bucket))
+    }
+
     async fn drain_bucket(&self, bucket: &bucket::Name) -> Result<(), <Self as Metadata>::Error> {
         let bucket = bucket.to_string();
         self.driver

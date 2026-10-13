@@ -99,11 +99,96 @@ pub fn prepare_home_derived(root: &Path, state_dir: &Path) -> Result<(), Error> 
 /// [`prepare_home_derived`] with an explicit home — the tests below pin a scratch home so they
 /// never touch the developer's; production goes through [`prepare_home_derived`], which is why
 /// this is private rather than a second public entry point.
+///
+/// **A root that cannot be canonicalized is not this function's subject.** The derivation *is*
+/// the canonicalization, so a root the serving half has not created yet answers with nothing to
+/// compare and nothing to harden — which is exactly a read-only pg run's first start: its state
+/// directory is `<synthetic root>/.tinio`, a leaf nothing has created, and before this arm the
+/// call failed the run on a `canonicalize` of a path that run was about to create itself.
 fn prepare_home_derived_in(root: &Path, state_dir: &Path, home: &Path) -> Result<(), Error> {
-    if state_dir != home_state_dir_path(root, home)? {
+    let Ok(derived) = home_state_dir_path(root, home) else {
+        return Ok(());
+    };
+    if state_dir != derived {
         return Ok(());
     }
     let _ = ensure_roots(home)?;
+    Ok(())
+}
+
+/// Create and harden a **pg run's synthetic root** — `<root>` and its reserved `.tinio` state
+/// directory — mode 0700 on unix, refusing a symlinked component.
+///
+/// **A pg run's state directory is the one leaf no backend hardens.** A filesystem run's
+/// `<root>/.tinio` is created mode 0700 by `tinio-fs`'s state-database open, and a read-only
+/// run's leaf is hardened by [`prepare_home_derived`]; a pg run's store is the database, so
+/// nothing but this call owns that directory — and a bare `create_dir_all` would leave the
+/// tool's own state (and the access log beside it) world-enumerable on a 022 umask.
+///
+/// **It is called immediately before the serving half's `create_dir_all`s**, the same position
+/// [`prepare_home_derived`] documents, so the directories exist and are already 0700 by the time
+/// those calls are no-ops. A missing parent is **created** 0700 — the XDG chain
+/// (`<home>/.local/state/tinio/pg/`) is the tool's own — while an existing one is left with the
+/// mode it has, so a `TINIO_STATE_DIR` the operator named keeps the shape they gave it apart
+/// from the two levels below, which are the tool's state and are enforced. The symlink refusal
+/// is the read-only leaf's rule for the same reason: following a planted link would put the
+/// tool's state wherever the link points.
+pub fn prepare_synthetic_root(root: &Path) -> Result<(), Error> {
+    let state_dir = root.join(RESERVED_SEGMENT);
+    create_dir_all_0700(&state_dir)?;
+    for dir in [root, state_dir.as_path()] {
+        refuse_pg_symlink(dir)?;
+        if !dir.is_dir() {
+            return Err(error::root(
+                dir,
+                io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "exists and is not a directory",
+                ),
+            ));
+        }
+        enforce_0700(dir)?;
+    }
+    Ok(())
+}
+
+/// [`prepare_synthetic_root`]'s symlink refusal, worded for the synthetic root rather than for
+/// the home-derived layout: the escape a locked-out operator has here is the dsn's own root
+/// (drop the symlink) or a `TINIO_STATE_DIR` pointing at a real directory.
+fn refuse_pg_symlink(dir: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(error::root(
+            dir,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "must not be a symlink (a pg run's synthetic root is the tool's own state; name \
+                 a real directory with TINIO_STATE_DIR, or a different dsn)",
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Create `dir` and every missing ancestor **mode 0700 on unix**, the hardening
+/// [`ensure_roots`] gives the home layout's two levels, generalized to a path the tool creates
+/// whole (a pg run's `<home>/.local/state/tinio/pg/<identity>/`).
+///
+/// A component that already exists is left alone: unlike the two levels `ensure_roots` owns, an
+/// ancestor here may be the user's own (`~/.local`), which this tool must not chmod.
+fn create_dir_all_0700(dir: &Path) -> Result<(), Error> {
+    let missing: Vec<&Path> = dir
+        .ancestors()
+        .filter(|dir| !dir.as_os_str().is_empty() && !dir.exists())
+        .collect();
+    for next in missing.into_iter().rev() {
+        // A concurrent instance may create the same directory between the probe and the create;
+        // AlreadyExists is the only tolerated error (the shape `ensure_roots` documents).
+        if let Err(e) = create_dir_0700(next)
+            && e.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(error::root(next, e));
+        }
+    }
     Ok(())
 }
 
@@ -413,6 +498,105 @@ mod tests {
         symlink(elsewhere.path(), home.path().join(".tinio")).unwrap();
         let derived = home_state_dir_path(root.path(), home.path()).unwrap();
         let err = prepare_home_derived_in(root.path(), &derived, home.path()).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    /// **A root the serving half has not created yet is no home-derived leaf, and must not fail
+    /// the run that is about to create it** (ruling R8's read-only half). The derivation is the
+    /// canonicalization, so the first start of a read-only pg run — its state directory being
+    /// `<synthetic root>/.tinio`, a leaf nothing has made — reached a `canonicalize` of a
+    /// missing path and refused before anything was created. The home tree stays untouched
+    /// either way: there is nothing to harden.
+    #[test]
+    fn a_root_that_does_not_exist_yet_is_not_hardened_and_not_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let missing = home.path().join("not-created-yet");
+        let state_dir = missing.join(".tinio");
+        prepare_home_derived_in(&missing, &state_dir, home.path())
+            .expect("a first start resolves a root it has not created");
+        assert!(
+            !home.path().join(".tinio").exists(),
+            "nothing may be minted in the home for a root that is not a home-derived leaf"
+        );
+        assert!(!missing.exists(), "and nothing is created here either");
+    }
+
+    /// **A pg run's synthetic root is created hardened** (the finding the read-only posture left
+    /// open): its state directory is a leaf no backend opens, so without
+    /// [`prepare_synthetic_root`] it — and the access log inside it — would inherit the process
+    /// umask (0755 on a 022 umask) and any local user could enumerate the tool's state.
+    #[cfg(unix)]
+    #[test]
+    fn a_synthetic_root_is_created_and_hardened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let root = home
+            .path()
+            .join(".local")
+            .join("state")
+            .join("tinio")
+            .join("pg")
+            .join("85b95498583db52c");
+        prepare_synthetic_root(&root).unwrap();
+
+        for dir in [root.clone(), root.join(".tinio")] {
+            let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
+        // The XDG parents this call created are private too, and an ancestor that already
+        // existed keeps its own mode (`~/.local` is the user's, not this tool's).
+        let tool_parents = home
+            .path()
+            .join(".local")
+            .join("state")
+            .join("tinio")
+            .join("pg");
+        let mode = fs::metadata(&tool_parents).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{}", tool_parents.display());
+        assert_eq!(
+            fs::metadata(home.path().join(".local"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "a missing ancestor is created 0700 rather than with the umask"
+        );
+    }
+
+    /// The other half of the same finding: the two levels the tool owns are enforced whatever
+    /// mode they were found in (the read-only leaf's rule), an ancestor that already exists is
+    /// left alone, and a symlinked component is refused rather than followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_synthetic_root_enforces_its_own_levels_and_refuses_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        // An ancestor the user made keeps its mode: it is not this tool's to tighten.
+        let users_own = dir.path().join("mine");
+        fs::create_dir(&users_own).unwrap();
+        fs::set_permissions(&users_own, fs::Permissions::from_mode(0o755)).unwrap();
+        let root = users_own.join("pg-root");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_synthetic_root(&root).unwrap();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the synthetic root is the tool's state and is enforced 0700"
+        );
+        assert_eq!(
+            fs::metadata(&users_own).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "an ancestor that already exists is left with the mode it was given"
+        );
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let linked = dir.path().join("linked");
+        symlink(elsewhere.path(), &linked).unwrap();
+        let err = prepare_synthetic_root(&linked).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
     }
 

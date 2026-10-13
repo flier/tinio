@@ -7,6 +7,8 @@
 - One-off scripts: any language; standing unit / e2e: Rust only.
 - Scratch outside the repo and not `target/`; clear stale leftovers before a round, the round's own at its end.
 - Placement: unit next to the subject; cucumber iff the migration rule admits, else integration.
+- DB-backed legs pin 4 test threads (`--test-threads=4`; nextest test group) — a 4-conn pool per leg vs the fixture's `max_connections`.
+- DB legs fail closed: `TINIO_PG_REQUIRED` set in the DB job ⇒ a missing `TINIO_PG_DSN` aborts, never skips.
 
 ## Harness & guards
 

@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT ckey AS \"ckey!\" FROM content_heads WHERE bucket = $1 AND kind = 'object'::content_kind AND live_seq IS NOT NULL AND starts_with(ckey, $2) AND ($3::text IS NULL OR ckey COLLATE \"C\" > $3) ORDER BY ckey COLLATE \"C\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ckey!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "content_heads",
+            "name": "ckey"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fad9fbeffd70ebfbbae41ed46689f134ae75b503c452d8b96b3c8c4e88e125ba"
+}

@@ -2,8 +2,9 @@
 //! byte-accounting entry points.
 //!
 //! All state lives in a redb database over the [`redb::InMemoryBackend`].
-//! The seven common tables (buckets, object_meta, uploads, parts,
-//! upload_checksums, part_checksums, object_parts) come from tinio-store-redb —
+//! The eight common tables (buckets, object_meta, uploads, parts,
+//! upload_checksums, part_checksums, part_stamps, object_parts) come from
+//! tinio-store-redb —
 //! row shapes, typed handles, and the scan/drain helpers are shared with
 //! the fs backend. Beside them sit the byte tables [`RedbContent`] writes,
 //! `objects` and `part_data`, and mem's part-stat plane `part_meta`, which
@@ -50,8 +51,8 @@ use crate::{
     },
     _store_redb::{
         Driver, Error as StoreError, RedbContent, RedbMetadata, bucket as bucket_row, ensure_all,
-        object_meta, object_part, objects, part, part_checksum, part_data, part_meta,
-        scan::{drain_pair, drain_triple, for_each_pair, has_prefix_pair},
+        object_meta, object_part, objects, part, part_checksum, part_data, part_meta, part_stamp,
+        scan::{drain_pair, drain_triple, for_each_pair},
         store, upload, upload_checksum,
     },
     Error,
@@ -365,13 +366,11 @@ impl MemHooks {
             // The two occupancy probes in the deleting transaction — one
             // key-range seek each, never a walk — so a concurrent write cannot
             // slip between the check and the removal. S3 answers BucketNotEmpty
-            // for object rows and in-progress uploads alike.
-            let objects = {
-                let table = object_meta::Table::open(txn)?;
-                has_prefix_pair::<_, _, Error>(&*table, (b.as_str(), ""), |owner, _| {
-                    owner == b.as_str()
-                })?
-            };
+            // for object rows and in-progress uploads alike, and both halves
+            // are the shared table layer's own probes: the object-row one is
+            // exactly what `ObjectMeta::has_objects` answers from, so the
+            // in-transaction re-probe cannot drift from the contract's.
+            let objects = object_meta::Table::open(txn)?.has_bucket(&b)?;
             if objects || upload::Table::open(txn)?.has_bucket(&b)? {
                 return Err(Error::from(not_empty(&name)));
             }
@@ -390,6 +389,7 @@ impl MemHooks {
             upload_checksum::Table::open(txn)?.drain_bucket(&b)?;
             part::Table::open(txn)?.drain_bucket(&b)?;
             part_checksum::Table::open(txn)?.drain_bucket(&b)?;
+            part_stamp::Table::open(txn)?.drain_bucket(&b)?;
             // The content plane's two byte tables: `objects` (an object's
             // bytes) and `part_data` (a part's). The occupancy probe reads the
             // object ROWS and the upload ROWS, so a byte row those planes no

@@ -931,15 +931,18 @@ jobs:
 
   # The PostgreSQL job (PG8, PG15–PG17): the workflow's only leg that carries a
   # database service. It owns every database-backed surface — the store's own
-  # suite, tinio-pg's conformance acceptance and the serialized @pg cucumber
-  # pass — because every other leg stays database-free: the DB-backed tests are
-  # ordinary `#[cfg(test)]` legs that skip unless `TINIO_PG_DSN` is set, so
-  # `cargo test --workspace` never needs a server. Gated on `check` only, not
-  # the ubuntu test chain: this is the phase's proof, and a red unit test must
-  # not withhold its signal.
+  # suite, tinio-pg's conformance acceptance, tinio-cli's pg-gated doctor/serve
+  # legs, and the serialized @pg cucumber pass — because every other leg stays
+  # database-free: the DB-backed tests are ordinary `#[cfg(test)]` legs that skip
+  # unless `TINIO_PG_DSN` is set, so `cargo test --workspace` never needs a
+  # server. Chained behind the ubuntu `test` job rather than `check` alone: that
+  # job is the chain head whose sccache store this leg reuses, so `needs: test`
+  # starts it warm where `needs: check` recompiled it cold on every PR (the
+  # 2026-10-13 review's finding 4b). The trade — a red unit test now withholds
+  # this signal — is the one the e2e/interop/bench-smoke chain already accepts.
   pg:
     name: PG (postgres:18-alpine)
-    needs: check
+    needs: test
     runs-on: ubuntu-latest
     # The workflow's first `services:` block, mirroring the store's
     # docker-compose fixture (crates/tinio-store-pg/docker-compose.yml): the
@@ -969,8 +972,39 @@ jobs:
       # 55432. A service block is the same fixture exception the compose file
       # already is — the credential is the pinned dev one, not a secret.
       TINIO_PG_DSN: postgres://tinio:tinio@127.0.0.1:5432/tinio?sslmode=disable
+      # Fail closed (2026-10-13 finding 2): the store's database legs abort
+      # instead of skipping when the dsn is unset, so a renamed or blank
+      # `TINIO_PG_DSN` cannot leave this job green with zero database tests run.
+      # The reader is `tinio-store-pg`'s harness (`test_support::base_dsn`).
+      TINIO_PG_REQUIRED: "1"
     steps:
       - *checkout
+
+      # Cheapest signal first: the credential scan reads text only. It is the
+      # PG25 claim's gate — no dsn credential in `crates/` outside the fixtures
+      # allowed to carry it. Re-running the design's pattern
+      # (`postgres://tinio:tinio@` under `crates/`) shows the design's own "as
+      # landed" list is inaccurate: the compose fixture does NOT match (it
+      # spells the credential as YAML env vars) and the CLI tests DO, so the
+      # allow-list below is the measured set, not the design's guess. A file the
+      # pattern newly names is a leaked credential and fails the job.
+      - name: credential scan (PG25)
+        run: |
+          set -euo pipefail
+          hits=$(grep -rnE 'postgres://tinio:tinio@' crates/ | cut -d: -f1 | sort -u || true)
+          allowed=$(printf '%s\n' \
+            crates/tinio-cli/src/commands/doctor/tests.rs \
+            crates/tinio-cli/src/commands/start/run.rs \
+            crates/tinio-pg/README.md \
+            crates/tinio-store-pg/README.md | sort -u)
+          unexpected=$(comm -23 <(printf '%s\n' "$hits") <(printf '%s\n' "$allowed"))
+          if [ -n "$unexpected" ]; then
+            echo "::error::the pinned dev credential appears outside the allowed fixtures:"
+            echo "$unexpected"
+            exit 1
+          fi
+          echo "credential scan clean: the pattern hits only the allowed fixtures"
+
       - *lld
       - *toolchain
       - *rust-cache
@@ -979,10 +1013,18 @@ jobs:
       # Cheapest signal first, in the order that wastes least: the store's own
       # database-backed suite proves the persistence layer before the backend
       # above it is exercised. Every DB-backed test creates its own scratch
-      # database, so the suite's own `cargo test` parallelism is safe and a run
-      # leaves no state behind.
+      # database, so within the pinned concurrency a run leaves no state behind.
+      #
+      # `--test-threads=4` is load-bearing (2026-10-13 finding 1): each leg
+      # opens a 4-connection pool to its own scratch database, so a runner whose
+      # default thread count outruns the fixture's `max_connections` fails the
+      # suite with `sorry, too many clients already` (reproduced red at 64
+      # threads on a 28-core host, green at 4). The pin reaches the plain
+      # `cargo test` invocation this job uses, which the nextest config cannot
+      # (no step here runs nextest); the same number is documented for local
+      # runs in `docs/tests.md` and the crate README.
       - name: store database-backed suite
-        run: cargo test --profile ci -p tinio-store-pg -- --nocapture
+        run: cargo test --profile ci -p tinio-store-pg -- --test-threads=4 --nocapture
 
       # tinio-pg's conformance acceptance: `assert_conformance` and the
       # versioning leg over a live PostgreSQL, the construction acceptances,
@@ -990,8 +1032,21 @@ jobs:
       # chunked-content risk). `versioning` is the crate's own feature — the
       # crate carries no `pg` feature, it *is* the backend (PG15) — and it is
       # what compiles the version plane the contract suite reaches.
+      # `--test-threads=4` bounds its scratch pools the same way the store step
+      # above does.
       - name: tinio-pg conformance (assert_conformance + the >100 MiB leg)
-        run: cargo test --profile ci -p tinio-pg --features versioning -- --nocapture
+        run: cargo test --profile ci -p tinio-pg --features versioning -- --test-threads=4 --nocapture
+
+      # The CLI's pg-gated legs run nowhere else (2026-10-13 finding 4a): the
+      # doctor's live pg checks (`postgres connection`/`pool`/`encoding`/…) and
+      # the pg serve round-trip are `#[cfg(feature = "pg")]` legs of `tinio-cli`,
+      # a feature no other leg turns on. This job already carries the service and
+      # the dsn, so they belong here. `--test-threads=4` bounds their scratch
+      # pools as in the store step. These legs test the dsn's presence themselves
+      # and do not yet read `TINIO_PG_REQUIRED`, so a mis-set dsn can still leave
+      # this one step green; closing that half of finding 2 is `tinio-cli`'s.
+      - name: tinio-cli database-backed legs (doctor + pg serve)
+        run: cargo test --profile ci -p tinio-cli --features pg -- --test-threads=4 --nocapture
 
       # The @pg pass runs the backend-neutral @cli scenarios too (they spawn
       # the real binary), so the `tinio` binary must exist beside the test
@@ -1018,13 +1073,25 @@ jobs:
           # the cucumber process, and no other step in this job wants it.
           TINIO_E2E_BACKEND: pg
 
+      # An explicit migration of the fixture database, before the drift check
+      # (2026-10-13 finding 4c): `cargo xtask sqlx check` describes every
+      # statement against `TINIO_PG_DSN`'s database, and an unmigrated one makes
+      # the driver fail to infer a column's type (`relation "…" does not exist`),
+      # which the check would report instead of drift. The @pg pass happens to
+      # migrate the base database as its first connect, so the check used to
+      # depend on that pass; this step is the migration on its own — the store
+      # suite's `the_base_database_is_migrated_for_the_sqlx_drift_check` leg
+      # against the base dsn — `always()` so the check reports drift whatever ran
+      # before it.
+      - name: migrate the fixture database (the drift check's subject)
+        if: always()
+        run: cargo test --profile ci -p tinio-store-pg --lib the_base_database_is_migrated_for_the_sqlx_drift_check
+
       # The sqlx-cache drift leg (design §"The SQL layout"): a committed `.sqlx`
       # entry that has gone stale against the schema it describes is caught
       # ONLY by `cargo xtask sqlx check` beside a live, migrated database — this
-      # job is that database's only home. It runs after the @pg pass, whose
-      # first connect migrated the base database the check describes against
-      # (the pass's own scenarios use it). `always()` so the drift is reported
-      # even when the pass above is red: the drift is independent of it.
+      # job is that database's only home. `always()` so the drift is reported
+      # even when a step above is red: the drift is independent of it.
       - name: sqlx cache drift (cargo xtask sqlx check)
         if: always()
         run: cargo xtask sqlx check

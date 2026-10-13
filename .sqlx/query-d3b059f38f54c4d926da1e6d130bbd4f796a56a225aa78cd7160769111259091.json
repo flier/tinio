@@ -1,0 +1,161 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- The bounded read of one chunk of the prefix's uploads: the same projection\n-- as the statement it replaces, but seeked to a cursor and capped, so a listing\n-- page costs its own rows rather than the whole prefix (F17).\n--\n-- `$2`/`$3` are the range's bounds and `$4` the prefix itself. `$3` is the\n-- prefix's last character incremented: UTF-8 orders by code point, so\n-- `[prefix, upper)` is exactly the keys that start with it -- no upload is\n-- missed and none is invented. The plane's `prefix_upper` drops a trailing\n-- `U+10FFFF` -- the last code point, which has no successor -- and increments\n-- the character before it, which makes the range a superset of the prefix\n-- set: `starts_with` is the definer that narrows it then, filtering the\n-- range's own rows, never the bucket. A prefix whose whole body is\n-- `U+10FFFF` characters (the empty prefix included) has no upper bound at\n-- all -- every key at or above it already starts with it -- and is read by\n-- list_uploads_chunk_open.sql, which spells no `$3`.\n--\n-- The bounds are explicit byte comparisons rather than a bare `starts_with`\n-- call for the plan's sake: only a range survives into an `Index Cond` under\n-- `plan_cache_mode = force_generic_plan`, where a function call becomes a\n-- filter that walks every upload of the bucket.\n--\n-- `$5`/`$6` are the row the read resumes after, compared as the tuple\n-- `(key, upload_id)` -- the byte order `uploads_order` builds and ORDER BY\n-- reads. `('', '')` is the \"no cursor\" sentinel: every stored key is longer\n-- than the empty string, so the bound is a no-op when the caller gave none.\n-- `$2` is what makes the cursor a seek rather than a filter: the scan starts\n-- at the cursor, never at the prefix the cursor sits inside.\nSELECT\n    u.upload_id,\n    u.key,\n    u.initiated_at,\n    u.tags AS \"tags: object::Tags\",\n    u.acl AS \"acl: Acl\",\n    c.algorithm AS \"algorithm?\",\n    c.kind AS \"kind?\"\nFROM uploads u LEFT JOIN upload_checksums c\n    ON c.bucket = u.bucket AND c.upload_id = u.upload_id\nWHERE\n    u.bucket = $1\n    AND u.key >= $2\n    AND u.key < $3\n    AND starts_with(u.key, $4)\n    AND (u.key, u.upload_id) > ($5, $6)\nORDER BY u.key COLLATE \"C\", u.upload_id COLLATE \"C\"\nLIMIT $7\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "upload_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "upload_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "initiated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "initiated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "tags: object::Tags",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "acl: Acl",
+        "type_info": {
+          "Custom": {
+            "name": "acl",
+            "kind": {
+              "Composite": [
+                [
+                  "owner",
+                  "Text"
+                ],
+                [
+                  "grants",
+                  {
+                    "Custom": {
+                      "name": "acl_grant[]",
+                      "kind": {
+                        "Array": {
+                          "Custom": {
+                            "name": "acl_grant",
+                            "kind": {
+                              "Composite": [
+                                [
+                                  "grantee",
+                                  {
+                                    "Custom": {
+                                      "name": "acl_grantee",
+                                      "kind": {
+                                        "Composite": [
+                                          [
+                                            "grantee_kind",
+                                            "Text"
+                                          ],
+                                          [
+                                            "grantee_value",
+                                            "Text"
+                                          ]
+                                        ]
+                                      }
+                                    }
+                                  }
+                                ],
+                                [
+                                  "permission",
+                                  "Text"
+                                ]
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "uploads",
+            "name": "acl"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "algorithm?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_checksums",
+            "name": "algorithm"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "kind?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_checksums",
+            "name": "kind"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d3b059f38f54c4d926da1e6d130bbd4f796a56a225aa78cd7160769111259091"
+}

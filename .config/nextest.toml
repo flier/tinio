@@ -24,3 +24,23 @@ retries = 2
 # whole leg fails before a test runs (exit 96; 94 when passed via `-E`).
 # Verified against cargo-nextest 0.9.146.
 default-filter = "not binary(jail) and not binary(signals)"
+
+# The store's database-backed legs run under a pinned thread count. Each leg
+# opens a 4-connection pool to its own scratch database, so a runner whose
+# test-thread count outruns the fixture's `max_connections` fails the whole
+# suite with `sorry, too many clients already` — reproduced red at 64 threads on
+# a 28-core host, green at 4 (the 2026-10-13 review's finding 1; `docs/tests.md`,
+# "Rust"). A test group is the nextest shape of that pin: `max-threads = 4` is a
+# logical semaphore over the matching tests, independent of the run's thread
+# count. The override lives in `profile.default`, which every custom profile
+# inherits (`ci` included, nextest >= 0.9.115), and a test group needs
+# cargo-nextest >= 0.9.48 — both below the 0.9.146 this file is verified
+# against. The CI `pg` job runs plain `cargo test`, where this file does not
+# apply, so it carries `--test-threads=4` on its own steps; this group is the
+# nextest path a developer takes against the live fixture.
+[test-groups]
+pg-db = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = 'package(tinio-store-pg)'
+test-group = 'pg-db'

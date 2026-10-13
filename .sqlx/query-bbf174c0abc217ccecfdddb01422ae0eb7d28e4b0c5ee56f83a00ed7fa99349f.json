@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- The inspecting role's DML grants over the store's own relations (PG6, the\n-- privilege layer). `can_write` is true when the role holds INSERT, UPDATE or\n-- DELETE on **any** relation of any schema the store's tables live in: one\n-- relation a reader can write is the guarantee broken.\n--\n-- The scope is the **store's bookkeeping table**, not the session's\n-- `search_path`. `current_schema()` answers for whichever schema the session\n-- resolves first, so a session opened with `options=-c search_path=...` that\n-- does not name the store's schema read zero rows, `bool_or` answered NULL, the\n-- `coalesce` below printed `false`, and the diagnosis certified a role it had\n-- not looked at (the 2026-10-13 review). Every schema holding a\n-- `schema_version` table is a schema this store owns relations in, and the\n-- answer names them all, so a reader can see what was checked.\n--\n-- The relation kinds are the ones a role could still write through: an ordinary\n-- table, a partitioned table, a view (DML on an automatically updatable view\n-- writes through to its base table) and a foreign table.\nWITH store_schemas AS (\n    SELECT n.nspname\n    FROM pg_class c JOIN pg_namespace n\n        ON n.oid = c.relnamespace\n    WHERE c.relname = 'schema_version' AND c.relkind IN ('r', 'p')\n)\n\nSELECT\n    current_user::text AS \"role!\",\n    coalesce(\n        (\n            SELECT string_agg(s.nspname, ', ' ORDER BY s.nspname)\n            FROM store_schemas s\n        ),\n        ''\n    )::text AS \"schemas!\",\n    coalesce(\n        bool_or(\n            has_table_privilege(current_user, c.oid, 'INSERT')\n            OR has_table_privilege(current_user, c.oid, 'UPDATE')\n            OR has_table_privilege(current_user, c.oid, 'DELETE')\n        ),\n        FALSE\n    ) AS \"can_write!\"\nFROM pg_class c JOIN pg_namespace n\n    ON n.oid = c.relnamespace\nWHERE\n    n.nspname IN (SELECT nspname FROM store_schemas)\n    AND c.relkind IN ('r', 'p', 'v', 'f')\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "role!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "schemas!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "can_write!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "bbf174c0abc217ccecfdddb01422ae0eb7d28e4b0c5ee56f83a00ed7fa99349f"
+}

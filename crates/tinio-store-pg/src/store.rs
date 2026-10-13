@@ -6,10 +6,17 @@
 //! a read-only instance verifies the schema version, never migrates, and takes
 //! no lock. A database newer than
 //! the binary is refused with the pg remedy (a newer binary, or dump/restore),
-//! never a rebuild.
+//! never a rebuild — on the serving read-only path too, and the inspecting path
+//! reports it so `doctor` can name it.
+//!
+//! The applied migration's **checksum** is part of the gate (R5): a database
+//! whose recorded checksum disagrees with the embedded file was built from a
+//! schema this binary does not carry, and serving it would diverge a fresh
+//! database from an existing one silently.
 
 use std::{
     process,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,14 +26,17 @@ use sqlx::{
     Connection, PgConnection, PgPool, postgres::types::Oid, query, query_file_as,
     query_file_scalar, query_scalar,
 };
-use tokio::time;
+use tokio::{
+    sync::{Mutex, OnceCell},
+    time,
+};
 
 use crate::{
     _core::storage::now_nanos,
     error::Error,
     migrations::{
         MIGRATION_LOCK_KEY, MIGRATION_TABLE, OWNERSHIP_LOCK_KEY, SCHEMA_VERSION, VERSION_TABLE_SQL,
-        pending,
+        applied_checksum, pending,
     },
     pool::{DEFAULT_POOL_SIZE, Pool, SslMode},
 };
@@ -187,6 +197,13 @@ pub struct PgStore {
     pool: Pool,
     access: Access,
     schema: SchemaState,
+    /// The ownership lock this store took, held **here** for the store's life
+    /// (PG12): a caller that drops the handle it asked for cannot leave a
+    /// serving store without a lock, because this store still holds one. Shared
+    /// across clones, and initialized once — a second `hold_ownership` is the
+    /// same lock, not a second attempt at it.
+    #[debug(skip)]
+    ownership: Arc<OnceCell<Ownership>>,
 }
 
 impl PgStore {
@@ -215,13 +232,22 @@ impl PgStore {
 
     /// Open a store over an already-built pool.
     ///
+    /// The pool is put in the session mode `access` names first (PG6, layer 2):
+    /// a pool that already carries the mode is used as it is, and a read-only
+    /// store handed a writable pool gets one whose connections are opened
+    /// `default_transaction_read_only = on` (`Pool::reopened_for`) — a store
+    /// cannot tell what session a pool it did not build opens, so it does not
+    /// serve one it has not checked. A **writable** store over a read-only pool
+    /// is refused ([`Error::ReadOnlyPoolForAWriter`]), because that direction
+    /// cannot be rebuilt.
+    ///
     /// # Examples
     ///
     /// ```no_run
     /// use tinio_store_pg::{Access, PgStore, pool::Pool};
     ///
     /// # async fn example() -> Result<(), tinio_store_pg::Error> {
-    /// let pool = Pool::open("postgres://user:password@db.example:5432/tinio", 8)?;
+    /// let pool = Pool::open_read_only("postgres://user:password@db.example:5432/tinio", 8)?;
     /// // Read-only verifies the schema version and refuses a mismatch; it
     /// // never migrates and takes no ownership lock.
     /// let store = PgStore::connect_with_pool(pool, Access::ReadOnly).await?;
@@ -230,11 +256,13 @@ impl PgStore {
     /// # }
     /// ```
     pub async fn connect_with_pool(pool: Pool, access: Access) -> Result<Self, Error> {
+        let pool = pool.reopened_for(access)?;
         schema_gate(&pool, access, SchemaGate::BringForward).await?;
         Ok(Self {
             pool,
             access,
             schema: SchemaState::current(),
+            ownership: Arc::new(OnceCell::new()),
         })
     }
 
@@ -297,6 +325,7 @@ impl PgStore {
     /// # }
     /// ```
     pub async fn inspect_with_pool(pool: Pool, access: Access) -> Result<Self, Error> {
+        let pool = pool.reopened_for(access)?;
         let applied = schema_gate(&pool, access, SchemaGate::ReportOnly).await?;
         Ok(Self {
             pool,
@@ -305,6 +334,7 @@ impl PgStore {
                 applied,
                 supported: SCHEMA_VERSION,
             },
+            ownership: Arc::new(OnceCell::new()),
         })
     }
 
@@ -369,13 +399,24 @@ impl PgStore {
 
     /// Take the ownership lock on a dedicated out-of-pool connection (PG12).
     ///
-    /// The guard holds the session-level advisory lock for the process's
-    /// lifetime and re-verifies it on an interval. The lock is session-scoped,
-    /// so a connection that dies has already released it: a failed recheck
-    /// terminates the process, the same as a recheck that finds the lock gone
-    /// (PG26: the driver exposes no keepalive knob, and the re-verify is also
-    /// what keeps the connection's TCP path warm). A read-only store refuses
-    /// to take the lock.
+    /// The lock is session-scoped, so it lives exactly as long as the dedicated
+    /// connection this guard owns. The **store holds the guard** ([`PgStore`]
+    /// keeps a handle for its own life), so the lock cannot be released while
+    /// the store exists: dropping the handle this call returned, or aborting a
+    /// task that moved it, cannot leave a serving store without a lock. The lock
+    /// is released when the store itself (and every handle taken from it) is
+    /// dropped, which is when nothing is left to serve.
+    ///
+    /// A second call on the **same** store returns a handle to the lock it
+    /// already holds; a second **store** is what gets [`Error::LockHeld`]. A
+    /// read-only store refuses to take the lock at all.
+    ///
+    /// The re-verify ([`Ownership::verify_forever`]) is what detects a lost
+    /// lock, and it probes every [`OWNERSHIP_RECHECK`] — so a loss is undetected
+    /// for **up to 30 seconds**; the guard's connection dying, a network
+    /// partition that lets the server release the session, or another instance
+    /// taking the lock in between are all seen at the next probe, not at the
+    /// moment they happen.
     ///
     /// # Examples
     ///
@@ -385,7 +426,8 @@ impl PgStore {
     /// # async fn example() -> Result<(), tinio_store_pg::Error> {
     /// let store = PgStore::connect("postgres://user:password@db.example:5432/tinio").await?;
     /// let guard = store.hold_ownership().await?;
-    /// // The re-verify terminates the process if the lock is lost, so a serving
+    /// // The store holds the lock whether or not this handle lives; the
+    /// // re-verify terminates the process if the lock is lost, so a serving
     /// // instance spawns it and keeps the guard for the process's lifetime.
     /// tokio::spawn(guard.verify_forever(OWNERSHIP_RECHECK));
     /// # Ok(())
@@ -397,23 +439,11 @@ impl PgStore {
                 "a read-only store never takes the ownership lock".into(),
             ));
         }
-        let connection = connect_dedicated(&self.pool).await?;
-        let mut ownership = Ownership {
-            connection,
-            key: OWNERSHIP_LOCK_KEY,
-        };
-        if !ownership.try_lock().await? {
-            // The lock was held a moment ago, so a `None` here means the holder
-            // released it between the attempt and this lookup.
-            let holder = lock_holder(&self.pool, ownership.key)
-                .await?
-                .unwrap_or_else(|| "another connection".to_owned());
-            return Err(Error::LockHeld {
-                key: ownership.key,
-                holder,
-            });
-        }
-        Ok(ownership)
+        let held = self
+            .ownership
+            .get_or_try_init(|| async { Ownership::take(&self.pool).await })
+            .await?;
+        Ok(held.clone())
     }
 
     /// The session holding the ownership lock right now, in the words a second
@@ -444,11 +474,14 @@ impl PgStore {
     }
 }
 
-/// A held ownership lock, released when the guard drops.
+/// A handle to a held ownership lock, released when the last handle to it drops.
 ///
-/// The lock is session-level, so the drop *is* the release: the driver closes
-/// the dedicated connection, and PostgreSQL frees the advisory lock with it. No
-/// `Drop` impl is needed for that, and none is written.
+/// The lock is session-level, so the release *is* the dedicated connection
+/// closing: the handle is shared ([`Arc`]) because the store keeps one for its
+/// own life beside every handle a caller took, and PostgreSQL frees the advisory
+/// lock with the session. No `Drop` impl releases it — nothing can, from safe
+/// code — and the last drop says so at `warn`, so a store being torn down is
+/// visible in the log rather than silent.
 ///
 /// # Examples
 ///
@@ -457,25 +490,59 @@ impl PgStore {
 ///
 /// # async fn example() -> Result<(), tinio_store_pg::Error> {
 /// let store = PgStore::connect("postgres://user:password@db.example:5432/tinio").await?;
-/// {
-///     let guard = store.hold_ownership().await?;
-///     assert_eq!(guard.key(), tinio_store_pg::migrations::OWNERSHIP_LOCK_KEY);
-/// } // the guard drops here, and a second writable instance may take the lock
-/// //
+/// let guard = store.hold_ownership().await?;
+/// assert_eq!(guard.key(), tinio_store_pg::migrations::OWNERSHIP_LOCK_KEY);
+/// // Dropping this handle does **not** release the lock: the store holds one
+/// // too, and a serving store is what the lock is for.
+/// drop(guard);
+/// assert!(store.ownership_holder().await?.is_some());
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Ownership {
     #[debug(skip)]
-    connection: PgConnection,
+    inner: Arc<OwnershipInner>,
+}
+
+#[derive(Debug)]
+struct OwnershipInner {
+    /// The dedicated out-of-pool connection the advisory lock lives on. Behind
+    /// an async mutex because the handle is shared: every probe is one short
+    /// statement on this one session, and the lock order is this mutex alone.
+    #[debug(skip)]
+    connection: Mutex<PgConnection>,
     key: i64,
 }
 
 impl Ownership {
+    /// Take the lock on a fresh dedicated connection, or report the session that
+    /// holds it (PG12).
+    async fn take(pool: &Pool) -> Result<Self, Error> {
+        let connection = connect_dedicated(pool).await?;
+        let ownership = Self {
+            inner: Arc::new(OwnershipInner {
+                connection: Mutex::new(connection),
+                key: OWNERSHIP_LOCK_KEY,
+            }),
+        };
+        if !ownership.try_lock().await? {
+            // The lock was held a moment ago, so a `None` here means the holder
+            // released it between the attempt and this lookup.
+            let holder = lock_holder(pool, ownership.key())
+                .await?
+                .unwrap_or_else(|| "another connection".to_owned());
+            return Err(Error::LockHeld {
+                key: ownership.key(),
+                holder,
+            });
+        }
+        Ok(ownership)
+    }
+
     /// The advisory lock's key.
     pub fn key(&self) -> i64 {
-        self.key
+        self.inner.key
     }
 
     /// Whether the lock is still held by this session.
@@ -487,32 +554,74 @@ impl Ownership {
     ///
     /// # async fn example() -> Result<(), tinio_store_pg::Error> {
     /// let store = PgStore::connect("postgres://user:password@db.example:5432/tinio").await?;
-    /// let mut guard = store.hold_ownership().await?;
+    /// let guard = store.hold_ownership().await?;
     /// // What the periodic re-verify asks: the lock is still this session's.
     /// assert!(guard.still_held().await?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn still_held(&mut self) -> Result<bool, Error> {
-        let (classid, objid) = key_parts(self.key);
+    pub async fn still_held(&self) -> Result<bool, Error> {
+        let (classid, objid) = key_parts(self.key());
+        let mut connection = self.inner.connection.lock().await;
         let held = query_file_scalar!("sql/store/ownership_recheck.sql", classid, objid)
-            .fetch_one(&mut self.connection)
+            .fetch_one(&mut *connection)
             .await?;
         Ok(held > 0)
     }
 
     /// Take the lock without waiting.
-    async fn try_lock(&mut self) -> Result<bool, Error> {
-        let locked = query_file_scalar!("sql/store/advisory_try_lock.sql", self.key)
-            .fetch_one(&mut self.connection)
+    async fn try_lock(&self) -> Result<bool, Error> {
+        let mut connection = self.inner.connection.lock().await;
+        let locked = query_file_scalar!("sql/store/advisory_try_lock.sql", self.key())
+            .fetch_one(&mut *connection)
             .await?;
         Ok(locked)
     }
 
-    /// Re-verify on the store's interval, terminating the process when the
-    /// lock is gone or the recheck itself fails (PG12/PG26). A failed probe
-    /// cannot prove the session lock is still held, and the advisory lock
-    /// dies with the connection. The loop is the caller's to spawn.
+    /// Re-verify every `interval`, calling `on_loss` when the lock is gone or the
+    /// probe itself fails (PG12/PG26), then return.
+    ///
+    /// A failed probe cannot prove the session lock is still held — the advisory
+    /// lock dies with the connection — so it is a loss like any other. The
+    /// action is the caller's: a serving instance's is
+    /// [`exit_on_lost_ownership`], which terminates with
+    /// [`OWNERSHIP_LOST_EXIT`], and a test's is whatever observes the path
+    /// without ending the test process.
+    ///
+    /// **The bound is `interval`**: a loss that lands just after a probe is
+    /// invisible until the next one, so a serving instance that spawns this with
+    /// [`OWNERSHIP_RECHECK`] serves for up to 30 seconds with a lock it no
+    /// longer holds.
+    pub async fn verify_with<A>(self, interval: Duration, on_loss: A) -> Result<(), Error>
+    where
+        A: FnOnce(OwnershipLoss),
+    {
+        loop {
+            time::sleep(interval).await;
+            let probe = self.still_held().await;
+            if !ownership_lost(&probe) {
+                continue;
+            }
+            let loss = OwnershipLoss {
+                key: self.key(),
+                reason: probe.err().map(|err| err.to_string()),
+            };
+            tracing::error!(
+                key = loss.key,
+                error = loss.reason.as_deref().unwrap_or("lock not held"),
+                "the ownership lock was lost: this process is no longer the database's single \
+                 writer"
+            );
+            on_loss(loss);
+            return Ok(());
+        }
+    }
+
+    /// Re-verify on the store's interval, terminating the process when the lock
+    /// is gone or the recheck itself fails (PG12/PG26). A failed probe cannot
+    /// prove the session lock is still held, and the advisory lock dies with the
+    /// connection. The loop is the caller's to spawn; the bound is
+    /// [`Ownership::verify_with`]'s.
     ///
     /// # Examples
     ///
@@ -528,26 +637,49 @@ impl Ownership {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn verify_forever(mut self, interval: Duration) -> Result<(), Error> {
-        loop {
-            time::sleep(interval).await;
-            let probe = self.still_held().await;
-            if !ownership_lost(&probe) {
-                continue;
-            }
-            tracing::error!(
-                key = self.key,
-                error = probe
-                    .as_ref()
-                    .err()
-                    .map(ToString::to_string)
-                    .as_deref()
-                    .unwrap_or("lock not held"),
-                "the ownership lock was lost: terminating so a second writer cannot coexist"
-            );
-            process::exit(OWNERSHIP_LOST_EXIT);
-        }
+    pub async fn verify_forever(self, interval: Duration) -> Result<(), Error> {
+        self.verify_with(interval, |loss| exit_on_lost_ownership(loss))
+            .await
     }
+}
+
+/// The last handle to an ownership lock going away: the store, or every clone of
+/// a handle, was dropped. The lock itself is released by the session closing, so
+/// this line is the one place a torn-down store is visible.
+impl Drop for OwnershipInner {
+    fn drop(&mut self) {
+        tracing::warn!(
+            key = self.key,
+            "the ownership lock's last handle was dropped: this process no longer owns it (PG12)"
+        );
+    }
+}
+
+/// What a lost re-verify found (PG12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipLoss {
+    /// The advisory lock's key.
+    pub key: i64,
+    /// The probe's own failure, when it failed rather than answering "not
+    /// held"; `None` is the lock's own answer that this session no longer holds
+    /// it.
+    pub reason: Option<String>,
+}
+
+/// The action [`Ownership::verify_forever`] takes on a lost lock: terminate with
+/// [`OWNERSHIP_LOST_EXIT`], which a process supervisor acts on, so a second
+/// writer can never start beside this one (PG12).
+///
+/// The action is a parameter of [`Ownership::verify_with`] rather than a
+/// library's own `std::process::exit` inside the loop, so a test can watch the
+/// loss path fire without ending the test process.
+pub fn exit_on_lost_ownership(loss: OwnershipLoss) -> ! {
+    tracing::error!(
+        key = loss.key,
+        error = loss.reason.as_deref().unwrap_or("lock not held"),
+        "terminating so a second writer cannot coexist"
+    );
+    process::exit(OWNERSHIP_LOST_EXIT)
 }
 
 /// A recheck that is not `Ok(true)` has lost the lock. The advisory lock is
@@ -660,6 +792,34 @@ async fn read_schema_version(pool: &Pool) -> Result<i64, Error> {
     Ok(version as i64)
 }
 
+/// Refuse a database whose recorded checksum for the applied migration disagrees
+/// with the embedded file (R5, PG11).
+///
+/// The recorded digest is the only thing that can tell a database built from
+/// this binary's schema from one built from an edited copy of it: the version
+/// number is the same either way, and the tables hold the only copy of the
+/// bytes. A version this binary does not carry — 0, or one ahead of it, whose
+/// own refusal [`refuse_a_newer_schema`] states — has nothing to compare.
+async fn verify_applied_checksum(pool: &Pool, applied: i64) -> Result<(), Error> {
+    let Some(expected) = applied_checksum(applied) else {
+        return Ok(());
+    };
+    let found: String = query_scalar!(
+        "SELECT checksum FROM schema_version WHERE id = $1",
+        applied as i32
+    )
+    .fetch_one(pool)
+    .await?;
+    if found != expected {
+        return Err(Error::SchemaChecksum {
+            version: applied,
+            found,
+            expected,
+        });
+    }
+    Ok(())
+}
+
 /// Which open path passes the schema gate — the one thing that decides what a
 /// database which does not match this binary means.
 #[derive(Debug, Clone, Copy)]
@@ -675,12 +835,21 @@ enum SchemaGate {
 }
 
 /// The encoding-and-schema gate both open paths pass: verify the encoding, read
-/// the applied version, and — on the writable path — refuse a database newer
-/// than this binary. What a database *behind* this binary means is the gate's
-/// own argument, so the sequence has one text.
+/// the applied version, verify its checksum, and — on the writable path —
+/// refuse a database newer than this binary. What a database *behind* this
+/// binary means is the gate's own argument, so the sequence has one text.
+///
+/// A database **ahead** of the binary takes the pg remedy on **both** serving
+/// paths: a read-only instance that answered `SchemaMismatch` ("run a writable
+/// instance") would only send the operator to a writable one, which refuses the
+/// same database with the remedy this gate states directly. The inspecting path
+/// reports instead of refusing (PG11) so `doctor` can name what it found, and
+/// the checksum is verified there too: a divergence is a fact about the
+/// database, not about the access mode.
 async fn schema_gate(pool: &Pool, access: Access, gate: SchemaGate) -> Result<i64, Error> {
     verify_encoding(pool).await?;
     let applied = read_schema_version(pool).await?;
+    verify_applied_checksum(pool, applied).await?;
     if access.is_writable() {
         refuse_a_newer_schema(applied)?;
         if applied < SCHEMA_VERSION {
@@ -694,11 +863,14 @@ async fn schema_gate(pool: &Pool, access: Access, gate: SchemaGate) -> Result<i6
                 }
             }
         }
-    } else if matches!(gate, SchemaGate::BringForward) && applied != SCHEMA_VERSION {
-        return Err(Error::SchemaMismatch {
-            found: applied,
-            supported: SCHEMA_VERSION,
-        });
+    } else if matches!(gate, SchemaGate::BringForward) {
+        refuse_a_newer_schema(applied)?;
+        if applied != SCHEMA_VERSION {
+            return Err(Error::SchemaMismatch {
+                found: applied,
+                supported: SCHEMA_VERSION,
+            });
+        }
     }
     Ok(applied)
 }
@@ -740,6 +912,7 @@ async fn migrate_with_lock_wait(pool: &Pool, wait: Duration) -> Result<(), Error
     // dedicated connection.
     let applied = read_schema_version(pool).await?;
     refuse_a_newer_schema(applied)?;
+    verify_applied_checksum(pool, applied).await?;
     if applied == 0 {
         sqlx::query(VERSION_TABLE_SQL)
             .execute(&mut connection)
@@ -755,11 +928,15 @@ async fn migrate_with_lock_wait(pool: &Pool, wait: Duration) -> Result<(), Error
         sqlx::raw_sql(migration.sql.as_str())
             .execute(&mut *tx)
             .await?;
+        // The checksum is recorded with the version (R5): the migration's own
+        // text is what a later binary compares against, so the row says which
+        // schema this database was built from and not only which number.
         query!(
-            "INSERT INTO schema_version (id, applied_at, note) VALUES ($1, $2, $3)",
+            "INSERT INTO schema_version (id, applied_at, note, checksum) VALUES ($1, $2, $3, $4)",
             migration.version as i32,
             now_nanos() as i64,
-            migration.description.as_ref()
+            migration.description.as_ref(),
+            hex::encode(&*migration.checksum)
         )
         .execute(&mut *tx)
         .await?;

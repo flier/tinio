@@ -41,7 +41,7 @@ The expected `server_encoding` is `UTF8`: the store refuses to start otherwise, 
 
 The crate compiles in **no** dsn: the DB-backed tests read `TINIO_PG_DSN`, and the value lives only in `docker-compose.yml` and here, so the credential scan (PG25) never meets a literal in the source. A connection error renders the dsn redacted -- never the password (PG5).
 
-TLS follows PG10: a dsn with **no** `sslmode` is treated as `require` (rustls over the system trust store, chain and hostname verified), and plaintext is reached only through an explicit `sslmode=disable`. The compose database above serves no TLS, so name it explicitly:
+TLS follows PG10: a dsn with **no** `sslmode` is treated as `require` (rustls over the system trust store, chain and hostname verified), and plaintext is reached only through an explicit `sslmode=disable`. **Every other spelling — `prefer`, `allow`, `verify-ca`, `verify-full`, an unknown value, or the key written in a case the driver's own parse ignores — is refused at connect** with a message naming the two modes that are served (R1, 2026-10-13: sqlx maps its `Prefer` onto a connection that accepts any certificate, so the mode could never mean what it said). `PGSSLMODE` can no longer weaken a dsn's mode, and the session is named by the dsn or by this crate, never by `PGAPPNAME`. The compose database above serves no TLS, so name it explicitly:
 
 ```console
 $env:TINIO_PG_DSN = 'postgres://tinio:tinio@127.0.0.1:55432/tinio?sslmode=disable'   # PowerShell
@@ -66,10 +66,10 @@ cargo build -p tinio-store-pg
 The database-backed gate, with `TINIO_PG_DSN` set (section 2):
 
 ```console
-cargo test -p tinio-store-pg -- --nocapture
+cargo test -p tinio-store-pg -- --test-threads=4 --nocapture
 ```
 
-Each DB-backed test creates its own scratch database from the base dsn, so the suite is safe under `cargo test`'s parallelism. An unset `TINIO_PG_DSN` skips those tests rather than failing the workspace gate.
+Each DB-backed test creates its own scratch database from the base dsn, but every leg still opens a **4-connection pool**, so the suite is safe only within the cluster's connection budget: on a host whose default test-thread count exceeds roughly `max_connections / 4` it fails with `sorry, too many clients already` (reproduced red at 28 and 64 threads; green at 4). The `--test-threads=4` above is that pin for a plain `cargo test`; `cargo nextest run -p tinio-store-pg` gets the same bound from `.config/nextest.toml`'s `pg-db` test group. An unset `TINIO_PG_DSN` skips those tests rather than failing the workspace gate — unless `TINIO_PG_REQUIRED` is set (as the CI job that owns the database sets it), which voids that skip: a missing or blank dsn aborts the run instead.
 
 ## 4. Migrations
 

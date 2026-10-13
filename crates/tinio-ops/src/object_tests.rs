@@ -891,6 +891,7 @@ async fn put_versioned<C: ObjectContent>(
         object::Tags::empty(),
         None,
         &Acl::default_private(None),
+        plane.version_rows.as_ref(),
     )
     .await
     .unwrap()
@@ -923,6 +924,7 @@ async fn a_versioned_put_supersedes_before_it_publishes() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            plane.version_rows.as_ref(),
         )
         .await
         .unwrap();
@@ -1075,6 +1077,7 @@ async fn a_refused_versioned_row_write_leaves_the_current_version_in_place() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            plane.version_rows.as_ref(),
         )
         .await
         .unwrap_err();
@@ -1095,6 +1098,74 @@ async fn a_refused_versioned_row_write_leaves_the_current_version_in_place() {
         plane.versions.latest(&name, &key).await.unwrap().is_none(),
         "the superseded row is taken back with the refusal"
     );
+}
+
+#[tokio::test]
+async fn a_refused_versioned_row_write_keeps_the_retained_parts() {
+    let base = Base::new();
+    let name = bucket(&base, "data").await;
+    let key = object::key("notes.txt").unwrap();
+    let plane = base.version_plane();
+    plane
+        .versions
+        .set_state(&name, State::Enabled)
+        .await
+        .unwrap();
+    let ops = base.objects(BucketRow::Guaranteed, MetadataFailure::Fail);
+    let first = put_versioned(&ops, &plane, &name, &key, &[b"first"]).await;
+    let first_id = first
+        .version_id
+        .expect("an enabled write mints a version id");
+    let row = base.meta.get(&name, &key).await.unwrap().unwrap();
+    base.meta
+        .put_with_parts(
+            &name,
+            &key,
+            &row,
+            &[PartRow {
+                number: 1,
+                size: row.size,
+                checksum: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+    base.counted().refuse_next_put_with_parts();
+    let staged = ops
+        .stage_body(&name, &key, body(&[b"second"]), None, None)
+        .await
+        .unwrap();
+    let err = ops
+        .put_object_versioned(
+            &plane,
+            &name,
+            &key,
+            staged,
+            object::Tags::empty(),
+            None,
+            &Acl::default_private(None),
+            plane.version_rows.as_ref(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::Io(_)), "{err:?}");
+    assert_eq!(
+        served(ops.get_object(&name, &key, None).await.unwrap()).await,
+        b"first"
+    );
+    assert_eq!(
+        ops.list_object_parts(&name, &key).await.unwrap().len(),
+        1,
+        "the retained parts survive the refused row write"
+    );
+    let slot = plane
+        .version_rows
+        .current_slot(&name, &key)
+        .await
+        .unwrap()
+        .expect("the first version's slot");
+    assert_eq!(slot.version.as_ref(), Some(&first_id));
 }
 
 #[tokio::test]
@@ -1130,6 +1201,7 @@ async fn a_refused_versioned_slot_advance_leaves_the_current_version_in_place() 
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            plane.version_rows.as_ref(),
         )
         .await
         .unwrap_err();
@@ -1150,4 +1222,14 @@ async fn a_refused_versioned_slot_advance_leaves_the_current_version_in_place() 
         plane.versions.latest(&name, &key).await.unwrap().is_none(),
         "the superseded row is taken back with the refusal"
     );
+}
+
+#[test]
+fn publish_ids_in_one_second_differ_in_the_sequence_half() {
+    let first = u64::from(mint_publish_id());
+    let second = u64::from(mint_publish_id());
+    assert_ne!(first, second);
+    if first >> 32 == second >> 32 {
+        assert_eq!(second & 0xFFFF_FFFF, (first & 0xFFFF_FFFF).wrapping_add(1));
+    }
 }

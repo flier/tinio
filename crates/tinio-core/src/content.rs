@@ -237,6 +237,16 @@ pub trait ObjectContent: Send + Sync + 'static {
     /// Remove `key`'s bytes (idempotent).
     async fn remove(&self, bucket: &bucket::Name, key: &ContentKey) -> Result<(), Self::Error>;
 
+    /// Whether a publish through [`publish_tagged`](Self::publish_tagged) is
+    /// recorded, so a later compensation can match that publish and leave a
+    /// newer writer's bytes alone.
+    ///
+    /// The default is `false`: the tag is dropped and the compensation falls
+    /// back to a byte compare. A plane that stores the tag overrides this.
+    fn records_publish_identity(&self) -> bool {
+        false
+    }
+
     /// Remove every key's bytes (idempotent; an empty batch removes
     /// nothing).
     ///

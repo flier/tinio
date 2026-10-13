@@ -10,7 +10,7 @@
 use std::{collections::HashMap, time::SystemTime};
 
 use async_trait::async_trait;
-use sqlx::{query, query_as, query_file, query_file_as, query_file_scalar};
+use sqlx::{query, query_as, query_file, query_file_scalar};
 use time::OffsetDateTime;
 
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
         object,
     },
     Error, begin,
-    meta::{acl_composite, project},
+    meta::{acl_composite, assert_bucket_row, project},
     store::PgStore,
     timestamp::{from_timestamp, to_timestamp},
 };
@@ -54,12 +54,6 @@ struct Stored {
 /// A row's CORS column: the config's wire, or the empty sentinel for none.
 fn cors_wire(cors: Option<&cors::Config>) -> String {
     cors.map(|cors| cors.to_wire()).unwrap_or_default()
-}
-
-/// `remove_if_empty`'s one-statement verdict.
-struct Verdict {
-    present: bool,
-    removed: bool,
 }
 
 #[async_trait]
@@ -302,34 +296,45 @@ impl BucketMeta for PgStore {
     }
 
     async fn remove_if_empty(&self, bucket: &bucket::Name) -> Result<(), Error> {
-        // ONE statement: the bucket row is locked, then deleted only while it
-        // is still empty. A concurrent delete that already removed the row
-        // leaves the lock empty, so the loser is NoSuchBucket rather than
-        // NotEmpty. A concurrent put_guarded holds the same lock until its
-        // object row commits, and this delete re-checks emptiness after it.
-        let answer = query_file_as!(Verdict, "sql/meta/bucket/remove_if_empty.sql", bucket)
-            .fetch_one(self.pool())
+        // Lock the bucket, then delete it in the next statement. That
+        // statement's snapshot includes every object and upload committed
+        // while this waited. Those writers take the same lock, so they cannot
+        // insert until this transaction ends. One statement cannot do this:
+        // its emptiness check would keep the snapshot from before the wait.
+        let mut tx = begin(self.pool()).await?;
+        assert_bucket_row(&mut tx, bucket).await?;
+        let removed = sqlx::query_file_scalar!("sql/meta/bucket/remove_if_empty.sql", bucket)
+            .fetch_optional(&mut *tx)
             .await?;
-        if !answer.present {
-            return Err(Error::NoSuchBucket(bucket.clone()));
-        }
-        if !answer.removed {
+        if removed.is_none() {
+            tx.rollback().await?;
             return Err(Error::NotEmpty(bucket.clone()));
         }
+        tx.commit().await?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::slice::from_ref;
+    use std::{
+        future::Future,
+        slice::from_ref,
+        time::{Duration, SystemTime},
+    };
+
+    use tokio::time::sleep;
 
     use crate::{
         _core::{
+            ETag,
             acl::{Acl, AclGrants, GROUP_ALL_USERS, Grant, Grantee, GroupUri, OwnerId, Permission},
-            meta::{BucketMeta, bucket::Row as BucketRow},
+            bucket::Name,
+            meta::{BucketMeta, bucket::Row as BucketRow, object::Row as ObjectRow},
+            object,
         },
-        Error,
+        Error, PgStore, begin,
+        meta::{assert_bucket_row, object::upsert_object},
         tests::fixtures::{bucket_tags, name, owner, scratch},
         timestamp::{unix_micros, unix_seconds as at},
     };
@@ -390,6 +395,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(many, vec![Some(at(20)), None]);
+        // One answer per occurrence: a name asked for twice is answered twice,
+        // not `None` on its second read.
+        assert_eq!(
+            BucketMeta::load_many(&store, &[other.clone(), other.clone()])
+                .await
+                .unwrap(),
+            vec![Some(at(20)), Some(at(20))],
+            "a duplicated name answers its creation time per occurrence"
+        );
         assert_eq!(
             BucketMeta::owners(&store, from_ref(&data)).await.unwrap(),
             vec![None]
@@ -498,8 +512,8 @@ mod tests {
                 .tags
                 .is_empty()
         );
-        // remove_if_empty is the one-statement decision: it removes a bucket
-        // with nothing in it and refuses an absent one.
+        // remove_if_empty removes a bucket with nothing in it and refuses an
+        // absent one.
         BucketMeta::remove_if_empty(&store, &data).await.unwrap();
         assert!(
             BucketMeta::created_at(&store, &data)
@@ -592,5 +606,100 @@ mod tests {
             vec![None]
         );
         db.drop_db().await;
+    }
+
+    /// An object that commits while bucket removal is waiting on the bucket
+    /// lock is visible to the emptiness check. The check is the statement
+    /// after the lock, so it does not keep the snapshot from before the wait.
+    #[tokio::test]
+    async fn a_put_that_commits_while_remove_waits_keeps_the_bucket() {
+        let Some((db, store)) = scratch().await else {
+            return;
+        };
+        let data = name("plane-bucket-remove-race");
+        BucketMeta::create(&store, &data, &BucketRow::at(at(1)))
+            .await
+            .unwrap();
+        let racing = store.clone();
+        let bucket = data.clone();
+        let err = object_commits_while_delete_waits(&store, &data, async move {
+            BucketMeta::remove_if_empty(&racing, &bucket).await
+        })
+        .await
+        .expect_err("the object landed before the delete could commit");
+        assert!(matches!(err, Error::NotEmpty(_)));
+        assert!(BucketMeta::row(&store, &data).await.unwrap().is_some());
+        db.drop_db().await;
+    }
+
+    /// The same wait, for the store's own bucket teardown
+    /// (`PgStore::teardown_bucket`, `crate::teardown`), which drops the whole
+    /// namespace and shares the bucket-row lock with `remove_if_empty`. The
+    /// object committed while the teardown held no snapshot yet, so the bucket
+    /// stays.
+    #[tokio::test]
+    async fn a_put_that_commits_while_teardown_waits_keeps_the_bucket() {
+        let Some((db, store)) = scratch().await else {
+            return;
+        };
+        let data = name("plane-bucket-teardown-race");
+        BucketMeta::create(&store, &data, &BucketRow::at(at(1)))
+            .await
+            .unwrap();
+        let racing = store.clone();
+        let bucket = data.clone();
+        let err = object_commits_while_delete_waits(&store, &data, async move {
+            racing.teardown_bucket(&bucket).await
+        })
+        .await
+        .expect_err("the object landed before the teardown could commit");
+        assert!(matches!(err, Error::NotEmpty(_)));
+        assert!(BucketMeta::row(&store, &data).await.unwrap().is_some());
+        db.drop_db().await;
+    }
+
+    /// Hold the bucket lock, wait until `delete` is blocked on it, commit an
+    /// object, then let `delete` run.
+    async fn object_commits_while_delete_waits(
+        store: &PgStore,
+        bucket: &Name,
+        delete: impl Future<Output = Result<(), Error>> + Send + 'static,
+    ) -> Result<(), Error> {
+        let mut tx = begin(store.pool()).await?;
+        assert_bucket_row(&mut tx, bucket).await?;
+        let task = tokio::spawn(delete);
+        let mut saw_waiter = false;
+        for _ in 0..50 {
+            let waiting: i64 = sqlx::query_scalar!(
+                r#"SELECT count(*) AS "waiting!" FROM pg_locks WHERE NOT granted"#
+            )
+            .fetch_one(store.pool())
+            .await?;
+            if waiting > 0 {
+                saw_waiter = true;
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(saw_waiter, "the delete never waited on the bucket lock");
+        let key = object::key("kept").expect("a valid object key");
+        upsert_object(
+            &mut tx,
+            bucket,
+            &key,
+            &ObjectRow {
+                etag: ETag::EMPTY,
+                size: 0,
+                mtime: SystemTime::UNIX_EPOCH,
+                identity: 0,
+                tags: object::Tags::empty(),
+                checksum: None,
+                owner: None,
+                acl: Acl::default_private(None),
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        task.await.expect("the delete task")
     }
 }

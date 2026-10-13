@@ -1,0 +1,422 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    o.key,\n    o.etag,\n    o.size,\n    o.mtime,\n    o.identity,\n    o.tags AS \"tags: object::Tags\",\n    o.checksum,\n    o.acl AS \"acl: Acl\",\n    s.seq AS \"slot_seq?\",\n    s.version_id AS \"version_id?\",\n    s.is_delete_marker AS \"is_delete_marker?\",\n    slot_row.kind AS \"slot_kind?: Kind\",\n    r.seq AS \"row_seq?\",\n    r.id AS \"id?\",\n    r.blob AS \"blob?\",\n    r.size AS \"row_size?\",\n    r.etag AS \"row_etag?\",\n    r.created AS \"created?\",\n    r.became_noncurrent AS \"became_noncurrent?\",\n    r.kind AS \"row_kind?: Kind\",\n    r.tags AS \"row_tags?: object::Tags\",\n    r.checksum AS \"row_checksum?\",\n    r.acl AS \"row_acl?: Acl\"\nFROM object_meta AS o\nLEFT JOIN current_slots AS s\n    ON s.bucket = o.bucket AND s.key = o.key\nLEFT JOIN version_rows AS slot_row\n    ON\n        slot_row.bucket = o.bucket\n        AND slot_row.key = o.key\n        AND slot_row.seq = s.seq\nLEFT JOIN version_rows AS r\n    ON r.bucket = o.bucket AND r.key = o.key\nWHERE o.bucket = $1\nORDER BY o.key COLLATE \"C\", r.seq DESC\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "etag",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "etag"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "mtime",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "mtime"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "identity",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "identity"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "tags: object::Tags",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "checksum",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "checksum"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "acl: Acl",
+        "type_info": {
+          "Custom": {
+            "name": "acl",
+            "kind": {
+              "Composite": [
+                [
+                  "owner",
+                  "Text"
+                ],
+                [
+                  "grants",
+                  {
+                    "Custom": {
+                      "name": "acl_grant[]",
+                      "kind": {
+                        "Array": {
+                          "Custom": {
+                            "name": "acl_grant",
+                            "kind": {
+                              "Composite": [
+                                [
+                                  "grantee",
+                                  {
+                                    "Custom": {
+                                      "name": "acl_grantee",
+                                      "kind": {
+                                        "Composite": [
+                                          [
+                                            "grantee_kind",
+                                            "Text"
+                                          ],
+                                          [
+                                            "grantee_value",
+                                            "Text"
+                                          ]
+                                        ]
+                                      }
+                                    }
+                                  }
+                                ],
+                                [
+                                  "permission",
+                                  "Text"
+                                ]
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "object_meta",
+            "name": "acl"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "slot_seq?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "current_slots",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "version_id?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "current_slots",
+            "name": "version_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "is_delete_marker?",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "current_slots",
+            "name": "is_delete_marker"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "slot_kind?: Kind",
+        "type_info": {
+          "Custom": {
+            "name": "version_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "marker"
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "row_seq?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "id?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "blob?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "blob"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "row_size?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "row_etag?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "etag"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "created?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "created"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "became_noncurrent?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "became_noncurrent"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "row_kind?: Kind",
+        "type_info": {
+          "Custom": {
+            "name": "version_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "marker"
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "row_tags?: object::Tags",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "row_checksum?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "checksum"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "row_acl?: Acl",
+        "type_info": {
+          "Custom": {
+            "name": "acl",
+            "kind": {
+              "Composite": [
+                [
+                  "owner",
+                  "Text"
+                ],
+                [
+                  "grants",
+                  {
+                    "Custom": {
+                      "name": "acl_grant[]",
+                      "kind": {
+                        "Array": {
+                          "Custom": {
+                            "name": "acl_grant",
+                            "kind": {
+                              "Composite": [
+                                [
+                                  "grantee",
+                                  {
+                                    "Custom": {
+                                      "name": "acl_grantee",
+                                      "kind": {
+                                        "Composite": [
+                                          [
+                                            "grantee_kind",
+                                            "Text"
+                                          ],
+                                          [
+                                            "grantee_value",
+                                            "Text"
+                                          ]
+                                        ]
+                                      }
+                                    }
+                                  }
+                                ],
+                                [
+                                  "permission",
+                                  "Text"
+                                ]
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "acl"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f11bad2e619b0528f1d8d7db80672c5802d5d4a67bb76949c3ddc04c44517966"
+}

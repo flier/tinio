@@ -22,7 +22,6 @@ use crate::{
     Error, RedbMetadata,
     bucket::{BucketRow, Table as BucketTable},
     object_meta::Table as MetaTable,
-    scan,
     upload::Table as UploadTable,
 };
 
@@ -330,15 +329,10 @@ impl BucketMeta for RedbMetadata {
                 }
                 // The two occupancy probes in the deleting transaction:
                 // one key-range seek each (never a walk), so a concurrent
-                // write cannot slip between the check and the removal.
-                let objects = {
-                    let table = MetaTable::open(txn)?;
-                    scan::has_prefix_pair::<_, _, Error>(
-                        &table.0,
-                        (key.as_str(), ""),
-                        |owner, _| owner == key,
-                    )?
-                };
+                // write cannot slip between the check and the removal. The
+                // object-row half is the table layer's own probe — the same
+                // one `ObjectMeta::has_objects` answers from.
+                let objects = MetaTable::open(txn)?.has_bucket(&key)?;
                 let uploads = UploadTable::open(txn)?.has_bucket(&key)?;
                 if objects || uploads {
                     return Err(Error::Refused(storage::not_empty(&name)));

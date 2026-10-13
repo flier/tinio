@@ -357,6 +357,12 @@ pub enum Command {
 /// read-only mode — which is exactly why decision 4 keeps `.env` out of the mode: a file whose
 /// own location is a function of the mode cannot also select it.
 ///
+/// **`Clone` is for the one caller that resolves with these answers twice** (ruling R8's sibling
+/// finding): a pg run whose dsn the `.env` supplies, where the root has to be derived from it and
+/// the store has to open the same value, so `run::command_line` locates once, then
+/// re-locates with the dsn the authoritative parse answered. Two uses of one parse's answers, not
+/// a second read of anything.
+///
 /// # Examples
 ///
 /// ```rust
@@ -374,7 +380,7 @@ pub enum Command {
 /// assert_eq!(discovery.dir, Some("/srv/data".into()));
 /// assert!(discovery.read_only);
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Discovery {
     /// `DIR`.
     pub dir: Option<PathBuf>,

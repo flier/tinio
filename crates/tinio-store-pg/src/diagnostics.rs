@@ -13,7 +13,8 @@ use crate::{Error, pool::Pool};
 ///
 /// The privilege layer PG6 relies on under the read-only entry guard is exactly this: a role
 /// without `INSERT`/`UPDATE`/`DELETE` on the store's tables. `can_write` is the answer for **any**
-/// table of the session's current schema — one table a reader can write is the guarantee broken.
+/// relation of **any** schema the store's relations live in — one relation a reader can write is
+/// the guarantee broken.
 ///
 /// # Examples
 ///
@@ -22,19 +23,26 @@ use crate::{Error, pool::Pool};
 ///
 /// let privileges = RolePrivileges {
 ///     role: "tinio_reader".to_owned(),
-///     schema: "public".to_owned(),
+///     schemas: "public".to_owned(),
 ///     can_write: false,
 /// };
 /// assert_eq!(privileges.role, "tinio_reader");
+/// assert_eq!(privileges.schemas, "public");
 /// assert!(!privileges.can_write);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolePrivileges {
     /// The role the session runs as.
     pub role: String,
-    /// The schema the probe scoped to (empty when the search path names none).
-    pub schema: String,
-    /// Whether the role holds `INSERT`, `UPDATE` or `DELETE` on any table of that schema.
+    /// The schemas the probe scoped to — every schema holding the store's own
+    /// bookkeeping table — comma-separated in name order. **Empty when the
+    /// database holds none**, which is not the same answer as "no grants": there
+    /// was nothing to check, and a diagnosis must say so rather than print a
+    /// green row naming a schema with none of the store's tables (the
+    /// 2026-10-13 review).
+    pub schemas: String,
+    /// Whether the role holds `INSERT`, `UPDATE` or `DELETE` on any relation of
+    /// those schemas.
     pub can_write: bool,
 }
 
@@ -70,7 +78,7 @@ pub async fn server_encoding(pool: &Pool) -> Result<String, Error> {
 ///
 /// # Examples
 ///
-/// Against a live server this prints the inspecting role, the schema the probe scoped to and
+/// Against a live server this prints the inspecting role, the schemas the probe scoped to and
 /// whether that role can write — the three facts PG6's row is built from.
 ///
 /// ```no_run
@@ -94,9 +102,9 @@ pub async fn role_privileges(pool: &Pool) -> Result<RolePrivileges, Error> {
 ///
 /// `pg_stat_ssl` joined to `pg_backend_pid()` answers for **this** connection — the one the pool
 /// handed out — so the reading is a fact about the session, not a restatement of the dsn. The
-/// server is the authority because the dsn only says what was asked for: the same `sslmode=prefer`
-/// dsn is encrypted against one server and plaintext against another, and only the server can say
-/// which happened.
+/// server is the authority because the dsn only says what was asked for: a `disable` dsn against a
+/// server that would have accepted TLS is a plaintext session nonetheless, and only the server can
+/// say whether the certificate the store verified was the one it expected.
 ///
 /// # Examples
 ///
@@ -128,8 +136,8 @@ pub struct TlsState {
 ///
 /// This is the server's own answer, not the dsn's: `enabled` is whether this session is encrypted
 /// at all, and `version`/`cipher`/`bits` name what was negotiated when it is. PG10 shows the
-/// *negotiated* mode, so a `prefer` dsn that fell back to plaintext reads as plaintext here, even
-/// though the policy `doctor` prints beside it reads as `prefer`.
+/// *negotiated* mode, so a plaintext session is reported as plaintext however the policy resolved
+/// — the policy says what was asked for, the server says what happened.
 ///
 /// # Examples
 ///
