@@ -1,8 +1,17 @@
-# `tinio-pg` — the PostgreSQL backend
+# `tinio-pg` — the servable PostgreSQL backend over the shared ops engine
 
-`tinio-pg` is the servable PostgreSQL backend: `PgStorage` implements `Storage`, `VersionOps` (under the `versioning` feature) and, elsewhere, `Cleanup`, over the shared operation engine (`tinio-ops`) and `tinio-store-pg`'s four persistence contracts. It carries the `[storage] type = "pg"` / `[storage.pg]` configuration, the synthetic root the tool state lives under (PG5/PG13), the read-only mode (PG6), the writable-ownership guard (PG12) and the `doctor` checks (PG11).
+`tinio-pg` is the servable PostgreSQL backend: `PgStorage` implements `Storage` and `VersionOps` (under the `versioning` feature), with `PgCleanup` beside it implementing `Cleanup`, over the shared operation engine (`tinio-ops`) and `tinio-store-pg`'s four persistence contracts. It consumes a `Config` (the dsn and the pool size) plus the access mode the CLI resolved; the configuration schema is not its own — `[storage] type = "pg"`, `[storage.pg]`, the `TINIO_PG_DSN` override, the synthetic root the tool state lives under (PG5/PG13) and every refusal are `tinio-config`'s and the CLI's. The persistence facts — the schema and its migrations, the dsn and its TLS policy, the schema gate and the ownership guard — are `tinio-store-pg`'s; what this crate owns is the backend itself: the read-only entry guard (PG6), the constructor's ownership lock (PG12), the `doctor` rows a pg deployment is diagnosed by (PG11), and the two steps the engine's `Hooks` seam leaves to a backend — an empty bucket-delete hook, because a bucket here *is* its rows, and the real part-write lock.
 
-This crate **is** the pg backend, so it carries no `pg` switch of its own: `tinio-store-pg` is a plain dependency and every module that implements the contracts over it is compiled in every build. A build that does not want pg does not reference this crate — the `pg` switch belongs to the consumers (`tinio-cli`, `tinio`), which is PG15's principle one level up. The crate's own `versioning` feature adds the version plane (`tinio-version`): without it `PgStorage` answers the trait's own defaults for the version surface — `State::Unversioned` and an access-denied class for every other version operation — exactly as `tinio-fs`'s stripped build does.
+This crate **is** the pg backend, so it carries no `pg` switch of its own: `tinio-store-pg` is a plain dependency and every module that implements the contracts over it is compiled in every build. A build that does not want pg does not reference this crate — the `pg` switch belongs to the consumers (`tinio-cli`, `tinio`), which is PG15's principle one level up.
+
+## Features
+
+| Feature | Effect |
+|---|---|
+| `versioning` | Adds the version plane (`tinio-version`). Without it `PgStorage` stays on the trait's own defaults for the version surface — `State::Unversioned` and an access-denied class for every other version operation — exactly as `tinio-fs`'s stripped build does. |
+| `testing` | Forwards `tinio-store-pg`'s dev-only scratch-database harness; the `@pg` pass turns it on and a production graph leaves it off. |
+
+`Config` and `Error` are feature-independent: a consumer that resolved `[storage.pg]` builds the one in every graph, and the other is what a resolution failure and a construction refusal are rendered with.
 
 ## Read-only deployments (FR-023, PG6)
 
@@ -33,9 +42,13 @@ A read-only instance never migrates and refuses a schema it does not match, so *
 | `src/readonly.rs` | the read-only entry guard (PG6, layer 1) |
 | `src/storage.rs` | `PgStorage` and its `Storage` categories over the ops engine |
 | `src/version.rs` | the version plane and `VersionOps` (the `versioning` feature) |
-| `src/cleanup.rs` | the `Cleanup` pass |
+| `src/complete.rs` | multipart completion: the commit half the engine leaves to the backend |
+| `src/cleanup.rs` | the `Cleanup` pass (PG7) |
 | `src/doctor.rs` | the `doctor` rows for a pg deployment (PG11) |
-| `src/config.rs`, `src/error.rs` | the `[storage.pg]` configuration and the crate error |
+| `src/hooks.rs` | the engine's `Hooks` seam: the empty bucket-delete hook and the real part-write lock |
+| `src/config.rs` | the runtime configuration the constructor consumes: the dsn and the pool size |
+| `src/error.rs` | the crate error and its total projection onto the contract's |
+| `tests/` | the DB-backed legs — conformance, cleanup, delete-bucket, large-body, part-lock — each skipping without `TINIO_PG_DSN` |
 
 ## Gates
 
@@ -45,9 +58,10 @@ Database-free (the default gate):
 cargo test -p tinio-pg
 ```
 
-The database-backed legs (`tests/conformance.rs`) read `TINIO_PG_DSN` and skip when it is unset, so `cargo test --workspace` stays database-free (PG8). Each leg creates its own scratch database.
+The database-backed legs read `TINIO_PG_DSN` through `tinio-store-pg`'s harness and skip when it is unset, so `cargo test --workspace` stays database-free (PG8) — that harness owns the dsn's skip rule and the `TINIO_PG_REQUIRED` switch that voids it. Each leg creates its own scratch database.
+
+Export a dsn first: the dsn itself, its TLS policy and the export line belong to `tinio-store-pg` and are not repeated here (`../tinio-store-pg/README.md`).
 
 ```console
-$env:TINIO_PG_DSN = 'postgres://tinio:tinio@127.0.0.1:55432/tinio?sslmode=disable'   # PowerShell
 cargo test -p tinio-pg --features versioning
 ```

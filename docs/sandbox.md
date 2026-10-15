@@ -44,6 +44,31 @@ The child re-invokes with the operator's argv and refuses before dispatch when i
 - An unreadable or uncreatable salt warns; that run derives the *unsalted* name.
 - The program directory's `ALL APPLICATION PACKAGES` RX is unchanged.
 
+## Windows: the grant a served tree costs, and what reports it
+
+The confined server reaches its data through a DACL grant, and the filesystem's own inheritance is what carries that grant to every object under an exposed directory — so the grant (before the child starts) costs one pass over the whole served tree, and it is the **only** pass: every grant is standing (decision 15).
+
+- The launcher's own directory pays nothing: one **non-inherited** read ACE.
+- Beside the program, the `*.dll` files get their read ACEs in one batched call through the tool's `*.dll` pattern.
+- A DLL in a subdirectory, or one loaded elsewhere at runtime, is **not** granted — the boundary follows the loader's own search path.
+- Exposed directories are untouched by that rule: they keep the inherited ACE, which makes a file already inside them readable.
+- A root already carrying its ACE pays a read instead of a write; nothing removes the grant when the server exits.
+- Expose the narrowest directory that serves the corpus — a parent holding far more pays for all of it.
+- Measure before exposing a corpus large enough for the pass to matter, on a tree of the same object count:
+
+```console
+pwsh crates/tinio-sandbox-windows/scripts/verify-windows.ps1 -AclCost <dirs> <files>
+```
+
+What the pass costs, its spread per filesystem, and every place a killed launcher can leave residue are the design's Risks table (`docs/superpowers/specs/2026-09-18-sandbox-design.md` §6); the method and its checks are `docs/tests.md`'s "Platform-gated verification".
+
+A run reports what the pass cost it, so an unfamiliar startup need not be guessed at:
+
+- Every launcher logs its grant phase's elapsed time on stderr as a `debug` event.
+- Half the readiness budget spent on the grant phase logs a `WARN`: elapsed time, exposures paid for, the threshold crossed.
+- The `sandbox: granting …` banner lists the directories whose trees the pass covered.
+- It is a diagnosis, not a remedy: nothing in the launcher shortens the pass.
+
 ## The process has no capabilities, even when it runs as root
 
 - Capabilities are dropped before the server starts — files are read as the account, not the superuser.
