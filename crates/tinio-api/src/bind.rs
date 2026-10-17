@@ -4,8 +4,9 @@
 //! unix socket is unlinked only after a probe proves nobody is listening behind it, and the
 //! Windows pipe is created with `FILE_FLAG_FIRST_PIPE_INSTANCE` (`management-api.md:5`).
 //!
-//! **Nothing here needs a runtime.** The listeners are `std` and the pipe is a raw handle
-//! carrying a DACL, because the CLI binds *before* it builds its runtime (design §1: steps a–j,
+//! **Nothing here needs a runtime.** The listeners are `std` and the pipe is a raw handle whose
+//! object carries Windows' default named-pipe descriptor, because the CLI binds *before* it builds
+//! its runtime (design §1: steps a–j,
 //! then k) and tokio's own constructors cannot be called there — `tokio::net::UnixListener::bind`
 //! panics ("there is no reactor running, must be called from the context of a Tokio 1.x
 //! runtime"), and `NamedPipeServer::from_raw_handle`, which both `ServerOptions::create` and
@@ -31,7 +32,7 @@ use std::{io, path::PathBuf};
 
 use crate::Error;
 #[cfg(windows)]
-use crate::dacl;
+use crate::pipe;
 
 /// A bound control channel, before it is served. This is the unix form: the bound `std` listener
 /// and the path it owns.
@@ -97,8 +98,8 @@ pub struct Channel {
 pub struct Channel {
     /// The pipe name (`\\.\pipe\tinio-<sha1(root)[..16]>`, or `[api.pipe] path`).
     pub(crate) name: String,
-    /// The bound instances, created with their DACL and adopted inside the runtime
-    /// (`dacl::adopt_pipe`, Task 4): `OwnedHandle`s rather than tokio's `NamedPipeServer`,
+    /// The bound instances, created with Windows' default pipe descriptor and adopted inside the
+    /// runtime (`pipe::adopt_pipe`, Task 4): `OwnedHandle`s rather than tokio's `NamedPipeServer`,
     /// because creating the latter needs the reactor the CLI does not have yet, and because
     /// they are `Send` where a raw pointer is not. The first carries the single-instance claim.
     pub(crate) handles: Vec<OwnedHandle>,
@@ -249,11 +250,13 @@ impl Channel {
     ///
     /// **Why a launcher needs them at all.** Inside a container the process's identity is
     /// the package SID and not the user, so a child that called [`bind_pipe`] itself would
-    /// have `CreateNamedPipeW` refused — the DACL these instances are created with grants the
-    /// current user and nobody else. The launcher runs unconfined, binds the pool here, and
-    /// passes every handle; the child serves on the objects it inherited and never creates one.
-    /// The DACL is therefore unchanged and the single-instance claim is still made exactly
-    /// once, by the launcher's first create.
+    /// have `CreateNamedPipeW` refused — Windows' default descriptor for the pipe names no
+    /// package SID, and a restricted token's second access check is satisfied only by one. The
+    /// launcher runs unconfined,
+    /// binds the pool here, and passes every handle; the child serves on the objects it
+    /// inherited and never creates one. The descriptor is therefore the launcher's either
+    /// way, and the single-instance claim is still made exactly once, by the launcher's first
+    /// create.
     ///
     /// **All of the pool and not just the first**, because a child holding one instance is back
     /// where it started: the name answers once and then goes deaf, which is the defect this
@@ -263,7 +266,7 @@ impl Channel {
     /// caller must hold it for as long as the handoff needs and the child's own duplicated
     /// handles are what keep the pipe alive afterwards. `unsafe` appears nowhere here — a
     /// borrow of the handle is safe, and the one conversion back is
-    /// [`dacl::adopted_pipe`]'s.
+    /// [`pipe::adopted_pipe`]'s.
     ///
     /// # Examples
     ///
@@ -464,19 +467,18 @@ pub(crate) const INSTANCES: usize = 2;
 /// **The first instance carries `FILE_FLAG_FIRST_PIPE_INSTANCE`, the rest do not**, and that is
 /// the whole single-instance rule: the claim is made exactly once, by the process that binds, and
 /// a second server's own first create is refused — while this channel's successors are ordinary
-/// instances of a name it already owns. **Every instance comes from the same [`dacl::create_pipe`]
-/// call**, so each carries the identical current-user-only DACL; nothing here widens a permission
-/// or asks for one.
+/// instances of a name it already owns. **Every instance comes from the same [`pipe::create_pipe`]
+/// call**, so all of them carry one descriptor: nothing here widens a permission or asks for one.
 ///
-/// **The pipe is created raw, with a current-user-only DACL, and this is a deliberate
-/// departure from `ServerOptions::create` on both counts.** The DACL is Task 1's reason
-/// extended to the channel: `create` passes a null `SECURITY_ATTRIBUTES`, so the pipe gets the
-/// creating token's default descriptor (the user, SYSTEM and Administrators full, Everyone and
-/// ANONYMOUS LOGON read-only — measured on this host), while the channel is the one place this
-/// crate claims is private (`Auth::Local` leaves `/metrics` and `/openapi.json` open on it,
-/// decision 8). And the raw call is also what keeps the bind runtime-free: `ServerOptions`
-/// ends in `NamedPipeServer::from_raw_handle`, which needs the reactor the CLI does not have
-/// yet. `dacl` is the crate's one raw module, so this is an added use of that site, not a
+/// **The pipe is created raw, and what the raw call buys is the runtime-free bind rather than a
+/// descriptor.** [`pipe::create_pipe`] hands `CreateNamedPipeW` a null `SECURITY_ATTRIBUTES`, so
+/// the channel's descriptor is Windows' own default named-pipe descriptor ([`pipe::create_pipe`]'s
+/// doc states the measured entries). What
+/// still makes the channel local is `PIPE_REJECT_REMOTE_CLIENTS`, and
+/// what guards `/status` and `/stop` on it is the access token (`Auth::Local` leaves `/metrics` and
+/// `/openapi.json` open, decision 8). And the raw call is also what keeps the bind runtime-free:
+/// `ServerOptions` ends in `NamedPipeServer::from_raw_handle`, which needs the reactor the CLI does
+/// not have yet. `pipe` is the crate's one raw module, so this is an added use of that site, not a
 /// second `unsafe` site (Task 1's lint note).
 ///
 /// # Examples
@@ -496,7 +498,7 @@ pub fn bind_pipe(name: &str) -> Result<Channel, Error> {
         // The claim belongs to the first create and to nothing else. Re-asserting it on a
         // successor would refuse this channel's own pool, and dropping it from the first would
         // leave the single-instance gate open.
-        let handle = dacl::create_pipe(&name, nth == 0).map_err(|err| match err.kind() {
+        let handle = pipe::create_pipe(&name, nth == 0).map_err(|err| match err.kind() {
             // `FILE_FLAG_FIRST_PIPE_INSTANCE` answers ERROR_ACCESS_DENIED when the name is taken;
             // `AlreadyExists` is matched too so the refusal does not depend on one mapping. The
             // successors carry no flag, so this answer is the first create's alone — but the

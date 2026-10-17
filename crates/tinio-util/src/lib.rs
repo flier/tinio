@@ -58,6 +58,21 @@
 //!   `--read-only`/`--sandbox` flags.
 //! - `testing` — the conformance test harness (behind the `testing`
 //!   feature: requires `tinio-core` types).
+//! - `win32` — `error_message`, the one sentence a failed `*W` call is reported
+//!   with (the management plane's pipe and the sandbox's ACE walk), and
+//!   `system_directory`, the kernel's own answer where the system directory is
+//!   (the sandbox's `icacls` oracle and the config crate's DACL test).
+//!   `#[cfg(windows)]` and **not** feature-gated: every reader compiles them in a
+//!   production build. The names are code spans rather than links because the
+//!   module is absent on the unix host the doc gate runs on.
+//! - `wide` — `to_wide`, the NUL-terminated UTF-16 form every
+//!   `*W` call takes its name from, lifted here out of the dissolved
+//!   `tinio-winsec` so the management plane's pipe name and the sandbox's own
+//!   Win32 calls share one copy. `#[cfg(windows)]` and **not** feature-gated:
+//!   both callers encode names in a production build. **This is the writer half
+//!   of the rule and the reader half is `tinio-sandbox-windows`'s**
+//!   (`from_wide_units` and `from_wide` at that crate's root), each naming the
+//!   other.
 
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
@@ -107,6 +122,19 @@ pub mod job;
 // primitives need them — and neither guard reaches for either).
 #[cfg(windows)]
 pub mod job_object;
+
+// **The wide-string writer is gated on the target and not on a feature**, the way the
+// job-object sequence is: the management plane's pipe name and the sandbox's own Win32
+// calls both need it in a production build, and `tinio-util` is where the workspace keeps
+// the one copy of a small runtime helper both crates already depend on.
+#[cfg(windows)]
+pub mod wide;
+
+// **The failure sentence takes the same gate for the same reason**: both readers of it —
+// the pipe's create and the ACE walk — report in a shipped build, so a feature would only
+// make the one definer possible to compile out from under one of them.
+#[cfg(windows)]
+pub mod win32;
 
 #[expect(
     clippy::unwrap_used,

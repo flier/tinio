@@ -1,6 +1,6 @@
 # `tinio-sandbox-windows` — the Windows backend: an AppContainer, a DACL whitelist and a signal relay
 
-`tinio-sandbox-windows` implements `tinio-sandbox-core`'s `Backend` for Windows. AppContainer membership is fixed at process creation, so this backend can only confine a process it creates: it writes the container's package-SID ACEs onto the exposed paths, launches the child inside the container, and supervises it. The confinement is three mechanisms rather than one — the DACL whitelist decides which paths the confined process may open, the container's capability set decides what it can reach over the network, and the relay forwards the stop the launcher receives. `tinio-sandbox` is the facade, `tinio-winsec` owns the shared Windows primitives this crate is built on, and the operator-facing notes — the grant's cost, the launcher's own-directory rule, the junction spelling, the two per-user files — stay where they are, in `docs/sandbox.md`.
+`tinio-sandbox-windows` implements `tinio-sandbox-core`'s `Backend` for Windows. AppContainer membership is fixed at process creation, so this backend can only confine a process it creates: it writes the container's package-SID ACEs onto the exposed paths, launches the child inside the container, and supervises it. The confinement is three mechanisms rather than one — the DACL whitelist decides which paths the confined process may open, the container's capability set decides what it can reach over the network, and the relay forwards the stop the launcher receives. `tinio-sandbox` is the facade, the shared Windows primitives this crate is built on sit in `tinio-util` (the wide-string writer) and this crate's own `acl` directory (the ACE walk moved in from the dissolved `tinio-winsec`), and the operator-facing notes — the grant's cost, the launcher's own-directory rule, the junction spelling, the one per-user file — stay where they are, in `docs/sandbox.md`.
 
 ## Features
 
@@ -16,13 +16,12 @@
 | `src/backend/exposures/` | exposure policy: the caller's resolved set, the loader entries beside the program, and the reparse-point refusals |
 | `src/backend/capability.rs` | the capability list the container may hold |
 | `src/backend/grant.rs` | the grant phase's budget, its warning threshold, and the event that reports the measurement |
-| `src/acl.rs` | writing the package SID's ACEs, and reading a descriptor back |
-| `src/sid.rs` | the derived package SID, the per-root cross-process lock, and the state directory |
+| `src/acl/` | writing the package SID's ACEs, reading a descriptor back, the per-path lock the read-merge-write is taken under, and the ACE walk moved in from the dissolved `tinio-winsec` |
+| `src/sid.rs` | the derived package SID, the per-root launch lock, and the state directory — created plainly, repaired never |
 | `src/process.rs`, `src/handles.rs` | `CreateProcessW`, its attribute and handle lists, and which handles cross |
 | `src/job.rs` | the job object that ties the confined child's lifetime to the launcher's |
 | `src/socket.rs`, `src/launch.rs` | the listener the parent binds and the child serves on, and the launcher's own payload and argv plumbing |
 | `src/control.rs` | the signal relay |
-| `src/ledger.rs` | the ACL grant ledger |
 | `src/sweep.rs` | reaping the AppContainer profiles an unclean exit left behind |
 | `src/capability.rs` | whether **this host** can confine a process at all — the facade's `can_confine()` delegates here |
 | `src/testing.rs` | test devices more than one crate's tests need, behind `testing` |
@@ -40,7 +39,6 @@
 
 - **Grants are standing**: nothing removes an ACE on the way out, on the clean path and the failure path alike, so the residue of a served root is one package-SID ACE per distinct root until an operator takes it back. The SID is *derived* from the root rather than generated, which is what makes the residue identifiable and reusable — the next run for that root takes its own over instead of adding another.
 - **An exit that runs no destructor leaves the AppContainer profile's two halves behind** — its directory under the local app-data package tree and its `AppContainer\Storage` registry key. `src/sweep.rs` reaps those once per process on the launch path, before the run about to start derives its own name, and it can never fail a launch.
-- The grant ledger records one appended line per path a run granted, so an operator can see which standing grants exist. It is a record and never a revoker; `docs/sandbox.md` owns the file, the salt beside it, and why revocation stays manual.
 - Every place the residue can be found, and what the grant pass costs, are `docs/sandbox.md`'s and the design's Risks table's to state.
 
 ## Gates

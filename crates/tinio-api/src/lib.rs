@@ -12,18 +12,15 @@
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
 extern crate tinio_util as _util;
-#[cfg(windows)]
-#[doc(hidden)]
-pub extern crate tinio_winsec as _winsec;
 
 pub mod bind;
 pub mod client;
-#[cfg(windows)]
-pub mod dacl;
 mod error;
 pub mod metrics;
 #[cfg(feature = "openapi")]
 pub mod openapi;
+#[cfg(windows)]
+pub mod pipe;
 pub mod router;
 pub mod state;
 #[cfg(test)]

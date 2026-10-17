@@ -427,7 +427,7 @@ mod tests {
         // that follows inherits whatever is left of that same instant — which is
         // why which of the two refuses is the kernel's answer rather than this
         // test's, and both are the same refusal to the caller.
-        let (mut child, pid, reader) = child_writing("sleep 5");
+        let (mut child, pid, reader) = child_writing("exec sleep 5");
         let err = await_verdict(reader, pid, steps(), Duration::from_millis(50))
             .expect_err("a child that never answers");
         assert_timed_out(&err);
@@ -451,7 +451,7 @@ mod tests {
         // leaves behind — the branch that makes the poll bounded rather than an
         // assumption. A probe whose child outlived its own check would leave a
         // process behind on every launch.
-        let (mut child, pid, reader) = child_writing("printf '\\001'; sleep 5");
+        let (mut child, pid, reader) = child_writing("printf '\\001'; exec sleep 5");
         assert!(
             await_verdict(reader, pid, steps(), Duration::from_secs(5))
                 .expect("a child that answered"),

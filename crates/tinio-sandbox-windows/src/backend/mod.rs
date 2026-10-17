@@ -23,7 +23,7 @@ use std::{
     ffi::OsString,
     io,
     net::TcpListener,
-    path::{Path, PathBuf},
+    path::PathBuf,
     rc::Rc,
     sync::{
         Arc,
@@ -60,9 +60,8 @@ use crate::{
     control, handles,
     job::Job,
     launch::command_args,
-    ledger,
     process::{self, Container, LaunchSpec, LaunchedProcess},
-    sid::{CapabilitySids, PackageSid, ProfileLock, package_name, root_digest},
+    sid::{CapabilitySids, PackageSid, ProfileLock, package_name},
     socket,
     sweep::stale_profiles,
 };
@@ -288,20 +287,6 @@ struct PreparedLaunch<'a> {
     siblings: Option<SiblingScan>,
     whitelist: Whitelist,
     listener: &'a TcpListener,
-    /// **The served root as the caller spelled it** — what the package name was
-    /// derived from and what [`ledger::record_run`]'s root line carries, so the
-    /// record and the derivation name one spelling of one root.
-    root: PathBuf,
-    /// **The caller's other exposed paths, in the caller's own spellings** — the
-    /// paths this launch writes a standing ACE on for a reason the served root's
-    /// derivation does not name, and what [`ledger::record_run`] writes one extra
-    /// line per entry for (the state directory in the product: `TINIO_STATE_DIR`, exposed
-    /// read-write when it lies outside the root, so its ACE is the one a ledger
-    /// holding only the root would miss).
-    ///
-    /// [`other_exposed_paths`] builds it, and both its doc and `grant_whitelist`'s
-    /// comment say what it is for.
-    others: Vec<PathBuf>,
     /// **The launch window's lock, taken before the profile is derived and
     /// released once `CreateProcessW` has returned** — see [`sid::ProfileLock`]
     /// for what it excludes a peer's delete from, and
@@ -309,42 +294,6 @@ struct PreparedLaunch<'a> {
     window: Option<ProfileLock>,
     sid: Arc<PackageSid>,
     capabilities: CapabilitySids,
-}
-
-/// **The caller's exposed paths besides the served root** — every path whose
-/// standing ACE the root's own ledger line does not name.
-///
-/// **The set is the caller's, in the caller's own spellings**, and that is
-/// [`Sandbox::exposures`]' rule rather than a second reading of it: the core keeps
-/// the caller's order and the served root is its first entry
-/// ([`Sandbox::served_root`]), so "every entry that is not the root" is the rest of
-/// the set. The spellings are the *caller's* rather than the resolved ones
-/// ([`canonical_whitelist`] works in the volume's spelling) because the ledger
-/// records what an operator typed beside what the derivation read, exactly as the
-/// root's line does.
-///
-/// **The membership question is the crate's identity for a directory and not a
-/// spelling comparison**: two spellings of one root — `E:\Data` and `e:/data`,
-/// both entries of a raw set the core has not folded — are one directory, one
-/// canonical resolution, one ACE and one root, and `root_digest` is the derivation
-/// that says so ([`root_digest`], the unsalted digest every naming and locking
-/// derivation in `sid` is built on). A spelling whose digest is the root's is
-/// therefore *not* a second path the run granted and gets no line of its own.
-///
-/// **One line per entry, and the product's set has one or none**: `tinio-cli`
-/// exposes the served root and, when it is outside the root, the state directory
-/// (`crates/tinio-cli/src/sandbox/product.rs`); an in-root state directory adds no
-/// entry there — the root's own exposure already covers it — so this is empty on
-/// the run whose state directory needs no grant of its own.
-fn other_exposed_paths(sandbox: &Sandbox, served_root: &Path) -> Vec<PathBuf> {
-    let root = root_digest(served_root);
-    sandbox
-        .exposures()
-        .iter()
-        .map(|exposure| &exposure.host)
-        .filter(|host| root_digest(host) != root)
-        .cloned()
-        .collect()
 }
 
 /// Resolve the served root, the whitelist, the listener, and the package SID.
@@ -419,19 +368,11 @@ fn prepare_launch<'a>(
     // enum, so nothing between an operator's `TINIO_SANDBOX_CAPABILITIES` and the
     // container's token is text a caller could spell.
     let capabilities = CapabilitySids::resolve(&options.capabilities)?;
-    // **The rest of the caller's exposure set, taken here because this is where the
-    // raw set is still in hand** — everything downstream works in the volume's
-    // resolved spelling ([`canonical_whitelist`]), and the ledger records the
-    // spelling an operator typed. `serve` exposes the root before anything else, so
-    // the first entry is the root by construction ([`Sandbox::served_root`]).
-    let others = other_exposed_paths(sandbox, &served);
     Ok(PreparedLaunch {
         program,
         siblings,
         whitelist,
         listener,
-        root: served,
-        others,
         window,
         sid,
         capabilities,
@@ -468,10 +409,10 @@ fn grant_whitelist(inputs: &PreparedLaunch<'_>) -> Result<Grants> {
         exposures = inputs.whitelist.listed_len(),
         granting = %inputs.whitelist.describe()
     );
-    let mut grants = Grants::new(Arc::clone(&inputs.sid));
+    let grants = Grants::new(Arc::clone(&inputs.sid));
     let granting = Instant::now();
     if let Some(siblings) = &inputs.siblings {
-        grants.apply_siblings(siblings, AccessMode::ReadOnly)?;
+        grants.apply_siblings(siblings.files(), AccessMode::ReadOnly)?;
     }
     for exposure in inputs.whitelist.granted() {
         let target = shape_for(
@@ -505,45 +446,6 @@ fn grant_whitelist(inputs: &PreparedLaunch<'_>) -> Result<Grants> {
         }
     }
     report_grant_phase(granting.elapsed(), inputs.whitelist.listed_len());
-    // **The run's lines are written here and not inside a grant**, which is the
-    // placement the ledger's own doc argues: every grant of this launch has returned
-    // `Ok` by now, so each line states a grant that happened, and a phase that fails
-    // halfway records nothing rather than claiming a root it could not finish. **It
-    // is after the phase report on purpose**: the report's duration is measured
-    // above this call, so the ledger's own file I/O is not counted into the phase
-    // the design's numbers are about (§6), and `record_run` cannot fail the launch —
-    // it has no `Result` to return and warns where it decides.
-    //
-    // **One call for the whole set, and the set is this launch's own spellings**:
-    // the ledger is one file, so its lock, its descriptor read-back and its open are
-    // the run's rather than the line's (`ledger::record_run` argues the shape), and
-    // what the slice holds is what an operator typed — the resolved spellings stay
-    // in `whitelist`, which is what the grants were made against.
-    //
-    // **Every other path the caller exposed gets a line of its own**, which is what
-    // makes the ledger the index of *every* standing ACE this crate writes rather
-    // than of the root's alone. The state directory is the product's case
-    // (`TINIO_STATE_DIR`, read-write and outside the root): its ACE names this
-    // run's package SID exactly as the root's does, so a ledger that recorded only
-    // the root would leave the one grant an operator most wants to find —
-    // read-write, on the directory the run keeps its own state in — invisible to
-    // the audit the file exists to be (finding 3 of the 2026-09-28 review).
-    let mut records = Vec::with_capacity(1 + inputs.others.len());
-    records.push(ledger::Grant {
-        kind: ledger::PathKind::ServedRoot,
-        root: &inputs.root,
-        package: inputs.sid.name(),
-        sid: inputs.sid.as_str(),
-        program_directory: inputs.whitelist.program_dir(),
-    });
-    records.extend(inputs.others.iter().map(|host| ledger::Grant {
-        kind: ledger::PathKind::Exposure,
-        root: host,
-        package: inputs.sid.name(),
-        sid: inputs.sid.as_str(),
-        program_directory: None,
-    }));
-    ledger::record_run(&records);
     Ok(grants)
 }
 
@@ -579,7 +481,7 @@ struct Spawned {
 ///
 /// **The payload carries the plan's token, and the relay announces readiness on a
 /// channel of its own.** The token is the launcher's (it is the process that
-/// publishes the child's `state`, whose DACL a confined child cannot write), so
+/// publishes the child's `state`, which a confined child does not write), so
 /// the frame is where it travels: `plan.token()`, serialized here, is the one
 /// place the platform turns the plan into the child's stdin. See [`Spawned`] for
 /// the two channel halves the relay hands back.
@@ -598,8 +500,9 @@ fn spawn_supervised_child(
     } = inputs;
     socket::mark_inheritable(listener)?;
     // The control channel, when the plan carries one: the launcher bound it (only an
-    // unrestricted process can — its DACL is current-user-only, and inside the container
-    // this child's identity is the package SID), so this process hands the handles over
+    // unrestricted process can — the pipe carries Windows' own default named-pipe descriptor,
+    // and inside the container this child's identity is the package SID), so this process
+    // hands the handles over
     // the way it hands the listener over, and the child serves on the objects rather than
     // creating one. **Every instance of the pool, not just the first**: the child cannot create
     // a pipe at all, so the handles it is handed are the whole of what it can ever serve on.

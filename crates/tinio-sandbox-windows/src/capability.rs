@@ -7,7 +7,11 @@
 
 use std::sync::OnceLock;
 
-use tracing::dispatcher;
+use tracing::{
+    Event, Metadata, Subscriber, dispatcher,
+    span::{Attributes, Id, Record},
+    subscriber::Interest,
+};
 use windows_sys::Win32::Foundation;
 
 use crate::{
@@ -109,8 +113,8 @@ pub(crate) const PROBE_NAME: &str = "tinio.sandbox.capability-probe";
 ///
 /// **The cell is the caller's, and the production one is a bare `static`.** A `OnceLock` in a
 /// one-field wrapper would carry a const constructor and a derived `Default` for no reader, and
-/// the workspace's shape for a process-wide memo is the bare `static` (`sid`'s
-/// `ensure_state_directory`, `tinio-cli`'s `STOPPER`, `tinio-util`'s `capture`); taking the cell
+/// the workspace's shape for a process-wide memo is the bare `static` (`tinio-cli`'s `STOPPER`
+/// and `tinio-util`'s `capture` are the other two); taking the cell
 /// as an argument is also what makes this testable without reaching for the static.
 ///
 /// **Only a definitive answer is stored.** A token does not change under a running process, so
@@ -250,6 +254,48 @@ impl<T> Window<T> {
     }
 }
 
+/// The dispatcher the probe's window runs under: **it records nothing and answers the callsite
+/// registry truthfully.**
+///
+/// `Dispatch::none()` is the obvious spelling and it was this window's until the delete event
+/// went missing: `NoSubscriber` answers `Interest::never()` for every callsite, and
+/// `tracing-core` caches that answer in a **process-global** cell — so the first event the probe
+/// raises, its own `PackageSid`'s `DeleteAppContainerProfile`, leaves every later reader of that
+/// callsite holding "never", and the delete event a capture device or an operator's log exists to
+/// read is dropped in silence. It is the hazard `tinio-util`'s capture device states from the
+/// other side: a dispatch created while another is registered rewrites the shared cells with
+/// whatever the *calling thread's* dispatch answers.
+///
+/// **The interest is `sometimes` and the event itself is refused in `enabled`**, so nothing is
+/// recorded between this window's ends and nothing outside them inherits its silence.
+struct Discard;
+
+impl Subscriber for Discard {
+    fn enabled(&self, _: &Metadata<'_>) -> bool {
+        false
+    }
+
+    /// `Interest::sometimes()` rather than the trait's default: the default asks `enabled`,
+    /// which answers `false` here, and `never` is the answer that gets cached (the type's doc).
+    fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+        Interest::sometimes()
+    }
+
+    fn new_span(&self, _: &Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _: &Id, _: &Record<'_>) {}
+
+    fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+    fn event(&self, _: &Event<'_>) {}
+
+    fn enter(&self, _: &Id) {}
+
+    fn exit(&self, _: &Id) {}
+}
+
 /// The probe's recipe, with the caller's work running while the profile is alive.
 ///
 /// **One recipe, two readings**: `probe_once` reads "this token could create a profile" out of
@@ -284,7 +330,7 @@ pub(crate) fn probe_window<T>(f: impl FnOnce(&PackageSid) -> T) -> Result<Window
     // is `sid.rs`'s failure-path `tracing::warn!(step = "host cannot confine", …)` — silent while
     // the probe runs, and that is acceptable because the refusal is the *error's* content, which
     // every caller surfaces, rather than the log line's.
-    let _quiet = dispatcher::set_default(&dispatcher::Dispatch::none());
+    let _quiet = dispatcher::set_default(&dispatcher::Dispatch::new(Discard));
 
     // **Best-effort, and held across the clear, the create *and* the delete** (the
     // plan-grilling ruling).

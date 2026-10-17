@@ -1482,7 +1482,7 @@ impl ObjectContent for PgStore {
     /// Copy the source's live generation onto the destination's next sequence,
     /// then clear the source. Both head rows stay, so neither key's `next_seq`
     /// starts over. The source's rows are copied one bounded window of
-    /// [`MOVE_BATCH_CHUNKS`] chunks a statement ([`publish_live_copy`]), all in
+    /// [`MOVE_BATCH_CHUNKS`] chunks a statement (`publish_live_copy`), all in
     /// the one transaction that pins the source head and flips the destination.
     /// A self-move is the identity (R14); a source with no live generation is
     /// [`Error::NoSuchKey`].
@@ -1516,7 +1516,7 @@ impl ObjectContent for PgStore {
     }
 
     /// Duplicate an object's live generation under the destination key, in one transaction: a
-    /// bounded window of [`MOVE_BATCH_CHUNKS`] chunks a statement ([`publish_live_copy`]), so
+    /// bounded window of [`MOVE_BATCH_CHUNKS`] chunks a statement (`publish_live_copy`), so
     /// the copy is not one `INSERT ... SELECT` over the whole source. A self-copy is the
     /// identity; a source with no live generation is [`Error::NoSuchKey`].
     async fn copy(

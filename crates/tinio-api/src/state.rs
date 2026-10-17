@@ -14,17 +14,16 @@ use std::{
     path::{Path, PathBuf},
     process,
 };
-#[cfg(unix)]
-use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub use crate::_util::secret::Secret;
-#[cfg(windows)]
-use crate::_winsec::{acl_is_current_user_only, create_restricted, restrict_to_current_user};
-use crate::{_util::secret::SecretKey, Error};
+use crate::{
+    _util::{fsutil::create_new_private, secret::SecretKey},
+    Error,
+};
 
 /// The file's name inside the state directory.
 ///
@@ -246,18 +245,22 @@ impl State {
 
     /// Records this process as the server for `root`, with **the caller's** token.
     ///
-    /// **For the plane that does not own its `state` file.** A confined child on Windows
-    /// cannot create or write that file — its DACL is current-user-only and protected, and the
-    /// child's identity inside the container is the package SID — so the **launcher** creates
-    /// it and generates the token that guards `/status` and `/stop`. The child adopts the same
-    /// token here, which is what makes the value a client reads out of that file the value this
-    /// plane verifies against: the two would otherwise be two answers to one question, and every
-    /// client that found the server would be refused `401` by it.
+    /// **For the plane that does not own its `state` file.** The process that launches a confined
+    /// server is the one that binds the control channel and knows the port it serves on, so it is
+    /// the one that publishes the file and generates the token that guards `/status` and `/stop`
+    /// with it. The child adopts the same token here, which is what makes the value a client reads
+    /// out of that file the value this plane verifies against: the two would otherwise be two
+    /// answers to one question, and every client that found the server would be refused `401` by
+    /// it.
+    ///
+    /// **This is not a claim that the child could not write that file.** Nothing about the file's
+    /// descriptor keeps the child out — the reason the launcher publishes it is who owns the
+    /// launch (`docs/superpowers/specs/2026-10-15-windows-file-dacl-removal-design.md`).
     ///
     /// `pid` is this process's either way, and it is deliberately **not** what the caller's file
     /// carries: the launcher's file names the launcher, so `Plane::shutdown`'s guard — `state.pid
     /// == process::id()`, the check that keeps a plane from deleting a file it did not write —
-    /// holds by construction and the child never attempts a deletion its confinement would refuse.
+    /// holds by construction.
     ///
     /// # Examples
     ///
@@ -300,8 +303,17 @@ impl State {
         })
     }
 
-    /// Writes the file atomically (a temp file beside it, then a rename), mode 0600 on unix
-    /// and a current-user-only DACL on Windows.
+    /// Writes the file atomically (a temp file beside it, then a rename), mode 0600 on unix.
+    ///
+    /// **The create call is the only moment on either platform, and no descriptor is installed
+    /// afterwards.** On unix the promise is the open call's own argument (`OpenOptions::mode`): the
+    /// file never exists wider than 0600. On Windows the create takes the platform's own answer —
+    /// the parent directory's inheritable ACEs, falling back to the creating token's default DACL
+    /// only when nothing was inherited — and nothing narrows it: there is no descriptor to install,
+    /// nothing to read back and no repair. **What reaches the file is therefore whatever that
+    /// directory's DACL names**, with no user-or-SYSTEM floor of its own. What both
+    /// platforms keep is the moment: the object is made by this call or not at all, and the rename
+    /// publishes it only once the token is in it.
     ///
     /// # Examples
     ///
@@ -323,42 +335,19 @@ impl State {
         })?;
 
         let tmp = state_dir.join("state.tmp");
-        // A stale temp is removed rather than reused. Both platforms apply the restriction only
-        // when they *create* — Windows ignores `SECURITY_ATTRIBUTES`, and unix ignores `mode`, for
-        // an object that already exists — so writing into a pre-existing `state.tmp` would leave
-        // the token in whatever that object was: a plant carrying the directory's inherited
-        // grants keeps them, and a symlink is followed rather than replaced. Removing first makes
-        // the path fresh, and the create call then has to make the file itself.
+        // A stale temp is removed rather than reused: the create below refuses an object that is
+        // already there (`create_new`), so a leftover would fail this write outright — and on unix
+        // a `mode` is taken by a create alone, so adopting the object instead would leave the token
+        // in whatever that object was (a plant's file, or a symlink followed rather than replaced).
+        // Removing first makes the path fresh, and the create call then has to make the file
+        // itself.
         remove_if_present(&tmp)?;
-        // The arms differ in what they hand the create call, not in when the restriction applies:
-        // unix's `mode` and Windows' `SECURITY_ATTRIBUTES` are both taken by that call, and both
-        // arms refuse to adopt an object that appeared in the meantime (`create_new`/`CREATE_NEW`
-        // fail rather than truncate). Creating first and restricting after would leave a window in
-        // which this file — the one that holds the token — exists under the directory's inherited
-        // ACL, and a reader that opened it in that window keeps the access its handle was granted.
-        #[cfg(unix)]
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(Error::Io)?;
-        #[cfg(windows)]
-        let mut file = create_restricted(&tmp).map_err(Error::Io)?;
-        // **Verified rather than re-asserted, and the difference is what a confined run can do.**
-        // `create_restricted` already installs the protected current-user-only DACL at creation —
-        // `CurrentUserDacl` marks the descriptor `SE_DACL_PROTECTED`, which is what keeps the
-        // parent directory's inheritable ACEs out — while installing one again through
-        // `SetNamedSecurityInfoW` needs `WRITE_DAC`. A confined child does not hold that right and
-        // must not: the launcher grants the state directory `(OI)(CI)M`, whose `M` deliberately
-        // excludes it (design §9, decision 14). So the descriptor the create call installed is read
-        // back, and repaired only when it did not take. **The promise is unchanged**: nothing is
-        // published by the rename unless it is current-user-only, and a descriptor that really
-        // failed to take ends in the same refusal rather than in a published token.
-        #[cfg(windows)]
-        if !acl_is_current_user_only(&tmp).map_err(Error::Io)? {
-            restrict_to_current_user(&tmp)?;
-        }
+        // **The create is the only moment, and that is why it carries the mode rather than a later
+        // call.** unix's `mode` is the open call's own argument and Windows takes what its create
+        // gives the file, so there is no window in which this file — the one that holds the token —
+        // exists under a descriptor this crate would then narrow: what the create call leaves is
+        // what the file has, on either platform.
+        let mut file = create_new_private(&tmp).map_err(Error::Io)?;
         file.write_all(text.as_bytes()).map_err(Error::Io)?;
         file.sync_all().map_err(Error::Io)?;
         fs::rename(&tmp, path(state_dir)).map_err(Error::Io)
@@ -439,8 +428,6 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use tempfile::TempDir;
@@ -584,18 +571,49 @@ mod tests {
         State::remove(dir.path()).expect("removing nothing is not an error");
     }
 
-    #[cfg(unix)]
+    /// **The token file's portable property**: `write` creates it, a second writer replaces it
+    /// atomically, and what is left can be read back — with the unix mode asserted where the
+    /// platform has one.
+    ///
+    /// **No descriptor is asserted, because `write` installs none**: the create call is the only
+    /// moment either way, and on Windows what it leaves is the platform's own answer. The unix half
+    /// is the one promise the file still makes beyond "the token is in it" — 0600 from the create's
+    /// own argument — and it is gated where the mode exists.
     #[test]
     fn the_file_is_private() {
         let (dir, root) = (dir(), dir());
-        State::new(control(dir.path(), root.path()), None, root.path())
-            .expect("new")
-            .write(dir.path())
-            .expect("write");
-        let mode = fs::metadata(path(dir.path()))
-            .expect("metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600, "the token is in this file");
+        let state = State::new(control(dir.path(), root.path()), None, root.path()).expect("new");
+        state.write(dir.path()).expect("write");
+
+        assert!(
+            path(dir.path()).is_file(),
+            "the write publishes the file it made"
+        );
+
+        // A second write replaces it rather than appending or refusing: the temp-then-rename pair
+        // is what makes the published file whole at every instant, and the second run's state is
+        // what a reader finds.
+        let second =
+            State::new(control(dir.path(), root.path()), Some(9001), root.path()).expect("new");
+        second.write(dir.path()).expect("write again");
+        assert_eq!(
+            State::read(dir.path())
+                .expect("read")
+                .expect("the replaced file decodes")
+                .port,
+            Some(9001),
+            "the second write is the one on disk"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mode = fs::metadata(path(dir.path()))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "the token is in this file");
+        }
     }
 }

@@ -307,8 +307,7 @@ const CLOSE_DRAIN: Duration = Duration::from_secs(3);
 /// argument for the action registered there lives. This item holds both halves of its own
 /// exception — the `unsafe extern "system" fn` a console handler must be and the raw `windows-sys`
 /// registration call — in one item, which is why `crates/tinio-cli/Cargo.toml`'s `unsafe_code` is
-/// `deny` rather than `forbid` (design decision 20; the same shape `tinio-winsec`'s file DACLs and
-/// `tinio-api`'s `dacl` module take). The invariant inside it is Windows's rather than this
+/// `deny` rather than `forbid` (design decision 20; the same shape `tinio-api`'s `pipe` module takes). The invariant inside it is Windows's rather than this
 /// design's: the handler runs on
 /// a thread the system creates, so it may not allocate, format or lock, and the whole of its
 /// work is **one atomic increment** (the termination count) and a **`send`** on the channel

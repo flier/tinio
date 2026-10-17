@@ -817,28 +817,6 @@ Feature: Confinement
       exposures=2
       """
 
-  # **Fact 7 — the ACL ledger**, the audit surface the standing grants are read back out of
-  # (`crates/tinio-sandbox-windows/src/ledger.rs`): one line for the served root
-  # (`kind=served-root`) and one for every other path the run exposed — the state directory on a
-  # read-only run, which is the mode whose exposure set has one, because a read-write run's state
-  # directory is in-root. **The fixture is what makes the file reachable**: the ledger is
-  # `%LOCALAPPDATA%\tinio\acl-ledger.jsonl`, so the scenario points `LOCALAPPDATA` at the served
-  # root's own name — again a relative path, resolved against the child's working directory — and
-  # the file lands under the served root with this run's lines in it. The count is part of the
-  # assertion: one line per granted path, so a second line of either kind is a grant this scenario
-  # did not ask for. **The JSON's own quotes are spelled inside a single-quoted argument**: a
-  # cucumber `{string}` takes `"…"` or `'…'`, and the double-quoted form hands the argument over
-  # with its `\"` escapes *unprocessed* (measured: the captured text kept the backslashes), so the
-  # single-quoted form is the one that carries a JSON key unescaped.
-  @cli @confinement @FR-036 @windows
-  Scenario: The ACL ledger records the grants this run made
-    Given a storage root
-    And the child's environment holds "LOCALAPPDATA" = "root"
-    When I run "tinio server {root} --port 0 --read-only --sandbox"
-    Then the readiness line reports a bound port
-    And the file "tinio/acl-ledger.jsonl" under the served root has 1 line containing '"kind":"served-root"'
-    And the file "tinio/acl-ledger.jsonl" under the served root has 1 line containing '"kind":"exposure"'
-
   # G18: **the capability set is chosen through the environment** — `TINIO_SANDBOX_CAPABILITIES`,
   # the one security-relevant parser on this operator's surface
   # (`crates/tinio-sandbox/src/serve.rs`'s Windows arm, over `backend::Capability::parse_list`),

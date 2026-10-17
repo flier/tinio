@@ -79,7 +79,7 @@ use tokio_rustls::{TlsAcceptor, rustls::ServerConfig, server::TlsStream};
 use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA};
 
 #[cfg(windows)]
-use crate::dacl;
+use crate::pipe;
 use crate::{
     Error,
     bind::{self, Channel},
@@ -208,9 +208,11 @@ pub(crate) async fn until_stopped(mut stop: watch::Receiver<bool>) {
 /// `status` after a first answer rather than `ERROR_PIPE_BUSY`.
 ///
 /// **Nothing here creates an instance, and that is the point.** Inside an AppContainer this
-/// process's identity is the package SID, so `CreateNamedPipeW` with the channel's
-/// current-user-only DACL ([`dacl::create_pipe`]) is refused `ERROR_ACCESS_DENIED`: a child that
-/// made its own successor would answer once and then stop listening. The unconfined bind creates
+/// process's identity is the package SID, so `CreateNamedPipeW` for an instance of the channel's
+/// name is refused `ERROR_ACCESS_DENIED`: the pipe carries Windows' own default named-pipe
+/// descriptor, which names the launcher's own user and not the package SID ([`pipe::create_pipe`]),
+/// and a child
+/// that made its own successor would answer once and then stop listening. The unconfined bind creates
 /// the pool ([`crate::bind::bind_pipe`]) and a confined launcher creates it and hands every
 /// handle over ([`Plane::adopt`]), so this loop only ever serves instances that already exist.
 ///
@@ -243,8 +245,8 @@ async fn serve_pipe(
     for handle in handles {
         // The raw handle becomes tokio's own type here, inside the runtime — the constructor
         // needs the reactor, which is why the bind could only hand over an `OwnedHandle`
-        // (`dacl` is the crate's one raw-Windows module, Task 2's note).
-        let pipe = dacl::adopt_pipe(handle).map_err(Error::Io)?;
+        // (`pipe` is the crate's one raw-Windows module, Task 2's note).
+        let pipe = pipe::adopt_pipe(handle).map_err(Error::Io)?;
         listeners.spawn(pipe_instance_loop(
             pipe,
             app.clone(),
@@ -406,8 +408,9 @@ async fn serve_pipe_connection(
 /// **Neither of the two mechanisms that would retire the state instead is available**, and both
 /// were measured or are written down rather than assumed. A *successor* instance — close this one
 /// and create the next at the same name — is refused to the process that serves these: inside a
-/// container its identity is the package SID and `CreateNamedPipeW` on a current-user-only DACL
-/// answers `ERROR_ACCESS_DENIED` (`dacl::adopted_pipe`'s note; `bind::INSTANCES` says the same
+/// container its identity is the package SID and `CreateNamedPipeW` on the launcher's pipe, whose
+/// descriptor is Windows' own default named-pipe descriptor rather than one naming the package SID,
+/// answers `ERROR_ACCESS_DENIED` (`pipe::adopted_pipe`'s note; `bind::INSTANCES` says the same
 /// about the name going deaf for good). And *renewing* the instance in place — duplicate the
 /// handle, drop the association that holds the state, wrap the duplicate — is refused by the
 /// kernel: the duplicate makes `DuplicateHandle` succeed, but the fresh association's
@@ -1525,13 +1528,13 @@ impl Plane {
     /// is already created, and this process serves on the instances it inherited.
     ///
     /// **Why adoption rather than a second bind.** The launcher binds the channel because
-    /// only it can: the pipe's DACL grants the current user and nobody else, and inside a
-    /// container this process's identity is the package SID — so its own
-    /// `CreateNamedPipeW` is refused `ERROR_ACCESS_DENIED`, and a child that tried would
-    /// fail its startup with a message about a second server. The launcher instead creates
-    /// the pool, keeps the single-instance claim, and passes every handle the way it passes
-    /// the data plane's listener (sandbox design decision 16, extended to the control
-    /// channel); nothing about the DACL, the identity of the claimant, or the refusal a
+    /// only it can: the pipe carries Windows' own default named-pipe descriptor, which names the
+    /// launcher's user and not the package SID — and inside a container this process's identity
+    /// is the package SID, so its own `CreateNamedPipeW` is refused `ERROR_ACCESS_DENIED`, and a
+    /// child that tried would fail its startup with a message about a second server. The launcher
+    /// instead creates the pool, keeps the single-instance claim, and passes every handle the way
+    /// it passes the data plane's listener (sandbox design decision 16, extended to the control
+    /// channel); nothing about the descriptor, the identity of the claimant, or the refusal a
     /// genuinely concurrent start gets changes.
     ///
     /// **The whole pool and not one handle**: `raws` is what the launcher handed over, and
@@ -1599,8 +1602,7 @@ impl Plane {
     /// )?;
     /// // **No `publish` here, and that is the ruling rather than an omission**: this plane's
     /// // `state` file is the launcher's — it wrote it, with the token above — and this process
-    /// // could not write it if it tried (the file's DACL names the user, and a confined child's
-    /// // token does not). The plane serves; the launcher publishes.
+    /// // does not write it: the plane serves, and the launcher publishes.
     /// # Ok(())
     /// # }
     /// # }
@@ -1618,8 +1620,9 @@ impl Plane {
         };
         // **Fewer instances than the channel needs is a refused handoff, not a channel to serve.**
         // A client only ever reaches a *listening* instance, and this process cannot create the
-        // next one — `CreateNamedPipeW` on the channel's current-user-only DACL is refused inside
-        // the container — so a pool of one answers its first client and is then connected for as
+        // next one — `CreateNamedPipeW` on the launcher's pipe is refused inside the container,
+        // whose descriptor names the launcher's user rather than the package SID — so a pool of one
+        // answers its first client and is then connected for as
         // long as it serves: the name goes deaf, which is exactly the defect the pool exists to
         // remove. `bind::INSTANCES` is the floor and the same constant the bind creates and the
         // launcher hands over, so a future change to the pool size moves this check with it
@@ -1635,11 +1638,11 @@ impl Plane {
             )));
         }
         let name = bind::pipe_name(name);
-        // The raw conversion, and it is `dacl`'s: this crate's designated `unsafe` site, where
+        // The raw conversion, and it is `pipe`'s: this crate's designated `unsafe` site, where
         // the launcher's handoff is the safety argument. One instance per inherited handle.
         let mut handles = Vec::with_capacity(raws.len());
         for raw in raws {
-            handles.push(dacl::adopted_pipe(*raw)?);
+            handles.push(pipe::adopted_pipe(*raw)?);
         }
         let transport = Transport::Local {
             channel: Channel { name, handles },
@@ -2244,18 +2247,14 @@ mod tests {
     // test module), and clippy's `absolute_paths` wants a `use` either way.
     #[cfg(windows)]
     use crate::_util::testing::{capture, recorder};
-    // The DACL read-back's other half, the state file's: the crate's one Windows security alias
-    // (`lib.rs`), named here rather than at its one use site.
-    #[cfg(windows)]
-    use crate::_winsec::acl_is_current_user_only;
     #[cfg(feature = "tls")]
     use crate::test_support::{fixture_pair, https_get};
     #[cfg(unix)]
-    use crate::{bind::bind_unix, test_support::sock};
+    use crate::{bind::bind_unix, state, test_support::sock};
     use crate::{
         client::{self, Call, RawResponse, Report},
         router::{Auth, Context, StatusBody},
-        state::{self, State},
+        state::State,
         test_support::{Counting, gauged},
     };
 
@@ -3067,7 +3066,7 @@ mod tests {
     // `plans/2026-10-01-test-placement-cleanup.md`). Their subject is this module's own
     // sequence — `Plane::bind(options)` → `publish(port)` → `serve(stop)` → the status/stop
     // client → `shutdown()` — plus the OS state a live run has to be read back for: the socket
-    // file and the pipe's DACL, the single-instance refusal, and the local channel dialled the
+    // file, the pipe's single-instance refusal, and the local channel dialled the
     // way the CLI dials it.
     //
     // The double the gauges' half uses is [`crate::test_support::Counting`], the crate's one
@@ -3136,8 +3135,8 @@ mod tests {
             static NEXT: AtomicU32 = AtomicU32::new(0);
             // The full `\\.\pipe\…` form, which is what a client dials and what `bind_pipe` records:
             // the bare spelling is the config's, and the bind's own normalisation is what turns it into
-            // this — the leg hands it the already-normalised one so the name it later dials and reads
-            // its DACL back from is byte-for-byte the one the plane bound.
+            // this — the leg hands it the already-normalised one so the name it later dials is
+            // byte-for-byte the one the plane bound.
             LocalForm::Pipe(format!(
                 r"\\.\pipe\tinio-test-{}-{}",
                 process::id(),
@@ -3161,7 +3160,7 @@ mod tests {
         serving: JoinHandle<Result<(), Error>>,
         /// The channel's own end, for the leg that stops the plane without the client. Both are
         /// the Windows channel's — [`Running::end`] is the field's only reader, and it is
-        /// `#[cfg(windows)]` with the DACL leg that drives it — so the field carries the same
+        /// `#[cfg(windows)]` with the stop leg that drives it — so the field carries the same
         /// gate rather than reading as dead code on the platforms that never stop this way.
         #[cfg(windows)]
         stop: watch::Sender<bool>,
@@ -3518,17 +3517,22 @@ mod tests {
         drop(channel);
     }
 
-    /// The Windows channel's two claims, checked rather than trusted: a second instance cannot bind
-    /// the same name, and both the pipe and the state file carry a DACL that names only this user.
+    /// **The Windows channel's one claim, checked rather than trusted**: a second instance cannot
+    /// bind the same name.
+    ///
+    /// **The DACL half this leg used to carry is gone with what it asserted.** The channel installs
+    /// no descriptor any more — [`pipe::create_pipe`] hands `CreateNamedPipeW` a null
+    /// `SECURITY_ATTRIBUTES`, so each instance takes Windows' own default named-pipe descriptor —
+    /// and the read-back that answered "the current user and nobody else", on the pipe and on the state
+    /// file alike, had no subject left. What holds the channel is `PIPE_REJECT_REMOTE_CLIENTS` and
+    /// the access token that guards `/status` and `/stop` (`Auth::Local`), which the story legs
+    /// assert over a real round trip.
     #[cfg(windows)]
     #[tokio::test]
-    async fn the_pipe_refuses_a_second_instance_and_both_dacls_are_current_user_only() {
+    async fn the_pipe_refuses_a_second_instance() {
         let dirs = Dirs::new();
         let local = dirs.local();
         let running = Running::start(&dirs, local_selection(&local), None).await;
-        let LocalForm::Pipe(name) = &local else {
-            unreachable!("the Windows leg binds a pipe");
-        };
 
         // The single-instance claim, as the CLI's second start meets it: the same name, refused.
         let (stop, _rx) = watch::channel(false);
@@ -3547,24 +3551,8 @@ mod tests {
             "names the reason: {err}"
         );
 
-        // The DACL that makes `Auth::Local`'s openness on this channel sound: read back from the pipe
-        // the plane is serving, and from the file the token is in.
-        assert!(
-            dacl::pipe_acl_is_current_user_only(name).expect("read the pipe's DACL back"),
-            "the control pipe grants the current user and nobody else"
-        );
-        assert!(
-            acl_is_current_user_only(&state::path(dirs.dir())).expect("read the file's DACL back"),
-            "the state file grants the current user and nobody else"
-        );
-
-        // Ended through the channel rather than by a second `client::stop` dial: this leg is about the
-        // DACL and the single-instance refusal, and the read-back above has already dialled the pipe
-        // once (a client connect, which is how `READ_CONTROL` reaches the object). The stop path over
-        // that channel is the story leg's and the `202` leg's, both of which reach it after a full
-        // round trip. With the instance pool the read-back costs the leg no listening instance — the
-        // pool's other instance still is one — so this is a choice about the leg's subject rather than
-        // the old limitation where the only instance was consumed by that dial.
+        // Ended through the channel rather than by a second `client::stop` dial: the stop path over
+        // it is the story leg's and the `202` leg's, both of which reach it after a full round trip.
         running.end(&dirs).await;
     }
 

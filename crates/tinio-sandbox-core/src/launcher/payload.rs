@@ -30,8 +30,8 @@
 //! an environment variable is no better. stdin is neither — it is a pipe between
 //! the two processes alone. The launcher needs it *here* rather than only in the
 //! child because that same launcher is the process that publishes the child's
-//! `state` file (the file's DACL is current-user-only, so a confined child cannot
-//! write it), and the token it writes there and the token the child verifies
+//! `state` file (it is the publisher the file's token and pid belong to), and the
+//! token it writes there and the token the child verifies
 //! against have to be one value.
 //!
 //! **The fourth field is the launcher's *command* to a child that confines
@@ -395,7 +395,8 @@ pub fn listener_fd_from_arg(arg: &OsStr) -> Option<i64> {
 /// field of one element: the two descriptors are handed over for different reasons. The
 /// listener is a socket the launcher bound because the child may not bind one (design
 /// decision 16); this is the control channel a launcher bound because **only the
-/// unrestricted launcher can create it** — its pipe carries a current-user-only DACL,
+/// unrestricted launcher can create it** — its pipe carries Windows' own default named-pipe
+/// descriptor rather than anything naming the package SID,
 /// and inside a container the creating process's identity is the package SID, not the
 /// user, so the child's own `CreateNamedPipeW` is refused — or because the confinement's
 /// profile grants no `bind()` at all, which is the macOS half. The launcher's channel

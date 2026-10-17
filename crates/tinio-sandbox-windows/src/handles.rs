@@ -3,9 +3,14 @@
 //!
 //! This module is one of the crate's enumerated `unsafe` sites (design
 //! decision 14): it exists so that every other module can name a handle, make it
-//! inheritable, create a pipe, report a Win32 error and take the system
-//! directory from the kernel without an unsafe call of its own. Every unsafe
-//! block below carries its safety argument.
+//! inheritable, create a pipe and report a Win32 error without an unsafe call of
+//! its own. Every unsafe block below carries its safety argument.
+//!
+//! **The system directory is not here any more, and that is where it belongs.**
+//! The config crate's DACL test asks the kernel the same question, and a second
+//! copy that read `%SystemRoot%` instead is what moved it: the answer lives in
+//! `tinio-util`'s `win32` module beside the failure sentence, and this module
+//! re-exports it so the old path still resolves.
 //!
 //! **The failure builder is not here any more, and that is where it belongs.**
 //! This module used to carry `step(operation, path, source)`, building
@@ -22,11 +27,10 @@
 #![allow(unsafe_code)]
 
 use std::{
-    ffi::OsString,
     fs::File,
     io::{self, Write},
     mem::size_of,
-    os::windows::{ffi::OsStringExt, io::FromRawHandle},
+    os::windows::io::FromRawHandle,
     path::PathBuf,
     ptr::null_mut,
 };
@@ -40,7 +44,6 @@ use windows_sys::Win32::{
     System::{
         Console::{GetStdHandle, STD_ERROR_HANDLE},
         Pipes::CreatePipe,
-        SystemInformation::GetSystemDirectoryW,
     },
 };
 
@@ -63,56 +66,6 @@ pub fn last_error() -> io::Error {
     // SAFETY: GetLastError reads the calling thread's last-error value; it takes
     // no arguments and has no preconditions.
     unsafe { io::Error::from_raw_os_error(GetLastError() as i32) }
-}
-
-/// The system directory, as the kernel reports it rather than as an environment
-/// variable spells it.
-///
-/// `GetSystemDirectoryW` answers with the directory the loader itself searches —
-/// `…\System32` under the installation wherever it is — so a tool the crate runs
-/// is not selectable through the environment. **That is robustness rather than
-/// defence**: an actor who can set this launcher's environment is a local actor,
-/// and local actors are outside this feature's threat model, so what the rule
-/// buys is that the path cannot be wrong for an environment reason. The one
-/// caller is `crate::acl::icacls_binary`.
-///
-/// **Infallible on purpose.** A system directory is far shorter than the buffer
-/// below, so the call cannot fail here, and every caller wants a path rather than
-/// an error it would have to invent a fallback for — the documented default
-/// location answers in the branch nothing reaches, which is why the return type
-/// is not a `Result`.
-///
-/// # Examples
-///
-/// ```no_run
-/// let system = tinio_sandbox_windows::handles::system_directory();
-/// assert!(system.is_absolute(), "{}", system.display());
-/// ```
-pub fn system_directory() -> PathBuf {
-    // `MAX_PATH` is 260 and a system directory is a fraction of it, so this
-    // buffer cannot be too small; the call reports the length it needs instead of
-    // overrunning if that ever stopped being true.
-    let mut buffer = [0u16; 260];
-    // SAFETY: `buffer` is a valid, writable array of `buffer.len()` UTF-16 units
-    // and stays alive for the call; the call writes at most that many and touches
-    // nothing else.
-    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
-    if len == 0 || len as usize >= buffer.len() {
-        return PathBuf::from(r"C:\Windows\System32");
-    }
-    // SAFETY: the call above copied `len` UTF-16 units into `buffer`, which is
-    // alive and unmodified here, `len` is the count it reported — bounded by the
-    // buffer's length by the branch above — and `GetSystemDirectoryW` terminates
-    // what it wrote, which is the contract `from_wide_units` scans to.
-    let units = unsafe { crate::from_wide_units(buffer.as_ptr()) };
-    // **`OsString::from_wide` and not `String::from_utf16_lossy`, and the
-    // difference is the one this crate refuses to make on a path**: the lossy
-    // form replaces a unit that is not valid UTF-8 with U+FFFD, so a system
-    // directory holding one — an unusual but legal installation — would come
-    // back as a *different* path, and `icacls_binary` would hand `CreateProcessW`
-    // something the operator never had. A string needs the lossy form and a path
-    // must not have it, which is why the two spellings exist.
-    PathBuf::from(OsString::from_wide(units))
 }
 
 /// Make `handle` inheritable, so a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` may name

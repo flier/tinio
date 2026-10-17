@@ -630,7 +630,7 @@ mod tests {
     /// `tinio-util` carries no `tempfile` dev-dependency, so the name is the
     /// mechanism: the process id keeps concurrent runs apart, the caller's
     /// suffix keeps the tests apart, and the removal makes the run repeatable
-    /// (`tinio-winsec`'s unit tests hand-roll theirs the same way).
+    /// (`tinio-winsec`'s unit tests hand-rolled theirs the same way, before that crate dissolved).
     fn scratch(name: &str) -> PathBuf {
         let dir = env::temp_dir().join(format!("tinio-util-path-{}-{name}", process::id()));
         let _ = fs::remove_dir_all(&dir);

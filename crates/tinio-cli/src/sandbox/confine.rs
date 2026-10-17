@@ -62,7 +62,7 @@ use crate::{_config::storage, _sandbox::Child, Error, commands::start::Args, res
 ///   from the configuration and the `--api*` flags (`start::api_options`, the one definer of that
 ///   rule), binds the local channel itself, and hands the child what it bound. **The two
 ///   platforms' reasons differ and the shape does not.** Windows' is identity: a process inside
-///   the container cannot create a pipe whose DACL names the user, and the child would otherwise
+///   the container cannot create a pipe (`CreateNamedPipeW` is refused there), and the child would otherwise
 ///   fail its own bind with a message about a second server. macOS' is the profile: the confined
 ///   child's unix `bind()` is a network operation the profile grants nothing for, so a child that
 ///   bound its own control socket would die `Operation not permitted` — and the grant that used

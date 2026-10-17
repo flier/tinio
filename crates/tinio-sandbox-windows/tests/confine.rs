@@ -12,11 +12,10 @@
 //! documented Rust leg; the read-only journey is that file's "A confined
 //! read-only server refuses the write and still serves the read"; the launcher's
 //! death taking its child is its "The launcher's death takes the confined
-//! child"; the ACL ledger is its "The ACL ledger records the grants this run
-//! made"; the capability set is its "A valid capability name is honoured" /
+//! child"; the capability set is its "A valid capability name is honoured" /
 //! "An unknown capability name fails the run", with the deleted capability leg's
 //! out-of-root refusal folded into the whitelist leg below; and the two per-`Grants` duplicate
-//! legs are folded into `tinio-sandbox-windows/src/acl.rs`'s
+//! legs are folded into `tinio-sandbox-windows/src/acl/descriptor.rs`'s
 //! `the_grant_refuses_a_path_it_cannot_open` and
 //! `a_satisfied_grant_is_not_written_twice`.
 //!
@@ -53,7 +52,11 @@
 // `child_role` shim — the name the harness spawns here, because the lib linked
 // into an integration target is compiled without `cfg(test)`
 // (`tinio_sandbox_windows::testing::CHILD_ROLE`).
-use std::{fs, net::TcpListener};
+use std::{
+    fs,
+    net::TcpListener,
+    path::{Path, PathBuf},
+};
 
 use tinio_sandbox_core::{AccessMode, Backend as BackendTrait, LaunchPlan, Sandbox};
 use tinio_sandbox_windows::{
@@ -182,6 +185,88 @@ fn the_whitelist_refuses_a_path_outside_the_exposures() {
         acl::revoke(&tree.root, &sid).expect("take the root's grant back");
         acl::revoke(&tree.report, &sid).expect("take the report's grant back");
     }
+}
+
+/// **The exposure the design accepts, pinned by reading from *inside* the confinement**: a
+/// file the product creates plainly inside a granted directory is readable by a process
+/// holding the package SID.
+///
+/// **Why an in-container read and not a DACL listing.** A listing of the granted directory
+/// cannot tell "the file is sealed, so the grant never reached it" from "the grant reached
+/// it": both render as ACEs on a path, and only the second is a fact about what a confined
+/// program can read. The harness's confined child *is* the process that holds the package
+/// SID, and its report is the reading.
+///
+/// **The tree mimics the product's layout rather than driving the product** — the root gains
+/// a `.tinio` child holding a `state` file, both created the way the product creates them
+/// now (a plain `create_dir_all` and a plain write, with no descriptor installed) — because
+/// the property under test is the grant's reach and not the product's file names.
+///
+/// **The control is the second file, created just before the launch.** It is the same kind
+/// of file in the same directory, so it pins the leg against the vacuous reading: on a host
+/// where the launcher's grant reached nothing at all, both reads would come back refused and
+/// the assertion below would be about the host rather than about the exposure.
+///
+/// **This leg does not change colour because of this task, and the plan says so**: the
+/// sandbox's propagation behaviour is untouched by the descriptor removal, so a leg about it
+/// is green before and after. What the removal changes is that the product stops sealing its
+/// own files — the evidence for *that* is the descriptor legs the same task deleted, not this
+/// pair. This pair exists so the exposure is pinned as a fact and the remedy beside it as
+/// available.
+#[test]
+fn the_grant_reaches_a_file_the_product_creates_inside_it() {
+    let volume = common::one_volume();
+    let (_dir, mut tree) = common::tree(&volume);
+    let sid = common::sid_for(&tree.root);
+
+    let (run, state) = run_against_a_state_file(&volume, &mut tree);
+    assert!(
+        run.report.contains("state: OK"),
+        "on {}: the launcher's grant did not reach {} — the file a plain create makes in a \
+         granted directory is reachable by the confined child: {}",
+        volume.display(),
+        state.display(),
+        run.report
+    );
+
+    acl::revoke(&tree.root, &sid).expect("take the root's grant back");
+}
+
+/// **The fixture the leg above reads**: a `.tinio` child of the granted root, holding a
+/// `state` file and a `control` file created just before the launch with no descriptor
+/// installed.
+///
+/// **The control's `OK` is asserted here rather than at the call site**: it is the guard that
+/// keeps the leg from asserting the host — on a host where the launcher's grant reached
+/// nothing at all, both reads come back refused and the leg's own assertion would be about the
+/// host rather than about its subject.
+///
+/// The probe carries both paths, and the child's own read is what the report lines are.
+#[expect(
+    clippy::expect_used,
+    reason = "test support: this helper builds the leg's fixture, which `docs/style.md` §Panics exempts — a fixture that cannot be created is the test's own failure"
+)]
+fn run_against_a_state_file(volume: &Path, tree: &mut common::Tree) -> (common::Run, PathBuf) {
+    let state_dir = tree.root.join(".tinio");
+    fs::create_dir_all(&state_dir).expect("the state directory");
+    let state = state_dir.join("state");
+    fs::write(&state, b"version = 1\n").expect("the state file");
+    let control = state_dir.join("control");
+    fs::write(&control, b"control\n").expect("the control file");
+
+    tree.reads = vec![state.clone(), control.clone()];
+    let run = common::run_confined(tree, AccessMode::ReadWrite);
+
+    assert_eq!(run.status, 0, "on {}: {}", volume.display(), run.report);
+    assert!(
+        run.report.contains("control: OK"),
+        "on {}: no ordinary file in {} was readable from inside the container, so the \
+         readings would be about this host and not about the subject: {}",
+        volume.display(),
+        state_dir.display(),
+        run.report
+    );
+    (run, state)
 }
 
 #[test]

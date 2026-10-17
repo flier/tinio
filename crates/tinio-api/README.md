@@ -4,7 +4,7 @@
 
 ## The state file and the single-instance claim
 
-`<state_dir>/state` is the plane's record of a running server; the fields it carries, and what each one means, are `../../CONTEXT.md`'s "State file" term. It is written atomically and private — mode `0600` on unix, a protected current-user-only DACL on Windows — because the token that guards `/status` and `/stop` is inside it, and that token is redacted from any rendering of the value.
+`<state_dir>/state` is the plane's record of a running server; the fields it carries, and what each one means, are `../../CONTEXT.md`'s "State file" term. It is written atomically, and private on unix — mode `0600`, because the token that guards `/status` and `/stop` is inside it — while on Windows the create installs no descriptor (`specs/001-s3-local-server/data-model.md`'s file-permissions row holds that clause). That token is redacted from any rendering of the value.
 
 The file's presence means "a server claims this root". The **effective** lock is the control channel, so a second start for the same root fails at the bind, before it can touch anything else: the unix socket is unlinked only after a probe proves nobody is listening behind it, and the Windows pipe is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`. What a client dials comes from `state.control_name` and is never re-derived, and both platforms derive their default channel name from the **canonical** served root — so two roots sharing one state directory, which `TINIO_STATE_DIR` exists to allow, cannot collide.
 
@@ -42,7 +42,7 @@ The token is `X-Tinio-Token`, with `Authorization: Bearer` as an alias so a stan
 | `src/client.rs` | the `status`/`stop` client over all three local forms |
 | `src/metrics.rs` | the gauge-source contract, the registry gather, and its reader task |
 | `src/openapi.rs` | the OpenAPI document (`openapi` feature) |
-| `src/dacl.rs` | the crate's one raw-Windows module: named-pipe DACLs |
+| `src/pipe.rs` | the crate's one raw-Windows module: named-pipe creation and adoption; the sentence a failed `*W` call is reported with is `tinio-util`'s `win32::error_message` |
 | `src/error.rs`, `src/lib.rs` | the HTTP-mapped error, and the crate's re-exports |
 | `src/test_support.rs` | test-only fixtures (the TLS pair, the metrics double), `#[cfg(test)]` |
 
@@ -52,4 +52,4 @@ The token is `X-Tinio-Token`, with `Authorization: Bearer` as an alias so a stan
 cargo test -p tinio-api
 ```
 
-The default graph has `tls` and `openapi` on, and the named-pipe pool and the DACL read-backs are Windows legs that run only there; what the pipe-pool legs require, and how such a leg is driven, are `docs/tests.md`'s.
+The default graph has `tls` and `openapi` on, and the named-pipe pool, its sequential-connection leg and the second-instance refusal are Windows legs that run only there; what the pipe-pool legs require, and how such a leg is driven, are `docs/tests.md`'s.

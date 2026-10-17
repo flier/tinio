@@ -150,7 +150,7 @@ pub(super) fn exposures(resolution: &Resolution, access: AccessMode) -> Sandbox 
 /// `(OI)(CI)M` form, and inheritance reaches descendants that already existed (§6's own
 /// measurement), so the ancestor's ACE lands on the root and on everything under it beside the
 /// root's own `(OI)(CI)RX` — access is the union, so `M` answers a write (**read from
-/// `crates/tinio-sandbox-windows/src/{acl.rs,backend/mod.rs}`, not measured for this pair**).
+/// `crates/tinio-sandbox-windows/src/{acl,backend/mod.rs}`, not measured for this pair**).
 ///
 /// **The equality case is decided once, and by the clause that already owned it.** The two
 /// conditions are asked in order and [`path_contains`] counts a path as contained in itself, so

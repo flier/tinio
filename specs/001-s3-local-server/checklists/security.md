@@ -30,10 +30,10 @@
 
 ## Credential & Secret Management
 
-- [x] CHK014 Are sensitive-file permission requirements specified — config/state 0600, state dir 0700 on unix, ACL-restricted to the current user on Windows? [Completeness, Spec §Assumptions/Environment]
+- [x] CHK014 Are sensitive-file permission requirements specified — config/state 0600, state dir 0700 on unix, and on Windows the platform's own DACL with no descriptor installed? [Completeness, Spec §Assumptions/Environment]
 - [x] CHK015 Is the read-only-mode home state dir (0700) and its credential-generation location specified without conflict with the root-config read rules? [Completeness, Spec §FR-023]
 - [x] CHK016 Is the management-plane token's generation, storage location, and protection clearly specified? [Clarity, contracts/management-api.md]
-  > **Resolution (2026-08-22)**: token CSPRNG-generated ≥ 32 bytes, stored in `state` (0600/0700 or Windows ACL) — contracts/management-api.md.
+  > **Resolution (2026-08-22; Windows half corrected 2026-10-15)**: token CSPRNG-generated ≥ 32 bytes, stored in `state` (0600/0700 on unix; on Windows its directory's inherited ACEs, falling back to the creating token's default DACL only when nothing is inherited) — contracts/management-api.md.
 - [x] CHK017 Is first-start credential generation ("auto-created config with generated credentials") vs. session-credential print-once behavior specified so credentials are never silently lost or silently exposed? [Clarity, Spec §FR-007, §FR-016]
 - [x] CHK018 Is the exposure trade-off of passing credentials via CLI flags / environment variables (process listing, shell history, env leakage to child processes) documented as an assumption? [Assumption, Gap]
   > **Resolution (2026-08-22)**: documented as an accepted trade-off for a local single-user tool, with the config file (0600) recommended — spec §Assumptions/Authentication.

@@ -8,14 +8,10 @@ publish = false
 [dependencies]
 getrandom.workspace = true
 hex.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
 sha2.workspace = true
-time = { workspace = true, features = ["formatting"] }
 tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "rt"] }
 tracing.workspace = true
-tracing-subscriber = { workspace = true, optional = true }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -28,7 +24,6 @@ windows-sys = { workspace = true, features = [
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Registry",
-    "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_UI_Shell",
@@ -36,13 +31,12 @@ windows-sys = { workspace = true, features = [
 
 tinio-sandbox-core.workspace = true
 tinio-util.workspace = true
-tinio-winsec.workspace = true
 
 [dev-dependencies]
 tinio-sandbox-windows = { path = ".", features = ["testing"] }
 
 [features]
-testing = ["tinio-util/testing", "dep:tempfile", "dep:tracing-subscriber"]
+testing = ["tinio-util/testing", "dep:tempfile"]
 
 [lints.clippy]
 absolute_paths = "warn"

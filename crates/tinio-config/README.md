@@ -12,7 +12,7 @@ The bottom two levels are this crate's. `<state dir>/.env` is loaded with `doten
 
 `discover::resolve_path` searches in order: an explicit `--config` path, returned verbatim and required to be a file already; the reserved directory `<root>/.tinio/`; the state directory; and, in each, `.tinio.toml` before its `config.toml` alias. In read-write mode the reserved directory **is** the state directory, so the two are one probe; in read-only mode they differ, and the state directory is exactly where an earlier read-only run left its file.
 
-`discover::load_or_create` reads that path and creates it when it is absent. The only reachable input for the create branch is the state directory's own `.tinio.toml`, written with a generated `[auth]` pair, and the file's protection is installed **by the create call** (unix `mode(0o600)`; `tinio_winsec::create_restricted` on Windows) and re-asserted after the write — a Windows descriptor that did not take removes the file rather than publishing credentials under the directory's inherited grants. Read-only mode refuses a path under the served root outright: nothing under the served root is ever written.
+`discover::load_or_create` reads that path and creates it when it is absent. The only reachable input for the create branch is the state directory's own `.tinio.toml`, written with a generated `[auth]` pair, and the create call is the whole of the file's protection — unix `mode(0o600)`, so it never exists wider than that; on Windows the create installs no descriptor, and `contracts/config.md` holds both platforms' clause. Read-only mode refuses a path under the served root outright: nothing under the served root is ever written.
 
 ## The schema
 
@@ -43,4 +43,4 @@ A generated pair is a CSPRNG access key of at least 16 bytes and a secret key of
 cargo test -p tinio-config
 ```
 
-Database-free and server-free: every leg parses a document or writes a temp file. The created credential file's protection is a platform leg — the unix mode is asserted on the file itself, and the Windows arm is the DACL its create call installs.
+Database-free and server-free: every leg parses a document or writes a temp file. The created credential file's protection is a platform leg — the unix arm asserts the mode on the file itself, and the Windows arm asserts that a fresh reader and a fresh writer both reach it and that it does not carry the protected single-entry descriptor the create used to install.

@@ -35,9 +35,14 @@
 //! - [`ensure_dir`], [`ok_if_missing`], [`entries_of`] — probe-then-create
 //!   with mode hardening, the removal that tolerates `NotFound`, and the
 //!   listing that reads a missing directory as empty.
+//! - [`create_new_private`] — the create every secret file (the config document,
+//!   the management plane's `state` file) goes through: refuse an existing name,
+//!   and on unix take `FILE_MODE_PRIVATE` at the open call itself.
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::{
-    fs::remove_file,
+    fs::{File as StdFile, OpenOptions, remove_file},
     io::{self, ErrorKind, SeekFrom},
     mem, panic,
     path::{Path, PathBuf},
@@ -75,6 +80,38 @@ pub const FILE_MODE_PRIVATE: u32 = 0o600;
 /// the directory half of [`FILE_MODE_PRIVATE`]'s rule.
 #[cfg(unix)]
 pub const DIR_MODE_PRIVATE: u32 = 0o700;
+
+/// Creates `path`, which must not exist, with `FILE_MODE_PRIVATE` on unix — **the one
+/// spelling of "a secret file never exists wider than this"**, shared by the config document
+/// and the management plane's `state` file.
+///
+/// **`create_new` is the refusal, not a caller's pre-check**: a file that appeared between the
+/// caller's own look and this call is what a create-then-write would adopt, and the mode is the
+/// open call's own argument so there is no window in which the object exists narrower-later.
+/// On Windows the create takes the platform's own answer — the parent directory's inheritable
+/// ACEs, falling back to the creating token's default DACL only when it inherits nothing —
+/// which is what every plain file under that directory gets.
+///
+/// # Examples
+///
+/// ```
+/// use std::io::Write as _;
+///
+/// let dir = tempfile::tempdir().expect("a scratch directory");
+/// let path = dir.path().join("secret");
+/// let mut file = tinio_util::fsutil::create_new_private(&path).expect("a fresh name");
+/// file.write_all(b"material").expect("write");
+///
+/// // The refusal is the create's: a name that already exists is never adopted.
+/// assert!(tinio_util::fsutil::create_new_private(&path).is_err());
+/// ```
+pub fn create_new_private(path: &Path) -> io::Result<StdFile> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(FILE_MODE_PRIVATE);
+    options.open(path)
+}
 
 /// Sync `parent` so a rename inside it is durable (D1 — the standard
 /// durable-write pattern: content fsynced before the rename, the directory

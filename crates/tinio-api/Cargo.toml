@@ -56,15 +56,10 @@ tinio-util = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [target.'cfg(windows)'.dependencies]
-tinio-winsec.workspace = true
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
-    "Win32_System_Memory",
     "Win32_System_Pipes",
-    "Win32_System_Threading",
 ] }
 
 [lints.clippy]

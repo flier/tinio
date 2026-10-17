@@ -58,8 +58,9 @@ pub struct Adopted {
     /// crate-private for the reason the struct's own doc gives.
     pub(crate) listener_fd: Option<i64>,
     /// The inherited control channel's handles, when the parent created the channel — a
-    /// launcher platform, either because a container's process cannot create the pipes its
-    /// current-user-only DACL needs (Windows) or because the confinement's profile grants no
+    /// launcher platform, either because a container's process cannot create the pipes Windows'
+    /// own default named-pipe descriptor does not name it in (Windows) or because the confinement's
+    /// profile grants no
     /// `bind()` for a socket (macOS).
     ///
     /// Spelled exactly like [`Adopted::listener_fd`], and for the same reason: only
@@ -297,11 +298,11 @@ impl Adopted {
     /// The inherited control channel's handles, when the parent created the channel.
     ///
     /// **What the child does with them is the whole point**: a non-empty answer means the
-    /// launcher already created the control channel — its pipes exist with a DACL only the
-    /// unrestricted launcher could attach, or its socket is bound where only the unconfined
-    /// process may bind one — so the child adopts those objects rather than creating a second
-    /// one. Empty is every other shape of launch: an in-place platform, an `api`-less build, and
-    /// a run whose selection carries no local channel at all.
+    /// launcher already created the control channel — its pipes exist under a descriptor that
+    /// names no package SID, or its socket is bound where only the unconfined process may bind
+    /// one — so the child adopts those objects rather than creating a second one. Empty is every
+    /// other shape of launch: an in-place platform, an `api`-less build, and a run whose
+    /// selection carries no local channel at all.
     ///
     /// One entry per instance, and the child serves on all of them: a Windows channel needs more
     /// than one so that a client can reach a listening instance while another serves, while a

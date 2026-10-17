@@ -26,7 +26,7 @@ use std::{
     ptr,
 };
 
-use tinio_winsec::to_wide;
+use tinio_util::wide::to_wide;
 // **The core's builder is imported under an alias here, and it has to be.**
 // `use tinio_sandbox_core::launch;` beside this module's own `pub fn launch`
 // below is `E0255` — one name cannot bind two functions — and `launch` is what
@@ -772,7 +772,9 @@ mod tests {
     use super::*;
     use crate::{
         acl::{self, Target},
-        launch, socket,
+        launch,
+        sid::{ProfileLock, package_name},
+        socket,
         testing::{CHILD_ROLE, Tree, answer, one_volume, sid_for, tree},
     };
 
@@ -923,6 +925,13 @@ mod tests {
         // `CreateProcessW` opens the image with the *launcher's* access rather than
         // the child's. What the grant buys is what the child opens for itself, which
         // is why decision 22 keeps it; what it does not buy is the launch.
+        // **The launch window, taken by hand.** This leg drives `launch` itself rather than
+        // `prepare_launch`, so nothing would hold this root's `ProfileLock` across
+        // derive→`CreateProcessW` — and a concurrent test process's launch-path sweep reads an
+        // unlocked profile as residue and reaps it, which is the `err=2 ERROR_FILE_NOT_FOUND`
+        // this leg failed with under a parallel run. Held to the end of the test, which also
+        // keeps another process's sweep out while the child runs.
+        let _window = ProfileLock::acquire(&package_name(&tree.root)).expect("the launch window");
         let sid = sid_for(&tree.root);
         // The launcher's own directory, read-only: Task 3's `exposures()` adds
         // exactly this path, first of all, and this test grants by hand because it
@@ -1149,8 +1158,13 @@ mod tests {
     #[test]
     fn the_empty_capability_set_launches() {
         let dir = tempfile::tempdir().expect("temp dir");
-        // As above: a name source, through the harness's derivation.
-        let sid = sid_for(&Tree::at(dir.path()).root);
+        // As above: a name source, through the harness's derivation — and the launch window
+        // held by hand, for the reason `a_rust_binary_runs_inside_the_container_and_the_
+        // whitelist_holds` states: a concurrent test process's sweep would otherwise read this
+        // unlocked profile as residue and reap it between the derive and the launch.
+        let root = Tree::at(dir.path()).root;
+        let _window = ProfileLock::acquire(&package_name(&root)).expect("the launch window");
+        let sid = sid_for(&root);
         let program = env::current_exe().expect("current exe");
         // The production exposure set's first entry, so this launches the way the
         // launcher does (decision 22, Task 3's `exposures()`).

@@ -32,14 +32,14 @@
 //! Windows implementation land across this phase's tasks**, so the list below
 //! grows one name per task: a module joins it in the task that creates it.
 //!
-//! **The NUL-terminated UTF-16 rule is `tinio_winsec::to_wide`'s, not this
+//! **The NUL-terminated UTF-16 rule is `tinio_util::wide::to_wide`'s, not this
 //! crate's.** Every name this crate hands the kernel — `sid`'s profile names and
-//! capability strings, `process`'s image path, `acl`'s descriptor read — goes
-//! through that one function, which the workspace's other Windows crates share,
-//! so the encoding has one spelling here rather than one per module. What stays
-//! at this root is the inverse: `from_wide_units` and `from_wide` below, which
-//! are this crate's own FFI because no other crate reads a name back out of the
-//! kernel.
+//! capability strings, `process`'s image path, `acl`'s descriptor read and its
+//! sweep's — goes through that one function, which the workspace's management
+//! plane shares, so the encoding has one spelling here rather than one per module.
+//! What stays at this root is the inverse: `from_wide_units` and `from_wide`
+//! below, which are this crate's own FFI because no other crate reads a name back
+//! out of the kernel.
 
 #![cfg(target_os = "windows")]
 
@@ -60,14 +60,6 @@ pub mod control;
 pub mod handles;
 pub mod job;
 pub mod launch;
-// **`pub`, and `path` is the one item that makes it so**: the record's fields,
-// `record_run` and its test seam stay `pub(crate)`, so what a consumer can do with
-// the module is ask where the ledger is — which
-// `tests/confine.rs` asks, because a leg that spelled
-// `%LOCALAPPDATA%\tinio\acl-ledger.jsonl` by hand would pass a rename on this side
-// and then fail with a ledger that is "not there" rather than a path that moved.
-// The crate that owns the file is still the crate that writes the lines.
-pub mod ledger;
 pub mod process;
 pub mod sid;
 pub mod socket;
@@ -185,11 +177,11 @@ pub fn confine(sandbox: &Sandbox, plan: &LaunchPlan) -> Result<Confinement> {
 
 /// Read a NUL-terminated UTF-16 buffer as the units before its terminator.
 ///
-/// **The reader to `tinio_winsec::to_wide`'s writer, and the half of the rule
-/// that stays here**: the encoding is shared (the crate doc names the one
+/// **The reader to [`to_wide`](tinio_util::wide::to_wide)'s writer, and the half of
+/// the rule that stays here**: the encoding is shared (the crate doc names the one
 /// function that applies it), while this direction is this crate's own FFI — the
-/// inverse of a rule is not something the writer's crate has to own, and
-/// `tinio-winsec` reads no name back out of the kernel.
+/// inverse of a rule is not something the writer's module has to own, and
+/// `tinio-util`'s `wide` reads no name back out of the kernel.
 ///
 /// **One of the crate root's two unsafe sites, and the reason each exception
 /// sits on its own function rather than on the file**: the manifest denies
@@ -223,10 +215,10 @@ pub(crate) unsafe fn from_wide_units<'a>(text: *const u16) -> &'a [u16] {
 /// `from_utf16_lossy` is right for those and wrong for a path — a Windows path is
 /// arbitrary UTF-16, so the lossy read replaces any unit that is not valid UTF-8
 /// with U+FFFD and a caller then names a different file from the one it was given
-/// — and [`system_directory`] is the one caller that has a path, so it goes
-/// through [`from_wide_units`] and `OsString::from_wide` instead.
-///
-/// [`system_directory`]: crate::handles::system_directory
+/// — and the path-shaped readers take [`from_wide_units`] instead. (`system_directory`
+/// was the one that did until the DACL removal moved it to `tinio-util`'s `win32` module,
+/// which builds its path with `OsString::from_wide` there; what remains here is
+/// [`from_wide`]'s own read and the argv parse in `process.rs`.)
 ///
 /// # Safety
 ///

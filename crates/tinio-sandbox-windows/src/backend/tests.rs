@@ -278,7 +278,7 @@ fn the_grant_phase_warns_only_past_a_share_of_the_readiness_budget() {
 #[test]
 // `Grants::new` takes an `Arc<PackageSid>` over a type that owns a raw `PSID` and
 // is deliberately neither `Send` nor `Sync` — the same `expect`, for the same
-// reason, as `src/acl.rs`'s tests module: this is shared ownership inside one
+// reason, as `src/acl/grant.rs`'s tests module: this is shared ownership inside one
 // thread, which is what the code under test is given.
 #[expect(
     clippy::arc_with_non_send_sync,
@@ -288,7 +288,7 @@ fn a_standing_grant_is_not_an_info_event() {
     let _recorder = recorder();
     let dir = tempdir().expect("temp dir");
     let sid = Arc::new(PackageSid::derive(&package_name(dir.path())).expect("the profile"));
-    let mut grants = Grants::new(sid);
+    let grants = Grants::new(sid);
     let ((), logged) = recorded(|| {
         grants
             .apply_standing(dir.path(), Target::ProgramDirectory, AccessMode::ReadOnly)
@@ -1161,43 +1161,6 @@ fn the_served_root_is_the_first_exposure() {
         .expose(r"E:\state", AccessMode::ReadWrite);
     assert_eq!(served_root(&sandbox).unwrap(), Path::new(r"E:\srv\tinio"));
     assert!(served_root(&Sandbox::new()).is_err());
-}
-
-/// **Every exposed path a launch's ledger records besides its root, as one leg** —
-/// finding 3 of the 2026-09-28 review, which is that a `TINIO_STATE_DIR` outside
-/// the root was granted read-write and never reached the file.
-///
-/// It would fail if the selection named the root by position alone, or compared
-/// spellings literally: a second spelling of the root is one directory, one ACE and
-/// one grant, and a line for it would claim a standing ACE the run did not write
-/// twice. What the product's set is — the served root, then the state directory
-/// when it lies outside the root — is the shape the first assertion pins, and the
-/// empty cases are the run whose state directory needs no entry of its own.
-#[test]
-fn the_paths_a_run_records_besides_its_root_are_its_other_exposures() {
-    let sandbox = Sandbox::new()
-        .expose(r"E:\srv\tinio", AccessMode::ReadOnly)
-        .expose(r"E:\state", AccessMode::ReadWrite);
-    assert_eq!(
-        other_exposed_paths(&sandbox, Path::new(r"E:\srv\tinio")),
-        vec![PathBuf::from(r"E:\state")],
-        "the state directory is the ACE the root's own line does not name"
-    );
-    // **The root's own second spelling is not a second path.** `E:\Data` and
-    // `e:/data` are one directory to this volume, so they are one canonical
-    // resolution, one grant and one line — the digest is the crate's identity rule
-    // and not the spelling (`sid::root_digest`).
-    let respelled = Sandbox::new()
-        .expose(r"E:\Data", AccessMode::ReadOnly)
-        .expose(r"e:/data", AccessMode::ReadWrite);
-    assert!(
-        other_exposed_paths(&respelled, Path::new(r"E:\Data")).is_empty(),
-        "a second spelling of the root earned a line of its own"
-    );
-    // A root with nothing beside it records nothing extra at all, which is the
-    // in-root state directory's case.
-    let alone = Sandbox::new().expose(r"E:\srv\tinio", AccessMode::ReadWrite);
-    assert!(other_exposed_paths(&alone, Path::new(r"E:\srv\tinio")).is_empty());
 }
 
 #[test]

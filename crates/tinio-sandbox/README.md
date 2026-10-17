@@ -13,7 +13,7 @@ It implements no mechanism of its own. What a confinement must promise is the co
 | Windows | `tinio-sandbox-windows`, launching a confined child |
 | Any other | none — `backend_available()` answers `false`, and a confinement request is refused rather than served |
 
-`backend_available()` names the same targets the selection's arms are written for, so a new backend's target is added to both in one edit; `can_confine()` is the run-time half of that question, asked of this host's token. `tinio-winsec` is not a backend: it is the Windows DACL helper the Windows backend reads descriptors through.
+`backend_available()` names the same targets the selection's arms are written for, so a new backend's target is added to both in one edit; `can_confine()` is the run-time half of that question, asked of this host's token. `tinio-winsec` was not a backend: it was the Windows DACL helper the Windows backend read descriptors through, and it dissolved into `tinio-util`'s wide-string writer and `tinio-sandbox-windows`'s own `acl` directory (`docs/superpowers/specs/2026-10-15-windows-file-dacl-removal-design.md` D4).
 
 ## The rule
 

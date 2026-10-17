@@ -18,8 +18,7 @@ Every crate carries its own README; those are the detail, this is the index.
 | [`tinio-blob`](crates/tinio-blob/README.md) | Content-addressed block engine: blobs by SHA-256, deduplicated, swept by live set |
 | [`tinio-store-redb`](crates/tinio-store-redb/README.md) | The shared redb table layer and the state-database driver |
 | [`tinio-store-pg`](crates/tinio-store-pg/README.md) | The four persistence contracts over PostgreSQL: migrations, the driver pool, the content and block planes |
-| [`tinio-util`](crates/tinio-util/README.md) | Shared runtime utilities: the evicting per-key lock map, commit primitives, path/process/secret helpers |
-| [`tinio-winsec`](crates/tinio-winsec/README.md) | Current-user-only Windows DACLs, shared by the config files and the management plane |
+| [`tinio-util`](crates/tinio-util/README.md) | Shared runtime utilities: the evicting per-key lock map, commit primitives, path/process/secret helpers, and the Windows wide-string writer |
 
 **Backends**
 

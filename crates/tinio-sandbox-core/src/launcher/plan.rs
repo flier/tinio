@@ -202,7 +202,8 @@ impl LaunchPlan {
     ///
     /// **A set, because one platform's channel is a pool and the other's is not.** On Windows the
     /// channel is a pool of pipe instances, and a client only ever reaches one that is
-    /// *listening*: the launcher creates them all (only it can — the DACL is current-user-only and
+    /// *listening*: the launcher creates them all (only it can — the pipe carries Windows' own
+    /// default named-pipe descriptor rather than one naming the package SID, and
     /// the child's identity is the package SID), and the child serves on all of them so that one
     /// instance serving a request does not leave the name deaf — handing over fewer than the
     /// launcher bound is a channel that answers once and then stops. On macOS the channel is a

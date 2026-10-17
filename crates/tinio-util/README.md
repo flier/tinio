@@ -23,6 +23,8 @@ Eviction is the map's stance and not the caller's business: a slot goes the mome
 | `src/lockmap.rs` | the evicting per-key lock map |
 | `src/fsutil.rs` | the atomic commit protocol, the ranged body stream, the staged-temp drop discipline and the directory/file helpers the backends are written on |
 | `src/job.rs`, `src/job_object.rs` | the guard that makes a test-spawned process die with the test process, and the Win32 job-object sequence the guard and the sandbox launcher both stand on |
+| `src/wide.rs` | the NUL-terminated UTF-16 writer every Windows `*W` call here takes its name from — `to_wide`; its reader, which turns a name back out of the kernel, is `tinio-sandbox-windows`'s `from_wide_units`/`from_wide` |
+| `src/win32.rs` | the one sentence a failed `*W` call is reported with (`error_message`) and the system directory the kernel reports rather than `%SystemRoot%` — both shared by `tinio-api` and the sandbox |
 | `src/testing/mod.rs`, `src/testing/metadata.rs` | the conformance harness and the persistence contracts' suite (the `testing` feature) |
 | `src/testing/http.rs`, `src/testing/sigv4.rs`, `src/testing/blocks.rs` | the shared test devices: the raw HTTP/1.1 client, the SigV4 signer, the in-memory block store |
 | `src/bench.rs` | the benches' pinned data root and flush control (the `bench` feature) |

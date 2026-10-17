@@ -3304,21 +3304,16 @@ async fn package_sid_granted(world: &mut World, target: String) {
     testing::icacls(&path, &["/grant:r", &spec, "/q"]);
 }
 
-/// The lines a file **under the served root** holds, for the one product document this suite can
-/// only reach through the file system: the ACL grant ledger.
+/// The lines a file **under the served root** holds, counted by the text they carry — the
+/// assertion a scenario makes about a file the run wrote inside its own root.
 ///
-/// **It exists because the ledger is not a stream and not under the root by default.** A launcher
-/// appends one JSON object per granted path to `%LOCALAPPDATA%\tinio\acl-ledger.jsonl`
-/// (`crates/tinio-sandbox-windows/src/ledger.rs`, whose module doc argues what the file is for), so
-/// the scenario that asserts it points `LOCALAPPDATA` at the served root's own name — a *relative*
-/// path, which every child resolves against its working directory, the scenario's scratch dir — and
-/// the ledger lands under the root. **The path stays the scenario's to spell**: a step that assumed
-/// it would be asserting about this suite's fixture rather than about the file the run wrote, and
-/// the operator's real ledger is a machine-wide file no scenario may assert on.
+/// **The path stays the scenario's to spell**: this step joins the relative path onto the run's
+/// root and reads it, so what it asserts about is the file the run wrote rather than anything of
+/// this suite's own.
 ///
 /// **A count of lines and not a substring of the file, because that is the fact being asserted**:
-/// the ledger holds one line per granted path, so "one `kind=…` line" and "no second line of that
-/// kind" are one assertion — a count that grew is a grant the scenario did not ask for.
+/// "one line containing `…`" and "no second line containing it" are one assertion — a count that
+/// grew is a write the scenario did not ask for.
 #[then(expr = "the file {string} under the served root has {int} line(s) containing {string}")]
 async fn rooted_file_has_lines(world: &mut World, relative: String, count: usize, text: String) {
     let path = cli(world).root().join(&relative);

@@ -80,7 +80,7 @@ use std::{
     sync::Once,
 };
 
-use tinio_winsec::to_wide;
+use tinio_util::wide::to_wide;
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, GetLastError,
@@ -594,7 +594,8 @@ fn delete_storage_key(storage: &str, name: &str) -> bool {
 }
 
 /// How many processes on this machine are named [`LAUNCHER_IMAGE`] and are not
-/// this one — **the liveness gate's whole input** (rule 2).
+/// this one — **the liveness gate's whole input** (rule 2), read as the length of
+/// [`tinio_processes`].
 ///
 /// # Errors
 ///
@@ -602,6 +603,17 @@ fn delete_storage_key(storage: &str, name: &str) -> bool {
 /// sweep: a walk that failed cannot show that no server is alive, and the sweep's
 /// only safe reading of "cannot show" is to do nothing.
 fn other_tinio_processes() -> io::Result<usize> {
+    tinio_processes().map(|pids| pids.len())
+}
+
+/// The live processes named [`LAUNCHER_IMAGE`], this one excluded — **the same walk as
+/// [`other_tinio_processes`], as pids rather than a count.**
+///
+/// A leg needs the pids and not the count: the liveness-gate test spawns its own `tinio.exe`
+/// and waits for *that process* to appear and disappear, and a predicate on the total would
+/// make an unrelated `tinio` on the machine either fail the wait or pass it for the wrong
+/// reason.
+fn tinio_processes() -> io::Result<Vec<u32>> {
     // SAFETY: `CreateToolhelp32Snapshot` takes no pointers; a process snapshot
     // ignores the process id, and the handle it returns is closed exactly once
     // below, on every path out of this function.
@@ -621,13 +633,13 @@ fn other_tinio_processes() -> io::Result<usize> {
     // SAFETY: `GetCurrentProcessId` reads this process's own id and takes no
     // arguments.
     let this_process = unsafe { GetCurrentProcessId() };
-    let mut others = 0;
+    let mut others = Vec::new();
     // SAFETY: `snapshot` is the live handle above and `entry` is a valid, writable
     // value whose `dwSize` the call requires and this function set.
     let mut walked = unsafe { Process32FirstW(snapshot, &mut entry) };
     while walked != 0 {
         if entry.th32ProcessID != this_process && image_is_the_launcher(&entry.szExeFile) {
-            others += 1;
+            others.push(entry.th32ProcessID);
         }
         // SAFETY: as above: the same snapshot handle and the same live entry.
         walked = unsafe { Process32NextW(snapshot, &mut entry) };
@@ -691,13 +703,13 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use tinio_util::testing::{
-        assert_recorded_at, assert_recorded_below, assert_step, host_cannot,
+    use tinio_util::{
+        testing::{assert_recorded_at, assert_recorded_below, assert_step, host_cannot},
+        win32::system_directory,
     };
 
     use super::*;
     use crate::{
-        handles,
         sid::{PackageSid, package_name},
         testing::{capture, recorder},
     };
@@ -740,7 +752,7 @@ mod tests {
         fn spawn() -> Self {
             let home = tempfile::tempdir().expect("temp dir");
             let image = home.path().join("tinio.exe");
-            fs::copy(handles::system_directory().join("ping.exe"), &image)
+            fs::copy(system_directory().join("ping.exe"), &image)
                 .expect("a copy of ping.exe named tinio.exe");
             let child = Command::new(&image)
                 .args(["-n", "30", "127.0.0.1"])
@@ -1107,7 +1119,9 @@ mod tests {
 
         let fake = FakeTinio::spawn();
         wait_until("the gate's walk reports the renamed process", || {
-            other_tinio_processes().expect("the process list is walkable") > 0
+            tinio_processes()
+                .expect("the process list is walkable")
+                .contains(&fake.id())
         });
 
         let scratch = Scratch::new();
@@ -1129,9 +1143,15 @@ mod tests {
         );
         assert!(key_is_there(&scratch_key));
 
+        // **This fake's pid and not the count**: the wait is about the process this leg
+        // spawned, and a `tinio` serving elsewhere on the machine would otherwise keep the
+        // predicate false (or, before the spawn, make it true for the wrong reason).
+        let fake_pid = fake.id();
         drop(fake);
         wait_until("the walk stops seeing the renamed process", || {
-            other_tinio_processes().expect("the process list is walkable") == 0
+            !tinio_processes()
+                .expect("the process list is walkable")
+                .contains(&fake_pid)
         });
         let report = sweep_with(&scratch.places, no_other_tinio);
         assert_eq!(

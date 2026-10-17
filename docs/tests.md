@@ -72,6 +72,15 @@
 - Confinement e2e = cucumber except oracles with no step-reachable surface, and feature-off refusal (Rust).
 - Default workspace run excludes confinement off macOS; operator opt-in via `TINIO_E2E_CONFINEMENT`.
 
+## WSL: the Linux side of `cfg`
+
+- The Linux side of a gate runs in WSL, distro `Ubuntu-26.04` — name it: the default distro is Docker's, with no shell tooling.
+- Rust comes from the login shell: `wsl -d Ubuntu-26.04 -e zsh -lic '<cmd>'`; a plain `bash -lc` has no cargo.
+- Never install a second toolchain: `~/.cargo` is the host's Rust, and a profile edit that re-points it is the failure.
+- The checkout is `/mnt/d/Github/tinio`; a Linux build must not write the Windows `target/` — put `CARGO_TARGET_DIR` on the WSL root fs.
+- What it buys: the `cfg(unix)` arms compile and their suite runs, and the ubuntu doc/clippy gates see no `cfg(windows)` modules.
+- Windows-only legs stay on Windows; WSL covers the other side of `cfg`, not a second run of the same legs.
+
 ## Windows: gates & network
 
 - Windows gates never compile `#[cfg(unix)]`: verify such tests/fns on Linux.

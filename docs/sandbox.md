@@ -34,12 +34,12 @@ The child re-invokes with the operator's argv and refuses before dispatch when i
 - macOS adds the resolved spelling *beside* the operator's; **ruled: Windows serves the canonical spelling alone**.
 - Record: `docs/superpowers/plans/2026-09-25-sandbox-followups.md` §22.
 
-## Windows: two per-user files, and the re-grant the salt costs
+## Windows: the per-user file, and the re-grant the salt costs
 
-- The local app-data directory holds the two per-user files: `acl-salt` (created once) and `acl-ledger.jsonl`.
+- The local app-data directory holds the one per-user file: `acl-salt`, created once.
 - The salt is mixed into the profile name — without it the name is a pure function of the served root.
-- The ledger records what a run granted (design §6); **revocation stays manual**.
-- The directory is **repaired, not only created** when its DACL is not this user's alone.
+- Salt's directory is **never granted**; the config/`state` directory is (design spec, two-directory table).
+- **The ledger is gone** — it listed grants and never revoked; revocation was already manual, the audit is lost.
 - **The first run after the salt lands re-grants every served root**; old unsalted ACEs stay as residue (decision 15).
 - An unreadable or uncreatable salt warns; that run derives the *unsalted* name.
 - The program directory's `ALL APPLICATION PACKAGES` RX is unchanged.

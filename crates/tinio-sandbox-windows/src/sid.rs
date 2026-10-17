@@ -10,9 +10,9 @@
 //!
 //! This module is one of the crate's enumerated `unsafe` sites (design decision
 //! 14): the SID derivation and the two SID/string conversions are the crate's
-//! only security-identifier FFI. **The salt's file API is not one of them** —
-//! [`tinio_winsec::create_restricted`] owns the create-time descriptor and this
-//! module only names the file — so the enumeration is unchanged by it.
+//! only security-identifier FFI. **The salt's file API is not one of them** — the
+//! file is created by a plain `create_new`, with no security descriptor at all, so
+//! this module still only names it — and the enumeration is unchanged by it.
 
 #![allow(unsafe_code)]
 
@@ -24,12 +24,10 @@ use std::{
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr,
-    sync::{Mutex, OnceLock},
 };
 
 use sha2::{Digest, Sha256};
-use tinio_util::path::plain_spelling;
-use tinio_winsec::to_wide;
+use tinio_util::{fsutil::create_new_private, path::plain_spelling, wide::to_wide};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
     Security::{
@@ -216,22 +214,21 @@ pub fn package_name_unsalted(root: &Path) -> String {
 /// stretched or padded ([`Salt::from_bytes`]).
 pub const SALT_BYTES: usize = 32;
 
-/// The crate's per-user state directory under `%LOCALAPPDATA%`, and the two files
-/// this crate keeps in it: the salt the derivation is mixed with, and the ACL
-/// grant ledger (`crate::ledger`).
+/// The crate's per-user state directory under `%LOCALAPPDATA%`, and the one file
+/// this crate keeps in it: the salt the derivation is mixed with.
 ///
-/// **One directory for both, and it is the directory the profile machinery's own
-/// data sits under** — `%LOCALAPPDATA%\Packages\<name>` is where
-/// `CreateAppContainerProfile` puts a profile (measured 2026-09-26:
-/// `DeleteAppContainerProfile` takes that directory with it).
+/// **One directory, beside the profile machinery's own data** —
+/// `%LOCALAPPDATA%\Packages\<name>` is where `CreateAppContainerProfile` puts a
+/// profile (measured 2026-09-26: `DeleteAppContainerProfile` takes that directory
+/// with it).
 const STATE_DIRECTORY: &str = "tinio";
 const SALT_FILE: &str = "acl-salt";
 
 /// The directory this crate keeps its per-user state in: `%LOCALAPPDATA%\tinio`.
 ///
 /// **Resolved from the environment variable rather than through a platform API,
-/// and that is not a defence being claimed** — the same rule
-/// [`crate::acl::icacls_binary`] states: an actor who can set this launcher's
+/// and that is not a defence being claimed** — the same rule `acl::icacls_binary`
+/// states: an actor who can set this launcher's
 /// environment is a local actor, and local actors are outside this feature's
 /// threat model, so what the variable buys is that the state directory is the
 /// operator's own even on a host where a shell API would answer differently.
@@ -240,82 +237,6 @@ const SALT_FILE: &str = "acl-salt";
 /// about rather than an error either of them can act on.
 pub(crate) fn state_directory() -> Option<PathBuf> {
     env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join(STATE_DIRECTORY))
-}
-
-/// **The state directory, created if it is not there and put back to the current
-/// user's alone if it is not** — the descriptor of `%LOCALAPPDATA%\tinio`, made
-/// intentional rather than inherited (finding 1 of the 2026-09-28 review, which
-/// measured `FLIER-WIN11\CodexSandboxUsers:(I)(OI)(CI)(M)` on it beside an
-/// unresolved SID).
-///
-/// **It repairs a directory it found as well as one it made, and that is deliberate
-/// after measurement rather than before it.** An earlier revision of this crate
-/// created the directory through `create_dir_all`, so every machine that has run it
-/// carries `%LOCALAPPDATA%`'s inherited grants on the directory — and an account
-/// those grants reach can *create* a file in it, which is the plant vector both
-/// files answer on their own descriptors. Putting the directory back is two calls
-/// (`tinio_winsec::acl_is_current_user_only`, then
-/// `tinio_winsec::restrict_to_current_user` when it answers no) and it is
-/// **idempotent**: the steady state is one `GetNamedSecurityInfoW` and no write.
-///
-/// **What re-describing a container costs, measured on this host 2026-09-28 and
-/// stated rather than hidden**: the system propagates the new (non-inheritable)
-/// DACL over the children that already exist and their inherited entries are
-/// dropped — a scratch directory showed exactly that, the child's DACL empty
-/// afterwards. The two children this crate keeps there answer for themselves, and
-/// in this order:
-///
-/// - the **salt** carries `create_restricted`'s `SE_DACL_PROTECTED` descriptor, and
-///   a protected DACL is what propagation does not touch — measured: `acl-salt`
-///   kept its single current-user entry across the first run of this revision;
-/// - the **ledger** may be emptied by it, and the same launch's append reads the
-///   file back and puts the descriptor right *before* the first byte of its run's
-///   lines (`crate::ledger`'s `ensure_private`), so what an operator can find is a
-///   repaired file rather than an unreadable one (measured: one current-user entry
-///   after the append).
-///
-/// **A third file placed under this directory by anything else would lose its
-/// inherited entries**, and that is the price of the repair: the directory is this
-/// crate's own state directory (`state_directory`'s doc says so), the owner can
-/// always re-describe what it owns, and the alternative — leaving the descriptor
-/// inherited on every machine that has already run a launcher — is the exposure
-/// this call exists to close.
-///
-/// **It is the call both writers make**, so the two files' directory cannot be
-/// created with an inherited descriptor by one path while the other creates it
-/// with a private one: the salt's first use and the ledger's first run are the
-/// same directory, and this is where it is made.
-///
-/// **A failure to set the descriptor is warned about and not returned**, because
-/// what it costs is the directory's own hardening rather than either file's: both
-/// files carry their own protection (the salt's `create_restricted` from its first
-/// instant and its read-back before use, the ledger's re-assertion before each
-/// run's lines), so a directory left as `%LOCALAPPDATA%` made it is not a reason to
-/// lose a salt or a ledger line. The caller's error is the directory's *creation*, which is
-/// the one thing this call cannot proceed without.
-pub(crate) fn create_state_directory(directory: &Path) -> io::Result<()> {
-    if !directory.is_dir() {
-        fs::create_dir_all(directory)?;
-    }
-    let isolated = tinio_winsec::acl_is_current_user_only(directory).and_then(|isolated| {
-        if isolated {
-            Ok(())
-        } else {
-            tinio_winsec::restrict_to_current_user(directory)
-        }
-    });
-    if let Err(error) = isolated {
-        tracing::warn!(
-            step = "create the state directory",
-            path = %directory.display(),
-            error = %error,
-            "this user's state directory keeps the descriptor %LOCALAPPDATA% gave \
-             it, so another account that descriptor reaches can create a file in \
-             it — the salt and the ledger each refuse or repair a file that is not \
-             this user's alone (design §6)"
-        );
-    }
-    Ok(())
 }
 
 /// Report a derivation that ran without the salt, and answer the `None` every
@@ -373,70 +294,27 @@ fn temporary_beside(file: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     )))
 }
 
-/// Write `bytes` into a private file at `temporary` and publish that same object at
-/// `file` by linking it — **the one spelling of "the published name never exists
-/// without its value and its descriptor"**, shared by the salt ([`Salt::create_at`])
-/// and the ledger (`crate::ledger`).
+/// Write `bytes` into a file at `temporary` and publish that same object at `file` by
+/// linking it — **the one spelling of "the published name never exists without its
+/// value"**, which is how the salt publishes itself ([`Salt::create_at`]).
 ///
 /// **The temporary is removed on every path out, the failure path included**, so the
-/// only residue this can leave is one private file nothing ever reads — and a
-/// removal this process could not make is warned about under `step` rather than
-/// swallowed.
-///
-/// **`link` is where a caller's own rule goes**, and the ledger's is the one caller
-/// that has one: it reads the descriptor back before the name is published
-/// ([`crate::ledger`]'s `ensure_private`). The salt has no such rule by construction
-/// — `tinio_winsec::create_restricted` is what created the object, so there is
-/// nothing to read back and repair.
-pub(crate) fn publish_private(
-    file: &Path,
-    bytes: &[u8],
-    step: &str,
-    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
-) -> io::Result<()> {
+/// only residue this can leave is one file nothing ever reads — and a removal this
+/// process could not make is warned about rather than swallowed.
+pub(crate) fn publish_private(file: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary = temporary_beside(file, bytes)?;
-    let published = link(&temporary, file);
+    let published = write_and_link(&temporary, file, bytes);
     if let Err(error) = fs::remove_file(&temporary)
         && error.kind() != io::ErrorKind::NotFound
     {
         tracing::warn!(
-            step = step,
+            step = "load the ACL salt",
             path = %temporary.display(),
             error = %error,
             "the private file a value was published through could not be removed"
         );
     }
     published
-}
-
-/// [`create_state_directory`], **once per process** — the call the salt's first use
-/// and every ledger run both make.
-///
-/// **The repair inside it cannot answer differently a second time**, so the read
-/// that decides it is not repeated: `acl_is_current_user_only` costs a token open,
-/// two `GetTokenInformation` calls and a descriptor read with an ACE walk, and the
-/// ledger reached this once per line until `crate::ledger`'s `record_run` made the
-/// run its unit of work — which is where that figure is now spent, once per run
-/// rather than once per path. The guard is a `Mutex<()>` rather than a `Once`
-/// because the directory path is the caller's — a leg points it at a temporary
-/// directory — and the answer is "this path has been done", which is what the map
-/// holds.
-///
-/// A failure is not cached: the path is left out of the map, so the next line
-/// reports the same creation error the first one did rather than a stale silence.
-pub(crate) fn ensure_state_directory(directory: &Path) -> io::Result<()> {
-    static DONE: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
-    let done = DONE.get_or_init(|| Mutex::new(Vec::new()));
-    let mut done = done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    // **The membership test borrows**: `contains` would need the value to look for as a
-    // `PathBuf`, so asking it here would allocate one per call for a comparison that
-    // reads two paths.
-    if done.iter().any(|done| done == directory) {
-        return Ok(());
-    }
-    create_state_directory(directory)?;
-    done.push(directory.to_path_buf());
-    Ok(())
 }
 
 /// One live SID's `S-1-…` text — **the one call that renders a raw SID**, so the
@@ -553,11 +431,10 @@ impl Salt {
     /// The load-or-create sequence for the file `file` names — `Self::load`'s
     /// body, and the seam a leg points at a temporary directory.
     ///
-    /// **The read is the whole of the steady state**: a salt file that is there is
-    /// 32 bytes, is this user's alone and is used as it stands, so a run after the
-    /// first costs one read of 32 bytes and one descriptor read-back. Everything
-    /// else — a file that is not there, is not 32 bytes, cannot be read, or is not
-    /// this user's alone — is [`Self::create_at`] or a warned `None`.
+    /// **The read is the whole of the steady state**: a salt file that is there and
+    /// holds [`SALT_BYTES`] is used as it stands, so a run after the first costs one
+    /// read of 32 bytes. Everything else — a file that is not there, is not 32 bytes,
+    /// or cannot be read — is [`Self::create_at`] or a warned `None`.
     pub(crate) fn load_at(file: &Path) -> Option<Self> {
         match fs::read(file) {
             Ok(bytes) => Self::from_bytes_at(file, bytes),
@@ -566,8 +443,8 @@ impl Salt {
         }
     }
 
-    /// The bytes a salt file holds, or the degradation a file that is not this
-    /// user's alone earns.
+    /// The bytes a salt file holds, or the degradation a file of the wrong length
+    /// earns: **one value, [`SALT_BYTES`] long, and no other question asked of it.**
     ///
     /// **A file that is not [`SALT_BYTES`] long is refused rather than stretched,
     /// padded or re-created**: the file is either this crate's own value or
@@ -576,27 +453,10 @@ impl Salt {
     /// residue takeover decision 21 rests on would then never find its SID
     /// again.
     ///
-    /// **Then the descriptor is read back, and a file that is not the current
-    /// user's alone is not used at all** — warned about at the same step, and the
-    /// run takes the same degrade-to-unsalted path the other refusals here take.
-    /// **What it closes is the plant**: an account with access to the state
-    /// directory can create `acl-salt` before this crate's first run, with 32
-    /// bytes of its own choosing and under whatever descriptor the directory gives
-    /// it, and a run that trusted the file as found would derive every name under
-    /// a value that account already knows — which is the whole of what the salt is
-    /// for. **What it is not is an ownership check**: the verdict is
-    /// [`tinio_winsec::acl_is_current_user_only`]'s, so a file whose DACL names
-    /// this user alone passes it whoever created it, and reading the owner is a
-    /// call this crate does not have. It is the *use* that is refused and never
-    /// the launch: this returns `None`, the caller derives the unsalted name, and
-    /// the warning beside the refusal is the only thing distinguishing the two
-    /// (design §6).
-    ///
-    /// **The creation path is deliberately not checked this way**: a file this
-    /// crate published carries `create_restricted`'s descriptor from its first
-    /// instant, and the race's loser reads a value a peer published through the
-    /// same call — so a read here covers every file that was not written by this
-    /// code, which is the set the check is about.
+    /// **Nothing is read back from the file's descriptor**: the file is used as it is found,
+    /// and what stands between it and another account is the state directory's own grants
+    /// (`%LOCALAPPDATA%`'s, which the launcher never widens — the design spec's
+    /// two-directory table, and design §6 for the scope that leaves).
     fn from_bytes_at(file: &Path, bytes: Vec<u8>) -> Option<Self> {
         let Ok(bytes) = <[u8; SALT_BYTES]>::try_from(bytes.as_slice()) else {
             return degrade(
@@ -609,19 +469,7 @@ impl Salt {
                 &"a file that is not a salt",
             );
         };
-        match tinio_winsec::acl_is_current_user_only(file) {
-            Ok(true) => Some(Self { bytes }),
-            Ok(false) => degrade(
-                Some(file),
-                "this user's salt file is not this user's alone",
-                &"a file another account can read",
-            ),
-            Err(error) => degrade(
-                Some(file),
-                "this user's salt file's DACL cannot be read",
-                &error,
-            ),
-        }
+        Some(Self { bytes })
     }
 
     /// Publish a fresh salt at `file` — **or read the one a peer published
@@ -629,8 +477,8 @@ impl Salt {
     ///
     /// **The value is published whole, and that is why the create is a link and
     /// not an open.** The file appears under its final name only once it holds all
-    /// [`SALT_BYTES`]: the bytes go into a private temporary file named after them,
-    /// and `fs::hard_link` — which fails rather than replacing when the name is
+    /// [`SALT_BYTES`]: the bytes go into a temporary file named after them, and
+    /// `fs::hard_link` — which fails rather than replacing when the name is
     /// taken — is what puts that object at the salt's name. A create-then-write at
     /// the final name would leave a window in which a concurrent first launch reads
     /// a file with no bytes in it and degrades; a rename would *replace* a winner's
@@ -640,20 +488,19 @@ impl Salt {
     /// held 32 bytes (the legs are `eight_races_on_a_fresh_salt_file_agree_on_one_
     /// value` and `the_salt_file_is_created_once_and_a_second_launch_reads_it`).
     ///
-    /// The temporary file carries the same descriptor as the published one — a hard
-    /// link names one object — so it is [`tinio_winsec::create_restricted`]'s
-    /// current-user-only DACL from its first instant, and it is removed on every
-    /// path out of this function, the failure path included.
+    /// The temporary is one object with the published name — a hard link names one
+    /// object — and it is removed on every path out of this function, the failure
+    /// path included.
     fn create_at(file: &Path) -> Option<Self> {
         let Some(directory) = file.parent() else {
             // `salt_file` always joins a name onto a directory, so this is the
             // type's contract rather than a host's state.
             return None;
         };
-        // **One directory create per process rather than per call**: the repair
-        // inside it cannot answer differently a second time, and the ledger beside
-        // this asks the same question once per run.
-        if let Err(error) = ensure_state_directory(directory) {
+        // **Nothing is read back and nothing is put back**: the directory is the platform's
+        // own answer from the create onwards, and this call installs no descriptor (the design
+        // spec's two-directory table, and design §6 for the scope that leaves).
+        if let Err(error) = fs::create_dir_all(directory) {
             return degrade(
                 Some(file),
                 "this user's state directory could not be created",
@@ -664,9 +511,7 @@ impl Salt {
         if let Err(error) = getrandom::fill(&mut bytes) {
             return degrade(Some(file), "the CSPRNG refused", &error);
         }
-        let published = publish_private(file, &bytes, "load the ACL salt", |temporary, file| {
-            publish_whole(temporary, file, &bytes)
-        });
+        let published = publish_private(file, &bytes);
         match published {
             Ok(()) => Some(Self { bytes }),
             // **The race's loser reads the winner's value**, which is the state
@@ -693,24 +538,19 @@ impl Salt {
     }
 }
 
-/// [`publish_private`]'s link step for the salt: the private file is created, the
-/// value goes into it, and the name is published — **in the order that makes the
-/// salt's name appear with its value already in it**.
+/// [`publish_private`]'s link step: the file is created, the value goes into it, and the
+/// name is published — **in the order that makes the salt's name appear with its value
+/// already in it**.
 ///
-/// The handle is closed before the link, so the two names never name an object
-/// another handle is still writing through; the value is on disk by then and the
-/// link is what publishes it.
-fn publish_whole(temporary: &Path, file: &Path, bytes: &[u8]) -> io::Result<()> {
-    // **`create_restricted` is what makes the file private from its first
-    // instant** — the descriptor travels in the create call, so the file never
-    // exists under the state directory's inherited ACL, and `CREATE_NEW` refuses a
-    // name that appeared between the check and the call. Measured on this host
-    // 2026-09-28: the published file carries one access-allowed entry, the current
-    // user's own SID at `0x001F01FF` with no inherited copy, and its control word is
-    // `0x9004` — `SE_DACL_PRESENT | SE_DACL_PROTECTED | SE_SELF_RELATIVE` —
-    // (`crate::acl`'s `the_salt_file_is_current_user_only_and_inherits_nothing` is
-    // the leg, and that module's own reader is what the descriptor is read with).
-    let mut handle = tinio_winsec::create_restricted(temporary)?;
+/// The handle is closed before the link, so the two names never name an object another
+/// handle is still writing through; the value is on disk by then and the link is what
+/// publishes it.
+fn write_and_link(temporary: &Path, file: &Path, bytes: &[u8]) -> io::Result<()> {
+    // **The workspace's one secret-file create**: `create_new` refuses a name that
+    // appeared between the check and the call, and the file takes what the state
+    // directory gives it — which is what `%LOCALAPPDATA%` gave the directory, and
+    // what the design spec records as the salt's whole defence.
+    let mut handle = create_new_private(temporary)?;
     handle.write_all(bytes)?;
     drop(handle);
     fs::hard_link(temporary, file)
@@ -728,8 +568,8 @@ fn salt_file() -> Option<PathBuf> {
 
 /// The state-directory path a test points the reader at, so a leg can drive the
 /// whole create/read cycle on a temporary directory instead of the operator's own
-/// state directory — **the seam both the salt and [`crate::ledger`] read**, since
-/// the two files it resolves are one directory's.
+/// state directory — **the seam the salt reads**, since what it resolves is one
+/// directory's.
 ///
 /// **A thread-local, the shape `acl`'s `opens`/`overlap` seams take**, and it
 /// exists because the product path resolves the path itself: the alternative was a
@@ -1327,13 +1167,17 @@ impl PackageSid {
     /// under**, which is the derivation's own name for the served root and not a
     /// second reading of it.
     ///
-    /// It is what the ACL grant ledger (`crate::ledger`) carries beside the SID:
-    /// an operator
-    /// greps the profile in the shell's package list by this name, and the
-    /// `S-1-15-2-…` string is what an ACE renders. **Nothing here re-derives it**:
+    /// An operator greps the profile in the shell's package list by this name, and
+    /// the `S-1-15-2-…` string is what an ACE renders. **Nothing here re-derives it**:
     /// a second call to [`package_name`] would read the salt file again and could
     /// answer with a different name than this value's profile exists under, which
     /// is the one thing the takeover rule (decision 21) cannot survive.
+    ///
+    /// **The accessor is kept although no in-tree caller takes it**, and the ruling is
+    /// recorded rather than re-derived: it is the type's public half for an operator-facing
+    /// reader — the profile a run holds has a name, and the one way to spell it without
+    /// re-deriving is here — so it stays beside [`as_str`](Self::as_str) rather than being
+    /// removed with its last caller.
     ///
     /// # Examples
     ///
@@ -1704,7 +1548,6 @@ mod tests {
         fs,
         os::windows::ffi::OsStringExt,
         path::{Path, PathBuf},
-        process::Command,
         sync::{Arc, Barrier, mpsc},
         thread,
         time::Duration,
@@ -1713,11 +1556,7 @@ mod tests {
     use tinio_util::testing::{assert_recorded_at, assert_step};
 
     use super::*;
-    use crate::{
-        _core::Error,
-        acl::{grant_everyone_read, icacls_binary},
-        testing::{capture, recorder},
-    };
+    use crate::testing::{capture, recorder};
 
     /// How many runs the creation race is opened with. **Eight rather than two**,
     /// because the window a loser reads in is the winner's create-to-link interval:
@@ -2068,119 +1907,6 @@ mod tests {
             b"not a salt, only sixteen".len(),
             "a file that is not a salt is left as it was found"
         );
-    }
-
-    /// **A salt file that is not this user's alone is refused rather than used** —
-    /// the plant an account with access to the state directory can make before this
-    /// crate's first run, and the degradation [`Salt::from_bytes_at`] warns about.
-    ///
-    /// It would fail without the descriptor read-back: a run that trusted a file it
-    /// found would derive every name — and so the ACEs of every grant it leaves —
-    /// under a value the account that planted it already knows, which is exactly the
-    /// pre-computation the salt exists to close. The foreign trustee is granted
-    /// through `icacls` rather than left to whatever this machine's `%TEMP%` passes
-    /// down, so the leg is about the refusal on any host. **The other half is
-    /// asserted with it**: the refused value is not used at all — the name is the
-    /// unsalted one — and the planted file is left exactly as it was found, because
-    /// this path never writes over a file that is not this user's alone.
-    #[test]
-    fn a_salt_file_that_is_not_this_users_alone_is_refused_rather_than_used() {
-        let _serial = recorder();
-        let directory = tempfile::tempdir().expect("temp dir");
-        let file = directory.path().join("acl-salt");
-        let planted = [0x11u8; SALT_BYTES];
-        fs::write(&file, planted).expect("plant a salt");
-        let granted = Command::new(icacls_binary())
-            .arg(&file)
-            .args(["/grant", "*S-1-1-0:(R)"])
-            .output()
-            .expect("run icacls");
-        assert!(
-            granted.status.success(),
-            "icacls /grant on {}: {}",
-            file.display(),
-            String::from_utf8_lossy(&granted.stdout)
-        );
-        assert!(
-            !tinio_winsec::acl_is_current_user_only(&file).expect("read the DACL back"),
-            "the planted salt is already this user's alone, so this leg would prove \
-             nothing"
-        );
-        let root = Path::new(r"E:\srv\tinio");
-
-        let capture = capture();
-        let recording = capture.record();
-        let name = test_path::with(&file, || package_name(root));
-        let logged = capture.text();
-        drop(recording);
-
-        assert_eq!(
-            name,
-            package_name_unsalted(root),
-            "the run derived a name under a value an account it cannot trust planted"
-        );
-        assert_ne!(
-            name,
-            package_name_with(root, &Salt::from_bytes(planted)),
-            "the planted bytes decided the name after all"
-        );
-        assert_step(&logged, "load the ACL salt");
-        assert_recorded_at(&logged, "is not this user's alone", tracing::Level::WARN);
-        assert_eq!(
-            fs::read(&file).expect("the file is still there"),
-            planted,
-            "a file that is not this user's alone is left as it was found"
-        );
-    }
-
-    /// **The state directory's own descriptor is made intentional rather than
-    /// inherited** — the part of the 2026-09-28 review's finding that is about the
-    /// directory the two files live in, and the plant vector it closes: an account
-    /// that the inherited descriptor reaches can *create* a file in the directory,
-    /// which is how a salt or a ledger is planted before this crate's first run.
-    ///
-    /// It would fail if the directory were only created and never put back: on this
-    /// host `%LOCALAPPDATA%\tinio` carries the operator's group at `(I)(OI)(CI)(M)`
-    /// beside SYSTEM and Administrators, and the copy made by a plain
-    /// `fs::create_dir_all` inherits the same grants. **The second half is the one
-    /// the repair could break and therefore the one worth pinning**: re-describing a
-    /// container propagates over its children, so a file that carries
-    /// `create_restricted`'s `SE_DACL_PROTECTED` descriptor has to survive it —
-    /// which is what lets the salt's first use run before the directory is put back.
-    #[test]
-    fn the_state_directory_is_put_back_to_the_current_user() {
-        let parent = tempfile::tempdir().expect("temp dir");
-        let state = parent.path().join("tinio");
-        fs::create_dir_all(&state).expect("create the directory under the temp grants");
-        grant_everyone_read(&state);
-        assert!(
-            !tinio_winsec::acl_is_current_user_only(&state).expect("read the DACL back"),
-            "the directory is already this user's alone, so this leg would prove nothing"
-        );
-        // The child a repair must not break: the salt, as `create_restricted` makes
-        // it, created while the directory still carries the foreign entry.
-        let salt = state.join("acl-salt");
-        drop(tinio_winsec::create_restricted(&salt).expect("the salt file"));
-
-        create_state_directory(&state).expect("the repair reports nothing");
-        assert!(
-            tinio_winsec::acl_is_current_user_only(&state).expect("read the DACL back"),
-            "the directory kept a descriptor another account is named in"
-        );
-        assert!(
-            tinio_winsec::acl_is_current_user_only(&salt).expect("read the DACL back"),
-            "the repair's propagation reached a child that carries a protected \
-             descriptor, so the salt would be lost by it"
-        );
-
-        // **Idempotent**: the steady state is one read and no write, so the call a
-        // first run makes on every launch after it costs nothing.
-        create_state_directory(&state).expect("the steady state reports nothing");
-        assert!(tinio_winsec::acl_is_current_user_only(&state).expect("read the DACL back"));
-        // And a directory this call *creates* is private from its first instant.
-        let fresh = parent.path().join("fresh");
-        create_state_directory(&fresh).expect("the directory is created");
-        assert!(tinio_winsec::acl_is_current_user_only(&fresh).expect("read the DACL back"));
     }
 
     #[test]

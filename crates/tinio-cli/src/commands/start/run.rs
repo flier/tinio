@@ -368,10 +368,10 @@ pub fn run(
         // which is this process's answer. The launcher stops here: it builds no runtime.
         //
         // **The teardown is where this launcher's `state` file comes back out, and where its
-        // signal relay is disarmed.** The launcher platforms published the file — the child cannot
-        // on Windows, whose DACL is current-user-only and whose container identity is the package
-        // SID, and on macOS the token is the launcher's because it is the process that publishes
-        // it — and `supervise`'s callback is the contract's own home for "removing a path the
+        // signal relay is disarmed.** The launcher publishes the file — the token is the
+        // publishing process's, and the file has to name the launcher, whose pid the readiness
+        // check and the removal guard both compare — and `supervise`'s callback is the contract's
+        // own home for "removing a path the
         // launcher created". It runs before this function reads the status, so a launcher never
         // exits leaving the file behind, and it is guarded by the pid the file names (see
         // `remove_launcher_state`), so a successor's file is never taken.
@@ -553,13 +553,12 @@ where
         gauges: Some(gauges),          // 404 on `/metrics` without it
         // **The launcher's token, when this process was launched by one** (design decision 17's
         // private channel, extended to the one secret the two processes share). The launcher
-        // generated it *and* published `state` with it, and **the launcher platforms reach that
-        // answer by different routes**. On Windows the cause is the file's DACL: current-user-only
-        // and protected, so this process — inside the container, with the package SID as its
-        // identity — could not write it. **On macOS nothing refuses the write**, and the cause is
-        // ownership instead: `state` must name the launcher, whose `--daemon` readiness check
-        // compares the file's pid against the pid it spawned and whose `Plane::shutdown` removal
-        // guard expects itself, and the token is minted by the process that publishes.
+        // generated it *and* published `state` with it, and **the reason is ownership on every
+        // platform**: `state` must name the launcher, whose `--daemon` readiness check compares
+        // the file's pid against the pid it spawned and whose `Plane::shutdown` removal guard
+        // expects itself, and the token is minted by the process that publishes. That ownership
+        // is the whole reason now — no descriptor keeps this process out of the file
+        // (`docs/superpowers/specs/2026-10-15-windows-file-dacl-removal-design.md`).
         // `platform_facts` and `serve::Spec` are that reason's home, as they are for the channel
         // handoff below. Either way a plane here that minted its own token would refuse every
         // client that read that file: `/status` and `/stop` would answer 401 for a server that is
@@ -568,9 +567,11 @@ where
         token: adopted.and_then(|adopted| adopted.token().map(str::to_owned)),
     };
     // **A launcher already bound the control channel, and this process serves on what it
-    // inherited** (`Adopted::controls`). Windows' reason is identity: the channel's pipes carry a
-    // current-user-only DACL, and inside the container this process's identity is the package SID,
-    // so `CreateNamedPipeW` here would be refused `ERROR_ACCESS_DENIED` — which `bind_pipe` reports
+    // inherited** (`Adopted::controls`). Windows' reason is identity: the launcher's pipes carry
+    // Windows' own default named-pipe descriptor rather than anything naming the package SID, and
+    // inside the container
+    // this process's identity *is* the package SID, so `CreateNamedPipeW` here would be refused
+    // `ERROR_ACCESS_DENIED` — which `bind_pipe` reports
     // as "another server is already listening", a message about a second server for a channel no
     // one could create. macOS' reason is the profile: the confined child's unix `bind()` is a
     // network operation the profile grants nothing for, so `bind_unix` here would be refused
@@ -708,7 +709,7 @@ const CONTROL_CHANNEL: &str = "control";
 /// A confined child that cannot open what it inherited (or, with no local channel in the
 /// selection, what it must bind itself) is refused by its confinement rather than by the plane:
 /// the launcher hands the channel over precisely because a process inside the container cannot
-/// create a pipe whose DACL names the user, and the child that tries anyway is answered
+/// create the pipe at all (`CreateNamedPipeW` is refused there), and the child that tries anyway is answered
 /// `ERROR_ACCESS_DENIED` — which arrives here as an io failure and would otherwise read as
 /// "I/O error: Access is denied" with nothing naming the channel.
 ///
@@ -798,11 +799,11 @@ fn launcher_exit(status: ExitStatus, child: &Child) -> (Option<String>, u8) {
 /// best-effort on the way out.
 ///
 /// **The file is the launcher's, and this is the launcher's half of that ruling** — the Windows
-/// confinement arm's `confine_or_launch` is the other half. A confined child cannot create,
-/// write or remove it: the DACL is current-user-only and `SE_DACL_PROTECTED`, and inside the
-/// container the child's identity is the package SID, so every path-based access it makes to the
-/// file is refused. The unconfined launcher therefore creates it once the child reports it is
-/// listening, and takes it back here, before the child's status is this process's answer.
+/// confinement arm's `confine_or_launch` is the other half. The launcher is the process that
+/// publishes the token and the pid the file names, so it is the one that creates and takes the
+/// file back. **Ownership is the whole rule** — no descriptor keeps the confined child out of the
+/// file (`docs/superpowers/specs/2026-10-15-windows-file-dacl-removal-design.md`), so the
+/// arrangement is the one the launch already had.
 ///
 /// **The guard is the pid the file names, which is this process's own.** `State::new` writes
 /// `process::id()`, and the launcher builds the file on its own side of the launch, so "the file

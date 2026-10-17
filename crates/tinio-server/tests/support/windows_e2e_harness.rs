@@ -443,40 +443,14 @@ impl Exit {
     }
 }
 
-/// The SID of the account this process runs as — `whoami`'s own answer, in the
-/// `S-1-5-…` form [`acl::grant_spec`] takes.
+/// **This process's own SID, in the `S-1-5-…` form [`acl::grant_spec`] takes** — the
+/// harness's one copy, re-exported from the sandbox crate's own testing module: the
+/// confinement legs seal their tree the same way, and the two copies drifted.
 ///
-/// **A SID and not a name, because a name is resolved.** `icacls` takes a
-/// `*`-prefixed SID literally and resolves every other spelling against the local
-/// (or domain) account database, so a name another principal happens to share would
-/// grant the wrong account — the rule [`acl::grant_spec`]'s own doc states from the
-/// crate's side, which is why this leg's fixture asks for a SID.
-///
-/// `/fo csv /nh` is `whoami`'s machine-parsable form: one record, no header, every
-/// field quoted and `,`-separated, the SID last. A refusal is the fixture's, so it
-/// fails with the tool's text.
-pub fn current_user_sid() -> String {
-    let mut command = Command::new("whoami");
-    command.args(["/user", "/fo", "csv", "/nh"]);
-    let output = job::output(&mut command).expect("run whoami");
-    assert!(
-        output.status.success(),
-        "whoami: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let text = String::from_utf8_lossy(&output.stdout);
-    let sid = text
-        .trim()
-        .rsplit("\",\"")
-        .next()
-        .map(|field| field.trim_matches('"').to_string())
-        .unwrap_or_default();
-    assert!(
-        sid.starts_with("S-1-5-"),
-        "whoami answered no SID this leg can grant: {text:?}"
-    );
-    sid
-}
+/// A SID and not a name, for [`acl::grant_spec`]'s reason: `icacls` takes a `*`-prefixed
+/// SID literally and resolves every other spelling against the account database, so a name
+/// another principal happens to share would grant the wrong account.
+pub use tinio_sandbox::windows::testing::current_user_sid;
 
 /// **`dir` and everything under it grant this process's own user alone** — the
 /// fixture a leg needs when the subject is a path a *confined child* cannot reach.

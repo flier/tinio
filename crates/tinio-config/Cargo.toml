@@ -27,9 +27,7 @@ tinio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-tinio-winsec.workspace = true
+tinio-util = { workspace = true, features = ["testing"] }
 
 [package.metadata.cargo-machete]
 # false positive: used via serde `with = "humantime_serde"` attributes (scanner.rs)

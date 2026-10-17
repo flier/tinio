@@ -412,15 +412,14 @@ where
         tokio::spawn(storage.background(stop.clone(), access, sweep_options_for(&resolution)));
 
     #[cfg(feature = "api")]
-    // **A launched child never writes `state`.** Its launcher does, and the two launcher
-    // platforms reach that answer by different routes. On Windows the cause is the file's
-    // DACL: current-user-only and protected, so this process — inside the container, with the
-    // package SID as its identity — is refused every path-based access to it. On macOS nothing
-    // refuses the write, and the cause is ownership instead: `state` must name the launcher,
-    // whose `--daemon` readiness check compares the file's pid against the pid it spawned and
-    // whose `Plane::shutdown` removal guard expects itself, and the launch token is minted by
-    // the publisher — the macOS arm's own module doc is that reason's home
-    // (`crate::sandbox::macos`). Either way the launcher publishes the file once *this* process
+    // **A launched child never writes `state`.** Its launcher does, and the reason is the same on
+    // every platform: `state` must name the launcher — whose `--daemon` readiness check compares
+    // the file's pid against the pid it spawned, and whose `Plane::shutdown` removal guard expects
+    // itself — and the launch token is minted by the publisher, which is the launcher
+    // (`crate::sandbox::macos`'s module doc is that reason's home). Ownership is the whole reason
+    // now: no descriptor keeps this process out of the file
+    // (`docs/superpowers/specs/2026-10-15-windows-file-dacl-removal-design.md`). Either way the
+    // launcher publishes the file once *this* process
     // reports it is listening. The skip is not a degradation: the file exists by the time any
     // client can act on the readiness event this line is part of. `adopted.is_none()` is every
     // process that owns its own `state`, which is every unconfined run and every in-place

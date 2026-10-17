@@ -5,20 +5,15 @@
 //! mode it is the relocated home directory, which is exactly where an earlier read-only run
 //! auto-created the file.
 
-#[cfg(not(windows))]
-use std::fs::OpenOptions;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
 };
 
-#[cfg(windows)]
-use crate::_winsec::{create_restricted, restrict_to_current_user as restrict_file};
 use crate::{
-    _util::path::contains_under_any_spelling, Config, Error, credentials, error,
+    _util::{fsutil::create_new_private, path::contains_under_any_spelling},
+    Config, Error, credentials, error,
     state::BASE_DIR_NAME,
 };
 
@@ -154,94 +149,39 @@ pub fn load_or_create(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| error::io(parent, err))?;
     }
-    let mut file = create_private(path)?;
+    // **The create is the whole of the file's protection**: unix's mode is the open call's own
+    // argument; Windows installs no descriptor and takes what the directory gives it. Both arms
+    // refuse an existing path (`create_new`), so nothing here can adopt a file that appeared
+    // between the `is_file` test above and this call (`contracts/config.md` holds both platforms'
+    // clause).
+    let mut file = create_new_private(path).map_err(|err| error::io(path, err))?;
     file.write_all(text.as_bytes())
         .map_err(|err| error::io(path, err))?;
-    #[cfg(windows)]
-    restrict_or_remove(path, restrict_to_current_user)?;
     Ok((config, Outcome::Created(text)))
-}
-
-/// Creates `path` — which must not exist yet — with the created config's protection applied **at
-/// creation**, and hands back the write handle.
-///
-/// Two platforms, two mechanisms, one promise. On unix the promise is the open call's own
-/// argument (`OpenOptions::mode`): the file never exists with a mode wider than `0o600`. On
-/// Windows it is `tinio_winsec::create_restricted`: the DACL is attached when the file is
-/// created, because Windows decides access when a handle is **opened** — a file that existed
-/// under its directory's inherited grants for even a moment could be opened by a reader that
-/// keeps the handle's access, and this file holds the credentials. `restrict_or_remove` still
-/// runs after the write as the re-assertion.
-///
-/// Both arms refuse an existing path (`create_new` / `CREATE_NEW`), so nothing here can adopt a
-/// file that appeared between the `is_file` test above and this call.
-fn create_private(path: &Path) -> Result<fs::File, Error> {
-    #[cfg(windows)]
-    {
-        create_restricted(path).map_err(|err| error::io(path, err))
-    }
-    #[cfg(not(windows))]
-    {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        options.open(path).map_err(|err| error::io(path, err))
-    }
-}
-
-/// Runs the Windows re-assertion after the create and **removes the file when it fails**.
-///
-/// The DACL already travelled in `tinio_winsec::create_restricted`, and this call is what refuses
-/// a descriptor that did not take — the same second line the management plane's state write runs
-/// before its first byte.
-///
-/// **A file whose restriction failed must not survive the run.** It holds the complete `[auth]`
-/// pair, and under the directory's inherited grants every account the parent grants can read it;
-/// leaving it behind would also make the exposure *persist*, because the next run finds the file,
-/// parses it and answers [`Outcome::Loaded`] — the pair would be served out of a file nothing ever
-/// narrows again. The removal is best-effort: the caller is answered the failure that explains why
-/// the config was not published, never a second one from the cleanup.
-///
-/// `restrict` is a parameter so a unit leg can drive the failure branch — `SetNamedSecurityInfoW`
-/// cannot be made to fail on a file this process owns (an owner may always write its own DACL), so
-/// the branch has no other way to be reached. The production call site passes
-/// [`restrict_to_current_user`].
-#[cfg(windows)]
-fn restrict_to_current_user(path: &Path) -> Result<(), Error> {
-    restrict_file(path).map_err(|err| error::io(path, err))
-}
-
-#[cfg(windows)]
-fn restrict_or_remove(
-    path: &Path,
-    restrict: impl FnOnce(&Path) -> Result<(), Error>,
-) -> Result<(), Error> {
-    match restrict(path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = fs::remove_file(path);
-            Err(err)
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(windows)]
+    use std::fs::OpenOptions;
     #[cfg(unix)]
     use std::fs::canonicalize;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt as _, symlink};
+    #[cfg(windows)]
+    use std::process::Command;
 
     use secrecy::ExposeSecret;
     use tempfile::TempDir;
 
     use super::*;
+    #[cfg(windows)]
+    use crate::_util::job;
     #[cfg(unix)]
     use crate::_util::path::path_contains;
     #[cfg(windows)]
-    use crate::_winsec::acl_is_current_user_only;
+    use crate::_util::win32::system_directory;
 
     /// Seeds `<dir>/<rel>`, parents included, and returns the path.
     fn seeded(dir: &Path, rel: &str) -> PathBuf {
@@ -314,40 +254,6 @@ mod tests {
             resolve_path(root.path(), state.path(), Some(&explicit)).expect("resolve"),
             explicit
         );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn a_restriction_that_fails_takes_the_file_with_it() {
-        // The other half of the create path: a config whose post-create restriction failed must
-        // not survive the run. It holds the complete `[auth]` pair under whatever the directory
-        // grants, and a later run would find it, parse it and answer `Outcome::Loaded` — so the
-        // exposure would persist rather than end with the failing run.
-        // `SetNamedSecurityInfoW` cannot be made to fail on a file this process owns (an owner may
-        // always write its own DACL), which is why `restrict_or_remove` takes the restriction as a
-        // parameter and this leg drives that seam.
-        let dir = TempDir::new().expect("dir");
-        let path = dir.path().join(CONFIG_FILE);
-        fs::write(&path, "version = 1\n").expect("seed");
-        let err = restrict_or_remove(&path, |_| {
-            Err(Error::InvalidValue {
-                key: "test".into(),
-                reason: "the restriction did not take".into(),
-            })
-        })
-        .expect_err("the failure is reported rather than swallowed");
-        assert!(format!("{err}").contains("did not take"), "{err}");
-        assert!(
-            !path.exists(),
-            "a config whose restriction failed must not be left on disk"
-        );
-
-        // And the production pair, on a file that is there: the restriction takes and the file
-        // stays, which is what every ordinary first start does.
-        let kept = dir.path().join("kept.toml");
-        fs::write(&kept, "version = 1\n").expect("seed");
-        restrict_or_remove(&kept, restrict_to_current_user).expect("the restriction took");
-        assert!(kept.exists(), "a restricted config is kept");
     }
 
     #[test]
@@ -601,30 +507,72 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600, "it holds the credentials");
     }
 
+    /// **The Windows config's portable property, asserted where the descriptor used to be**: the
+    /// create makes a real file, a reader and a writer both reach it, and the descriptor it
+    /// carries is not the single-ACE protected shape this module used to install.
+    ///
+    /// **What is asserted is the absence of that shape and never the presence of an entry.** A
+    /// plain create takes its directory's inherited ACEs, falling back to the creating token's
+    /// default DACL (on this host the user, `SYSTEM` and a logon-session SID) only when it inherits
+    /// nothing — one or the other, never both — and both halves are the host's, so a leg naming any
+    /// of those entries would redden on a machine configured differently. The old shape is
+    /// unambiguous beside it: **one entry, the calling user at full
+    /// control, nothing inherited**, which is a protected single-ACE DACL and which this leg would
+    /// have failed on before the removal.
     #[cfg(windows)]
     #[test]
-    fn the_created_config_is_private_on_windows() {
-        // A second account's absence cannot be tested from a single-account runner, so the
-        // read-back answers whether every ACE is the current user's full control and nothing
-        // is inherited.
+    fn the_created_config_opens_for_read_and_for_write() {
         let root = TempDir::new().expect("root");
         let state = TempDir::new().expect("state");
         let path = resolve_path(root.path(), state.path(), None).expect("resolve");
         load_or_create(root.path(), &path, false).expect("create");
-        assert!(
-            acl_is_current_user_only(&path).expect("DACL"),
-            "only the current user, full control, nothing inherited"
-        );
 
-        // And the create-time form alone, with no path-form call after it: the descriptor
-        // travels in the create, so this is the leg that would fail if the create silently
-        // kept the directory's inherited grants — which the run above cannot show, because its
-        // re-assertion would have narrowed the DACL either way.
-        let direct = state.path().join("direct.toml");
-        let _file = create_restricted(&direct).expect("created with the descriptor");
+        assert!(path.is_file(), "a first start creates a file");
+
+        // A fresh handle each: this is the property the deleted descriptor leg stood in for,
+        // restated as what a reader and a writer of this file actually need.
+        fs::File::open(&path).expect("a fresh read handle opens the config");
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("a fresh write handle opens the config");
+
+        let entries = acl_entries(&path);
         assert!(
-            acl_is_current_user_only(&direct).expect("DACL"),
-            "the file exists with the current user's ACE and nothing inherited"
+            !(entries.len() == 1 && entries[0].contains("(F)") && !entries[0].contains("(I)")),
+            "the created config carries the protected single-entry descriptor this module used \
+             to install — one entry, the calling user at full control, nothing inherited: \
+             {entries:?}"
         );
+    }
+
+    /// The ACE lines `icacls` renders for `path` — **the crate's only descriptor oracle now that
+    /// the create installs none**, and an independent one rather than a reader this crate wrote.
+    ///
+    /// The tool is resolved from the system directory rather than from `PATH`, through the
+    /// workspace's one definer ([`tinio_util::win32::system_directory`], which asks the kernel):
+    /// a test answered by a different binary than the one Windows ships would be asserting a
+    /// host's environment rather than this crate.
+    #[cfg(windows)]
+    fn acl_entries(path: &Path) -> Vec<String> {
+        let mut command = Command::new(system_directory().join("icacls.exe"));
+        command.arg(path);
+        let listing = job::output(&mut command).expect("run icacls");
+        assert!(
+            listing.status.success(),
+            "icacls on {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&listing.stderr)
+        );
+        // The tool prints the path beside the first entry, then one entry per line, then its own
+        // counted footer. Every entry line carries the rights in parentheses — `:(F)`, `:(I)(F)`,
+        // `:(I)(OI)(CI)(M)` — the path's own `:` is never followed by one, and the footer carries
+        // the count in the console's language rather than in this crate's, so the filter is the
+        // entry's own shape rather than a line the tool might spell differently on a host.
+        String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .filter(|line| line.contains(":("))
+            .map(|line| line.trim().to_string())
+            .collect()
     }
 }

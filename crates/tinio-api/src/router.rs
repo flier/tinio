@@ -81,8 +81,10 @@ pub enum Auth {
     /// group- or world-connectable between `bind(2)` and that `chmod` — and a client that
     /// connected inside that window keeps the connection, because the mode is checked at connect
     /// and not per request. The state directory is expected to be private, which is what keeps
-    /// the window unreachable in practice. Windows carries no such window: `dacl::create_pipe`
-    /// installs the pipe's DACL at creation.
+    /// the window unreachable in practice. Windows carries no such window: `pipe::create_pipe`
+    /// installs no descriptor at all, so the pipe carries Windows' own default named-pipe
+    /// descriptor from the instant it exists — the platform's own answer rather than one this
+    /// crate narrows later — and what guards `/status` and `/stop` there is the access token.
     Local,
     /// A TCP transport bound to a loopback address: `/metrics` alone is open, because a
     /// scraper cannot send a custom header; everything else — `/status`, `/stop`,

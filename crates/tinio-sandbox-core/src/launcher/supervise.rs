@@ -29,7 +29,7 @@ use crate::{Attribution, error::Result, launcher::Terminal};
 /// **That answer is final only once the child is gone, and one caller cannot wait
 /// that long.** A launcher that has to *act* the moment its child becomes ready —
 /// the Windows launcher publishes the child's `state` then, because the file's
-/// DACL is current-user-only and the confined child cannot write it — needs the
+/// token and pid are the publisher's — needs the
 /// announcement while the child is still serving. [`Self::with_ready`] carries the
 /// mid-stream half: the same first terminal event, sent once by the relay's
 /// `Observer` as it records it, read by [`Self::wait_for_ready`]. Two channels
@@ -478,9 +478,8 @@ impl Child {
     /// reason it is not [`Self::wait`] plus [`Self::terminal`]: the record is final
     /// only after the relay has been joined, which happens when the child is gone.
     /// `Some(Terminal::Listening(addr))` is the child saying its listener is up —
-    /// the moment a Windows launcher publishes the child's `state`, because the
-    /// file's DACL is current-user-only and the confined child cannot write it
-    /// itself.
+    /// the moment a Windows launcher publishes the child's `state`, whose token and
+    /// pid are the publishing process's.
     ///
     /// **A child that dies without reporting does not hold this call for the whole
     /// bound.** The relay's sender is dropped with the relay's `Observer`, so the
@@ -844,8 +843,11 @@ mod tests {
     fn lingering() -> Child {
         #[cfg(windows)]
         let script = "ping -n 60 127.0.0.1 > NUL";
+        // `exec` so the shell *is* the sleeper: the kill below reaches the process the test
+        // spawned, and no forked `sleep` outlives it (nextest reports such a survivor as a
+        // leak, and a fixture that leaks is not testing what it says it is).
         #[cfg(not(windows))]
-        let script = "sleep 60";
+        let script = "exec sleep 60";
         let process = exiting(script)
             .stdin(Stdio::piped())
             .spawn()

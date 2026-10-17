@@ -159,6 +159,42 @@ pub fn icacls(path: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+/// This process's own SID, in the `S-1-5-…` form [`acl::grant_spec`] takes —
+/// `whoami`'s machine-parsable answer (`/fo csv /nh`: one record, no header, the SID last).
+///
+/// **A SID and not a name**, because `icacls` takes a `*`-prefixed SID literally and resolves
+/// every other spelling against the account database: a name another principal happens to share
+/// would seal or grant the wrong account. **One copy for every suite that needs it** — the
+/// confinement legs and the server's Windows harness both seal a fixture to the calling user,
+/// and the two copies that stood in those files drifted.
+///
+/// The spawn goes through [`job::output`], the rule every harness spawn site takes
+/// (`docs/tests.md` §Harness & guards). A `whoami` that cannot run is the fixture's own
+/// failure, so it fails with the tool's text rather than leaving an assertion to discover the
+/// missing seal.
+pub fn current_user_sid() -> String {
+    let mut command = Command::new("whoami");
+    command.args(["/user", "/fo", "csv", "/nh"]);
+    let output = job::output(&mut command).expect("run whoami");
+    assert!(
+        output.status.success(),
+        "whoami: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let sid = text
+        .trim()
+        .rsplit("\",\"")
+        .next()
+        .map(|field| field.trim_matches('"').to_string())
+        .unwrap_or_default();
+    assert!(
+        sid.starts_with("S-1-5-"),
+        "whoami answered no SID this leg can seal with: {text:?}"
+    );
+    sid
+}
+
 /// `<link>` as a directory junction onto `target`, through `cmd`'s `mklink /J`.
 ///
 /// **A junction and not a symlink.** `mklink /D` needs
@@ -259,6 +295,17 @@ pub struct Tree {
     pub denied: PathBuf,
     /// A directory exposed read-write, where the child writes its report.
     pub report: PathBuf,
+    /// **Files the child is asked to read, one report line each** — empty for every
+    /// leg that does not ask.
+    ///
+    /// The seam the grant-reach legs use, and it exists because a *listing* of a
+    /// granted directory cannot answer the question they ask: whether the launcher's
+    /// ACEs reached a file inside it is answered by the process that holds the package
+    /// SID trying to open the file, and a DACL read from outside cannot tell a
+    /// propagated entry from an inherited one. Each path earns one line —
+    /// `<file name>: OK` or `<file name>: refused (<kind>)` — beside the lines the
+    /// role already writes.
+    pub reads: Vec<PathBuf>,
     /// The address the child should try to reach, when a test sets one. It
     /// travels in the probe file, so the confined child needs no environment
     /// channel to learn it.
@@ -279,6 +326,7 @@ impl Tree {
             root: path.join("root"),
             denied: path.join("denied"),
             report: path.join("report"),
+            reads: Vec::new(),
             path: path.to_path_buf(),
             target: None,
         }
@@ -292,6 +340,11 @@ impl Tree {
             self.denied.display(),
             self.report.join("report.txt").display()
         );
+        // One `read=` per path, in the caller's order: the role reads them in the same
+        // order, and the report lines carry each file's own name.
+        for path in &self.reads {
+            text.push_str(&format!("read={}\n", path.display()));
+        }
         if let Some(target) = self.target {
             text.push_str(&format!("target={target}\n"));
         }
@@ -636,7 +689,7 @@ pub struct Run {
 /// using with it — `DeleteAppContainerProfile` answers an already-gone profile with `S_OK`
 /// (measured 2026-09-21), and what is left is a live `PackageSid` whose profile no longer
 /// exists, which cannot launch (decision 21's 2026-09-19 measurement). Callers that need the
-/// SID for the length of a test therefore derive it once and hold the value; `acl.rs`'s tests
+/// SID for the length of a test therefore derive it once and hold the value; the `acl` directory's tests
 /// are the ones that made this a rule.
 pub fn sid_for(root: &Path) -> sid::PackageSid {
     sid::PackageSid::derive(&sid::package_name(root)).expect("derive the package SID")
@@ -852,6 +905,20 @@ pub fn child_role_body(config: &str, listener: TcpListener) {
     match fs::write(root.join("written.txt"), b"nope") {
         Ok(()) => log.push_str("root-write: ALLOWED\n"),
         Err(err) => log.push_str(&format!("root-write: refused ({})\n", err.kind())),
+    }
+    // **Every file the probe asked for, one line each, and this process is the reader
+    // that matters**: its identity inside the container is the package SID, so whether it
+    // opens a path is the answer a DACL listing cannot give. The line names the file, so a
+    // leg asserts on the name it asked for rather than on a position.
+    for path in probe.lines().filter_map(|line| line.strip_prefix("read=")) {
+        let name = Path::new(path).file_name().map_or_else(
+            || path.to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        match fs::read_to_string(path) {
+            Ok(_) => log.push_str(&format!("{name}: OK\n")),
+            Err(err) => log.push_str(&format!("{name}: refused ({})\n", err.kind())),
+        }
     }
     append_to_report(&report, log.trim_end());
 
@@ -1154,7 +1221,7 @@ pub mod low_integrity {
         ptr,
     };
 
-    use tinio_winsec::to_wide;
+    use tinio_util::wide::to_wide;
     use windows_sys::Win32::{
         Foundation::{HANDLE, WAIT_OBJECT_0},
         Security::{
@@ -1544,10 +1611,11 @@ mod tests {
         time::Duration,
     };
 
-    use super::*;
     // Two segments, so `absolute_paths` is not provoked by the Low-integrity leg's path to
     // the system directory; the module's own `use` above does not carry it.
-    use crate::handles;
+    use tinio_util::win32::system_directory;
+
+    use super::*;
 
     /// The confined child's role, as this binary's libtest entry point.
     ///
@@ -1657,14 +1725,14 @@ mod tests {
     /// **Nothing here parses an absolute path and nothing quotes one.** The target
     /// is the bare name `probe.txt` relative to the child's working directory, so
     /// cmd's redirection cannot be split by a space in the path — and the system
-    /// directory is asked for through `handles::system_directory` (the kernel's own
+    /// directory is asked for through `tinio_util::win32::system_directory` (the kernel's own
     /// answer) with a backslash join, because cmd rejects its own command line at
     /// the *exit 1* the first assertion reads when that path is spelled with a
     /// forward slash.
     #[test]
     fn a_low_integrity_child_cannot_write_a_medium_directory() {
         let dir = tempfile::tempdir().expect("scratch");
-        let program = handles::system_directory().join("cmd.exe");
+        let program = system_directory().join("cmd.exe");
         let out = low_integrity::run(&program, &["/C", "echo x > probe.txt"], dir.path());
         assert!(
             out.status.code().unwrap_or(-1) != 0,

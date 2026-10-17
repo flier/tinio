@@ -118,7 +118,6 @@ tinio-store-pg = { path = "crates/tinio-store-pg", default-features = false }
 tinio-store-redb = { path = "crates/tinio-store-redb" }
 tinio-util = { path = "crates/tinio-util" }
 tinio-version = { path = "crates/tinio-version" }
-tinio-winsec = { path = "crates/tinio-winsec" }
 
 [patch.crates-io]
 soft-canonicalize = { path = "vendor/soft-canonicalize" }

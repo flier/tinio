@@ -2,8 +2,8 @@
 //! `tinio-server`'s Linux e2e legs.
 //!
 //! **Three of them are this platform's own and live here rather than in
-//! `tinio-util::testing`**: [`requested_model`] and [`host_can_confine`] speak
-//! this crate's [`Mechanism`], and [`unshare_probe`] runs util-linux's
+//! `tinio-util::testing`**: `requested_model` and `host_can_confine` speak
+//! this crate's [`Mechanism`], and `unshare_probe` runs util-linux's
 //! `unshare(1)` against this platform's `/proc` — none of the three can cross to
 //! a shared crate without taking this crate's vocabulary and this platform's
 //! tooling with it. They are here because `tests/jail.rs` and

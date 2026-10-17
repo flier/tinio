@@ -92,7 +92,7 @@
 //! (`docs/cargo.md`'s rule, and the sites list in the sandbox design's decision 14). What is left
 //! here is raw platform API and nothing else in the crate is: the one `pre_exec` registration that
 //! arms the Linux child, and the one `GetCurrentProcess` that puts *this* process in the guard's
-//! job. **The job calls themselves and the handle wrapper moved to [`crate::job_object`]**, which
+//! job. **The job calls themselves and the handle wrapper moved to `crate::job_object`**, which
 //! is the module a production build on Windows compiles; this module is the guard, and it stays
 //! behind its own gate.
 //!

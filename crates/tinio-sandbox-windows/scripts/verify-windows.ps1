@@ -91,7 +91,7 @@ if ($AclCost) {
     # mechanism's per-object cost — which is what the caller's exposures still pay
     # and what this calibration exists for (design §6 and its Risks row,
     # `README.md`'s operator note). A measurement of the launcher's own directory
-    # is `src/backend/tests.rs`'s exposure set and `src/acl.rs`'s sibling-batch
+    # is `src/backend/tests.rs`'s exposure set and `src/acl/grant.rs`'s sibling-batch
     # test, not this mode.
     $sid = 'S-1-15-2-1-2-3'
     $deep = Join-Path (Join-Path $corpus "d$Dirs") "f$Files.bin"

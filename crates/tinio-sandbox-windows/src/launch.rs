@@ -202,8 +202,8 @@ pub fn disarm() -> Result<()> {
 /// arguments.
 ///
 /// `controls` is the inherited control channel's **instances**, for the launch that
-/// carries them: the Windows launcher binds the pipes (only an unrestricted
-/// process may, given the DACL the channel needs) and the child serves on every
+/// carries them: the Windows launcher binds the pipes (only an unconfined
+/// process may — a confined child's `CreateNamedPipeW` is refused) and the child serves on every
 /// handle it inherits. The same element is written once per instance — one prefix,
 /// repeated — so the child's parse is unchanged and only the count differs. An
 /// empty slice is every other launch, and the child's argv is then byte-for-byte
