@@ -7,7 +7,7 @@
 //! its own. Every unsafe block below carries its safety argument.
 //!
 //! **The system directory is not here any more, and that is where it belongs.**
-//! The config crate's DACL test asks the kernel the same question, and a second
+//! The CLI config root's independent DACL test asks the kernel the same question, and a second
 //! copy that read `%SystemRoot%` instead is what moved it: the answer lives in
 //! `tinio-util`'s `win32` module beside the failure sentence, and this module
 //! re-exports it so the old path still resolves.

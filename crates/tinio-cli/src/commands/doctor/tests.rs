@@ -13,18 +13,18 @@ use std::path::PathBuf;
 // re-exporting it would put a foreign `_sandbox::Error` in this crate's public API.
 use super::checks::{HOST_CONFINEMENT, HOST_CONFINEMENT_OK, host_confinement_finding};
 use super::*;
-#[cfg(feature = "pg")]
-use crate::{
-    _config::Config,
-    _util::secret::{Secret, SecretKey},
-    cli::{Discovery, Provenance},
-    resolve::{locate_from, pg},
-};
 use crate::{
     _sandbox,
     _util::testing::assert_send_sync,
     commands::DirArgs,
     report::{Finding, Severity},
+};
+#[cfg(feature = "pg")]
+use crate::{
+    _util::secret::{Secret, SecretKey},
+    cli::{Discovery, Provenance},
+    config::Config,
+    resolve::{locate_from, pg},
 };
 
 impl Args {
@@ -795,7 +795,8 @@ fn resolution(root: &Path, config: &str) -> Resolution {
     Resolution {
         pg_root: None,
         root: root.to_path_buf(),
-        config: crate::_config::Config::parse(config).expect("config"),
+        config: crate::config::Config::parse(config).expect("config"),
+        identity: Default::default(),
         config_text: config.to_owned(),
         config_path: state_dir.join(".tinio.toml"),
         read_only: false,
@@ -1030,6 +1031,7 @@ fn pg_resolution(config_text: &str, read_only: bool) -> crate::resolve::Resoluti
         pg_root: None,
         root: PathBuf::from("/srv/pg"),
         config: Config::parse(config_text).expect("the fixture configuration parses"),
+        identity: Default::default(),
         config_text: config_text.to_owned(),
         config_path: PathBuf::from("/srv/pg/.tinio/.tinio.toml"),
         read_only,
@@ -1236,6 +1238,7 @@ async fn a_pg_run_skips_the_served_root_legs_and_is_green() {
         pg_root: Some(root.clone()),
         root: root.clone(),
         config: Config::default(),
+        identity: Default::default(),
         config_text: String::new(),
         config_path: state_dir.join(".tinio.toml"),
         read_only: false,
@@ -1302,6 +1305,7 @@ async fn a_root_that_is_also_the_state_dir_override_still_runs_the_root_legs() {
         pg_root: None,
         root: root.clone(),
         config: Config::default(),
+        identity: Default::default(),
         config_text: String::new(),
         config_path: root.join(".tinio").join(".tinio.toml"),
         read_only: false,

@@ -14,13 +14,92 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::{_core::object::RESERVED_SEGMENT, Error, error};
+use crate::_core::object::RESERVED_SEGMENT;
 
-/// Length of the derived directory name, in hexadecimal characters.
+/// A state-directory failure: a missing environment fact, an invalid value, or a path in the
+/// layout that could not be resolved or prepared.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_util::state::Error;
+///
+/// let err = Error::Missing("home directory".into());
+/// assert_eq!(err.to_string(), "missing required value: home directory");
+/// ```
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// A required environment fact is absent (the home directory the layout derives under).
+    #[error("missing required value: {0}")]
+    Missing(String),
+    /// A value the state-directory resolution reads is invalid.
+    #[error("invalid value for `{key}`: {reason}")]
+    InvalidValue {
+        /// The offending key (the variable name).
+        key: String,
+        /// Why the value is invalid.
+        reason: String,
+    },
+    /// A path in the state-directory layout could not be resolved or violates a layout rule, so
+    /// the state directory cannot be derived or prepared.
+    #[error("failed to resolve the state directory at `{path}`: {source}")]
+    Root {
+        /// The path the resolution failed at.
+        path: PathBuf,
+        /// The underlying I/O error, or the layout rule the path violates.
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl Error {
+    /// Build an [`Error::InvalidValue`] for a key with a reason.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_util::state::Error;
+    ///
+    /// let err = Error::invalid_value("TINIO_STATE_DIR", "must not be empty");
+    /// assert!(err.to_string().contains("TINIO_STATE_DIR"));
+    /// ```
+    pub fn invalid_value(key: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::InvalidValue {
+            key: key.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// State-directory resolution failure or layout-rule refusal at a path in its layout.
+#[inline]
+fn root(path: impl Into<PathBuf>, source: io::Error) -> Error {
+    Error::Root {
+        path: path.into(),
+        source,
+    }
+}
+
+/// Length of every derived leaf name, in hexadecimal characters.
 const HASH_LEN: usize = 16;
+
+/// The first `HASH_LEN` hex characters of SHA-256 over `data` — the leaf-name width shared by
+/// the home state tree and the pg synthetic root.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_util::state::short_digest;
+///
+/// assert_eq!(short_digest(b"tinio").len(), 16);
+/// ```
+pub fn short_digest(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    hex::encode(digest)[..HASH_LEN].to_string()
+}
 /// The tool's home directory name, spelled by `tinio-core`'s own constant so the home layout
 /// and the storage layout cannot diverge.
-pub(crate) const BASE_DIR_NAME: &str = RESERVED_SEGMENT;
+pub const BASE_DIR_NAME: &str = RESERVED_SEGMENT;
 /// The per-root state directory parent.
 const ROOTS_DIR_NAME: &str = "roots";
 
@@ -139,7 +218,7 @@ pub fn prepare_synthetic_root(root: &Path) -> Result<(), Error> {
     for dir in [root, state_dir.as_path()] {
         refuse_pg_symlink(dir)?;
         if !dir.is_dir() {
-            return Err(error::root(
+            return Err(self::root(
                 dir,
                 io::Error::new(
                     io::ErrorKind::NotADirectory,
@@ -157,7 +236,7 @@ pub fn prepare_synthetic_root(root: &Path) -> Result<(), Error> {
 /// (drop the symlink) or a `TINIO_STATE_DIR` pointing at a real directory.
 fn refuse_pg_symlink(dir: &Path) -> Result<(), Error> {
     match fs::symlink_metadata(dir) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(error::root(
+        Ok(meta) if meta.file_type().is_symlink() => Err(root(
             dir,
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -186,7 +265,7 @@ fn create_dir_all_0700(dir: &Path) -> Result<(), Error> {
         if let Err(e) = create_dir_0700(next)
             && e.kind() != io::ErrorKind::AlreadyExists
         {
-            return Err(error::root(next, e));
+            return Err(root(next, e));
         }
     }
     Ok(())
@@ -195,61 +274,8 @@ fn create_dir_all_0700(dir: &Path) -> Result<(), Error> {
 /// The per-root leaf name (`<sha256(canonical root)16>`), the one computation [`home_state_dir`]
 /// and [`home_state_dir_path`] share so the creating and the non-creating form cannot disagree.
 fn derived_name(root: &Path) -> Result<String, Error> {
-    let canonical = root.canonicalize().map_err(|e| error::root(root, e))?;
-    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
-    Ok(hex::encode(digest)[..HASH_LEN].to_string())
-}
-
-/// The environment variable that overrides the derived state dir (FR-023).
-///
-/// **The name lives here and the reading lives in the CLI**, which is what keeps one owner per
-/// variable: this constant is what [`parse_state_dir`] refuses an empty value by, and that
-/// parser is the `value_parser` of the CLI's environment-only `--state-dir` argument. A caller
-/// that wants the value reads it from the parse, never from the environment.
-///
-/// What the variable means is the contract's (`contracts/config.md`'s read-only section): an
-/// explicit state dir used verbatim instead of the `~/.tinio/roots/<hash>/` derivation — the
-/// escape hatch for the environments read-only mode is actually for (service accounts,
-/// containers, immutable images) where the home may be absent or unwritable, and where the
-/// home-derived state dir cannot be created at all — [`prepare_home_derived`], which is what a
-/// serving or `--fix` run calls before its own `create_dir_all`, or [`default_home_state_dir`],
-/// which derives and creates in one step. **It is consulted in both
-/// modes, and what it moves differs between them.** A read-only run's served state dir *is*
-/// this value when it is set, and the pair such a client probes is `[this value, <root>/.tinio]`,
-/// so the home-derived candidate is never derived there at all. A read-write run's served dir
-/// stays `<root>/.tinio` — the CLI's `resolve::resolve_state_dir` never consults it on that path
-/// — but the variable answers in place of the second derivation a client makes there, the
-/// home-derived one, which is why a machine with no usable home needs no second variable to be
-/// reported on. An exported value is therefore never silently ignored: in read-write mode it
-/// moves what `status`, `stop` and `doctor` look at second, and nothing else.
-pub const STATE_DIR_VAR: &str = "TINIO_STATE_DIR";
-
-/// Parse a `TINIO_STATE_DIR` value — the CLI's `--state-dir` argument's parser, and the one
-/// place the value's shape is decided.
-///
-/// An empty value is an error, never "the current directory"; the trimmed value is the path.
-/// The path is taken verbatim: its parents are **not** created mode 0700 and no symlink check
-/// applies, because the caller chose the location explicitly — the backend still creates the
-/// leaf itself and sets it 0700.
-///
-/// # Examples
-///
-/// ```rust
-/// use tinio_config::state::parse_state_dir;
-///
-/// assert_eq!(
-///     parse_state_dir(" /srv/tinio-state ")
-///         .expect("a path")
-///         .to_str(),
-///     Some("/srv/tinio-state")
-/// );
-/// ```
-pub fn parse_state_dir(raw: &str) -> Result<PathBuf, Error> {
-    let path = raw.trim();
-    if path.is_empty() {
-        return Err(Error::invalid_value(STATE_DIR_VAR, "must not be empty"));
-    }
-    Ok(PathBuf::from(path))
+    let canonical = root.canonicalize().map_err(|e| self::root(root, e))?;
+    Ok(short_digest(canonical.as_os_str().as_encoded_bytes()))
 }
 
 /// Refuse a symlinked `<home>/.tinio` or `<home>/.tinio/roots`.
@@ -264,7 +290,7 @@ pub fn parse_state_dir(raw: &str) -> Result<PathBuf, Error> {
 /// subject is a path in the state-directory layout, never a config key.
 fn refuse_symlink(dir: &Path) -> Result<(), Error> {
     match fs::symlink_metadata(dir) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(error::root(
+        Ok(meta) if meta.file_type().is_symlink() => Err(root(
             dir,
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -289,7 +315,7 @@ fn ensure_roots(home: &Path) -> Result<PathBuf, Error> {
         if let Err(e) = create_dir_0700(dir)
             && e.kind() != io::ErrorKind::AlreadyExists
         {
-            return Err(error::root(dir, e));
+            return Err(root(dir, e));
         }
         // A pre-existing regular file lands here too: `create_dir` answers
         // `AlreadyExists` for it and `set_permissions` succeeds on a file,
@@ -298,7 +324,7 @@ fn ensure_roots(home: &Path) -> Result<PathBuf, Error> {
         // `ENOTDIR` inside the backend. Checked before the mode below, so a
         // file that is not ours is never chmodded.
         if !dir.is_dir() {
-            return Err(error::root(
+            return Err(root(
                 dir,
                 io::Error::new(
                     io::ErrorKind::NotADirectory,
@@ -320,7 +346,7 @@ fn ensure_roots(home: &Path) -> Result<PathBuf, Error> {
 fn enforce_0700(dir: &Path) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| error::root(dir, e))
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| root(dir, e))
 }
 
 #[cfg(not(unix))]
@@ -598,15 +624,5 @@ mod tests {
         symlink(elsewhere.path(), &linked).unwrap();
         let err = prepare_synthetic_root(&linked).unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
-    }
-
-    #[test]
-    fn state_dir_override_parses_strictly() {
-        assert_eq!(
-            parse_state_dir(" /srv/tinio-state ").unwrap(),
-            PathBuf::from("/srv/tinio-state")
-        );
-        let err = parse_state_dir("   ").unwrap_err();
-        assert!(err.to_string().contains(STATE_DIR_VAR), "{err}");
     }
 }

@@ -1,6 +1,9 @@
 //! The concurrent pipeline runtime: the real implementation of the
 //! `tinio-core` [`pipeline::Runner`] contract (pipeline-spec.md §3.1, §3.5).
 //!
+//! It also owns the `[pipeline]` schema (`Config`, `Io`, `Remove`, `Db`),
+//! parseable behind the `config` feature.
+//!
 //! Each pipeline is a bounded mpsc queue plus worker threads on its **own**
 //! tokio runtime (`worker_threads = workers`, `thread_name
 //! "tinio-pipeline-io"` / `"tinio-pipeline-db"`). Tasks run directly on the
@@ -48,6 +51,12 @@ use std::{
 use async_trait::async_trait;
 use derive_more::Deref;
 use futures::FutureExt;
+#[cfg(feature = "config")]
+use garde::Validate;
+use parse_display::{Display, FromStr};
+#[cfg(feature = "config")]
+use serde::{Deserialize, Serialize};
+use smart_default::SmartDefault;
 use thread_priority::{Error as ThreadPriorityError, ThreadPriority, ThreadPriorityValue};
 use tokio::{
     runtime::{Builder, Runtime},
@@ -56,13 +65,138 @@ use tokio::{
     time::timeout,
 };
 
+#[cfg(feature = "config")]
+use crate::_core::pipeline::{CAPACITY_MAX, CAPACITY_MIN};
 use crate::{
-    _config::pipeline::{self as pipeline_config, Priority},
     _core::pipeline::{
-        self, Completion, Error::ShutDown, Outcome, Reply, RunOutput, Runner, Stats, Task,
+        self, Completion, DB_WORKERS_MAX, DB_WORKERS_MIN, DEFAULT_CAPACITY, DEFAULT_DB_WORKERS,
+        DEFAULT_IO_WORKERS, DEFAULT_REMOVE_WORKERS, Error::ShutDown, IO_WORKERS_MAX,
+        IO_WORKERS_MIN, Outcome, Reply, RunOutput, Runner, Stats, Task,
     },
     Error,
 };
+
+/// Worker-thread priority of a pipeline (`priority` in `[pipeline.*]`;
+/// pipeline-spec.md §3.4, Q7).
+///
+/// # Examples
+///
+/// ```rust
+/// use std::str::FromStr;
+///
+/// use tinio_server::pipeline::Priority;
+///
+/// assert_eq!(Priority::from_str("low").unwrap(), Priority::Low);
+/// assert_eq!(Priority::default().to_string(), "normal");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, FromStr)]
+#[cfg_attr(feature = "config", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "config", serde(rename_all = "lowercase"))]
+#[display(style = "lowercase")]
+pub enum Priority {
+    /// Do not set a thread priority — the pipeline runs at the OS default.
+    #[default]
+    Normal,
+    /// The lowest legal thread priority (background work).
+    Low,
+    /// The highest legal thread priority (opt-in).
+    High,
+}
+
+/// The task-pipeline sections (`[pipeline]`; presence-gated — an absent
+/// section resolves to the defaults, pipeline-spec.md Q8).
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::pipeline::{Config, Priority};
+///
+/// let config = Config::default();
+/// assert_eq!(config.io.workers, 2);
+/// assert_eq!(config.remove.workers, 1);
+/// assert_eq!(config.db.workers, 1);
+/// assert_eq!(config.io.capacity, 1024);
+/// assert_eq!(config.io.priority, Priority::Normal);
+/// ```
+#[derive(Debug, Clone, PartialEq, SmartDefault)]
+#[cfg_attr(feature = "config", derive(Serialize, Deserialize, Validate))]
+#[cfg_attr(feature = "config", garde(allow_unvalidated))]
+pub struct Config {
+    /// The IO pipeline (ETag computation: bounded file reads + hashing).
+    #[cfg_attr(feature = "config", serde(default))]
+    #[cfg_attr(feature = "config", garde(dive))]
+    pub io: Io,
+    /// The removal pipeline (delete-bucket tombstone `remove_dir_all` —
+    /// physically isolated from ETag compute, D-A).
+    #[cfg_attr(feature = "config", serde(default))]
+    #[cfg_attr(feature = "config", garde(dive))]
+    pub remove: Remove,
+    /// The DB write pipeline (batched meta writes).
+    #[cfg_attr(feature = "config", serde(default))]
+    #[cfg_attr(feature = "config", garde(dive))]
+    pub db: Db,
+}
+
+/// The `workers`/`priority`/`capacity` field triple shared by the two
+/// pipeline sections (F45 — one definition, two aliases; the worker
+/// range and default differ per pipeline).
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::pipeline::Io;
+///
+/// let io = Io::default();
+/// assert_eq!(io.workers, 2);
+/// assert_eq!(io.capacity, 1024);
+/// ```
+#[derive(Debug, Clone, PartialEq, SmartDefault)]
+#[cfg_attr(feature = "config", derive(Serialize, Deserialize, Validate))]
+#[cfg_attr(feature = "config", garde(allow_unvalidated))]
+pub struct Queue<const DEFAULT_WORKERS: u8, const WORKERS_MIN: u8, const WORKERS_MAX: u8> {
+    /// Worker-thread count (each worker runs one blocking task; the
+    /// range is per pipeline — db is 1..=4, redb is single-writer, so
+    /// the default 1 is the write-throughput optimum).
+    #[cfg_attr(
+        feature = "config",
+        serde(default = "default_workers::<DEFAULT_WORKERS>")
+    )]
+    #[default(_code = "DEFAULT_WORKERS")]
+    #[cfg_attr(feature = "config", garde(range(min = WORKERS_MIN, max = WORKERS_MAX)))]
+    pub workers: u8,
+    /// Worker-thread priority (`normal` = do not set).
+    #[cfg_attr(feature = "config", serde(default))]
+    #[default(Priority::Normal)]
+    pub priority: Priority,
+    /// Bounded queue capacity (1..=65536; the backpressure bound).
+    #[cfg_attr(feature = "config", serde(default = "default_capacity"))]
+    #[default(_code = "DEFAULT_CAPACITY")]
+    #[cfg_attr(feature = "config", garde(range(min = CAPACITY_MIN, max = CAPACITY_MAX)))]
+    pub capacity: u32,
+}
+
+/// The IO pipeline keys (`[pipeline.io]`).
+pub type Io = Queue<DEFAULT_IO_WORKERS, IO_WORKERS_MIN, IO_WORKERS_MAX>;
+
+/// The removal pipeline keys (`[pipeline.remove]`) — the IO pipeline's
+/// worker range, but a 1-worker default (background cleanup).
+pub type Remove = Queue<DEFAULT_REMOVE_WORKERS, IO_WORKERS_MIN, IO_WORKERS_MAX>;
+
+/// The DB write pipeline keys (`[pipeline.db]`).
+pub type Db = Queue<DEFAULT_DB_WORKERS, DB_WORKERS_MIN, DB_WORKERS_MAX>;
+
+/// The serde default of `workers` — the pipeline's own constant, never a
+/// round-trip through `Default` (F46: the serde defaults mirror the
+/// constants they exist to mirror).
+#[cfg(feature = "config")]
+fn default_workers<const DEFAULT_WORKERS: u8>() -> u8 {
+    DEFAULT_WORKERS
+}
+
+#[cfg(feature = "config")]
+fn default_capacity() -> u32 {
+    DEFAULT_CAPACITY
+}
 
 /// One queued job: the task plus the reply the worker sends after `run()`
 /// (the other end is [`Completion`]).
@@ -379,7 +513,7 @@ where
     /// construction site (the server passes the tinio-fs task outputs when
     /// wiring `FsOptions`). IO is ETag compute (`tinio_fs::etag::Result`);
     /// removal is unit-success tombstone work (`Result<(), tinio_fs::Error>`).
-    pub fn build(config: &pipeline_config::Config) -> Result<Self, Error> {
+    pub fn build(config: &Config) -> Result<Self, Error> {
         let io = Pipeline::new(spec(
             "io",
             config.io.workers,
@@ -934,14 +1068,14 @@ mod tests {
         db_workers: u8,
         capacity: u32,
     ) -> Pipelines<RunOutput, RunOutput, RunOutput> {
-        Pipelines::build(&pipeline_config::Config {
-            io: pipeline_config::Io {
+        Pipelines::build(&Config {
+            io: Io {
                 workers: io_workers,
                 capacity,
                 ..Default::default()
             },
             remove: Default::default(),
-            db: pipeline_config::Db {
+            db: Db {
                 workers: db_workers,
                 capacity,
                 ..Default::default()
@@ -1521,14 +1655,14 @@ mod tests {
         // The `Pipelines` output types are inferred from the `FsOptions`
         // fields: IO = [`tinio_fs::etag::Result`], remove and DB =
         // `Result<(), tinio_fs::Error>` (D-A).
-        let pipelines = Pipelines::build(&pipeline_config::Config {
-            io: pipeline_config::Io {
+        let pipelines = Pipelines::build(&Config {
+            io: Io {
                 workers: 1,
                 capacity: 16,
                 ..Default::default()
             },
             remove: Default::default(),
-            db: pipeline_config::Db {
+            db: Db {
                 workers: 1,
                 capacity: 16,
                 ..Default::default()
@@ -1626,5 +1760,108 @@ mod tests {
         assert_eq!(panic_message(&"str message"), "str message");
         assert_eq!(panic_message(&"owned".to_string()), "owned");
         assert_eq!(panic_message(&42i32), "unknown panic payload");
+    }
+}
+
+#[cfg(all(test, feature = "config"))]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_the_contract() {
+        let config = Config::default();
+        assert_eq!(config.io.workers, DEFAULT_IO_WORKERS);
+        assert_eq!(config.remove.workers, DEFAULT_REMOVE_WORKERS);
+        assert_eq!(config.db.workers, DEFAULT_DB_WORKERS);
+        assert_eq!(config.io.capacity, DEFAULT_CAPACITY);
+        assert_eq!(config.remove.capacity, DEFAULT_CAPACITY);
+        assert_eq!(config.db.capacity, DEFAULT_CAPACITY);
+        assert_eq!(config.io.priority, Priority::Normal);
+        assert_eq!(config.remove.priority, Priority::Normal);
+        assert_eq!(config.db.priority, Priority::Normal);
+    }
+
+    #[test]
+    fn workers_range_validated() {
+        // io/remove: 1..=64; db: 1..=4 — outside → validation error.
+        for (section, bad) in [
+            ("io", 0u8),
+            ("io", 65),
+            ("remove", 0),
+            ("remove", 65),
+            ("db", 0),
+            ("db", 5),
+        ] {
+            let text = format!("[{section}]\nworkers = {bad}");
+            let config: Config = toml::from_str(&text).unwrap();
+            assert!(config.validate().is_err(), "{text}");
+        }
+        let config: Config = toml::from_str("[io]\nworkers = 64").unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.io.workers, 64);
+        let config: Config = toml::from_str("[remove]\nworkers = 64").unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.remove.workers, 64);
+        let config: Config = toml::from_str("[db]\nworkers = 4").unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.db.workers, 4);
+    }
+
+    #[test]
+    fn capacity_range_validated() {
+        for bad in [0u32, 65537] {
+            for section in ["io", "remove", "db"] {
+                let text = format!("[{section}]\ncapacity = {bad}");
+                let config: Config = toml::from_str(&text).unwrap();
+                assert!(config.validate().is_err(), "{text}");
+            }
+        }
+        let config: Config = toml::from_str("[io]\ncapacity = 65536").unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.io.capacity, 65536);
+        let config: Config = toml::from_str("[remove]\ncapacity = 65536").unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.remove.capacity, 65536);
+    }
+
+    #[test]
+    fn unknown_priority_rejected() {
+        let err = toml::from_str::<Config>("[io]\npriority = \"realtime\"").unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn priority_parses_and_displays() {
+        for (text, priority) in [
+            ("normal", Priority::Normal),
+            ("low", Priority::Low),
+            ("high", Priority::High),
+        ] {
+            assert_eq!(text.parse::<Priority>().unwrap(), priority);
+            assert_eq!(priority.to_string(), text);
+        }
+        assert!("realtime".parse::<Priority>().is_err());
+    }
+
+    #[test]
+    fn priority_defaults_to_normal() {
+        // `normal` = do not set a thread priority (the tinio-server runtime
+        // owns the Q7 low/high mapping; pinned in its own tests).
+        assert_eq!(Priority::default(), Priority::Normal);
+    }
+
+    #[test]
+    fn partial_sections_keep_field_defaults() {
+        let config: Config = toml::from_str("[io]\nworkers = 3").unwrap();
+        config.validate().unwrap();
+        let io = &config.io;
+        assert_eq!(io.workers, 3);
+        assert_eq!(io.capacity, DEFAULT_CAPACITY);
+        assert_eq!(io.priority, Priority::Normal);
+        let config: Config = toml::from_str("").unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.io, Io::default());
+        assert_eq!(config.remove, Remove::default());
+        assert_eq!(config.db, Db::default());
     }
 }

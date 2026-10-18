@@ -27,25 +27,21 @@ use crate::_api::{
 use crate::_core::storage::Storage;
 #[cfg(feature = "api")]
 use crate::daemon;
-#[cfg(feature = "pg")]
-use crate::{_config::storage::pg::DEFAULT_POOL_SIZE, _pg, _util::secret::Secret};
 use crate::{
-    _config::{
-        self, Config,
-        log::{AccessFormat, Format, Verbosity},
-        state::{prepare_home_derived, prepare_synthetic_root},
-        storage::Backend,
-    },
     _fs::{Error as FsError, FsStorage},
     _sandbox::{Adopted, Attribution, Child, Refused, disarm_signal_relay, supervise},
-    _server::{identity, log},
+    _server::log,
+    _util::state::{prepare_home_derived, prepare_synthetic_root},
     Error,
     cli::Provenance,
     commands::is_pg_root,
+    config::{self, Config, storage::Backend},
     events,
     resolve::{self, Located, Pipelines, Resolution},
     sandbox, signal,
 };
+#[cfg(feature = "pg")]
+use crate::{_pg, _util::secret::Secret, config::storage::pg::DEFAULT_POOL_SIZE};
 
 /// §1's pre-runtime half: steps a–j, resolve through the control-channel bind.
 ///
@@ -220,7 +216,7 @@ pub fn run(
     // and before the directories below, and `serve` is left with the warning alone (the only arm
     // this refusal does not end).
     if let Some(detail) = resolution.credential_policy()?.refusal() {
-        return Err(Error::Config(_config::Error::invalid_value("auth", detail)));
+        return Err(Error::Config(config::Error::invalid_value("auth", detail)));
     }
 
     // h: the bind sources must exist before anything binds — the data plane and the plane's
@@ -242,7 +238,7 @@ pub fn run(
     // leaf, so that branch keeps the call: there the parents really are unmade, and this is what
     // hardens them before the `create_dir_all` below. **The macOS profile is no longer the other
     // half**: its home grant is deleted and neither mode spends a rule on `$HOME`, so
-    // `tinio_config::state::prepare_home_derived` is the whole of the hardening. A confined child's
+    // `tinio_util::state::prepare_home_derived` is the whole of the hardening. A confined child's
     // own `$HOME`-derived leaf is still refused `file-write-mode` on `<home>/.tinio`, which sits
     // above the read-write state-directory exposure `sandbox_request` adds, and there the remedy is
     // an explicit writable `TINIO_STATE_DIR`
@@ -258,7 +254,7 @@ pub fn run(
         // below minted `<root>/.tinio` with the process umask — 0755 on a 022 umask, listing
         // the tool's state and its access log to every local user. The filesystem backend
         // creates its own leaf 0700 (`tinio-fs`'s state-database open); a pg run opens no such
-        // database, so the hardening is this call's (`tinio_config::state`).
+        // database, so the hardening is this call's (`tinio_util::state`).
         prepare_synthetic_root(&resolution.root)?;
     } else if resolution.read_only {
         prepare_home_derived(&resolution.root, &resolution.state_dir)?;
@@ -440,7 +436,7 @@ pub fn run(
     // Windows never carries a mapping: the config parser rejects the key there, so the
     // probe is a no-op and the identity's uid map is empty by construction.
     if !resolution.read_only {
-        identity::ensure_chown_privilege(&resolution.config, &resolution.root)?;
+        super::chown::ensure_chown_privilege(resolution.identity(), &resolution.root)?;
     }
 
     // j, before k: the handlers are registered before the runtime exists, so a signal that
@@ -456,7 +452,8 @@ pub fn run(
     // `Served::Pg`), because `PgStorage::connect` is async and is built on the one runtime `serve`
     // is dispatched on. A launcher has already returned by this line, so this is the child, or the
     // single non-launching process.
-    let pipelines = Pipelines::build(&resolution.config.pipeline.clone().unwrap_or_default())?;
+    let pipeline_section = resolution.config.pipeline.clone().unwrap_or_default();
+    let pipelines = Pipelines::build(&pipeline_section)?;
     let backend = match resolution.config.backend() {
         #[cfg(feature = "pg")]
         Backend::Pg => {
@@ -608,7 +605,7 @@ where
 /// **The dsn is `resolve::pg::resolve_dsn`'s answer** — the parsed `TINIO_PG_DSN` over
 /// `[storage.pg] dsn` — so the value the storage opens and the value the synthetic root was
 /// derived from are one; the pool is `[storage.pg] pool` (defaulting to the store's own
-/// [`DEFAULT_POOL_SIZE`](crate::_config::storage::pg::DEFAULT_POOL_SIZE)); and the mode is the
+/// [`DEFAULT_POOL_SIZE`](crate::config::storage::pg::DEFAULT_POOL_SIZE)); and the mode is the
 /// resolution's, `ReadWrite` for a run that takes the ownership guard (PG12) and `ReadOnly` for
 /// one that does not. Nothing here connects — the storage is constructed on the runtime.
 ///
@@ -858,33 +855,35 @@ fn install_subscriber(resolution: &Resolution) -> Result<(), Error> {
 /// FR-016's chain for this key: `--verbosity`, `TINIO_LOG_LEVEL`, `.env` and `[log] verbosity`
 /// are one value by the time a run reaches here, so re-running the chain would be a second
 /// implementation of a rule that already has one.
-fn verbosity(resolution: &Resolution) -> Verbosity {
+fn verbosity(resolution: &Resolution) -> log::Verbosity {
     resolution
         .config
         .log
         .as_ref()
-        .map_or_else(Verbosity::default, |log| log.verbosity)
+        .map_or_else(log::Verbosity::default, |log| log.verbosity)
 }
 
 /// The effective operational log format, resolved the same way [`verbosity`] is.
-fn format(resolution: &Resolution) -> Format {
+fn format(resolution: &Resolution) -> log::Format {
     resolution
         .config
         .log
         .as_ref()
-        .map_or_else(Format::default, |log| log.server_log_format)
+        .map_or_else(log::Format::default, |log| log.server_log_format)
 }
 
 /// The access-log format (`[log] access_log_format`; `combined` by default).
 ///
 /// There is deliberately no flag and no variable for it — `contracts/config.md`'s list has
 /// none — so the config file is the only level there is.
-fn access_format(resolution: &Resolution) -> AccessFormat {
+fn access_format(resolution: &Resolution) -> log::AccessFormat {
     resolution
         .config
         .log
         .as_ref()
-        .map_or_else(AccessFormat::default, |log| log.access_log_format.clone())
+        .map_or_else(log::AccessFormat::default, |log| {
+            log.access_log_format.clone()
+        })
 }
 
 /// The OTLP endpoint, when `[telemetry]` names one — `None` without the section, which is what
@@ -1050,6 +1049,7 @@ mod tests {
             pg_root: None,
             root: root.to_path_buf(),
             config: Config::default(),
+            identity: Default::default(),
             config_text: String::new(),
             config_path: state_dir.join(".tinio.toml"),
             read_only: true,
@@ -1300,6 +1300,7 @@ mod tests {
                 pg_root: None,
                 root: PathBuf::from("/srv/pg"),
                 config: Config::parse(&text).expect("the pg configuration parses"),
+                identity: Default::default(),
                 config_text: text,
                 config_path: PathBuf::from("/srv/pg/.tinio/.tinio.toml"),
                 read_only,
@@ -1356,6 +1357,7 @@ mod tests {
             pg_root: None,
             root: PathBuf::from("/srv/pg"),
             config: Config::parse(text).expect("the pg configuration parses"),
+            identity: Default::default(),
             config_text: text.to_owned(),
             config_path: PathBuf::from("/srv/pg/.tinio/.tinio.toml"),
             read_only: false,

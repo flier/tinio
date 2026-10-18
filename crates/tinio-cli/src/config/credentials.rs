@@ -1,9 +1,7 @@
 //! Generated credentials for a first start (`config.md:141`, FR-007).
 
-use crate::{
-    Error,
-    auth::{Secret, SecretKey},
-};
+use super::Error;
+use crate::_util::secret::{Secret, SecretKey};
 
 /// The generated pair.
 ///
@@ -15,7 +13,7 @@ use crate::{
 ///
 /// ```rust
 /// use secrecy::ExposeSecret;
-/// use tinio_config::credentials::{Credentials, generate};
+/// use tinio_cli::config::credentials::{Credentials, generate};
 ///
 /// let pair: Credentials = generate()?;
 /// assert_eq!(pair.access_key.len(), 32); // 16 bytes, hex-encoded
@@ -23,7 +21,7 @@ use crate::{
 /// // The secret is redacted whenever the pair is formatted.
 /// let secret = pair.secret_key.expose_secret();
 /// assert!(!format!("{pair:?}").contains(&**secret));
-/// # Ok::<(), tinio_config::Error>(())
+/// # Ok::<(), tinio_cli::config::Error>(())
 /// ```
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Credentials {
@@ -43,11 +41,11 @@ const SECRET_BYTES: usize = 32;
 ///
 /// ```rust
 /// use secrecy::ExposeSecret;
-/// use tinio_config::credentials::generate;
+/// use tinio_cli::config::credentials::generate;
 ///
 /// let pair = generate()?;
 /// assert_ne!(pair.access_key.as_str(), &**pair.secret_key.expose_secret());
-/// # Ok::<(), tinio_config::Error>(())
+/// # Ok::<(), tinio_cli::config::Error>(())
 /// ```
 pub fn generate() -> Result<Credentials, Error> {
     Ok(Credentials {
@@ -58,7 +56,7 @@ pub fn generate() -> Result<Credentials, Error> {
 
 fn hex(bytes: usize) -> Result<String, Error> {
     let mut buffer = vec![0u8; bytes];
-    // There is no `Error::Utf8` variant in this crate: a CSPRNG failure is an
+    // There is no `Error::Utf8` variant in this module: a CSPRNG failure is an
     // "environment fact the configuration cannot proceed without", which is
     // `Error::Missing`'s own doc — so it maps there rather than to a new variant
     // invented for one call site.

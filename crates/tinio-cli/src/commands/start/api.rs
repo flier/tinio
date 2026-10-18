@@ -3,13 +3,15 @@
 use std::path::{Path, PathBuf};
 
 use super::{ApiFlags, Args};
+#[cfg(all(feature = "api", feature = "tls"))]
+use crate::config;
 use crate::{
     _api::{
         state as api_state,
         transport::{HttpsOptions, LocalForm, Selection},
     },
-    _config::api,
     Error,
+    config::api,
     resolve::{Resolution, authority_addr, bind_addr},
 };
 
@@ -197,7 +199,7 @@ fn api_from_flags(resolution: &Resolution, flags: &ApiFlags) -> Result<Selection
 /// like its only caller: without the feature there is no https arm to raise it from.
 #[cfg(all(feature = "api", feature = "tls"))]
 fn missing_https(key: &str) -> Error {
-    Error::Config(_config::Error::invalid_value(
+    Error::Config(config::Error::invalid_value(
         key,
         "an https management transport needs a certificate and a key: pass `--api-cert` and `--api-key`, or configure `[api.https]`",
     ))

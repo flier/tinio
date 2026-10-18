@@ -1,6 +1,6 @@
 # `tinio` — the facade crate
 
-`tinio` is the facade: the only public API surface of the project, and the crate the semver checks and the rustdoc-example gate are held against. It carries the `tinio` binary and curates the re-exports an embedder needs — the storage contract from `tinio-core`, the configuration type from `tinio-config`, the S3 layer from `tinio-server`, the management plane from `tinio-api`, and the CLI entry from `tinio-cli`. It owns no behaviour of its own: what the binary does is `tinio-cli`'s, what gets served is `tinio-server`'s, and this crate's job is the seam and the default feature set.
+`tinio` is the facade: the only public API surface of the project, and the crate the semver checks and the rustdoc-example gate are held against. It carries the `tinio` binary and curates the re-exports an embedder needs — the storage contract from `tinio-core`, the configuration type from `tinio-cli`'s composition root (`tinio_cli::config`), the S3 layer from `tinio-server`, the management plane from `tinio-api`, and the CLI entry from `tinio-cli`. It owns no behaviour of its own: what the binary does is `tinio-cli`'s, what gets served is `tinio-server`'s, and this crate's job is the seam and the default feature set.
 
 ## The binary
 

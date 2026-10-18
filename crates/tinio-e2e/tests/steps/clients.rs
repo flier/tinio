@@ -47,9 +47,10 @@ use super::{
     common::{contains_ignore_case, deterministic_bytes},
     has_tag,
 };
-use crate::_server::{
-    _config::{Config, s3},
-    Capabilities,
+use crate::{
+    _cli::config::{Config, s3},
+    _server::Capabilities,
+    _util::env::{READ_ONLY_VAR, SANDBOX_VAR, STATE_DIR_VAR},
 };
 
 /// The fixed MinIO-convention credential pair the harness signs every
@@ -288,13 +289,13 @@ fn spawn_child(
         cmd.arg("--config").arg(config);
     }
     cmd.env_remove("TINIO_SCANNER")
-        .env_remove("TINIO_READ_ONLY")
-        .env_remove("TINIO_STATE_DIR")
-        .env_remove("TINIO_SANDBOX")
+        .env_remove(READ_ONLY_VAR)
+        .env_remove(STATE_DIR_VAR)
+        .env_remove(SANDBOX_VAR)
         .env("TINIO_ACCESS_KEY", ACCESS_KEY)
         .env("TINIO_SECRET_KEY", SECRET_KEY);
     if let Some(state) = state_dir {
-        cmd.env("TINIO_STATE_DIR", state);
+        cmd.env(STATE_DIR_VAR, state);
     }
     if let Some(s) = scanner {
         cmd.env("TINIO_SCANNER", if s { "1" } else { "0" });

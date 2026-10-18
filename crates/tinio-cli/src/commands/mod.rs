@@ -25,15 +25,15 @@ use clap::{ArgAction, Args};
 
 #[cfg(feature = "api")]
 use crate::_api::client::{self, Report};
+use crate::{
+    _util::secret::{Secret, SecretKey},
+    config::state::parse_state_dir,
+};
 #[cfg(any(feature = "api", test))]
 use crate::{
-    _config::state,
+    _util::state,
     Error,
     resolve::{self, Located, Resolution},
-};
-use crate::{
-    _config::state::parse_state_dir,
-    _util::secret::{Secret, SecretKey},
 };
 
 /// The environment-only channels the resolution reads: `TINIO_STATE_DIR` and the `[auth]` pair.
@@ -168,9 +168,9 @@ pub struct DirArgs {
 /// `1`/`true`/`0`/`false` spelling and **the one definer of it in this workspace**.
 ///
 /// **Re-exported rather than re-spelled, because the flag and the variable are one decision on two
-/// channels.** `TINIO_READ_ONLY`/`TINIO_SANDBOX` are parsed from the environment by `tinio-config`
-/// (`sources.rs`), and the same two names reach the same flags through their `env` attributes
-/// here; while each side carried its own `match`, the four spellings and the refusal's wording were
+/// channels.** `TINIO_READ_ONLY`/`TINIO_SANDBOX` reach the flags through their `env` attributes
+/// here, so the flag and the variable parse through this one `value_parser`; while each side
+/// carried its own `match`, the four spellings and the refusal's wording were
 /// equal exactly as long as an author remembered the other copy existed, and the answer decides
 /// whether the process protects its root or confines itself.
 ///
@@ -325,8 +325,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        _config::state::STATE_DIR_VAR,
-        _util::testing::assert_send_sync,
+        _util::{env::STATE_DIR_VAR, testing::assert_send_sync},
         cli::{ACCESS_KEY_VAR, Cli, PG_DSN_VAR, SECRET_KEY_VAR},
     };
 

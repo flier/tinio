@@ -61,7 +61,6 @@ use std::{
 use async_trait::async_trait;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use md5::{Digest, Md5};
-use tinio_config::pipeline::{Config, Db, Io};
 use tinio_core::{
     ETag, bucket, object,
     pipeline::{Completion, DEFAULT_CAPACITY, Runner, Task},
@@ -70,7 +69,7 @@ use tinio_fs::{
     Error as FsError, etag,
     meta::{self},
 };
-use tinio_server::pipeline::{Pipeline, Pipelines as PipelinePair};
+use tinio_server::pipeline::{Config, Db, Io, Pipeline, Pipelines as PipelinePair};
 use tinio_util::bench;
 use tokio::runtime::Runtime;
 

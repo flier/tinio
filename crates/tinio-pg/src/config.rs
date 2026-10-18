@@ -1,12 +1,12 @@
 //! Runtime configuration for the pg backend: the dsn and the pool size.
 //!
 //! **This is not the schema section.** `[storage.pg]` (`dsn`, `pool`; the selector, the
-//! `TINIO_PG_DSN` override, the synthetic root and every refusal) is `tinio-config`'s, resolved
-//! by the CLI before anything is constructed (PG5). What lands here is the small value the
-//! backend's constructor consumes: the connection string, always present, and the pool size the
-//! driver is opened with (PG9). Neither type re-exports the other — a schema is parsed, a
-//! construction is configured — and the dsn stays a [`Secret`] across the seam, so a rendering
-//! of this value redacts the credential.
+//! `TINIO_PG_DSN` override, the synthetic root and every refusal) is the CLI's configuration
+//! root's, resolved by the CLI before anything is constructed (PG5). What lands here is the
+//! small value the backend's constructor consumes: the connection string, always present, and
+//! the pool size the driver is opened with (PG9). Neither type re-exports the other — a schema
+//! is parsed, a construction is configured — and the dsn stays a [`Secret`] across the seam, so
+//! a rendering of this value redacts the credential.
 
 use crate::_util::secret::Secret;
 
@@ -41,8 +41,8 @@ impl Config {
     ///
     /// The two values are the caller's resolution: the dsn it opened (the environment override
     /// applied) and the pool it read from `[storage.pg] pool`. Neither has a default here —
-    /// `tinio-config` owns both — so a backend is never constructed from a configuration no
-    /// operator wrote.
+    /// `tinio-cli`'s configuration root owns both — so a backend is never constructed from a
+    /// configuration no operator wrote.
     ///
     /// # Examples
     ///

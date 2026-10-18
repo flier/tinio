@@ -1,5 +1,8 @@
 //! Logging layers (task T052).
 //!
+//! It also owns the `[log]` schema (`Config`, `Verbosity`, `Format`,
+//! `AccessFormat`), parseable behind the `config` feature.
+//!
 //! The access-log tracing layer formats events on the `tinio::access`
 //! target (emitted by the data-plane middleware) into the configured
 //! nginx-style format (`combined`/`common`/custom over the fixed variable
@@ -18,6 +21,12 @@ use std::{
     sync::Mutex,
 };
 
+#[cfg(feature = "config")]
+use garde::Validate;
+use parse_display::{Display, FromStr};
+#[cfg(feature = "config")]
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use smart_default::SmartDefault;
 use tracing::{
     Event, Level, Subscriber,
     field::{Field, Visit},
@@ -32,7 +41,166 @@ use tracing_subscriber::{
     registry::LookupSpan,
 };
 
-use crate::_config::log::{self, Format, Verbosity};
+/// Log level.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::str::FromStr;
+///
+/// use tinio_server::log::Verbosity;
+///
+/// assert_eq!(Verbosity::from_str("debug").unwrap(), Verbosity::Debug);
+/// assert_eq!(Verbosity::default().to_string(), "info");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, FromStr)]
+#[cfg_attr(feature = "config", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "config", serde(rename_all = "lowercase"))]
+#[display(style = "lowercase")]
+pub enum Verbosity {
+    Error,
+    Warn,
+    /// Informational (default).
+    #[default]
+    Info,
+    Debug,
+}
+
+/// Server log output format.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::str::FromStr;
+///
+/// use tinio_server::log::Format;
+///
+/// assert_eq!(Format::from_str("json").unwrap(), Format::Json);
+/// assert_eq!(Format::default().to_string(), "text");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, FromStr)]
+#[cfg_attr(feature = "config", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "config", serde(rename_all = "lowercase"))]
+#[display(style = "lowercase")]
+pub enum Format {
+    /// Human-readable text lines.
+    #[default]
+    Text,
+    Json,
+}
+
+/// The access-log format: `combined`, `common`, or a custom nginx-style
+/// string over the closed variable set (FR-017 — it cannot reference
+/// Authorization, query strings, or credentials).
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::log::AccessFormat;
+///
+/// assert!(AccessFormat::default().as_str().contains("$status"));
+/// let custom = AccessFormat::Custom("$remote_addr $status".into());
+/// assert_eq!(custom.as_str(), "$remote_addr $status");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "config", derive(Validate))]
+pub enum AccessFormat {
+    /// Nginx combined: `$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"`.
+    #[default]
+    Combined,
+    Common,
+    Custom(
+        // FR-017 closed set, as a pattern gate. Known boundary: the regex
+        // matches the longest listed variable, so a name with an identifier
+        // suffix (e.g. `$statusx`) passes — acceptable while the formatter
+        // resolves the set by exact name lookup at serve time.
+        #[cfg_attr(
+            feature = "config",
+            garde(pattern(
+                r"^([^\$]|\$(remote_addr|remote_user|time_local|request|status|body_bytes_sent|http_referer|http_user_agent|request_time))*$"
+            ))
+        )]
+        String,
+    ),
+}
+
+impl AccessFormat {
+    /// The format as a format string (custom formats pass through).
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Combined => {
+                "$remote_addr - $remote_user [$time_local] \"$request\" $status \
+                 $body_bytes_sent \"$http_referer\" \"$http_user_agent\""
+            }
+            Self::Common => {
+                "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent"
+            }
+            Self::Custom(s) => s,
+        }
+    }
+}
+
+#[cfg(feature = "config")]
+impl Serialize for AccessFormat {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Combined => serializer.serialize_str("combined"),
+            Self::Common => serializer.serialize_str("common"),
+            Self::Custom(s) => serializer.serialize_str(s),
+        }
+    }
+}
+
+#[cfg(feature = "config")]
+impl<'de> Deserialize<'de> for AccessFormat {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "combined" => Ok(Self::Combined),
+            "common" => Ok(Self::Common),
+            other => Ok(Self::Custom(other.into())),
+        }
+    }
+}
+
+/// Logging configuration (`[log]`).
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::log::Config;
+///
+/// let log = Config::default();
+/// assert_eq!(log.access_log, "access.log");
+/// assert_eq!(log.server_log_file, ""); // empty = stderr
+/// ```
+#[derive(Debug, Clone, PartialEq, SmartDefault)]
+#[cfg_attr(feature = "config", derive(Serialize, Deserialize, Validate))]
+#[cfg_attr(feature = "config", garde(allow_unvalidated))]
+pub struct Config {
+    /// `error | warn | info | debug` (default `info`).
+    #[cfg_attr(feature = "config", serde(default))]
+    pub verbosity: Verbosity,
+    /// Access-log file name (relative to the state dir, or absolute).
+    #[cfg_attr(feature = "config", serde(default = "access_log"))]
+    #[default = r#"access.log"#]
+    pub access_log: String,
+    /// `combined | common | custom nginx-style string` (default `combined`).
+    #[cfg_attr(feature = "config", serde(default))]
+    #[cfg_attr(feature = "config", garde(dive))]
+    pub access_log_format: AccessFormat,
+    /// `text | json` (default `text`; json defaults the file to `server.json`).
+    #[cfg_attr(feature = "config", serde(default))]
+    pub server_log_format: Format,
+    /// Server-log file (empty = stderr; daemon mode defaults it).
+    #[cfg_attr(feature = "config", serde(default))]
+    pub server_log_file: String,
+}
+
+#[cfg(feature = "config")]
+fn access_log() -> String {
+    Config::default().access_log
+}
 
 /// The access-log event target (the data-plane middleware emits events
 /// with this target).
@@ -156,7 +324,7 @@ impl AccessFields {
     /// `$request` prefix never eats `$request_time`); unknown variables
     /// stay as their literal `$name` (the config gate already restricted
     /// the set).
-    pub fn format_line(&self, format: &log::AccessFormat) -> String {
+    pub fn format_line(&self, format: &AccessFormat) -> String {
         let fmt = format.as_str();
         let mut out = String::with_capacity(fmt.len() + 32);
         let mut rest = fmt;
@@ -218,8 +386,7 @@ impl Visit for FieldCollector {
 /// ```rust
 /// use std::io::sink;
 ///
-/// use tinio_config::log::AccessFormat;
-/// use tinio_server::log::{ACCESS_TARGET, AccessFields, AccessLogLayer};
+/// use tinio_server::log::{ACCESS_TARGET, AccessFields, AccessFormat, AccessLogLayer};
 /// use tracing_subscriber::layer::SubscriberExt;
 ///
 /// let layer = AccessLogLayer::new(AccessFormat::Common, sink());
@@ -243,13 +410,13 @@ impl Visit for FieldCollector {
 /// ```
 #[derive(Debug)]
 pub struct AccessLogLayer<W: Write + Send + 'static> {
-    format: log::AccessFormat,
+    format: AccessFormat,
     writer: Mutex<W>,
 }
 
 impl<W: Write + Send + 'static> AccessLogLayer<W> {
     /// Create the layer writing to `writer`.
-    pub fn new(format: log::AccessFormat, writer: W) -> Self {
+    pub fn new(format: AccessFormat, writer: W) -> Self {
         Self {
             format,
             writer: Mutex::new(writer),
@@ -289,9 +456,9 @@ where
 /// `Io` when the access-log file cannot be opened for appending; OTLP
 /// exporter construction failures when the `otel` feature is enabled.
 pub fn build_subscriber(
-    verbosity: log::Verbosity,
-    format: log::Format,
-    access_format: &log::AccessFormat,
+    verbosity: Verbosity,
+    format: Format,
+    access_format: &AccessFormat,
     access_path: &Path,
     otel_endpoint: Option<&str>,
 ) -> Result<Box<dyn Subscriber + Send + Sync>, Box<dyn Error + Send + Sync>> {
@@ -389,7 +556,7 @@ mod tests {
     use tracing::subscriber::with_default;
 
     use super::*;
-    use crate::{_config::log::AccessFormat, _util::testing::SharedBuf};
+    use crate::_util::testing::SharedBuf;
 
     fn fields(remote_addr: &str, request: &str, status: u16, body_bytes_sent: u64) -> AccessFields {
         AccessFields::new(
@@ -637,5 +804,65 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "config"))]
+mod schema_tests {
+    use super::*;
+
+    #[test]
+    fn access_log_format_variables_validated() {
+        let config: Config = toml::from_str(
+            "access_log_format = \"$remote_addr - $remote_user [$time_local] \\\"$request\\\" $status\"",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let config: Config = toml::from_str("access_log_format = \"$authorization\"").unwrap();
+        assert!(
+            config.validate().is_err(),
+            "$authorization must be rejected"
+        );
+        let config: Config = toml::from_str("access_log_format = \"$query_string\"").unwrap();
+        assert!(config.validate().is_err(), "$query_string must be rejected");
+    }
+
+    #[test]
+    fn access_log_format_serialization() {
+        let log = Config {
+            access_log_format: AccessFormat::Combined,
+            ..Default::default()
+        };
+        let toml = toml::to_string(&log).unwrap();
+        assert!(toml.contains("access_log_format = \"combined\""), "{toml}");
+        let custom = Config {
+            access_log_format: AccessFormat::Custom("$status".into()),
+            ..Default::default()
+        };
+        let toml = toml::to_string(&custom).unwrap();
+        assert!(toml.contains("access_log_format = \"$status\""), "{toml}");
+        // And it round-trips back to Custom.
+        let back: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(
+            back.access_log_format,
+            AccessFormat::Custom("$status".into())
+        );
+    }
+
+    #[test]
+    fn verbosity_display_and_parse() {
+        assert_eq!(Verbosity::Info.to_string(), "info");
+        assert_eq!(Verbosity::Debug.to_string(), "debug");
+        assert_eq!("warn".parse::<Verbosity>().unwrap(), Verbosity::Warn);
+        assert!("loud".parse::<Verbosity>().is_err());
+        assert_eq!(Format::Json.to_string(), "json");
+        assert_eq!("text".parse::<Format>().unwrap(), Format::Text);
+    }
+
+    #[test]
+    fn access_log_format_as_str() {
+        assert!(AccessFormat::Combined.as_str().contains("$remote_addr"));
+        assert!(AccessFormat::Common.as_str().contains("$body_bytes_sent"));
+        assert_eq!(AccessFormat::Custom("$request".into()).as_str(), "$request");
     }
 }

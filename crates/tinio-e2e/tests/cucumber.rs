@@ -48,6 +48,8 @@
 
 use std::{env, fs::File, io, process, thread};
 #[doc(hidden)]
+pub extern crate tinio_cli as _cli;
+#[doc(hidden)]
 pub extern crate tinio_core as _core;
 #[doc(hidden)]
 pub extern crate tinio_fs as _fs;

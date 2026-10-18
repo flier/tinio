@@ -51,13 +51,13 @@ use tokio::{
 
 pub use crate::_fs::testing::fs_options;
 use crate::{
+    _cli::config::Config,
     _core::{mode::AccessMode, storage::Storage},
     _fs::{FsOptions, FsStorage, Scanner, ScannerOptions},
     _mem::MemoryStorage,
     _server::{
-        _config::{Config, auth, owner, users},
         Capabilities, DataPlane, Identity, PlaneConfig,
-        identity::IdentityFromConfig,
+        identity::{IdentityFromConfig, auth, owner, users},
     },
 };
 
@@ -129,7 +129,7 @@ fn acl_fixture_config() -> Config {
 /// ([`IdentityFromConfig`] — the config-driven path, never a direct
 /// `Identity` construction).
 pub fn acl_fixture_identity() -> Arc<Identity> {
-    Identity::from_config(&acl_fixture_config())
+    Identity::from_config(&acl_fixture_config().identity())
 }
 
 /// Which storage backend the in-process server runs on.

@@ -87,14 +87,14 @@ impl OwnerId {
 
 /// The default owner display name (`"tinio"` — the `[owner]` config
 /// default; design §6). The feature-off / `identity: None` fallback
-/// lives in core so tinio-config and the auth layer share one source
+/// lives in core so the CLI's config root and the auth layer share one source
 /// without a dependency on core's hashing.
 pub const DEFAULT_OWNER_DISPLAY_NAME: &str = "tinio";
 
 /// The root access-key fallback (`"minioadmin"` — the US1 interop pair,
 /// design §6: with no `[auth]` section the root credential is
 /// `minioadmin`/`minioadmin`). ONE home so the config uniqueness
-/// validation (tinio-config) reserves the same effective root access key
+/// validation (the CLI's config root) reserves the same effective root access key
 /// the identity assembly (tinio-server) falls back to — a `[[users]]` key
 /// equal to it would shadow the root in the access-key map.
 pub const DEFAULT_ROOT_ACCESS_KEY: &str = "minioadmin";
@@ -108,7 +108,7 @@ pub fn default_owner_id() -> OwnerId {
 
 /// `hex(SHA-256(access_key))` — the canonical ID for a `[[users]]` entry
 /// whose config omits one, and the user-test fixture basis. ONE home:
-/// tinio-config (the derived-ID uniqueness default) and the identity
+/// the CLI's config root (the derived-ID uniqueness default) and the identity
 /// assembly (tinio-auth re-exports it) share the derivation.
 pub fn derive_canonical_id(access_key: &str) -> OwnerId {
     let digest = Sha256::digest(access_key.as_bytes());

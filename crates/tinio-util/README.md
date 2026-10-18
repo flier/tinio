@@ -9,6 +9,7 @@
 | `testing` | Publishes the conformance harness (`assert_conformance`, the persistence contracts' own suite in `testing::metadata`, and the test devices the crates' legs share — the raw HTTP/1.1 client, the SigV4 signer, the in-memory block store). A production build leaves it off: no shipped binary compiles the harness, and a crate that wants it enables it in its `[dev-dependencies]`. |
 | `bench` | Publishes the benches' pinned data root and the flush control every reading carries — the one copy every bench target in the workspace runs on, read by `tinio-bench`. |
 | `render` | Publishes the one Handlebars renderer — strict mode, no escaping — behind the status report, the systemd unit and the Seatbelt profile. |
+| `state` | Publishes the state-directory resolver (FR-023): the home-derived `<home>/.tinio/roots/<hash>/` layout, the mode-0700 parents, the symlink refusals and the read-only layout's preparation, behind `tinio_util::state`. |
 
 ## The lock map's guarantee
 
@@ -30,6 +31,8 @@ Eviction is the map's stance and not the caller's business: a slot goes the mome
 | `src/bench.rs` | the benches' pinned data root and flush control (the `bench` feature) |
 | `src/render.rs` | the one Handlebars renderer (the `render` feature) |
 | `src/pacing.rs`, `src/path.rs`, `src/process.rs` | the shutdown-cuttable sleep, the path-containment rule, and kill-and-reap with its bounded exit poll |
+| `src/state.rs` | state-directory resolution and hardening (the `state` feature): the derived read-only layout, its mode-0700 parents and its symlink refusals |
+| `src/env.rs` | the `TINIO_READ_ONLY`, `TINIO_SANDBOX` and `TINIO_STATE_DIR` names, one definition per variable |
 | `src/secret.rs`, `src/switch.rs` | the zeroizing secret string and the tolerant switch grammar |
 
 ## Gates
@@ -44,4 +47,5 @@ The features are what that build leaves out, and each is a graph of its own — 
 
 ```console
 cargo check -p tinio-util --features testing
+cargo test -p tinio-util --features state
 ```

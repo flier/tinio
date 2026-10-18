@@ -19,8 +19,8 @@
 pub use crate::_api::Error as ApiError;
 /// The CLI error (tinio-cli).
 pub use crate::_cli::Error as CliError;
-/// The configuration error (tinio-config).
-pub use crate::_config::Error as ConfigError;
+/// The configuration error (tinio-cli's config root).
+pub use crate::_cli::config::Error as ConfigError;
 /// The storage-contract error (tinio-core).
 pub use crate::_core::storage::Error as StorageError;
 /// The server error (tinio-server).

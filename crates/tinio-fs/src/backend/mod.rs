@@ -205,7 +205,7 @@ pub struct FsOptions {
     /// its owner's mapped uid, and bucket/prefix dirs to the bucket
     /// owner's. An owner without an entry stays server-user-owned
     /// (still `0600`/`0700`). Plain injected data — tinio-fs takes no
-    /// tinio-config/tinio-auth dependency; the config layer builds the
+    /// config or auth dependency; the config layer builds the
     /// map (Task 14). Inert on Windows (the creating user's ACLs
     /// isolate).
     #[garde(skip)]
@@ -680,7 +680,7 @@ impl FsStorage {
         // mode promises to leave alone, and a writable root would never
         // complain. The rule itself is `tinio-util`'s
         // `contains_under_any_spelling` (the one definer, shared with the
-        // server launcher's exposure set and `tinio-config`'s config
+        // server launcher's exposure set and the config layer's config
         // write), and it compares both spellings of either side — a
         // second copy of a case-folding rule is how the other owner ends
         // up comparing components literally, an in-root state dir in

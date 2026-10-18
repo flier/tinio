@@ -31,12 +31,11 @@ use std::{
 };
 
 use tempfile::TempDir;
-use tinio_config::{
-    sources::{READ_ONLY_VAR, SANDBOX_VAR},
-    state::STATE_DIR_VAR,
-};
 use tinio_sandbox::Event;
-use tinio_util::testing::{PipedChild, frame_line};
+use tinio_util::{
+    env::{READ_ONLY_VAR, SANDBOX_VAR, STATE_DIR_VAR},
+    testing::{PipedChild, frame_line},
+};
 use tokio::time::sleep;
 
 use super::common::{signed, tinio_bin, wait_timeout};

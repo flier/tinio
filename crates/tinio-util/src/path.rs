@@ -12,9 +12,9 @@
 //!   directory judged outside the root is granted a read-write entry, and
 //!   one judged outside a **read-only** root is a hole in the exposure
 //!   set rather than a storage error;
-//! - `tinio-config`'s discovery guard, one process earlier — the same
-//!   read-only refusal at the config path, whose leaf a run has not
-//!   created yet;
+//! - the CLI config root's discovery guard (`tinio_cli::config::discover`),
+//!   one process earlier — the same read-only refusal at the config path,
+//!   whose leaf a run has not created yet;
 //! - the `xtask`'s `sqlx check`/`update` guard — a cache directory inside
 //!   the scratch directory (or the reverse) would have the run regenerate
 //!   and then compare against the same tree.
@@ -34,9 +34,9 @@
 //! resolved spelling is compared beside it. **The pairings are not the caller's decision any more**
 //! — the four-pairing rule is [`contains_under_any_spelling`], which every guard calls, and the
 //! resolution behind it is private: a public half-step was an invitation to compose a fifth
-//! pairing set, which is the divergence this module exists to end. `tinio-config` was the last call
-//! site to stop composing its own, on 2026-09-26, when the `tinio-util` edge landed and its private
-//! copy went with it.
+//! pairing set, which is the divergence this module exists to end. The config layer was the last
+//! call site to stop composing its own, on 2026-09-26, when the `tinio-util` edge landed and its
+//! private copy went with it.
 
 #[cfg(windows)]
 use std::{
@@ -215,7 +215,7 @@ pub fn path_contains(candidate: &Path, root: &Path) -> bool {
 /// `a_rejoin_in_the_written_order_keeps_an_in_root_state_directory`.
 ///
 /// **A prefix comparison does not see that permutation, and saying so keeps
-/// the claim exact.** `Path::starts_with`, which `tinio-config`'s guard
+/// the claim exact.** `Path::starts_with`, which the config layer's guard
 /// compared with before it was widened to the shared rule, never lets a `..`
 /// escape the prefix it matched, so that form answered in-root for every
 /// `..`-bearing spelling probed on macOS 15.8, 2026-09-26 — and the refusal a

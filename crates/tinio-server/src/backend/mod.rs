@@ -175,11 +175,11 @@ use crate::_auth::canned::GrantHeaders;
 use crate::_auth::identity::Identity;
 #[cfg(feature = "copy")]
 use crate::_auth::source::copy_source_of;
-pub use crate::_config::s3::Capabilities;
 #[cfg(feature = "acl")]
 use crate::_core::acl;
 #[cfg(feature = "multipart")]
 use crate::_core::checksum as core_checksum;
+pub use crate::s3::Capabilities;
 use crate::{
     _core::{
         BodyStream, ETag, bucket, object,

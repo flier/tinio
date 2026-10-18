@@ -173,7 +173,7 @@ mod tests {
     use super::*;
     use crate::{
         _api::{State, client::Report, router::StatusBody},
-        _config::Config,
+        config::Config,
     };
 
     /// A resolution with nothing in it but what these legs read.
@@ -182,6 +182,7 @@ mod tests {
             pg_root: None,
             root: PathBuf::from(root),
             config: Config::default(),
+            identity: Default::default(),
             config_text: String::new(),
             config_path: PathBuf::from(root).join(".tinio/.tinio.toml"),
             read_only: false,

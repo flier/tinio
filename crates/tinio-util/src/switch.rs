@@ -1,10 +1,10 @@
 //! The tolerant on/off switch grammar, defined once: `1`/`true` and `0`/`false`, trimmed.
 //!
-//! [`parse_switch`] has two readers, and they are the two channels that decide whether a run
-//! protects its root or confines itself: `tinio-config`'s `TINIO_READ_ONLY`/`TINIO_SANDBOX`
-//! variables (`sources.rs`), and the CLI's `--read-only`/`--sandbox` flags, which carry an `env`
-//! attribute and therefore parse through a `value_parser` of their own
-//! (`crates/tinio-cli/src/commands/mod.rs`).
+//! [`parse_switch`] is the grammar the channels that decide whether a run protects its root or
+//! confines itself share: the CLI's `--read-only`/`--sandbox` flags carry an `env` attribute for
+//! `TINIO_READ_ONLY`/`TINIO_SANDBOX` and register this function as their `value_parser`
+//! (`crates/tinio-cli/src/commands/mod.rs`), so the flag and the variable parse through one
+//! grammar.
 //!
 //! **The two copies this module replaced are why it exists.** While each side carried its own
 //! `match`, the four accepted spellings and the refusal's wording happened to be identical —
@@ -22,12 +22,11 @@
 /// so a value nobody recognises has to stop the run rather than pick one of the two.
 ///
 /// **The refusal is a [`String`] and not an error type of this crate's, and that is the callers'
-/// shape rather than an omission.** The message is the whole payload. One reader is clap's
-/// `value_parser` contract, which is `Result<T, String>` and takes nothing else; the other folds
-/// the same message into `tinio-config`'s `Error::invalid_value` beside its variable name, so a
-/// typed error here would be converted back into this string at both ends and every reader would
-/// still name its own type. A `String` carries the one decision — the exact spelling the contract
-/// documents — and adds no dependency to a module whose content is one `match`.
+/// shape rather than an omission.** The message is the whole payload: clap's `value_parser`
+/// contract is `Result<T, String>` and takes nothing else, so a typed error here would be
+/// converted back into this string at the boundary and every reader would still name its own
+/// type. A `String` carries the one decision — the exact spelling the contract documents — and
+/// adds no dependency to a module whose content is one `match`.
 ///
 /// # Examples
 ///

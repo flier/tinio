@@ -55,7 +55,7 @@ use crate::_util::path::path_contains;
 // The shared recording device (`tinio_util::testing`), which this crate's dev edge turns on.
 #[cfg(all(feature = "sandbox", target_os = "linux"))]
 use crate::_util::testing::{assert_recorded_at, assert_step, record_events};
-use crate::{_config::Config, cli::Provenance, commands::start::Args, resolve::Resolution};
+use crate::{cli::Provenance, commands::start::Args, config::Config, resolve::Resolution};
 
 /// A resolution whose config asked for the confinement, with `root` and `state_dir` as given —
 /// and the state directory **named**, which is `TINIO_STATE_DIR`'s case.
@@ -67,6 +67,7 @@ fn requested(root: &Path, state_dir: &Path) -> Resolution {
         pg_root: None,
         root: root.to_path_buf(),
         config,
+        identity: Default::default(),
         config_text: config_text.to_owned(),
         config_path: state_dir.join(".tinio.toml"),
         read_only: false,
@@ -134,6 +135,7 @@ fn no_channel_is_a_disabled_request() {
         pg_root: None,
         root: Path::new("/srv/data").to_path_buf(),
         config: Config::default(),
+        identity: Default::default(),
         config_text: String::new(),
         config_path: Path::new("/srv/data/.tinio/.tinio.toml").to_path_buf(),
         read_only: false,
@@ -803,7 +805,7 @@ fn a_handoff_is_absent_or_refused_and_never_half() {
 #[test]
 fn the_mapping_follows_the_config() {
     assert!(
-        !local_uid_configured(&Config::default()),
+        !local_uid_configured(&Config::default().identity()),
         "a config with no `local_uid` asks for no capability"
     );
     // The key does not parse on Windows, so the mapped half is the unix config's.
@@ -811,7 +813,7 @@ fn the_mapping_follows_the_config() {
     {
         let mapped = Config::parse("version = 1\n[owner]\nlocal_uid = 1000\n").expect("config");
         assert!(
-            local_uid_configured(&mapped),
+            local_uid_configured(&mapped.identity()),
             "a configured `local_uid` mapping is what the Linux jail keeps `CAP_CHOWN` for"
         );
     }

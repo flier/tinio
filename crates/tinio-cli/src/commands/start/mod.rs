@@ -11,6 +11,7 @@
 #[cfg(feature = "api")]
 pub(crate) mod api;
 mod args;
+mod chown;
 #[cfg(feature = "api")]
 mod metrics;
 mod run;

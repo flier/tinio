@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use clap::{ArgAction, Args as ClapArgs};
 
 use crate::{
-    _config::log::{Format, Verbosity},
+    _server::log::{Format, Verbosity},
     commands::{EnvArgs, parse_switch},
 };
 
@@ -237,8 +237,8 @@ mod tests {
     use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
 
     use crate::{
-        _config::{log::Format, state::STATE_DIR_VAR},
-        _util::testing::assert_send_sync,
+        _server::log::Format,
+        _util::{env::STATE_DIR_VAR, testing::assert_send_sync},
         Error,
         cli::{
             ACCESS_KEY_VAR, Cli, Command, HOST_VAR, LOG_FORMAT_VAR, LOG_LEVEL_VAR, PG_DSN_VAR,

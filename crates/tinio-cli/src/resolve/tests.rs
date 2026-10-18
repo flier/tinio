@@ -43,6 +43,7 @@ fn resolution_with(root: &Path, state_dir: &Path, config_text: &str) -> Resoluti
         root: root.to_path_buf(),
         read_only: config.server.read_only,
         config,
+        identity: Default::default(),
         config_text: text,
         config_path: state_dir.join(discover::CONFIG_FILE),
         state_dir: state_dir.to_path_buf(),
@@ -60,7 +61,7 @@ fn toml_path(path: &Path) -> String {
 }
 
 /// `config_text` with the local channel's section spelled the way this platform parses it: the
-/// other platform's section is an unknown key at parse (`tinio-config`'s own platform tests),
+/// other platform's section is an unknown key at parse (the config root's own platform tests),
 /// and the legs above are written once, in the spelling `contracts/config.md` documents. What
 /// is under test is the channel's *path* rule, not the section's name.
 fn platform_config(config_text: &str) -> String {
@@ -315,7 +316,7 @@ fn the_candidates_lead_with_the_state_dir_the_chain_resolved() {
     // unsafe under edition 2024 and a unit test mutating one process-global table across
     // parallel threads is the rule's whole point). `derived` is the home-derived
     // candidate, *lazily*: the real one is `default_home_state_dir`, which **creates**
-    // `<home>/.tinio/roots` while it computes (`crates/tinio-config/src/state.rs:37-42`),
+    // `<home>/.tinio/roots` while it computes (`crates/tinio-util/src/state.rs:84-87`),
     // so a unit test that derived it would seed the developer's real home — the rule
     // `home_state_dir`'s own doc states ("home is an explicit parameter, never
     // `dirs::home_dir()` inline: tests must resolve a scratch home instead of the real

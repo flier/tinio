@@ -28,12 +28,12 @@ use crate::resolve::for_doctor;
 #[cfg(feature = "pg")]
 use crate::resolve::pg;
 use crate::{
-    _config::state::prepare_home_derived,
     _core::cleanup::{Cleanup, CleanupOptions, RepairActionLevel, RepairKind},
     _fs::{
         FsCleanup, FsStorage,
         database::{Open, compact_if_needed},
     },
+    _util::state::prepare_home_derived,
     Error,
     report::{Finding, PRIVATE_STATE, Report, Severity},
     resolve::{Located, Resolution},

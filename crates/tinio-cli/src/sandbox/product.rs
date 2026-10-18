@@ -203,12 +203,13 @@ pub(super) fn exposures(resolution: &Resolution, access: AccessMode) -> Sandbox 
 /// `tinio_util::path::contains_under_any_spelling`'s — the literal pair, the resolved candidate
 /// against the literal root, the literal candidate against the resolved root, and both resolved —
 /// so this guard names the question in both directions and nothing more. The two read-only guards
-/// (`tinio-fs`'s and `tinio-config`'s, whose call sites reach the same function directly) ask it of
-/// a root that is already canonical (`resolve_root`), and there the last two pairings repeat the
-/// first two: the four-pairing set is exact for them rather than wider, which is why one function
-/// serves all three call sites. **The `tinio-config` → `tinio-util` edge is what let its copy go**:
-/// measured 2026-09-26, neither crate had named the other in its manifest in either direction, and
-/// the edge that landed is `tinio-config` → `tinio-util`.
+/// (`tinio-fs`'s and the CLI config root's, whose call sites reach the same function directly)
+/// ask it of a root that is already canonical (`resolve_root`), and there the last two pairings
+/// repeat the first two: the four-pairing set is exact for them rather than wider, which is why
+/// one function serves all three call sites. **The config layer → `tinio-util` edge is what let
+/// its copy go**: measured 2026-09-26, neither the config layer's crate nor `tinio-util` had
+/// named the other in its manifest in either direction, and the edge that landed is the config
+/// layer → `tinio-util`.
 ///
 /// **Nothing here is Windows-specific, and the gate says so** — it is the arms' gate widened by
 /// `test` and narrowed by the `sandbox` feature. Three pure values in, a decision out.
@@ -267,7 +268,7 @@ pub(crate) fn refuse_in_root_state_dir(
 /// `home` paragraph). The remedy is the
 /// operator's `TINIO_STATE_DIR`, which names a directory the profile exposes whole; the refusal
 /// names it rather than letting the child die on its own `EPERM`, which arrives as
-/// `configuration error: failed to resolve the state directory at …: Operation not permitted` with
+/// `state error: failed to resolve the state directory at …: Operation not permitted` with
 /// no way for the operator to tell that a grant was the missing thing.
 ///
 /// **What decides is whether the state directory was named, not where it lands** — and *named*
@@ -338,7 +339,7 @@ pub(crate) fn refuse_underived_state_dir(
 /// something to mint: creating it here would change what a refused run leaves behind, and it is
 /// also what keeps the caller's *bind* from minting one, since a unix socket's parent is created
 /// by the bind that this probe stands in front of. **Who makes the directory is that same step's**
-/// — it hardens a derived read-only leaf with `tinio_config::state::prepare_home_derived` just
+/// — it hardens a derived read-only leaf with `tinio_util::state::prepare_home_derived` just
 /// before the `create_dir_all` — and this probe only asks whether the directory that step produced
 /// will take an entry; it neither creates nor hardens one. `create_new` rather than a plain create
 /// is deliberate: a name already taken is refused instead of opened, so a symlink planted at the

@@ -18,7 +18,7 @@ Every crate carries its own README; those are the detail, this is the index.
 | [`tinio-blob`](crates/tinio-blob/README.md) | Content-addressed block engine: blobs by SHA-256, deduplicated, swept by live set |
 | [`tinio-store-redb`](crates/tinio-store-redb/README.md) | The shared redb table layer and the state-database driver |
 | [`tinio-store-pg`](crates/tinio-store-pg/README.md) | The four persistence contracts over PostgreSQL: migrations, the driver pool, the content and block planes |
-| [`tinio-util`](crates/tinio-util/README.md) | Shared runtime utilities: the evicting per-key lock map, commit primitives, path/process/secret helpers, and the Windows wide-string writer |
+| [`tinio-util`](crates/tinio-util/README.md) | Shared runtime utilities: the evicting per-key lock map, commit primitives, path/process/secret helpers, the state-directory resolver and the `TINIO_*` names, and the Windows wide-string writer |
 
 **Backends**
 
@@ -35,9 +35,8 @@ Every crate carries its own README; those are the detail, this is the index.
 | [`tinio-server`](crates/tinio-server/README.md) | The s3s data plane: routing, XML, error mapping, metrics, and the `[s3]` capability switches it enforces |
 | [`tinio-auth`](crates/tinio-auth/README.md) | The authn/authz engine: the secret lookup and the pre-route authorization pipeline |
 | [`tinio-select`](crates/tinio-select/README.md) | The streaming SQL SELECT engine for S3 objects (S3 Select) |
-| [`tinio-config`](crates/tinio-config/README.md) | TOML configuration schema, discovery and auto-create, credentials, `.env` and the environment chain |
 | [`tinio-api`](crates/tinio-api/README.md) | The management plane: the `state` file and single-instance bind, the local channel / named pipe / TCP transports, `/status`, `/stop`, `/metrics`, `/openapi.json` |
-| [`tinio-cli`](crates/tinio-cli/README.md) | The CLI: `server`/`start`, `status`, `stop`, `doctor`, and the `service` verbs that register the server with systemd, launchd or the SCM |
+| [`tinio-cli`](crates/tinio-cli/README.md) | The CLI: `server`/`start`, `status`, `stop`, `doctor`, the `service` verbs that register the server with systemd, launchd or the SCM, and the configuration composition root |
 | [`tinio`](crates/tinio/README.md) | The facade: the `tinio` binary and the re-export library |
 
 **Confinement**

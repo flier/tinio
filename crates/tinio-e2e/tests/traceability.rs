@@ -211,10 +211,11 @@ const NOT_COVERED_BY_CUCUMBER: &[AllowListed] = &[
     AllowListed {
         id: "T018",
         reason: "`.env` loading — the config layer's, not S3-observable: \
-                 T018 landed as `load_env_file` and its tests in \
-                 `crates/tinio-config/src/sources.rs`, the path \
+                 T018 landed as `load_env_file` and its tests in the CLI's \
+                 composition root at \
+                 `crates/tinio-cli/src/config/sources.rs`, the path \
                  contracts/config.md cites for the file's loading.",
-        home: Home::Path("crates/tinio-config/src/sources.rs"),
+        home: Home::Path("crates/tinio-cli/src/config/sources.rs"),
     },
     AllowListed {
         id: "T087",

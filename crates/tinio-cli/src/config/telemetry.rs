@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::telemetry::Config;
+/// use tinio_cli::config::telemetry::Config;
 ///
 /// let t = Config::default();
 /// assert_eq!(t.otlp_endpoint, ""); // unset; a present section must carry a valid URL

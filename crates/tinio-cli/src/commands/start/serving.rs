@@ -22,6 +22,7 @@ use crate::{
         FsCleanup, FsStorage, Scanner, ScannerOptions,
         sweep::{self, Sweeper},
     },
+    config,
     resolve::Resolution,
 };
 #[cfg(feature = "pg")]
@@ -300,8 +301,9 @@ pub(super) trait ServingBackend: Storage + Clone + Send + Sync + 'static {
         stop: watch::Receiver<bool>,
         access: AccessMode,
         sweep: sweep::Options,
+        scanner: ScannerOptions,
     ) -> BoxFuture<'static, ()> {
-        let _ = (stop, access, sweep);
+        let _ = (stop, access, sweep, scanner);
         Box::pin(ready(()))
     }
 }
@@ -332,8 +334,15 @@ impl ServingBackend for FsStorage {
         stop: watch::Receiver<bool>,
         access: AccessMode,
         sweep: sweep::Options,
+        scanner: ScannerOptions,
     ) -> BoxFuture<'static, ()> {
-        Box::pin(scanner_and_sweeper(self.clone(), stop, access, sweep))
+        Box::pin(scanner_and_sweeper(
+            self.clone(),
+            stop,
+            access,
+            sweep,
+            scanner,
+        ))
     }
 }
 
@@ -369,6 +378,7 @@ impl ServingBackend for PgStorage {
         stop: watch::Receiver<bool>,
         access: AccessMode,
         sweep: sweep::Options,
+        _scanner: ScannerOptions,
     ) -> BoxFuture<'static, ()> {
         Box::pin(pg_pass(
             self.clone(),
@@ -415,13 +425,13 @@ pub(super) fn fs_cleanup(storage: &FsStorage, resolution: &Resolution) -> FsClea
 /// the same `Err(ShutDown)` and its loop logs it ("scanner pass failed"/"sweep pass failed") and
 /// drops it. Nothing is lost: the work a pass does is idempotent and resumes on the next start.
 ///
-/// **A read-only run builds neither pass.** The scanner's gate is `enabled: false` there — its
-/// purpose is to pre-warm ETags by *writing* rows, and a read-only run reads the rows instead
-/// (the read paths recompute what they cannot hit without writing it back, FR-023 amended) — and
-/// the sweeper is not built at all: its pass removes `<state-dir>/tmp` and `multipart/` residue
-/// and writes the retention/compaction rows, and in this mode the state dir is the **root's own**
-/// `.tinio/`, so running it would write the very tree the mode promises to leave alone. The
-/// existing `Cleanup` access gate stays what covers the startup repair
+/// **A read-only run builds neither pass.** The early return below skips both, before any
+/// `Scanner` is constructed. The scanner's purpose is to pre-warm ETags by *writing* rows, and a
+/// read-only run reads the rows instead (the read paths recompute what they cannot hit without
+/// writing it back, FR-023 amended); the sweeper's pass removes `<state-dir>/tmp` and
+/// `multipart/` residue and writes the retention/compaction rows, and in this mode the state dir
+/// is the **root's own** `.tinio/`, so running it would write the very tree the mode promises to
+/// leave alone. The existing `Cleanup` access gate stays what covers the startup repair
 /// ([`ServingBackend::repair`]), which is a different pass.
 ///
 /// The scanner's `TINIO_SCANNER=0`/`1` toggle is read inside `Scanner::new`, so the strict
@@ -431,6 +441,7 @@ async fn scanner_and_sweeper(
     stop: watch::Receiver<bool>,
     access: AccessMode,
     sweep_options: sweep::Options,
+    scanner_options: ScannerOptions,
 ) {
     if access.is_read_only() {
         // Read-only mode builds neither pass (see the doc above): the scanner
@@ -438,20 +449,42 @@ async fn scanner_and_sweeper(
         // sweeper's passes would write the state dir the mode serves from.
         return;
     }
-    let scanner = Scanner::new(
-        storage.clone(),
-        ScannerOptions {
-            // The `[scanner]` section's own gate is Task 9's/its own wiring; what this task
-            // lifts is the shape, and `TINIO_SCANNER=0` still switches the scanner off here.
-            enabled: true,
-            delay: Duration::from_secs(10),
-            max_wait: Duration::from_secs(15),
-            cycle: Duration::from_secs(24 * 3600),
-            access,
-        },
-    );
+    let scanner = Scanner::new(storage.clone(), scanner_options);
     let sweeper = Sweeper::new(storage, sweep_options);
     let (_, _) = tokio::join!(scanner.run(stop.clone()), sweeper.run(stop));
+}
+
+/// The scanner options a resolved `[scanner]` section describes.
+///
+/// **Presence is the gate** (FR-024): the section present switches the scanner on, absent leaves
+/// it off, and the three pacing keys carry their documented defaults when the section omits them.
+/// The `TINIO_SCANNER` `0`/`1` override is not read here — it belongs to [`Scanner::new`], which
+/// applies it on top of this `enabled`.
+///
+/// `delay` is seconds as a float in the config; a value [`Duration`] cannot represent (a TOML
+/// `nan`/`inf` slips through the parser's lower-bound check) falls back to the default rather than
+/// panicking in `Duration::from_secs_f64`.
+pub(super) fn scanner_options(
+    section: Option<&config::scanner::Config>,
+    access: AccessMode,
+) -> ScannerOptions {
+    let enabled = section.is_some();
+    let defaults = config::scanner::Config::default();
+    let section = section.unwrap_or(&defaults);
+    let default_delay = Duration::try_from_secs_f64(defaults.delay).unwrap_or(Duration::ZERO);
+    ScannerOptions {
+        enabled,
+        delay: Duration::try_from_secs_f64(section.delay).unwrap_or(default_delay),
+        max_wait: section.max_wait,
+        cycle: section.cycle,
+        access,
+    }
+}
+
+/// [`scanner_options`] for the resolved configuration — the one reading of
+/// `resolution.config.scanner` on the serving path.
+pub(super) fn scanner_options_for(resolution: &Resolution, access: AccessMode) -> ScannerOptions {
+    scanner_options(resolution.config.scanner.as_ref(), access)
 }
 
 /// The background sweep's options from the resolved `[s3]` section (R2): the two TTLs —

@@ -101,7 +101,6 @@ tinio-auth = { path = "crates/tinio-auth" }
 tinio-bench = { path = "crates/tinio-bench" }
 tinio-blob = { path = "crates/tinio-blob" }
 tinio-cli = { path = "crates/tinio-cli", default-features = false }
-tinio-config = { path = "crates/tinio-config" }
 tinio-core = { path = "crates/tinio-core" }
 tinio-fs = { path = "crates/tinio-fs" }
 tinio-mem = { path = "crates/tinio-mem" }

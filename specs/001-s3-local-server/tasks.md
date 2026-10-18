@@ -22,7 +22,7 @@ description: "Task list for the S3-compatible local storage server (tinio) featu
 
 ## Path Conventions
 
-- **Workspace**: eight crates under `crates/` (`tinio`, `tinio-core`, `tinio-mem`, `tinio-fs`, `tinio-config`, `tinio-server`, `tinio-api`, `tinio-cli`); workspace root `Cargo.toml` at the repository root
+- **Workspace**: seven crates under `crates/` (`tinio`, `tinio-core`, `tinio-mem`, `tinio-fs`, `tinio-server`, `tinio-api`, `tinio-cli`); workspace root `Cargo.toml` at the repository root
 - **Interop tests**: `e2e/interop/` (third-party S3 client scenarios — mandated clients CI-gated, best-effort clients targeted/manual, per FR-025)
 - **Performance scripts**: `e2e/perf/` (streaming-memory and flat-memory verification scripts)
 - **User docs**: `docs/` (user manual + usage tutorial, markdown)
@@ -187,10 +187,10 @@ description: "Task list for the S3-compatible local storage server (tinio) featu
 
 - [ ] T082 [US3] Implement the auth provider in `crates/tinio-server/src/auth.rs`: `S3Auth` impl resolving the secret key from the resolved config (thin lookup; s3s performs SigV4/SigV2 verification); `check-bucket-name` framework feature retained (FR-012); unit tests written first
 - [ ] T083 [US3] Wire auth into the data plane in `crates/tinio-server/src/data.rs`: build `S3Service` with the auth provider by default; anonymous mode builds it without (framework skips access checks); explicit anonymous switch overrides configured credentials with a logged warning (FR-009); unit tests written first
-- [ ] T084 [US3] Extend `crates/tinio-config/src/sources.rs` with the `MINIO_*` credential fallback: `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` (legacy) and `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` (modern) accepted when the `TINIO_*` names are absent (minio-compat contract); unit tests written first
-- [ ] T085 [US3] Implement the session-credential branch in `crates/tinio-config/src/credentials.rs`: config present without credentials and no anonymous mode → session credentials generated and printed once (daemon: into the log); unit tests written first
+- [ ] T084 [US3] Extend `crates/tinio-cli/src/config/sources.rs` with the `MINIO_*` credential fallback: `MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY` (legacy) and `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` (modern) accepted when the `TINIO_*` names are absent (minio-compat contract); unit tests written first
+- [ ] T085 [US3] Implement the session-credential branch in `crates/tinio-cli/src/config/credentials.rs`: config present without credentials and no anonymous mode → session credentials generated and printed once (daemon: into the log); unit tests written first
 - [ ] T086 [US3] Implement the `sig_v2` runtime toggle in `crates/tinio-server/src/data.rs` (FR-021): `[s3] sig_v2 = false` default; enabling prints a startup warning (deprecated scheme, slated for removal in v2); unit tests written first
-- [ ] T087 [US3] Wire the `--anonymous` flag through `crates/tinio-cli/src/commands/start.rs` and the env resolution in `crates/tinio-config/src/sources.rs` (`TINIO_ANONYMOUS`): flag/env-only semantics — an `anonymous` key in `[auth]` is rejected as unknown at startup; unit tests written first
+- [ ] T087 [US3] Wire the `--anonymous` flag through `crates/tinio-cli/src/commands/start/` and the env resolution in `crates/tinio-cli/src/config/sources.rs` (`TINIO_ANONYMOUS`): flag/env-only semantics — an `anonymous` key in `[auth]` is rejected as unknown at startup; unit tests written first
 
 **Checkpoint**: All user stories independently functional — authenticated and anonymous flows verified against aws cli v2 and rclone; error-code suite (SC-004) green including auth failures.
 

@@ -5,13 +5,19 @@
 //! validation at parse).
 
 use derive_more::PartialEq;
+#[cfg(feature = "config")]
 use garde::Validate;
+#[cfg(feature = "config")]
 use secrecy::ExposeSecret;
+#[cfg(feature = "config")]
 use serde::{Deserialize, Serialize};
 
-#[cfg(windows)]
+#[cfg(feature = "config")]
+use super::auth::Secret;
+#[cfg(all(windows, feature = "config"))]
 use super::validate_local_uid;
-use super::{auth::Secret, reject_empty, validate_canonical_id_opt};
+#[cfg(feature = "config")]
+use super::{reject_empty, validate_canonical_id_opt};
 use crate::_core::acl::{OwnerId, derive_canonical_id};
 
 /// One configured S3 user (`[[users]]`).
@@ -20,11 +26,11 @@ use crate::_core::acl::{OwnerId, derive_canonical_id};
 ///
 /// ```rust
 /// use secrecy::ExposeSecret;
-/// use tinio_config::users::Config;
+/// use tinio_server::identity::{auth::SecretKey, users::Config};
 ///
 /// let user = Config {
 ///     access_key: "AKID".into(),
-///     secret_key: tinio_config::auth::SecretKey::from("secret").into(),
+///     secret_key: SecretKey::from("secret").into(),
 ///     canonical_id: None,
 ///     display_name: None,
 ///     local_uid: None,
@@ -33,27 +39,28 @@ use crate::_core::acl::{OwnerId, derive_canonical_id};
 /// assert_eq!(user.resolved_canonical_id().as_str().len(), 64);
 /// assert_eq!(&**user.secret_key.expose_secret(), "secret");
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Validate, PartialEq)]
-#[garde(allow_unvalidated)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "config", derive(Serialize, Deserialize, Validate))]
+#[cfg_attr(feature = "config", garde(allow_unvalidated))]
 pub struct Config {
     /// The SigV4 access key (≥ 1 char).
-    #[garde(length(min = 1))]
+    #[cfg_attr(feature = "config", garde(length(min = 1)))]
     pub access_key: String,
     /// The SigV4 secret key (non-empty — the `[auth]` rule body).
-    #[garde(custom(validate_secret_key))]
-    pub secret_key: Secret,
+    #[cfg_attr(feature = "config", garde(custom(validate_secret_key)))]
+    pub secret_key: super::auth::Secret,
     /// The canonical account ID (default `hex(SHA-256(access_key))`).
-    #[serde(default)]
-    #[garde(custom(validate_canonical_id_opt))]
+    #[cfg_attr(feature = "config", serde(default))]
+    #[cfg_attr(feature = "config", garde(custom(validate_canonical_id_opt)))]
     pub canonical_id: Option<String>,
     /// The presentation display name (default the access key).
-    #[serde(default)]
+    #[cfg_attr(feature = "config", serde(default))]
     pub display_name: Option<String>,
     /// This user's files chown to this uid on unix (unix-only; a Windows
     /// config with the key set fails validation at parse). The field
     /// stays on every platform (the portable type); Windows arms the
     /// rule.
-    #[cfg_attr(windows, garde(custom(validate_local_uid)))]
+    #[cfg_attr(all(windows, feature = "config"), garde(custom(validate_local_uid)))]
     pub local_uid: Option<u32>,
 }
 
@@ -64,14 +71,20 @@ impl Config {
     /// argument).
     #[expect(
         clippy::expect_used,
-        reason = "argued: a configured `canonical_id` is validated at config parse — `validate_canonical_id_opt` is this field's garde rule (`schema/mod.rs`) and runs inside `Config::parse`/`Config::load`, and the `None` arm derives instead; the `pub` field's remaining hole is a hand-built struct, and no in-repo production caller builds one (checked 2026-10-09)"
+        reason = "argued: a configured `canonical_id` is validated at config parse — `validate_canonical_id_opt` is this field's garde rule (`identity.rs`) and runs when the CLI's root document validates (`tinio_cli::config::Config::parse`/`load`), and the `None` arm derives instead; the `pub` field's remaining hole is a hand-built struct, and no in-repo production caller builds one (checked 2026-10-09)"
     )]
     pub fn resolved_canonical_id(&self) -> OwnerId {
+        self.effective_canonical_id()
+            .expect("canonical_id is validated at config parse")
+    }
+
+    /// The effective canonical ID, or `None` when the configured one is invalid (the per-field
+    /// rule reports that at parse). The one definition of the `None` default
+    /// `hex(SHA-256(access_key))`, shared by the assembly and the uniqueness validation.
+    pub fn effective_canonical_id(&self) -> Option<OwnerId> {
         match &self.canonical_id {
-            Some(id) => {
-                OwnerId::new(id.clone()).expect("canonical_id is validated at config parse")
-            }
-            None => derive_canonical_id(&self.access_key),
+            Some(id) => OwnerId::new(id.clone()).ok(),
+            None => Some(derive_canonical_id(&self.access_key)),
         }
     }
 
@@ -84,6 +97,7 @@ impl Config {
 }
 
 /// The secret-key rule (spec §6): the `[auth]` non-empty check.
+#[cfg(feature = "config")]
 fn validate_secret_key(value: &Secret, _context: &()) -> garde::Result {
     reject_empty(
         "users.secret_key must not be empty",
@@ -91,21 +105,20 @@ fn validate_secret_key(value: &Secret, _context: &()) -> garde::Result {
     )
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, feature = "config"))]
+mod schema_tests {
+    use garde::Validate;
     use secrecy::ExposeSecret;
 
-    use crate::{Config, Error};
+    use super::*;
 
     #[test]
     fn user_defaults_derive_canonical_id_and_display_name() {
         // Spec §6: canonical_id defaults to hex(SHA-256(access_key)),
         // display_name to the access key.
-        let config = Config::parse(
-            "version = 1\n[[users]]\naccess_key = \"AKID\"\nsecret_key = \"secret\"\n",
-        )
-        .unwrap();
-        let user = &config.users()[0];
+        let user: Config =
+            toml::from_str("access_key = \"AKID\"\nsecret_key = \"secret\"\n").unwrap();
+        user.validate().unwrap();
         assert_eq!(
             user.resolved_canonical_id().as_str(),
             "2c8a2a08ad81dddf7e7830cbc75310f731a1381431bb29afb55a76ee07e81721"
@@ -116,11 +129,11 @@ mod tests {
 
     #[test]
     fn explicit_canonical_id_and_display_name_override_the_defaults() {
-        let config = Config::parse(
-            "version = 1\n[[users]]\naccess_key = \"AKID\"\nsecret_key = \"secret\"\ncanonical_id = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\ndisplay_name = \"alice\"\n",
+        let user: Config = toml::from_str(
+            "access_key = \"AKID\"\nsecret_key = \"secret\"\ncanonical_id = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\ndisplay_name = \"alice\"\n",
         )
         .unwrap();
-        let user = &config.users()[0];
+        user.validate().unwrap();
         assert_eq!(
             user.resolved_canonical_id().as_str(),
             "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
@@ -130,19 +143,15 @@ mod tests {
 
     #[test]
     fn empty_access_key_rejected() {
-        let err =
-            Config::parse("version = 1\n[[users]]\naccess_key = \"\"\nsecret_key = \"secret\"\n")
-                .unwrap_err();
-        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        let user: Config = toml::from_str("access_key = \"\"\nsecret_key = \"secret\"\n").unwrap();
+        assert!(user.validate().is_err());
     }
 
     #[test]
     fn empty_secret_key_rejected() {
         // The `[auth]` secret-key rule body (non-empty only).
-        let err =
-            Config::parse("version = 1\n[[users]]\naccess_key = \"AKID\"\nsecret_key = \"\"\n")
-                .unwrap_err();
-        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        let user: Config = toml::from_str("access_key = \"AKID\"\nsecret_key = \"\"\n").unwrap();
+        let err = user.validate().unwrap_err();
         assert!(err.to_string().contains("secret_key"), "{err}");
     }
 
@@ -150,11 +159,21 @@ mod tests {
     fn user_never_accepts_the_anonymous_canonical_id() {
         // Task 7 ruling: a configured user with the anonymous ID would
         // BECOME the anonymous principal.
-        let err = Config::parse(
-            "version = 1\n[[users]]\naccess_key = \"AKID\"\nsecret_key = \"secret\"\ncanonical_id = \"65a011a29cdf8ec533ec3d1ccaae921c\"\n",
+        let user: Config = toml::from_str(
+            "access_key = \"AKID\"\nsecret_key = \"secret\"\ncanonical_id = \"65a011a29cdf8ec533ec3d1ccaae921c\"\n",
         )
-        .unwrap_err();
-        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        .unwrap();
+        let err = user.validate().unwrap_err();
         assert!(err.to_string().contains("anonymous"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_local_uid_is_rejected_on_windows() {
+        let user: Config =
+            toml::from_str("access_key = \"AKID\"\nsecret_key = \"secret\"\nlocal_uid = 1000\n")
+                .unwrap();
+        let err = user.validate().unwrap_err();
+        assert!(err.to_string().contains("local_uid"), "{err}");
     }
 }

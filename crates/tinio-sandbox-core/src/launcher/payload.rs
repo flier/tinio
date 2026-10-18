@@ -12,7 +12,7 @@
 //! deserializer be the validator.
 //!
 //! `config` is a `String`, not bytes: `Config::load` reads the file with
-//! `read_to_string` and `toml::from_str` takes a `&str` (`crates/tinio-config/src/schema/config.rs:131`),
+//! `read_to_string` and `toml::Deserializer::parse` takes a `&str` (`crates/tinio-cli/src/config/mod.rs:191`),
 //! so a configuration that is not valid UTF-8 already fails to load long before
 //! a launch happens. Carrying bytes here would mean a base64 adapter hand-written
 //! for an input the rest of the program cannot produce.

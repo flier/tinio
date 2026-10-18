@@ -17,10 +17,10 @@ use tokio::{
 #[cfg(all(test, feature = "pg"))]
 use super::serving::pg_pass;
 #[cfg(test)]
-use super::serving::{fs_cleanup, multipart_grace_for};
+use super::serving::{fs_cleanup, multipart_grace_for, scanner_options};
 use super::{
     Args, Prepared, Ready, Served,
-    serving::{ServingBackend, sweep_options_for},
+    serving::{ServingBackend, scanner_options_for, sweep_options_for},
 };
 #[cfg(feature = "versioning")]
 use crate::_fs::FsStorage;
@@ -28,8 +28,9 @@ use crate::_fs::FsStorage;
 use crate::_fs::sweep;
 #[cfg(unix)]
 use crate::notify;
+#[cfg(feature = "pg")]
+use crate::{_core::storage::Error as StorageError, _pg::PgStorage};
 use crate::{
-    _config,
     _core::{mode::AccessMode, storage::Storage},
     _sandbox::{Adopted, platform_facts},
     _server::{
@@ -42,8 +43,6 @@ use crate::{
     resolve::{Pipelines, Resolution},
     sandbox, signal,
 };
-#[cfg(feature = "pg")]
-use crate::{_core::storage::Error as StorageError, _pg::PgStorage};
 
 /// The drain bound `contracts/cli.md:43` promises: "cease accepting, drain ≤ 10 s, remove `state`
 /// and the socket, exit 0".
@@ -408,8 +407,12 @@ where
         async move { plane.serve(stop).await }
     });
     let data = tokio::spawn(data.serve(listener, stop.clone()));
-    let background =
-        tokio::spawn(storage.background(stop.clone(), access, sweep_options_for(&resolution)));
+    let background = tokio::spawn(storage.background(
+        stop.clone(),
+        access,
+        sweep_options_for(&resolution),
+        scanner_options_for(&resolution, access),
+    ));
 
     #[cfg(feature = "api")]
     // **A launched child never writes `state`.** Its launcher does, and the reason is the same on
@@ -438,7 +441,7 @@ where
         } else {
             "read-write"
         },
-        origin = credential_origin(&args.env, &resolution.config),
+        origin = credential_origin(&args.env, resolution.identity()),
     );
     if let Some(on_ready) = on_ready {
         on_ready();
@@ -694,7 +697,7 @@ fn background_arm(name: &str, outcome: Result<(), JoinError>) -> Result<(), Erro
 /// left.
 fn capabilities_for(resolution: &Resolution) -> Capabilities {
     match resolution.config.s3.as_ref() {
-        Some(s3) => Capabilities::from(s3),
+        Some(s3) => s3.capabilities,
         None => Capabilities::default(),
     }
 }
@@ -717,7 +720,11 @@ fn plane_for<S: Storage>(storage: S, plane: PlaneConfig, resolution: &Resolution
         // `identity::IdentityFromConfig`), which is also what the root credential pair inside
         // it derives from — so the acl plane and the auth-only one cannot disagree about who
         // the root user is.
-        return DataPlane::new_with_acl(storage, plane, Identity::from_config(&resolution.config));
+        return DataPlane::new_with_acl(
+            storage,
+            plane,
+            Identity::from_config(resolution.identity()),
+        );
     }
     let (access_key, secret_key) = credentials_of(resolution);
     DataPlane::new_with_auth(storage, plane, &access_key, &secret_key)
@@ -732,7 +739,7 @@ fn plane_for<S: Storage>(storage: S, plane: PlaneConfig, resolution: &Resolution
 /// `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY` (and `.env` with them) onto `config.auth`, which is
 /// why the lookup is a read of the resolved config and not a second environment read.
 fn credentials_of(resolution: &Resolution) -> (String, String) {
-    identity::root_auth_pair(&resolution.config)
+    identity::root_auth_pair(resolution.identity())
 }
 
 /// Where the served pair came from, for the stderr summary line.
@@ -749,7 +756,7 @@ fn credentials_of(resolution: &Resolution) -> (String, String) {
 /// summary at odds with the loopback warning printed just above it. The predicate is
 /// [`identity::uses_builtin_fallback`], the same one that warning and the non-loopback refusal
 /// read.
-fn credential_origin(env: &EnvArgs, config: &_config::Config) -> &'static str {
+fn credential_origin(env: &EnvArgs, config: &identity::Config) -> &'static str {
     if env.access_key.is_some() {
         "from TINIO_ACCESS_KEY/TINIO_SECRET_KEY"
     } else if identity::uses_builtin_fallback(config) {

@@ -21,7 +21,7 @@ pub mod pg;
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::storage::Backend;
+/// use tinio_cli::config::storage::Backend;
 ///
 /// assert_eq!(Backend::default(), Backend::Fs);
 /// assert_eq!(Backend::Pg.to_string(), "pg");
@@ -46,7 +46,7 @@ pub enum Backend {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::storage::Config;
+/// use tinio_cli::config::storage::Config;
 ///
 /// let storage = Config::default();
 /// assert!(!storage.fs.follow_symlinks); // secure default: reject symlinks
@@ -83,7 +83,7 @@ pub struct Config {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::storage::Fs;
+/// use tinio_cli::config::storage::Fs;
 ///
 /// let fs = Fs::default();
 /// assert!(!fs.follow_symlinks); // secure default: reject symlinks
@@ -172,7 +172,6 @@ fn meta_batch_bytes() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config as RootConfig, Error};
 
     #[test]
     fn defaults_match_the_contract() {
@@ -181,126 +180,6 @@ mod tests {
         let fs = Fs::default();
         assert_eq!(fs.meta_batch_size, DEFAULT_META_BATCH_SIZE);
         assert_eq!(fs.meta_batch_bytes, DEFAULT_META_BATCH_BYTES);
-    }
-
-    #[test]
-    fn meta_batch_size_range_validated() {
-        // 1..=4096; outside → startup error (pipeline-spec.md §3.3).
-        for bad in [0u16, 4097] {
-            let text = format!("version = 1\n[storage.fs]\nmeta_batch_size = {bad}");
-            let err = RootConfig::parse(&text).unwrap_err();
-            assert!(matches!(err, Error::InvalidValue { .. }), "{text}: {err}");
-        }
-        for good in [1u16, 128, 4096] {
-            let text = format!("version = 1\n[storage.fs]\nmeta_batch_size = {good}");
-            let config = RootConfig::parse(&text).unwrap();
-            assert_eq!(config.storage.as_ref().unwrap().fs.meta_batch_size, good);
-        }
-    }
-
-    #[test]
-    fn meta_batch_bytes_range_validated() {
-        // 1024..=16 MiB; outside → startup error.
-        for bad in [1023u32, 16 * 1024 * 1024 + 1] {
-            let text = format!("version = 1\n[storage.fs]\nmeta_batch_bytes = {bad}");
-            let err = RootConfig::parse(&text).unwrap_err();
-            assert!(matches!(err, Error::InvalidValue { .. }), "{text}: {err}");
-        }
-        for good in [1024u32, 262144, 16 * 1024 * 1024] {
-            let text = format!("version = 1\n[storage.fs]\nmeta_batch_bytes = {good}");
-            let config = RootConfig::parse(&text).unwrap();
-            assert_eq!(config.storage.as_ref().unwrap().fs.meta_batch_bytes, good);
-        }
-    }
-
-    #[test]
-    fn absent_keys_keep_the_defaults() {
-        // Presence-gated (Q8): a section that omits the keys deserializes
-        // the defaults — never the field-type default (0 would fail garde).
-        let config =
-            RootConfig::parse("version = 1\n[storage.fs]\nfollow_symlinks = false").unwrap();
-        let fs = &config.storage.as_ref().unwrap().fs;
-        assert_eq!(fs.meta_batch_size, DEFAULT_META_BATCH_SIZE);
-        assert_eq!(fs.meta_batch_bytes, DEFAULT_META_BATCH_BYTES);
-    }
-
-    #[test]
-    fn mem_limits_default_to_unlimited() {
-        // `[storage.mem]` is absent by default, and the limits are
-        // optional — the documented no-limit posture (CHK028).
-        let config = RootConfig::parse("version = 1").unwrap();
-        assert!(config.storage.is_none());
-
-        let config = RootConfig::parse("version = 1\n[storage.mem]").unwrap();
-        let mem = config.storage.as_ref().unwrap().mem.as_ref().unwrap();
-        assert_eq!(mem.max_object_bytes, None);
-        assert_eq!(mem.max_total_bytes, None);
-    }
-
-    #[test]
-    fn mem_limits_parse_when_set() {
-        let config = RootConfig::parse(
-            "version = 1\n[storage.mem]\nmax_object_bytes = 1048576\nmax_total_bytes = 1073741824",
-        )
-        .unwrap();
-        let mem = config.storage.as_ref().unwrap().mem.as_ref().unwrap();
-        assert_eq!(mem.max_object_bytes, Some(1048576));
-        assert_eq!(mem.max_total_bytes, Some(1073741824));
-    }
-
-    #[test]
-    fn mem_limits_reject_zero() {
-        // A byte limit must be positive when present (absent = unlimited).
-        for bad in [
-            "version = 1\n[storage.mem]\nmax_object_bytes = 0",
-            "version = 1\n[storage.mem]\nmax_total_bytes = 0",
-        ] {
-            let err = RootConfig::parse(bad).unwrap_err();
-            assert!(matches!(err, Error::InvalidValue { .. }), "{bad}: {err}");
-        }
-    }
-
-    #[test]
-    fn the_type_key_defaults_to_fs_and_selects_pg() {
-        // No key (and no section at all): the filesystem backend, so a configuration written
-        // before the selector existed keeps its meaning.
-        let config = RootConfig::parse("version = 1").unwrap();
-        assert!(config.storage.is_none());
-        assert_eq!(Config::default().backend, Backend::Fs);
-
-        let config = RootConfig::parse("version = 1\n[storage]\ntype = \"pg\"").unwrap();
-        let storage = config.storage.as_ref().unwrap();
-        assert_eq!(storage.backend, Backend::Pg);
-        // The selector and the section are independent keys: `type = "pg"` with no
-        // `[storage.pg]` parses, because the dsn's other source is `TINIO_PG_DSN` (PG5) and the
-        // refusal for having neither belongs where the environment is readable.
-        assert!(storage.pg.is_none());
-        assert_eq!(storage.fs, Fs::default());
-    }
-
-    #[test]
-    fn an_unknown_type_names_the_alternatives() {
-        // A startup error naming the remedy: the value the key accepts is what the message has
-        // to carry, because the config file is the only place the key can be corrected.
-        let err = RootConfig::parse("version = 1\n[storage]\ntype = \"s3\"").unwrap_err();
-        assert!(matches!(err, Error::Parse { .. }), "{err}");
-        let rendered = err.to_string();
-        assert!(rendered.contains("fs"), "{rendered}");
-        assert!(rendered.contains("pg"), "{rendered}");
-    }
-
-    #[test]
-    fn a_pg_section_round_trips_beside_the_type_key() {
-        // The whole `[storage]` section in one text: the selector, the filesystem keys and the
-        // pg keys together, through parse -> to_toml -> parse.
-        let text = "version = 1\n[storage]\ntype = \"pg\"\n[storage.fs]\nfollow_symlinks = true\n[storage.pg]\ndsn = \"postgres://user:password@db.example:5432/tinio\"\npool = 4";
-        let config = RootConfig::parse(text).unwrap();
-        let again = RootConfig::parse(&config.to_toml().unwrap()).unwrap();
-        assert_eq!(config, again);
-        let storage = config.storage.as_ref().unwrap();
-        assert_eq!(storage.backend, Backend::Pg);
-        assert!(storage.fs.follow_symlinks);
-        assert_eq!(storage.pg.as_ref().unwrap().pool, 4);
     }
 
     #[test]

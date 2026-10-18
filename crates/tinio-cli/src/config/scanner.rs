@@ -13,7 +13,7 @@ use smart_default::SmartDefault;
 /// ```rust
 /// use std::time::Duration;
 ///
-/// use tinio_config::scanner::Config;
+/// use tinio_cli::config::scanner::Config;
 ///
 /// let s = Config::default();
 /// assert_eq!(s.delay, 10.0);

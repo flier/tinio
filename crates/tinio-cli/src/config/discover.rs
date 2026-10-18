@@ -11,10 +11,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{
-    _util::{fsutil::create_new_private, path::contains_under_any_spelling},
-    Config, Error, credentials, error,
-    state::BASE_DIR_NAME,
+use super::{Config, Error, credentials, error};
+use crate::_util::{
+    fsutil::create_new_private, path::contains_under_any_spelling, state::BASE_DIR_NAME,
 };
 
 /// The primary file's name inside a state directory.
@@ -22,7 +21,7 @@ use crate::{
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::discover::CONFIG_FILE;
+/// use tinio_cli::config::discover::CONFIG_FILE;
 ///
 /// assert_eq!(CONFIG_FILE, ".tinio.toml");
 /// ```
@@ -33,7 +32,7 @@ pub const CONFIG_FILE: &str = ".tinio.toml";
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::discover::CONFIG_ALIAS;
+/// use tinio_cli::config::discover::CONFIG_ALIAS;
 ///
 /// assert_eq!(CONFIG_ALIAS, "config.toml");
 /// ```
@@ -44,7 +43,7 @@ pub const CONFIG_ALIAS: &str = "config.toml";
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::discover::Outcome;
+/// use tinio_cli::config::discover::Outcome;
 ///
 /// assert_ne!(Outcome::Created("port = 9000".into()), Outcome::Loaded);
 /// ```
@@ -71,10 +70,10 @@ pub enum Outcome {
 /// ```no_run
 /// use std::path::Path;
 ///
-/// use tinio_config::discover::resolve_path;
+/// use tinio_cli::config::discover::resolve_path;
 ///
 /// let path = resolve_path(Path::new("/srv/data"), Path::new("/srv/data/.tinio"), None)?;
-/// # Ok::<(), tinio_config::Error>(())
+/// # Ok::<(), tinio_cli::config::Error>(())
 /// ```
 pub fn resolve_path(
     root: &Path,
@@ -118,13 +117,13 @@ pub fn resolve_path(
 /// ```no_run
 /// use std::path::Path;
 ///
-/// use tinio_config::discover::{Outcome, load_or_create, resolve_path};
+/// use tinio_cli::config::discover::{Outcome, load_or_create, resolve_path};
 ///
 /// let root = Path::new("/srv/data");
 /// let path = resolve_path(root, Path::new("/srv/data/.tinio"), None)?;
 /// let (_config, outcome) = load_or_create(root, &path, false)?;
 /// assert!(matches!(outcome, Outcome::Loaded | Outcome::Created(_)));
-/// # Ok::<(), tinio_config::Error>(())
+/// # Ok::<(), tinio_cli::config::Error>(())
 /// ```
 pub fn load_or_create(
     root: &Path,
@@ -550,7 +549,7 @@ mod tests {
     /// the create installs none**, and an independent one rather than a reader this crate wrote.
     ///
     /// The tool is resolved from the system directory rather than from `PATH`, through the
-    /// workspace's one definer ([`tinio_util::win32::system_directory`], which asks the kernel):
+    /// workspace's one definer ([`crate::_util::win32::system_directory`], which asks the kernel):
     /// a test answered by a different binary than the one Windows ships would be asserting a
     /// host's environment rather than this crate.
     #[cfg(windows)]

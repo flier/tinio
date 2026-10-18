@@ -16,13 +16,18 @@ clap = { workspace = true, features = [
     "usage",
 ] }
 dirs.workspace = true
+dotenvy.workspace = true
 either.workspace = true
 futures.workspace = true
+garde = { workspace = true, features = ["derive", "url"] }
+getrandom.workspace = true
 handlebars.workspace = true
 hex.workspace = true
+humantime-serde.workspace = true
 parse-display.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_ignored.workspace = true
 serde_json.workspace = true
 service-manager.workspace = true
 sha2.workspace = true
@@ -37,17 +42,17 @@ tokio = { workspace = true, features = [
     "macros",
     "sync",
 ] }
+toml.workspace = true
 tracing.workspace = true
 
 tinio-api = { workspace = true, optional = true }
-tinio-config.workspace = true
 tinio-core.workspace = true
 tinio-fs.workspace = true
 tinio-mem = { workspace = true, optional = true }
 tinio-pg = { workspace = true, optional = true }
 tinio-sandbox.workspace = true
-tinio-server = { workspace = true, features = ["acl"] }
-tinio-util = { workspace = true, features = ["render"] }
+tinio-server = { workspace = true, features = ["acl", "config"] }
+tinio-util = { workspace = true, features = ["render", "state"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -17,6 +17,7 @@
 | `versioning` | the version plane: Get/PutBucketVersioning, ListObjectVersions, the version-addressed object and delete surface, and the guard that refuses a version-addressed request outright |
 | `sandbox` | nothing in the library: it is the `required-features` gate of the confined-server end-to-end targets |
 | `api` | the `tinio-api` re-export — a name for the management plane, with no server code behind it |
+| `config` | the section types' serde + garde derives (the `[s3]` capability, identity, log and pipeline schemas the CLI composes) |
 | `otel` | the OpenTelemetry export layer beside the ordinary logging layers |
 
 ## Layout
@@ -42,13 +43,15 @@
 | `src/data.rs` | the hyper data plane: `DataPlane`, `PlaneConfig`, the decorator stack and graceful shutdown |
 | `src/pipeline.rs` | the pipeline runtime: the IO, removal and DB pipelines over their own runtimes |
 | `src/identity.rs` | the config's auth/owner/user sections into the identity map and the owner-uid map |
+| `src/identity/{auth,owner,users}.rs` | the `[auth]`, `[owner]` and `[[users]]` section types with their per-field rules (serde behind `config`) |
+| `src/s3.rs` | the `[s3]` section's capability half — the runtime toggles and page-size caps (serde behind `config`) |
 | `src/metrics.rs` | the Prometheus families, the metrics/access-log wrapper, and the refresh hook the management plane's scrape reaches through the CLI |
 | `src/log.rs` | the access-log format and the operational logging layers |
 | `src/error.rs` | the server's own startup and mapping failures |
 
 ## The `[s3]` capability switches (FR-021)
 
-A disabled toggle answers `NotImplemented`, named by the **operation's** wire name (`"PutBucketTagging is disabled"`), never by the toggle. The refusals are one column of the operation inventory, so the answer and the operation list cannot drift; the switches themselves are `tinio-config`'s `[s3]` section, re-exported here as `Capabilities`. A group whose cargo feature has the same name is also stripped from the build, and the strip wins where the two disagree — an absent operation answers s3s's own default instead.
+A disabled toggle answers `NotImplemented`, named by the **operation's** wire name (`"PutBucketTagging is disabled"`), never by the toggle. The refusals are one column of the operation inventory, so the answer and the operation list cannot drift; the switches themselves are this crate's `[s3]` section (`s3::Capabilities`), composed into the root document by the CLI. A group whose cargo feature has the same name is also stripped from the build, and the strip wins where the two disagree — an absent operation answers s3s's own default instead.
 
 | Toggle | A disabled toggle refuses |
 |---|---|

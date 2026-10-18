@@ -1,4 +1,4 @@
-//! Configuration source loading (task T018).
+//! Configuration source loading.
 //!
 //! This module owns the **file** level of FR-016's precedence chain and nothing else:
 //! `CLI flags > process environment > .env > config file`.
@@ -11,15 +11,8 @@
 //!   are one parser's answers and one precedence, expressed in one place rather than
 //!   re-implemented beside it. The parse is two-pass for exactly that reason — `.env` is
 //!   loaded between the passes, and the second one sees the file;
-//! - [`parse_read_only`] and [`parse_sandbox`] are **pure syntax helpers**: they are
-//!   `tinio_util::switch::parse_switch` — the one definer of the tolerant `1`/`true`/`0`/`false`
-//!   grammar, shared with the CLI's `--read-only`/`--sandbox` flags and their `value_parser`
-//!   (`crates/tinio-cli/src/commands/mod.rs`) — each naming the variable whose refusal it wraps
-//!   ([`READ_ONLY_VAR`], [`SANDBOX_VAR`]). No code path here reads an environment variable, and
-//!   nothing in this workspace calls these two helpers: the variable names travel beside the
-//!   flags that do read them;
 //! - the config file is the lowest-precedence source: parsed by
-//!   [`crate::schema::Config::parse`] as the base, overlaid by the CLI's resolution
+//!   [`crate::config::Config::parse`] as the base, overlaid by the CLI's resolution
 //!   (`tinio-cli`'s `resolve` module).
 //!
 //! The `MINIO_*` credential fallback (T084) and `TINIO_ANONYMOUS` (T087) extend this module in
@@ -27,7 +20,7 @@
 
 use std::path::Path;
 
-use crate::{_util::switch::parse_switch, Error, error};
+use super::{Error, error};
 
 /// Load `<state-dir>/.env` if present (FR-016; loaded from the state dir).
 ///
@@ -44,7 +37,7 @@ use crate::{_util::switch::parse_switch, Error, error};
 /// ```rust
 /// use std::env::temp_dir;
 ///
-/// use tinio_config::sources::load_env_file;
+/// use tinio_cli::config::sources::load_env_file;
 ///
 /// let dir = temp_dir();
 /// // No .env in the temp dir — the call must succeed silently.
@@ -56,32 +49,6 @@ pub fn load_env_file(state_dir: &Path) -> Result<(), Error> {
         dotenvy::from_path(&path).map_err(|e| error::env(path, e))?;
     }
     Ok(())
-}
-
-/// The environment variable that selects read-only mode (FR-023).
-pub const READ_ONLY_VAR: &str = "TINIO_READ_ONLY";
-
-/// Parse a `TINIO_READ_ONLY` value: `1`/`true` and `0`/`false` only.
-/// Anything else is a startup error — a typo must not silently serve a
-/// writable root. Deliberately stricter than `TINIO_SCANNER`, whose
-/// handler (`tinio-fs`'s `scanner_enabled`) ignores an unrecognised value
-/// and falls back to the `[scanner]` section gate.
-pub fn parse_read_only(raw: &str) -> Result<bool, Error> {
-    parse_switch(raw).map_err(|refusal| Error::invalid_value(READ_ONLY_VAR, refusal))
-}
-
-/// The environment variable that selects sandbox mode — decision 1's third
-/// channel, beside the `--sandbox` flag and the `[server] sandbox` key.
-pub const SANDBOX_VAR: &str = "TINIO_SANDBOX";
-
-/// Parse a `TINIO_SANDBOX` value: `1`/`true` and `0`/`false` only. Anything
-/// else is a startup error — the same strictness as [`parse_read_only`] and
-/// for the same reason: the value decides whether the process confines
-/// itself, and a typo that fell back to the default would leave an operator
-/// who wrote `TINIO_SANDBOX=yes` serving unconfined with nothing logged
-/// (design decision 5, §11).
-pub fn parse_sandbox(raw: &str) -> Result<bool, Error> {
-    parse_switch(raw).map_err(|refusal| Error::invalid_value(SANDBOX_VAR, refusal))
 }
 
 #[cfg(test)]
@@ -132,41 +99,5 @@ mod tests {
             ),
             "the dotenvy error itself must be carried, not replaced, got {err:?}"
         );
-    }
-
-    #[test]
-    fn read_only_flag_parses_strictly() {
-        // The trimmed form parses like its bare value.
-        for raw in ["1", "true", " 1 "] {
-            assert!(parse_read_only(raw).unwrap(), "{raw}");
-        }
-        for raw in ["0", "false"] {
-            assert!(!parse_read_only(raw).unwrap(), "{raw}");
-        }
-        // An empty value is an error, never "unset" or "false".
-        for raw in ["", "yes"] {
-            let err = parse_read_only(raw).unwrap_err();
-            assert!(err.to_string().contains(READ_ONLY_VAR), "{raw}: {err}");
-        }
-    }
-
-    #[test]
-    fn sandbox_flag_parses_strictly() {
-        // The same grammar and the same strictness as `TINIO_READ_ONLY`, and
-        // for the stronger version of the same reason: this variable decides
-        // whether the run confines itself, so `TINIO_SANDBOX=yes` answering
-        // "off" would be an operator who believes they are confined and is
-        // not (design decision 5, §11).
-        for raw in ["1", "true", " 1 "] {
-            assert!(parse_sandbox(raw).unwrap(), "{raw}");
-        }
-        for raw in ["0", "false"] {
-            assert!(!parse_sandbox(raw).unwrap(), "{raw}");
-        }
-        // An empty value is an error, never "unset" or "false".
-        for raw in ["", "yes"] {
-            let err = parse_sandbox(raw).unwrap_err();
-            assert!(err.to_string().contains(SANDBOX_VAR), "{raw}: {err}");
-        }
     }
 }

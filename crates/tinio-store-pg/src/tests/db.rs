@@ -173,7 +173,7 @@ impl TestDb {
     /// Connect a writable store to this database (migrating it).
     ///
     /// The pool is deliberately smaller than `DEFAULT_POOL_SIZE` (the serving
-    /// default, `tinio-config`'s): every leg opens its own store, and
+    /// default, the CLI config root's): every leg opens its own store, and
     /// `cargo test` runs many legs at once, so the serving default (8 per
     /// store) exhausts the server's connection limit before the suite is half
     /// done. No leg needs more than one connection at a time.

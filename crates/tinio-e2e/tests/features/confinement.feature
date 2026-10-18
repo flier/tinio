@@ -139,7 +139,7 @@ Feature: Confinement
   # G2's third reader, and the spelling the outline above does not reach: **the
   # configuration file's own `false`**. `[server] sandbox = false` never reaches the
   # process as an environment variable, so it is read by the configuration probe
-  # alone (`crates/tinio-config/src/discover.rs`'s `load_or_create` over the file the
+  # alone (`crates/tinio-cli/src/config/discover.rs`'s `load_or_create` over the file the
   # step plants) — and a run that refused it would be a bug of the same family as the
   # one the outline's own rows close. The pair asserted here is the
   # outline's own: the run serves, and it did not confine — the platform's `step=`
@@ -581,7 +581,7 @@ Feature: Confinement
   # **The in-root row's sentence is the configuration layer's, and that is the arrival an
   # operator gets**: the run writes `<state dir>/.tinio.toml` before the confinement is asked
   # for, and on a root that does not hold the file yet, that write is refused first
-  # (`crates/tinio-config/src/discover.rs`'s `load_or_create`, over the same containment rule).
+  # (`crates/tinio-cli/src/config/discover.rs`'s `load_or_create`, over the same containment rule).
   # The sandbox's own clause is what lands on a root that already holds the file — a second
   # arrival, not this row.
   #

@@ -7,7 +7,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use super::{Resolution, fs_cleanup, multipart_grace_for, stopping, sweep, sweep_options_for};
+use super::{
+    Resolution, fs_cleanup, multipart_grace_for, scanner_options, scanner_options_for, stopping,
+    sweep, sweep_options_for,
+};
 #[cfg(feature = "versioning")]
 use super::{bounded_versioning_warning, versioning_disabled_warning};
 #[cfg(feature = "versioning")]
@@ -20,8 +23,9 @@ use crate::_core::{
 #[cfg(feature = "versioning")]
 use crate::_server::Capabilities;
 use crate::{
-    _config::{Config, s3},
+    _core::mode::AccessMode,
     _fs::{FsStorage, testing},
+    config::{Config, s3, scanner},
 };
 
 /// **The drain bound is armed by a stop, never by the clock**, and this leg is the defect in
@@ -157,8 +161,8 @@ async fn a_timed_out_versioning_warning_names_the_condition_without_a_count() {
 /// **The trade this makes, stated rather than hidden.** Building the section as a struct
 /// rather than parsing a TOML fixture means these legs pin the **conversions** — `temp_ttl_hours`
 /// and the days/minutes keys to the `Duration`s the sweeper reads — and not the key names or
-/// their units. That half lives in `tinio-config`'s own tests, which parse the very keys:
-/// `schema/s3.rs`'s `versioning_defaults_on_and_the_retention_knobs_default_to_keep_everything`
+/// their units. That half lives in the root parser's own tests (`config/mod.rs`), which parse the
+/// very keys: `versioning_defaults_on_and_the_retention_knobs_default_to_keep_everything`
 /// (temp/multipart/`noncurrent_keep`/`noncurrent_expire_days`/`block_grace_minutes` at their
 /// values) and `a_zero_sweep_ttl_is_refused`/`a_zero_block_grace_is_refused` (the floors). So
 /// no key name or unit is left unpinned by the tree, only by this file.
@@ -170,6 +174,7 @@ fn resolution(s3: Option<s3::Config>) -> Resolution {
             s3,
             ..Config::default()
         },
+        identity: Default::default(),
         config_text: String::new(),
         config_path: PathBuf::from("/srv/data/.tinio/.tinio.toml"),
         read_only: false,
@@ -218,6 +223,73 @@ fn the_sweep_options_carry_the_resolved_ttl_and_retention_keys() {
         sweep_options_for(&resolution(None)),
         sweep::Options::default()
     );
+}
+
+/// `[scanner]` presence is the enabled gate (FR-024): an absent section leaves the scanner off
+/// with the documented `10s`/`15s`/`24h` pacing, a present one turns it on with those same
+/// defaults when it omits a key, and its three keys are the scanner's own when written. The
+/// access mode travels through unchanged — the read-only early return is not this mapping's.
+#[test]
+fn scanner_options_map_the_section_presence_and_pacing() {
+    let write = AccessMode::ReadWrite;
+    let read_only = AccessMode::ReadOnly;
+
+    let absent = scanner_options(None, write);
+    assert!(!absent.enabled);
+    assert_eq!(absent.delay, Duration::from_secs(10));
+    assert_eq!(absent.max_wait, Duration::from_secs(15));
+    assert_eq!(absent.cycle, Duration::from_secs(24 * 3600));
+    assert_eq!(absent.access, write);
+
+    let present = scanner_options(Some(&scanner::Config::default()), read_only);
+    assert!(present.enabled);
+    assert_eq!(present.delay, Duration::from_secs(10));
+    assert_eq!(present.max_wait, Duration::from_secs(15));
+    assert_eq!(present.cycle, Duration::from_secs(24 * 3600));
+    assert_eq!(present.access, read_only);
+
+    let custom = scanner::Config {
+        delay: 2.5,
+        max_wait: Duration::from_secs(60),
+        cycle: Duration::from_secs(2 * 3600),
+    };
+    let options = scanner_options(Some(&custom), write);
+    assert!(options.enabled);
+    assert_eq!(options.delay, Duration::from_millis(2_500));
+    assert_eq!(options.max_wait, Duration::from_secs(60));
+    assert_eq!(options.cycle, Duration::from_secs(2 * 3600));
+    assert_eq!(options.access, write);
+
+    let non_finite = scanner::Config {
+        delay: f64::INFINITY,
+        ..scanner::Config::default()
+    };
+    assert_eq!(
+        scanner_options(Some(&non_finite), write).delay,
+        Duration::from_secs(10)
+    );
+}
+
+/// The resolved configuration's own section is what [`scanner_options_for`] maps — the keys as
+/// the parser reads them, so the config field to the options is pinned, not only the mapping
+/// function.
+#[test]
+fn scanner_options_for_reads_the_resolved_scanner_section() {
+    let config =
+        Config::parse("version = 1\n[scanner]\ndelay = 2.5\nmax_wait = \"1m\"\ncycle = \"2h\"")
+            .unwrap();
+    let configured = Resolution {
+        config,
+        ..resolution(None)
+    };
+    let options = scanner_options_for(&configured, AccessMode::ReadWrite);
+    assert!(options.enabled);
+    assert_eq!(options.delay, Duration::from_millis(2_500));
+    assert_eq!(options.max_wait, Duration::from_secs(60));
+    assert_eq!(options.cycle, Duration::from_secs(2 * 3600));
+
+    let absent = scanner_options_for(&resolution(None), AccessMode::ReadWrite);
+    assert!(!absent.enabled);
 }
 
 /// The startup repair hands the cleanup the resolved `[s3] multipart_expire_days` as its
@@ -279,17 +351,17 @@ use super::{Args, Ready, Served, pg_pass, serve};
 #[cfg(all(feature = "pg", feature = "api"))]
 use crate::{
     _api::state::State as ApiState,
-    _config::{
-        auth, server,
-        storage::{self, Backend, pg},
-    },
-    _core::mode::AccessMode,
     _pg::{
         _store_pg::_sqlx::{Executor as _, PgPool, query, query_scalar},
         Access as PgAccess, Config as PgConfig, PgStorage,
     },
+    _server::identity::auth,
     _store_pg::test_support::TestDb,
     _util::secret::{Secret, SecretKey},
+    config::{
+        server,
+        storage::{self, Backend, pg},
+    },
     resolve::Pipelines,
     signal,
 };
@@ -347,7 +419,7 @@ async fn run_pg_serve_round_trip() -> TestDb {
 
     // A pg configuration, a loopback ephemeral bind and one credential pair — the shape the
     // CLI resolves for `[storage] type = "pg"`. Built as a struct, never parsed from TOML: the
-    // key names and units are `tinio-config`'s own tests' to pin, and this leg is about the
+    // key names and units are the config root's own tests' to pin, and this leg is about the
     // serving path, not the schema.
     let secret = Secret::from(SecretKey::from(dsn));
     let config = Config {
@@ -374,6 +446,7 @@ async fn run_pg_serve_round_trip() -> TestDb {
         pg_root: None,
         root: root.clone(),
         config,
+        identity: Default::default(),
         config_text: String::new(),
         config_path: state_dir.join(".tinio.toml"),
         read_only: false,
@@ -381,8 +454,8 @@ async fn run_pg_serve_round_trip() -> TestDb {
         state_dir_override: None,
         config_error: None,
     };
-    let pipelines = Pipelines::build(&resolution.config.pipeline.clone().unwrap_or_default())
-        .expect("the pipelines build");
+    let pipeline_section = resolution.config.pipeline.clone().unwrap_or_default();
+    let pipelines = Pipelines::build(&pipeline_section).expect("the pipelines build");
 
     // `signal::Handles` is a plain pair of a `watch` channel (its doc says so), so the test
     // builds one instead of installing process-global signal handlers.

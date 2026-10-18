@@ -26,20 +26,17 @@
 use std::path::{Path, PathBuf};
 
 use secrecy::ExposeSecret;
-use sha2::{Digest as _, Sha256};
 
 use crate::{
-    _config::{Error as ConfigError, storage::pg},
     _core::object::RESERVED_SEGMENT,
-    _util::secret::{Secret, SecretKey},
+    _util::{
+        secret::{Secret, SecretKey},
+        state,
+    },
     Error,
     cli::Discovery,
+    config::{Error as ConfigError, storage::pg},
 };
-
-/// Length of the derived root's leaf, in hexadecimal characters — the same width the
-/// home-derived state directory uses ([`crate::resolve::resolve_state_dir`]'s
-/// `~/.tinio/roots/<hash>/`), so the two layouts read alike.
-const HASH_LEN: usize = 16;
 
 /// The state-directory family the synthetic root lives under, relative to `$HOME`
 /// (`~/.local/state/tinio/pg/`). Chosen because creating it must not mint a `.tinio` directory
@@ -77,7 +74,7 @@ const DEFAULT_PG_PORT: &str = "5432";
 /// use std::path::Path;
 ///
 /// use tinio_cli::resolve::pg::resolve_root;
-/// use tinio_config::auth::{Secret, SecretKey};
+/// use tinio_server::identity::auth::{Secret, SecretKey};
 ///
 /// let dsn = Secret::from(SecretKey::from(
 ///     "postgres://user:password@db.example:5432/tinio".to_owned(),
@@ -103,7 +100,7 @@ pub fn resolve_root(dsn: &Secret, override_dir: Option<&Path>) -> Result<PathBuf
 /// [`resolve_root`]'s derivation with the home as an **explicit parameter**, never
 /// `dirs::home_dir()` inline: a test must resolve a scratch home instead of the developer's, and
 /// the caller that *wants* the environment's answer is [`resolve_root`] alone (the shape
-/// `tinio_config::state::home_state_dir` uses for the read-only leaf).
+/// `tinio_util::state::home_state_dir` uses for the read-only leaf).
 ///
 /// **The layout is `{PG_STATE_DIR}/<leaf>`, and the leaf is the dsn's identity's digest** — the
 /// first sixteen hex characters of the SHA-256 over `dsn_identity` — so the root is stable
@@ -115,7 +112,7 @@ pub fn resolve_root(dsn: &Secret, override_dir: Option<&Path>) -> Result<PathBuf
 /// use std::path::Path;
 ///
 /// use tinio_cli::resolve::pg::synthetic_root;
-/// use tinio_config::auth::{Secret, SecretKey};
+/// use tinio_server::identity::auth::{Secret, SecretKey};
 ///
 /// let dsn = Secret::from(SecretKey::from(
 ///     "postgres://user:hunter2@db.example:5432/tinio".to_owned(),
@@ -133,11 +130,10 @@ pub fn synthetic_root(dsn: &Secret, home: &Path) -> PathBuf {
         .join(dsn_leaf(dsn))
 }
 
-/// The leaf name: the first [`HASH_LEN`] hex characters of the SHA-256 over the dsn's
-/// **credential-free identity** ([`dsn_identity`]).
+/// The leaf name: [`state::short_digest`] over the dsn's **credential-free identity**
+/// ([`dsn_identity`]).
 fn dsn_leaf(dsn: &Secret) -> String {
-    let digest = Sha256::digest(dsn_identity(dsn.expose_secret()).as_bytes());
-    hex::encode(digest)[..HASH_LEN].to_string()
+    state::short_digest(dsn_identity(dsn.expose_secret()).as_bytes())
 }
 
 /// The identity a dsn's leaf is derived from: `scheme://host:port/database`, with the userinfo
@@ -256,7 +252,7 @@ fn key_value_identity(dsn: &str) -> String {
 ///
 /// ```rust
 /// use tinio_cli::resolve::pg::resolve_dsn;
-/// use tinio_config::auth::{Secret, SecretKey};
+/// use tinio_server::identity::auth::{Secret, SecretKey};
 ///
 /// let from_env = Secret::from(SecretKey::from(
 ///     "postgres://user:password@db.example:5432/tinio".to_owned(),
@@ -423,9 +419,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        _config::{Config, state, storage::Backend},
-        _util::secret::SecretKey,
+        _util::{secret::SecretKey, state},
         cli::{Discovery, PG_DSN_VAR, Provenance},
+        config::{Config, storage::Backend},
         resolve::{locate, locate_from},
     };
 
@@ -754,7 +750,7 @@ mod tests {
     /// leaf, which nothing has made yet — and `prepare_home_derived`, whose derivation
     /// canonicalizes the root, used to refuse the run before it created anything. The leg drives
     /// the call the serving half makes over the resolution such a run produces; the creation half
-    /// (`prepare_synthetic_root`) is covered with a scratch root in `tinio_config::state`'s own
+    /// (`prepare_synthetic_root`) is covered with a scratch root in `tinio_util::state`'s own
     /// tests, because this one resolves the developer's home on purpose (the environment branch a
     /// read-only run with no override takes), and a leg must not mint a state tree there.
     #[test]

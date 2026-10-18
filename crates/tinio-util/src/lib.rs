@@ -6,6 +6,9 @@
 //!   runs on, which is why it is a library module and not a bench-local
 //!   include; see the module's docs for the false "2.7× regression" a
 //!   `TMP`-following root produced).
+//! - [`mod@env`] — the `TINIO_READ_ONLY`, `TINIO_SANDBOX` and `TINIO_STATE_DIR` names, one
+//!   definition per variable for the CLI that parses them and the tests that set or clear
+//!   them. No reading helpers: the reader is the CLI's.
 //! - [`fsutil`] — the filesystem primitives the storage backends are written
 //!   on, lifted here so there is one copy of each: the atomic commit protocol
 //!   ([`commit`](fsutil::commit) — parent creation, rename, the EXDEV
@@ -53,6 +56,9 @@
 //!   and the Seatbelt profile.
 //! - [`secret`] — the zeroizing secret string and the box that redacts it,
 //!   shared by the config's credentials and the management plane's tokens.
+//! - `state` — state-directory resolution and hardening (FR-023) behind the `state` feature:
+//!   the `<home>/.tinio/roots/<hash>/` derivation, the 0700/symlink rules and the pg run's
+//!   synthetic root, with the error type the CLI wraps.
 //! - [`switch`] — the tolerant `1`/`true`/`0`/`false` grammar, the one
 //!   definer behind `TINIO_READ_ONLY`/`TINIO_SANDBOX` and the CLI's
 //!   `--read-only`/`--sandbox` flags.
@@ -61,7 +67,7 @@
 //! - `win32` — `error_message`, the one sentence a failed `*W` call is reported
 //!   with (the management plane's pipe and the sandbox's ACE walk), and
 //!   `system_directory`, the kernel's own answer where the system directory is
-//!   (the sandbox's `icacls` oracle and the config crate's DACL test).
+//!   (the sandbox's `icacls` oracle and the CLI config root's independent DACL test).
 //!   `#[cfg(windows)]` and **not** feature-gated: every reader compiles them in a
 //!   production build. The names are code spans rather than links because the
 //!   module is absent on the unix host the doc gate runs on.
@@ -89,6 +95,7 @@ pub extern crate tinio_core as _core;
 #[cfg(feature = "bench")]
 pub mod bench;
 
+pub mod env;
 pub mod fsutil;
 pub mod lockmap;
 pub mod pacing;
@@ -97,6 +104,8 @@ pub mod process;
 #[cfg(feature = "render")]
 pub mod render;
 pub mod secret;
+#[cfg(feature = "state")]
+pub mod state;
 pub mod switch;
 
 // **The job guard sits outside the `testing` feature on purpose.** The feature exists for the

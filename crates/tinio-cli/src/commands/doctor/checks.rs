@@ -810,7 +810,7 @@ fn writability(root: &Path) -> Finding {
 /// The absent-`[auth]` row is a `warn` rather than an `error` because a start still comes up;
 /// what its text says is the **loopback** story, and that is the fact the credential remediation
 /// changed here. A config that exists without the section is not the generated-credentials case
-/// — [`discover::load_or_create`](crate::_config::discover::load_or_create) only generates when
+/// — [`discover::load_or_create`](crate::config::discover::load_or_create) only generates when
 /// the file is *absent* — so a start serves `identity::root_auth_pair`'s built-in `minioadmin`
 /// development pair on loopback and refuses a non-loopback bind instead.
 ///
@@ -836,7 +836,7 @@ fn config_finding(resolution: &Resolution) -> Finding {
     // policy the start's refusal and warning enforce (`commands::start::run`'s
     // static half, `commands::start::serve`'s loopback warning; P2), so the two
     // must not be able to disagree.
-    if identity::uses_builtin_fallback(&resolution.config) {
+    if identity::uses_builtin_fallback(resolution.identity()) {
         return Finding::check(
             "configuration",
             Severity::Warn,

@@ -6,7 +6,9 @@
 //! hyper data plane, and `log.rs`/`metrics.rs` provide observability. The
 //! capability groups `multipart`, `copy`, `list-v1`, `list-v2`, `acl` are
 //! strippable cargo features (default on); `otel` enables the opt-in
-//! OpenTelemetry export layer.
+//! OpenTelemetry export layer. `s3.rs` holds the `[s3]` section's capability
+//! schema, and the optional `config` feature adds the serde and garde derives
+//! the CLI's configuration parser composes.
 
 #[cfg(feature = "api")]
 #[doc(hidden)]
@@ -14,8 +16,6 @@ pub extern crate tinio_api as _api;
 #[cfg(any(feature = "acl", feature = "copy"))]
 #[doc(hidden)]
 pub extern crate tinio_auth as _auth;
-#[doc(hidden)]
-pub extern crate tinio_config as _config;
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
 #[cfg(test)]
@@ -39,6 +39,7 @@ pub mod log;
 pub mod metrics;
 pub mod pipeline;
 pub mod readonly;
+pub mod s3;
 
 #[cfg(feature = "acl")]
 pub use self::_auth::{Identity, User};

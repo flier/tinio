@@ -7,9 +7,8 @@ description = "Tinio: an S3-compatible local storage server (facade crate with t
 [dependencies]
 tinio-api = { workspace = true, optional = true }
 tinio-cli = { workspace = true, default-features = false }
-tinio-config.workspace = true
 tinio-core.workspace = true
-tinio-server.workspace = true
+tinio-server = { workspace = true, features = ["config"] }
 
 [dev-dependencies]
 serde_json.workspace = true

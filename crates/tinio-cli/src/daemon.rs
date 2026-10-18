@@ -352,7 +352,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::_config::Config;
+    use crate::config::Config;
 
     fn args_without_daemon() -> Args {
         Args::default()
@@ -363,6 +363,7 @@ mod tests {
             pg_root: None,
             root: root.to_path_buf(),
             config: Config::default(),
+            identity: Default::default(),
             config_text: String::new(),
             config_path: root.join(".tinio/.tinio.toml"),
             read_only: false,

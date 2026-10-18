@@ -9,10 +9,11 @@ use clap::parser::ValueSource;
 
 use super::pg;
 use crate::{
-    _config::{Config, discover, sources, state, storage},
     _core::object::RESERVED_SEGMENT,
+    _util::state,
     Error,
     cli::{Discovery, Provenance},
+    config::{Config, discover, sources, storage},
 };
 
 /// Flag/env (clap) beat the config file; clap's default is last resort when the file is silent.
@@ -174,8 +175,7 @@ fn rooted(
 ///
 /// ```rust
 /// use clap::parser::ValueSource;
-/// use tinio_cli::resolve::resolve_mode;
-/// use tinio_config::Config;
+/// use tinio_cli::{config::Config, resolve::resolve_mode};
 ///
 /// let config = Config::default();
 /// assert!(

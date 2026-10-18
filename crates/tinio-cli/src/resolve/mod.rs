@@ -26,23 +26,23 @@ use std::{cell::Cell, ffi::OsString, fs};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use clap::parser::ValueSource;
 
 use crate::{
-    _config::{
-        self, Config, auth, discover,
-        log::{self, Format},
-        server, storage,
-    },
     _core::{mode::AccessMode, pipeline::InlineRunner},
     _fs::{Error as FsError, FsOptions, etag},
-    _server::{identity, pipeline::Pipelines as ServerPipelines},
+    _server::{
+        identity::{self, auth},
+        log::{self, Format},
+        pipeline::Pipelines as ServerPipelines,
+    },
     Error,
     cli::{self, Provenance},
     commands::{DirArgs, EnvArgs, is_pg_root, start},
+    config::{self, Config, discover, server, storage},
 };
 
 mod locate;
@@ -72,7 +72,7 @@ fn default_port() -> u16 {
 ///
 /// ```no_run
 /// use tinio_cli::resolve::Pipelines;
-/// use tinio_config::pipeline::Config;
+/// use tinio_server::pipeline::Config;
 ///
 /// let pipelines = Pipelines::build(&Config::default()).expect("pipelines");
 /// assert_eq!(pipelines.io().kind(), "io");
@@ -113,8 +113,7 @@ pub type Pipelines = ServerPipelines<etag::Result, Result<(), FsError>, Result<(
 /// ```rust
 /// use std::path::PathBuf;
 ///
-/// use tinio_cli::resolve::Resolution;
-/// use tinio_config::Config;
+/// use tinio_cli::{config::Config, resolve::Resolution};
 ///
 /// let resolution = Resolution {
 ///     pg_root: None,
@@ -126,6 +125,7 @@ pub type Pipelines = ServerPipelines<etag::Result, Result<(), FsError>, Result<(
 ///     state_dir: PathBuf::from("/srv/data/.tinio"),
 ///     state_dir_override: None,
 ///     config_error: None,
+///     identity: Default::default(),
 /// };
 /// assert_eq!(resolution.address().expect("address").port(), 9000);
 /// ```
@@ -137,6 +137,10 @@ pub struct Resolution {
     pub root: PathBuf,
     /// The effective configuration: the file, with the flags and `.env` folded in.
     pub config: Config,
+    /// The identity assembly, composed once from [`config`](Self::config) — the one value
+    /// consumers read instead of recomposing (and cloning) the sections.
+    #[doc(hidden)]
+    pub identity: OnceLock<identity::Config>,
     /// The text [`config`](Self::config) was parsed from — the launch payload's own bytes (design
     /// decision 18), read once by the chain that built this resolution.
     pub config_text: String,
@@ -159,6 +163,11 @@ pub struct Resolution {
 }
 
 impl Resolution {
+    /// The identity assembly, composed once from [`config`](Self::config) and cached.
+    pub fn identity(&self) -> &identity::Config {
+        self.identity.get_or_init(|| self.config.identity())
+    }
+
     /// The resolved bind address, from `[server] host` and `[server] port` — the two fields,
     /// as the flags and `.env` folded them.
     ///
@@ -167,8 +176,7 @@ impl Resolution {
     /// ```rust
     /// use std::path::PathBuf;
     ///
-    /// use tinio_cli::resolve::Resolution;
-    /// use tinio_config::Config;
+    /// use tinio_cli::{config::Config, resolve::Resolution};
     ///
     /// let resolution = Resolution {
     ///     pg_root: None,
@@ -181,6 +189,7 @@ impl Resolution {
     ///     state_dir: PathBuf::from("/srv/data/.tinio"),
     ///     state_dir_override: None,
     ///     config_error: None,
+    ///     identity: Default::default(),
     /// };
     /// assert_eq!(
     ///     resolution.address().expect("address").to_string(),
@@ -238,8 +247,10 @@ impl Resolution {
     /// ```rust
     /// use std::path::PathBuf;
     ///
-    /// use tinio_cli::resolve::{CredentialPolicy, Resolution};
-    /// use tinio_config::Config;
+    /// use tinio_cli::{
+    ///     config::Config,
+    ///     resolve::{CredentialPolicy, Resolution},
+    /// };
     ///
     /// let resolution = Resolution {
     ///     pg_root: None,
@@ -251,6 +262,7 @@ impl Resolution {
     ///     state_dir: PathBuf::from("/srv/data/.tinio"),
     ///     state_dir_override: None,
     ///     config_error: None,
+    ///     identity: Default::default(),
     /// };
     /// assert_eq!(
     ///     resolution
@@ -260,7 +272,7 @@ impl Resolution {
     /// );
     /// ```
     pub fn credential_policy(&self) -> Result<CredentialPolicy, Error> {
-        if !identity::uses_builtin_fallback(&self.config) {
+        if !identity::uses_builtin_fallback(self.identity()) {
             return Ok(CredentialPolicy::Configured);
         }
         Ok(if self.address()?.ip().is_loopback() {
@@ -365,7 +377,7 @@ fn builtin_pair() -> String {
 pub(crate) fn bind_addr(key: &str, host: &str, port: u16) -> Result<SocketAddr, Error> {
     let authority = authority(host, port);
     authority.parse().map_err(|_| {
-        Error::Config(_config::Error::invalid_value(
+        Error::Config(config::Error::invalid_value(
             key,
             format!("`{authority}` is not a bind address"),
         ))
@@ -463,9 +475,9 @@ fn spell_authority(authority: &str, default_port: u16) -> Result<String, Error> 
 ///
 /// use tinio_cli::{
 ///     commands::start::Args,
+///     config::Config,
 ///     resolve::{Resolution, log_file},
 /// };
-/// use tinio_config::Config;
 ///
 /// let resolution = Resolution {
 ///     pg_root: None,
@@ -477,6 +489,7 @@ fn spell_authority(authority: &str, default_port: u16) -> Result<String, Error> 
 ///     state_dir: PathBuf::from("/srv/data/.tinio"),
 ///     state_dir_override: None,
 ///     config_error: None,
+///     identity: Default::default(),
 /// };
 /// let path = log_file(&resolution, &Args::default())?;
 /// assert!(path.ends_with("server.log"));
@@ -794,6 +807,7 @@ fn resume(located: Located, chain: Chain, adopted: Option<&str>) -> Result<Resol
     Ok(Resolution {
         root,
         config,
+        identity: Default::default(),
         config_text: text,
         config_path: path,
         read_only,
@@ -825,7 +839,7 @@ fn fold_credentials(env: &EnvArgs, config: &mut Config) -> Result<(), Error> {
             });
             Ok(())
         }
-        (access, _secret) => Err(_config::Error::invalid_value(
+        (access, _secret) => Err(config::Error::invalid_value(
             if access.is_none() {
                 cli::ACCESS_KEY_VAR
             } else {
@@ -858,7 +872,7 @@ fn fold_credentials(env: &EnvArgs, config: &mut Config) -> Result<(), Error> {
 /// **`locate`'s anchoring read is the other caller**: the document `--config` named is parsed
 /// once for the pg selector, and the same pair travels on [`Located::config_doc`] so this chain
 /// and the mode's file level reuse it rather than reading the file again.
-pub(super) fn document(path: &Path) -> Result<(Config, String), _config::Error> {
+pub(super) fn document(path: &Path) -> Result<(Config, String), config::Error> {
     let config = Config::load(path)?;
     let text = config.to_toml()?;
     Ok((config, text))
@@ -1014,8 +1028,10 @@ fn fold_flags(
 /// ```no_run
 /// use std::path::PathBuf;
 ///
-/// use tinio_cli::resolve::{Resolution, fs_options};
-/// use tinio_config::Config;
+/// use tinio_cli::{
+///     config::Config,
+///     resolve::{Resolution, fs_options},
+/// };
 ///
 /// let resolution = Resolution {
 ///     pg_root: None,
@@ -1027,6 +1043,7 @@ fn fold_flags(
 ///     state_dir: PathBuf::from("/srv/data/.tinio"),
 ///     state_dir_override: None,
 ///     config_error: None,
+///     identity: Default::default(),
 /// };
 /// let options = fs_options(&resolution, None);
 /// assert_eq!(
@@ -1047,7 +1064,7 @@ pub fn fs_options(resolution: &Resolution, pipelines: Option<&Pipelines>) -> FsO
         compact_threshold_percent: fs.compact_threshold_percent,
         meta_batch_size: fs.meta_batch_size,
         meta_batch_bytes: fs.meta_batch_bytes,
-        owner_uids: identity::owner_uids_for(&resolution.config),
+        owner_uids: identity::owner_uids_for(resolution.identity()),
         io_pipeline: Arc::new(InlineRunner::default()),
         remove_pipeline: Arc::new(InlineRunner::default()),
         db_pipeline: Arc::new(InlineRunner::default()),

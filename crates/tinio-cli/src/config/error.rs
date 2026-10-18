@@ -1,6 +1,6 @@
-//! Configuration errors (task T015).
+//! Configuration errors.
 //!
-//! The single error type of `tinio-config`: parse failures (I/O, TOML
+//! The single error type of [`crate::config`]: parse failures (I/O, TOML
 //! syntax), validation failures (unknown keys, invalid values, missing
 //! requirements), and environment-file loading failures. Every failure is a
 //! startup error — the configuration is fail-fast (FR-016/FR-021).
@@ -12,7 +12,7 @@ use std::{io, path::PathBuf};
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::Error;
+/// use tinio_cli::config::Error;
 ///
 /// let err = Error::Missing("api.https.cert".into());
 /// assert_eq!(err.to_string(), "missing required value: api.https.cert");
@@ -53,8 +53,7 @@ pub enum Error {
         /// Why the value is invalid.
         reason: String,
     },
-    /// A required value is absent: a configuration key, or an environment
-    /// fact such as the home directory the state-directory layout needs.
+    /// A required configuration value is absent.
     #[error("missing required value: {0}")]
     Missing(String),
     /// The `.env` file could not be loaded.
@@ -65,20 +64,6 @@ pub enum Error {
         /// The underlying dotenvy error.
         #[source]
         source: dotenvy::Error,
-    },
-    /// A path in the state-directory layout could not be resolved or
-    /// violates a layout rule, so the state directory cannot be derived
-    /// or prepared: the storage root could not be canonicalized; a
-    /// `<home>/.tinio` parent is a symlink, could not be created, or
-    /// could not be restricted to 0700; or a path the layout needs as a
-    /// directory exists as something else.
-    #[error("failed to resolve the state directory at `{path}`: {source}")]
-    Root {
-        /// The path the resolution failed at.
-        path: PathBuf,
-        /// The underlying I/O error, or the layout rule the path violates.
-        #[source]
-        source: io::Error,
     },
 }
 
@@ -112,23 +97,13 @@ pub(crate) fn env(path: PathBuf, source: dotenvy::Error) -> Error {
     Error::Env { path, source }
 }
 
-/// State-directory resolution failure or layout-rule refusal at a path
-/// in its layout.
-#[inline]
-pub(crate) fn root(path: impl Into<PathBuf>, source: io::Error) -> Error {
-    Error::Root {
-        path: path.into(),
-        source,
-    }
-}
-
 impl Error {
     /// Build an [`Error::InvalidValue`] for a key with a reason.
     ///
     /// # Examples
     ///
     /// ```rust
-    /// use tinio_config::Error;
+    /// use tinio_cli::config::Error;
     ///
     /// let err = Error::invalid_value("server.port", "not a number");
     /// assert!(err.to_string().contains("server.port"));

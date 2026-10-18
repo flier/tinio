@@ -3,25 +3,25 @@
 //! ([`IdentityFromConfig::from_config`]) and the chown `OwnerId → uid`
 //! map ([`owner_uids_for`]). Plain data in, plain data out — the only
 //! config consumers of the identity types (feature `acl`).
+//!
+//! The section types live here with their per-field garde rules; the
+//! module's [`Config`] is assembled after parsing by the caller (the CLI
+//! composes it from the root document), so it derives no serde.
 
 use std::collections::HashMap;
-#[cfg(not(unix))]
-use std::path::Path;
 #[cfg(feature = "acl")]
 use std::sync::Arc;
-#[cfg(unix)]
-use std::{
-    os::unix::fs::{DirBuilderExt, chown},
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
-};
 
+#[cfg(feature = "config")]
+use garde::Error as GardeError;
 #[cfg(feature = "acl")]
 use s3s::auth::SecretKey;
 use secrecy::ExposeSecret;
 
 #[cfg(feature = "acl")]
 use crate::_auth::{Identity, User};
+#[cfg(feature = "config")]
+use crate::_core::acl::ANONYMOUS_CANONICAL_ID;
 /// The root access-key fallback (`"minioadmin"`), **published here because the policy that names
 /// it is this module's**: [`uses_builtin_fallback`] is the predicate a caller asks, and a caller
 /// rendering a sentence about the fallback — `tinio-cli`'s start refusal and its loopback warning
@@ -42,7 +42,91 @@ use crate::_auth::{Identity, User};
 /// assert_eq!(DEFAULT_ROOT_ACCESS_KEY, "minioadmin");
 /// ```
 pub use crate::_core::acl::DEFAULT_ROOT_ACCESS_KEY;
-use crate::{_config::Config, _core::acl::OwnerId};
+use crate::_core::acl::OwnerId;
+
+pub mod auth;
+pub mod owner;
+pub mod users;
+
+/// The identity module's configuration: the three values `Identity::from_config`,
+/// [`root_auth_pair`], [`uses_builtin_fallback`] and [`owner_uids_for`] read.
+///
+/// Assembled after parsing — the CLI composes it from the root document and
+/// applies the `[owner]` default on the way in — so it derives no serde.
+///
+/// # Examples
+///
+/// ```
+/// use tinio_server::identity::Config;
+///
+/// let config = Config::default();
+/// assert!(config.auth.is_none());
+/// assert_eq!(config.owner.display_name, "tinio");
+/// assert!(config.users.is_empty());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Config {
+    /// The root `[auth]` credential pair (`None` = the built-in fallback pair).
+    pub auth: Option<auth::Config>,
+    /// The root owner element (the core defaults when `[owner]` is absent).
+    pub owner: owner::Config,
+    /// The configured `[[users]]` entries (empty when absent).
+    pub users: Vec<users::Config>,
+}
+
+/// The shared "must not be empty" garde rule body: the auth secret key and
+/// the users secret key reject empty values with their own messages (one
+/// home for the boilerplate, so the rule cannot drift).
+#[cfg(feature = "config")]
+fn reject_empty(message: &str, is_empty: bool) -> garde::Result {
+    if is_empty {
+        Err(GardeError::new(message))
+    } else {
+        Ok(())
+    }
+}
+
+/// The canonical-ID garde rule (spec §6, shared by `[owner]` and
+/// `[[users]]`): 64 lowercase hex digits per [`OwnerId::new`] — and never
+/// the anonymous special-grantee ID, whose holder would BE the anonymous
+/// uploader (Task 7 ruling).
+#[cfg(feature = "config")]
+fn validate_canonical_id(value: &str, _context: &()) -> garde::Result {
+    if value == ANONYMOUS_CANONICAL_ID {
+        return Err(GardeError::new(
+            "must not be the anonymous canonical ID (it would make the principal the anonymous uploader)",
+        ));
+    }
+    match OwnerId::new(value) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(GardeError::new(
+            "must be 64 lowercase hex digits (the canonical-account ID shape)",
+        )),
+    }
+}
+
+/// The optional-canonical-ID variant of [`validate_canonical_id`] (the
+/// `[[users]]` field; `None` = the derived default).
+#[cfg(feature = "config")]
+fn validate_canonical_id_opt(value: &Option<String>, context: &()) -> garde::Result {
+    match value {
+        Some(id) => validate_canonical_id(id, context),
+        None => Ok(()),
+    }
+}
+
+/// The Windows `local_uid` rejection (spec §6, fail fast): the type stays
+/// portable, the key parses, and validation errors instead — a unix-only
+/// key in a Windows config is an invalid value, not a silent ignore.
+#[cfg(all(windows, feature = "config"))]
+fn validate_local_uid(value: &Option<u32>, _context: &()) -> garde::Result {
+    match value {
+        Some(uid) => Err(GardeError::new(format!(
+            "local_uid ({uid}) is unsupported on Windows — remove the key or run on a unix system"
+        ))),
+        None => Ok(()),
+    }
+}
 
 /// The root credential pair: the configured `[auth]` keys, or the US1
 /// interop convention pair (`minioadmin`/`minioadmin`) when no `[auth]`
@@ -70,13 +154,17 @@ pub fn root_auth_pair(config: &Config) -> (String, String) {
 /// # Examples
 ///
 /// ```
-/// use tinio_server::{_config::Config, identity::uses_builtin_fallback};
+/// use tinio_server::identity::{Config, auth, uses_builtin_fallback};
 ///
 /// assert!(uses_builtin_fallback(&Config::default()));
-/// let text = "version = 1\n[auth]\naccess_key = \"ak\"\nsecret_key = \"sk\"\n";
-/// assert!(!uses_builtin_fallback(
-///     &Config::parse(text).expect("config")
-/// ));
+/// let configured = Config {
+///     auth: Some(auth::Config {
+///         access_key: "ak".into(),
+///         secret_key: auth::SecretKey::from("sk").into(),
+///     }),
+///     ..Config::default()
+/// };
+/// assert!(!uses_builtin_fallback(&configured));
 /// ```
 pub fn uses_builtin_fallback(config: &Config) -> bool {
     config.auth.is_none()
@@ -89,11 +177,10 @@ pub fn uses_builtin_fallback(config: &Config) -> bool {
 /// server-user-owned (the hardened default).
 pub fn owner_uids_for(config: &Config) -> HashMap<OwnerId, u32> {
     let mut map = HashMap::new();
-    let owner = config.owner();
-    if let Some(uid) = owner.local_uid {
-        map.insert(owner.resolved_canonical_id(), uid);
+    if let Some(uid) = config.owner.local_uid {
+        map.insert(config.owner.resolved_canonical_id(), uid);
     }
-    for user in config.users() {
+    for user in &config.users {
         if let Some(uid) = user.local_uid {
             map.insert(user.resolved_canonical_id(), uid);
         }
@@ -107,14 +194,14 @@ pub fn owner_uids_for(config: &Config) -> HashMap<OwnerId, u32> {
 /// plane.
 #[cfg(feature = "acl")]
 pub trait IdentityFromConfig {
-    /// Build the identity map for the acl plane from the parsed config.
+    /// Build the identity map for the acl plane from the composed config.
     fn from_config(config: &Config) -> Arc<Identity>;
 }
 
 #[cfg(feature = "acl")]
 impl IdentityFromConfig for Identity {
     fn from_config(config: &Config) -> Arc<Identity> {
-        let owner = config.owner();
+        let owner = &config.owner;
         let owner_id = owner.resolved_canonical_id();
         let (access_key, secret) = root_auth_pair(config);
         let root = User {
@@ -123,9 +210,9 @@ impl IdentityFromConfig for Identity {
             display_name: owner.display_name.clone(),
             secret: SecretKey::from(secret),
         };
-        let mut users: HashMap<String, User> = HashMap::with_capacity(1 + config.users().len());
+        let mut users: HashMap<String, User> = HashMap::with_capacity(1 + config.users.len());
         users.insert(root.access_key.clone(), root);
-        for user in config.users() {
+        for user in &config.users {
             users.insert(
                 user.access_key.clone(),
                 User {
@@ -140,97 +227,39 @@ impl IdentityFromConfig for Identity {
     }
 }
 
-/// Spec §6 OS-mapping validation (unix): when `[owner]`/`[[users]]`
-/// configure ANY `local_uid`, startup must be able to chown object files
-/// to the mapped uids — root (euid 0) or CAP_CHOWN — and fails with a
-/// config error otherwise (fail-closed: no silent degradation to
-/// server-user ownership). Windows configs never reach this — the
-/// parser rejects the key.
-///
-/// The probe reuses the real mechanism (`std::os::unix::fs::chown`) on a
-/// private temp file inside `dir` rather than testing `geteuid()` only,
-/// so a CAP_CHOWN-only process (the mitigation the design prefers over
-/// full root) verifies as privileged too.
-use crate::_config;
-#[cfg(unix)]
-pub fn ensure_chown_privilege(config: &Config, dir: &Path) -> Result<(), _config::Error> {
-    use crate::_config;
-    let configured = config.owner().local_uid.is_some()
-        || config.users().iter().any(|user| user.local_uid.is_some());
-    if !configured {
-        return Ok(());
-    }
-    probe_chown(dir).map_err(|err| {
-        _config::Error::invalid_value(
-            "local_uid",
-            format!(
-                "chown privilege (root or CAP_CHOWN) is required for the configured local_uid mappings but the process lacks it — startup fails closed: {err}. Remove the mappings or grant the capability"
-            ),
-        )
-    })
-}
-
-/// Windows never maps `local_uid` — the parser rejects the key — so there is nothing to probe.
-///
-/// # Examples
-///
-/// ```
-/// # #[cfg(not(unix))]
-/// # {
-/// use std::path::Path;
-///
-/// use tinio_server::_config::Config;
-/// tinio_server::identity::ensure_chown_privilege(&Config::default(), Path::new("."))
-///     .expect("no mapping");
-/// # }
-/// ```
-#[cfg(not(unix))]
-pub fn ensure_chown_privilege(config: &Config, dir: &Path) -> Result<(), _config::Error> {
-    let _ = (config, dir);
-    Ok(())
-}
-
-/// The chown probe: create a private 0700 dir + file under `dir`, chown
-/// the file away from our own uid (to 0) — allowed only with root euid
-/// or CAP_CHOWN — and clean up (the 0700 dir stays removable even after
-/// the file is root-owned).
-#[cfg(unix)]
-use std::io;
-#[cfg(unix)]
-fn probe_chown(dir: &Path) -> io::Result<()> {
-    use std::{
-        fs,
-        fs::{DirBuilder, File},
-        process,
-    };
-    let nonce = format!(
-        "{}-{}",
-        process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    let probe_dir = dir.join(format!(".tinio-chown-probe-{nonce}"));
-    let mut builder = DirBuilder::new();
-    builder.mode(0o700);
-    builder.create(&probe_dir)?;
-    let file = probe_dir.join("probe");
-    let outcome = (|| {
-        File::create(&file)?;
-        chown(&file, Some(0), None)
-    })();
-    let _ = fs::remove_file(&file);
-    let _ = fs::remove_dir(&probe_dir);
-    outcome
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(text: &str) -> Config {
-        Config::parse(text).unwrap()
+    fn configured() -> Config {
+        Config {
+            auth: Some(auth::Config {
+                access_key: "root-ak".into(),
+                secret_key: auth::SecretKey::from("root-sk").into(),
+            }),
+            owner: owner::Config {
+                canonical_id: "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+                    .into(),
+                display_name: "ops".into(),
+                local_uid: None,
+            },
+            users: vec![
+                users::Config {
+                    access_key: "AKID".into(),
+                    secret_key: auth::SecretKey::from("user-sk-1").into(),
+                    canonical_id: None,
+                    display_name: Some("alice".into()),
+                    local_uid: None,
+                },
+                users::Config {
+                    access_key: "BKID".into(),
+                    secret_key: auth::SecretKey::from("user-sk-2").into(),
+                    canonical_id: None,
+                    display_name: None,
+                    local_uid: None,
+                },
+            ],
+        }
     }
 
     #[cfg(feature = "acl")]
@@ -241,9 +270,7 @@ mod tests {
     #[cfg(feature = "acl")]
     #[test]
     fn from_config_assembles_root_and_users() {
-        let config = parse(
-            "version = 1\n[auth]\naccess_key = \"root-ak\"\nsecret_key = \"root-sk\"\n[owner]\ncanonical_id = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\ndisplay_name = \"ops\"\n[[users]]\naccess_key = \"AKID\"\nsecret_key = \"user-sk-1\"\ndisplay_name = \"alice\"\n[[users]]\naccess_key = \"BKID\"\nsecret_key = \"user-sk-2\"\n",
-        );
+        let config = configured();
         let identity = Identity::from_config(&config);
         assert_eq!(identity.users.len(), 3);
         let root = identity.users.get("root-ak").unwrap();
@@ -285,8 +312,10 @@ mod tests {
             root_auth_pair(&Config::default()),
             ("minioadmin".into(), "minioadmin".into())
         );
-        let config = parse("version = 1\n[auth]\naccess_key = \"ak\"\nsecret_key = \"sk\"\n");
-        assert_eq!(root_auth_pair(&config), ("ak".into(), "sk".into()));
+        assert_eq!(
+            root_auth_pair(&configured()),
+            ("root-ak".into(), "root-sk".into())
+        );
     }
 
     #[test]
@@ -296,9 +325,16 @@ mod tests {
         // carry a mapping at all (parse rejects it).
         assert!(owner_uids_for(&Config::default()).is_empty());
         assert!(
-            owner_uids_for(&parse(
-                "version = 1\n[owner]\n[[users]]\naccess_key = \"ak\"\nsecret_key = \"sk\"\n"
-            ))
+            owner_uids_for(&Config {
+                users: vec![users::Config {
+                    access_key: "ak".into(),
+                    secret_key: auth::SecretKey::from("sk").into(),
+                    canonical_id: None,
+                    display_name: None,
+                    local_uid: None,
+                }],
+                ..Config::default()
+            })
             .is_empty()
         );
     }
@@ -306,9 +342,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn owner_uids_for_assembles_configured_mappings() {
-        let config = parse(
-            "version = 1\n[owner]\nlocal_uid = 1000\n[[users]]\naccess_key = \"AKID\"\nsecret_key = \"sk\"\nlocal_uid = 1001\n",
-        );
+        let config = Config {
+            owner: owner::Config {
+                local_uid: Some(1000),
+                ..owner::Config::default()
+            },
+            users: vec![users::Config {
+                access_key: "AKID".into(),
+                secret_key: auth::SecretKey::from("sk").into(),
+                canonical_id: None,
+                display_name: None,
+                local_uid: Some(1001),
+            }],
+            ..Config::default()
+        };
         let map = owner_uids_for(&config);
         assert_eq!(map.len(), 2);
         assert_eq!(
@@ -325,25 +372,5 @@ mod tests {
             ),
             Some(&1001)
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn mapping_configured_without_chown_privilege_fails_startup() {
-        use crate::_config;
-        // Spec §6: fail closed — any local_uid mapping requires chown
-        // privilege (root or CAP_CHOWN); without it startup fails with a
-        // config error. Skipped when the runner is privileged (the probe
-        // passes — the failure is unobservable).
-        let root = tempfile::tempdir().unwrap();
-        if probe_chown(root.path()).is_ok() {
-            return;
-        }
-        let config = parse("version = 1\n[owner]\nlocal_uid = 1000\n");
-        let err = ensure_chown_privilege(&config, root.path()).unwrap_err();
-        assert!(matches!(err, _config::Error::InvalidValue { .. }), "{err}");
-        assert!(err.to_string().contains("local_uid"), "{err}");
-        // Without any mapping the check passes even unprivileged.
-        ensure_chown_privilege(&Config::default(), root.path()).unwrap();
     }
 }

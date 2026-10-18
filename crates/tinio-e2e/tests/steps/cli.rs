@@ -70,15 +70,20 @@ use tokio::time::sleep;
 #[cfg(target_os = "macos")]
 use super::common::sweep_confined_grandchild;
 use super::{World, common::ACL_ROOT};
-#[cfg(feature = "pg")]
-use crate::_pg::_store_pg::test_support::TestDb;
-// The configuration document's own schema and the file name discovery looks for
-// (`steps/clients.rs` reaches the same pair through `crate::_server::_config`): the config-channel
+// The configuration root's own schema and the file name discovery looks for
+// (`steps/clients.rs` reaches the same pair through `crate::_cli::config`): the config-channel
 // fixture is written through the types the run reads it back with, so a renamed key is a compile
 // error here rather than a section a run silently takes as unset.
-use crate::_server::_config::{Config, discover, server};
 #[cfg(feature = "pg")]
-use crate::_server::_config::{auth, storage};
+use crate::_cli::config::storage;
+#[cfg(feature = "pg")]
+use crate::_pg::_store_pg::test_support::TestDb;
+#[cfg(feature = "pg")]
+use crate::_server::identity::auth;
+use crate::{
+    _cli::config::{Config, discover, server},
+    _util::env::{READ_ONLY_VAR, SANDBOX_VAR, STATE_DIR_VAR},
+};
 
 /// How long a run may go without exiting and without reporting readiness before the harness
 /// calls it hung.
@@ -139,18 +144,9 @@ const PUBLISH_SETTLE: Duration = Duration::from_secs(2);
 /// scenario asserts on the poll's own cadence.
 const POLL: Duration = Duration::from_millis(20);
 
-/// `TINIO_SANDBOX`, the variable half of the confinement's channel (design decision 10) — and the
-/// spelling every refusal that channel raises carries, whether the value came from the process
-/// environment or from the `.env` file one level below it (FR-016).
-const SANDBOX_VAR: &str = "TINIO_SANDBOX";
-
 /// The dotenv file `resolve::apply_env_file` loads: `<state dir>/.env`
-/// (`tinio-config/src/sources.rs`, which spells the name once).
+/// (`tinio-cli/src/config/sources.rs`, which spells the name once).
 const ENV_FILE: &str = ".env";
-
-/// `TINIO_READ_ONLY`, FR-023's mode channel — read here for one thing only: which directory a run
-/// resolves its `state` file in ([`Cli::state_dir_of`]).
-const READ_ONLY_VAR: &str = "TINIO_READ_ONLY";
 
 /// The credential pair's two variables, `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY` — the
 /// **environment-only** arguments `resolve::fold_credentials` folds onto `[auth]`
@@ -486,7 +482,7 @@ impl Cli {
         // ([`Cli::state_dir_named`]): the variable is the resolution's `Named` answer, and its
         // absence is what makes a run derive one from the home.
         if self.state_dir_named {
-            cmd.env("TINIO_STATE_DIR", &self.state);
+            cmd.env(STATE_DIR_VAR, &self.state);
         }
         for (key, value) in &self.vars {
             cmd.env(key, value);
@@ -1513,7 +1509,7 @@ async fn state_dir_holds_a_directory(world: &mut World, name: String) {
 /// **Two writes, and both are load-bearing.** The target file is written first and is a valid
 /// dotenv document, so what the confined child meets is the *read through the link* and not a
 /// file that is missing or malformed; the link is the entry a run's `.env` load finds at
-/// `<state dir>/.env` (`tinio_config::sources::load_env_file`). The state directory is the
+/// `<state dir>/.env` (`tinio_cli::config::sources::load_env_file`). The state directory is the
 /// **read-write** one ([`Cli::state_dir`]): this is the mode whose state dir is lexically in-root,
 /// which is what keeps the profile from ever naming the link's resolution — the mechanism the
 /// scenario's own comment states in full.
@@ -1631,10 +1627,8 @@ async fn an_earlier_probe_left_its_profile_behind(_world: &mut World) {
 #[given("the child's state directory override is the served root")]
 async fn state_dir_override_is_the_root(world: &mut World) {
     let cli = cli(world);
-    cli.vars.push((
-        "TINIO_STATE_DIR".to_owned(),
-        cli.root().display().to_string(),
-    ));
+    cli.vars
+        .push((STATE_DIR_VAR.to_owned(), cli.root().display().to_string()));
 }
 
 /// **The fixture every `@pg` scenario owns: a scratch PostgreSQL database and the
@@ -1661,7 +1655,7 @@ async fn scratch_pg_database(world: &mut World) {
 
     let cli = cli(world);
     // Through the schema, never as text (the same rule `config_asks_for_the_confinement`
-    // follows): the section, the key and its value are `tinio-config`'s own types, so a
+    // follows): the section, the key and its value are `tinio_cli::config`'s own types, so a
     // renamed key is a compile error here rather than a document the run silently reads as
     // an unset default.
     let config = Config {
@@ -2385,7 +2379,7 @@ impl SandboxChannel {
     fn parse(spelling: &str) -> Self {
         match spelling {
             "--sandbox" => Self::Flag,
-            "TINIO_SANDBOX" => Self::Env,
+            SANDBOX_VAR => Self::Env,
             "[server] sandbox" => Self::Config,
             ".env" => Self::DotEnv,
             other => panic!(
@@ -2442,7 +2436,7 @@ impl SandboxChannel {
 /// document `discover::resolve_path` finds first for a read-write run, carrying
 /// `[server] sandbox = true`.
 ///
-/// **Through the schema, never as text**: the section, the key and its value are `tinio-config`'s
+/// **Through the schema, never as text**: the section, the key and its value are `tinio_cli::config`'s
 /// own types, so a renamed key is a compile error here rather than a document the run silently
 /// reads as an unset default. That is the rule `steps/clients.rs`'s `config_for` follows for the
 /// capability overrides, and this is the same call on a different section.
@@ -2466,7 +2460,7 @@ fn config_asks_for_the_confinement(cli: &Cli) {
 }
 
 /// The variable one level lower: `<state dir>/.env`, the file `resolve::apply_env_file` loads
-/// between the two parses (FR-016's level 3; `tinio-config/src/sources.rs` spells the name).
+/// between the two parses (FR-016's level 3; `tinio-cli/src/config/sources.rs` spells the name).
 ///
 /// **The process environment stays empty**, which is the whole of what this arm adds: the file is
 /// the channel, and the run's command line carries neither the flag nor a variable — the state
@@ -3498,7 +3492,7 @@ async fn state_dir_holds_the_root(world: &mut World) {
         .expect("the scratch directory is the served root's parent")
         .to_path_buf();
     cli.vars
-        .push(("TINIO_STATE_DIR".to_owned(), parent.display().to_string()));
+        .push((STATE_DIR_VAR.to_owned(), parent.display().to_string()));
 }
 
 /// The state directory **inside** the served root — the same rule's other direction, and the pair
@@ -3507,13 +3501,13 @@ async fn state_dir_holds_the_root(world: &mut World) {
 ///
 /// The directory the value names is the reserved one, so the run that would write it is the run
 /// whose configuration file lands under the root — which is the layer that answers first when the
-/// file is not there yet (`tinio-config`'s `load_or_create`).
+/// file is not there yet (`tinio_cli::config::discover::load_or_create`).
 #[given("the child's state directory is inside the served root")]
 async fn state_dir_inside_the_root(world: &mut World) {
     let cli = cli(world);
     let inside = cli.root().join(".tinio");
     cli.vars
-        .push(("TINIO_STATE_DIR".to_owned(), inside.display().to_string()));
+        .push((STATE_DIR_VAR.to_owned(), inside.display().to_string()));
 }
 
 /// The same in-root state directory, **spelled the root's other way round**: `<scratch>/ROOT/state`
@@ -3539,7 +3533,7 @@ async fn state_dir_inside_the_root_other_case(world: &mut World) {
         .join("ROOT")
         .join("state");
     cli.vars
-        .push(("TINIO_STATE_DIR".to_owned(), folded.display().to_string()));
+        .push((STATE_DIR_VAR.to_owned(), folded.display().to_string()));
 }
 
 /// The channel an operator **has not named**: no `TINIO_STATE_DIR` on the child, so the
@@ -3569,7 +3563,7 @@ async fn state_dir_is_derived(world: &mut World) {
 ///   answers `logging error: Permission denied (os error 13)` and the probe is never reached.
 ///   Planted, the open only needs the file's own write bit, and the sink is no longer in the way.
 /// - `.tinio.toml` is the configuration the run would otherwise write
-///   (`tinio-config`'s `load_or_create`, reached from `start::run`'s own step), for the same
+///   (`tinio_cli::config::discover::load_or_create`, reached from `start::run`'s own step), for the same
 ///   reason: a directory that cannot take that file refuses the run with the configuration
 ///   layer's error. The planted document is the smallest one the schema accepts.
 ///
@@ -3627,7 +3621,7 @@ async fn state_dir_is_a_junction(world: &mut World) {
     let link = cli.scratch().join("state-link");
     testing::junction(&link, &target);
     cli.vars
-        .push(("TINIO_STATE_DIR".to_owned(), link.display().to_string()));
+        .push((STATE_DIR_VAR.to_owned(), link.display().to_string()));
 }
 
 /// The escaping bucket P5's scenario reads: **a junction inside the served root that lands

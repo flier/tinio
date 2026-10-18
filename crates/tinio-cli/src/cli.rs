@@ -105,12 +105,11 @@ pub struct Provenance {
 
 /// `--host`'s variable name (config `[server] host`).
 ///
-/// **All of the names live here**, and the flags' `env` attributes spell the same strings:
+/// The CLI's own names live here, and the flags' `env` attributes spell the same strings:
 /// `start::Args`'s test asserts every pair agrees, which is what keeps a declaration and its
-/// constant from drifting. `TINIO_STATE_DIR`'s name is the exception and it is deliberate —
-/// `tinio_config::state::STATE_DIR_VAR` owns it, because `parse_state_dir` is the flag's
-/// `value_parser` and refuses an empty value by name — so that test checks that one against
-/// `state`'s constant rather than declaring a second one.
+/// constant from drifting. `TINIO_READ_ONLY`, `TINIO_SANDBOX` and `TINIO_STATE_DIR` are
+/// `tinio_util::env`'s — the switches' parser and the state-dir parser name them — so they are
+/// re-exported or checked from that one definition rather than declared a second time here.
 ///
 /// # Examples
 ///
@@ -155,27 +154,22 @@ pub const LOG_LEVEL_VAR: &str = "TINIO_LOG_LEVEL";
 /// ```
 pub const LOG_FORMAT_VAR: &str = "TINIO_LOG_FORMAT";
 
-/// `--read-only`'s variable name (config `[server] read_only`, FR-023).
+/// `--read-only`'s and `--sandbox`'s variable names (config `[server] read_only` and
+/// `[server] sandbox`).
+///
+/// Re-exported from [`tinio_util::env`], the one definition of the two names:
+/// `--read-only`/`TINIO_READ_ONLY` is FR-023's mode and `--sandbox`/`TINIO_SANDBOX` is design
+/// decision 10's confinement.
 ///
 /// # Examples
 ///
 /// ```rust
-/// use tinio_cli::cli::READ_ONLY_VAR;
+/// use tinio_cli::cli::{READ_ONLY_VAR, SANDBOX_VAR};
 ///
 /// assert_eq!(READ_ONLY_VAR, "TINIO_READ_ONLY");
-/// ```
-pub const READ_ONLY_VAR: &str = "TINIO_READ_ONLY";
-
-/// `--sandbox`'s variable name (config `[server] sandbox`, design decision 10).
-///
-/// # Examples
-///
-/// ```rust
-/// use tinio_cli::cli::SANDBOX_VAR;
-///
 /// assert_eq!(SANDBOX_VAR, "TINIO_SANDBOX");
 /// ```
-pub const SANDBOX_VAR: &str = "TINIO_SANDBOX";
+pub use crate::_util::env::{READ_ONLY_VAR, SANDBOX_VAR};
 
 /// The access-key variable's name (`contracts/config.md:110`), the `[auth]` pair's first half.
 ///
@@ -471,9 +465,9 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
-    // `TINIO_STATE_DIR`'s name is `tinio-config`'s (`cli`'s constant doc states why), so the
+    // `TINIO_STATE_DIR`'s name is `tinio_util::env`'s (`cli`'s constant doc states why), so the
     // closed-set walk below checks that name rather than a second constant here.
-    use crate::{_config::state::STATE_DIR_VAR, _util::testing::assert_send_sync};
+    use crate::_util::{env::STATE_DIR_VAR, testing::assert_send_sync};
 
     /// The set of variables the parser may read is the contract's, and it is closed: an argument
     /// reading anything else is a channel no document describes. Walked over every arm, so a new

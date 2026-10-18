@@ -16,8 +16,6 @@
 #[doc(hidden)]
 pub extern crate tinio_api as _api;
 #[doc(hidden)]
-pub extern crate tinio_config as _config;
-#[doc(hidden)]
 pub extern crate tinio_core as _core;
 #[doc(hidden)]
 pub extern crate tinio_fs as _fs;
@@ -45,6 +43,7 @@ pub use self::{error::Error, run::run};
 
 pub mod cli;
 pub mod commands;
+pub mod config;
 /// **`api`-only, like the flag it serves.** A build without the feature has no plane, so it has
 /// no `state` file to prove readiness on and no parent-side wait that could; `--daemon` is
 /// therefore not in that build's surface at all (clap answers an unknown argument), the same

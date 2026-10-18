@@ -1,12 +1,12 @@
 //! Server errors (task T020).
 //!
-//! Startup failures (bind, config, storage construction) and S3-mapping
+//! Startup failures (bind, storage construction) and S3-mapping
 //! failures of the compatibility layer. The S3 protocol layer itself reports
 //! standard S3 error codes; this type covers the server's own failures.
 
 use std::io;
 
-use crate::{_config, _core::storage};
+use crate::_core::storage;
 
 /// A server failure: startup or S3-mapping.
 ///
@@ -23,9 +23,6 @@ pub enum Error {
     /// A filesystem/network I/O failure (bind, read, write).
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    /// A configuration failure (invalid config, missing sections).
-    #[error("configuration error: {0}")]
-    Config(#[from] _config::Error),
     /// A storage-contract failure surfaced during startup or mapping.
     #[error("storage error: {0}")]
     Storage(#[from] storage::Error),
@@ -43,9 +40,7 @@ mod tests {
     use prometheus::Error as PrometheusError;
 
     use super::*;
-    use crate::{
-        _config::Error as ConfigError, _core::storage::Error::*, _util::testing::assert_send_sync,
-    };
+    use crate::{_core::storage::Error::*, _util::testing::assert_send_sync};
 
     #[test]
     fn displays_variants() {
@@ -53,10 +48,6 @@ mod tests {
             (
                 Error::Io(IoError::other("port in use")),
                 "I/O error: port in use",
-            ),
-            (
-                Error::Config(ConfigError::Missing("api".into())),
-                "configuration error: missing required value: api",
             ),
             (
                 Error::Storage(NoSuchBucket("data".into())),

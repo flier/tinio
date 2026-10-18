@@ -26,12 +26,11 @@ use crate::_sandbox::{SECCOMP_SKIP_WARNING, linux::Seccomp};
 use crate::commands::start::api_options;
 #[cfg(feature = "sandbox")]
 use crate::{
-    _config::Config,
     _core::mode::AccessMode,
     _sandbox::{self, Terminal, serve},
     _server::identity,
 };
-use crate::{_config::storage, _sandbox::Child, Error, commands::start::Args, resolve::Resolution};
+use crate::{_sandbox::Child, Error, commands::start::Args, config::storage, resolve::Resolution};
 
 /// Runs the confinement — §1 step i, the **dynamic** half, after the fork.
 ///
@@ -113,10 +112,10 @@ use crate::{_config::storage, _sandbox::Child, Error, commands::start::Args, res
 ///
 /// use tinio_cli::{
 ///     commands::start::Args,
+///     config::Config,
 ///     resolve::Resolution,
 ///     sandbox::{Request, confine},
 /// };
-/// use tinio_config::Config;
 ///
 /// # fn main() -> Result<(), tinio_cli::Error> {
 /// let resolution = Resolution {
@@ -129,6 +128,7 @@ use crate::{_config::storage, _sandbox::Child, Error, commands::start::Args, res
 ///     state_dir: PathBuf::from("/srv/data/.tinio"),
 ///     state_dir_override: None,
 ///     config_error: None,
+///     identity: Default::default(),
 /// };
 /// let args = Args::default();
 /// // Nothing asked for the confinement: there is nothing to run.
@@ -183,7 +183,7 @@ fn confine_enabled(
     let sandbox = sandbox_request(resolution, access)?;
     // Read once, off the rule that owns it, and carried as a value: the spec takes it and the
     // confinement applies it.
-    let local_uid = local_uid_configured(&resolution.config);
+    let local_uid = local_uid_configured(resolution.identity());
     let spec = serve::Spec::from_sandbox(sandbox).local_uid(local_uid);
     if !facts.launches_child {
         let _ = args;
@@ -252,7 +252,7 @@ fn confine_enabled(
 /// so the capability `serve::Spec` keeps and the chowns storage performs cannot disagree about
 /// whether a mapping exists.
 #[cfg(feature = "sandbox")]
-pub(super) fn local_uid_configured(config: &Config) -> bool {
+pub(super) fn local_uid_configured(config: &identity::Config) -> bool {
     !identity::owner_uids_for(config).is_empty()
 }
 

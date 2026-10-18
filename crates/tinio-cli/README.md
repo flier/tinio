@@ -1,6 +1,6 @@
 # `tinio-cli` — the command-line interface
 
-`tinio-cli` is the CLI: the lifecycle verbs an operator types, the process sequence behind them, and the exit codes they answer with. It implements the CLI contract (`contracts/cli.md`) — a Minio-style invocation (a positional directory, default ports 9000/9001) and the exit-code mapping `0` success, `1` operational error, `2` usage error. It owns the **verb surface** — what each verb does at the operator's level — and the `service` verbs that register the server with the platform's supervisor. It owns no configuration schema (`tinio-config` owns the chain and the schema) and no control-plane mechanics (`tinio-api` owns the state file, the transports and the endpoints): what this crate does is reduce flags, environment and the config file to one resolution and hand each plane the inputs it expects.
+`tinio-cli` is the CLI: the lifecycle verbs an operator types, the process sequence behind them, and the exit codes they answer with. It implements the CLI contract (`contracts/cli.md`) — a Minio-style invocation (a positional directory, default ports 9000/9001) and the exit-code mapping `0` success, `1` operational error, `2` usage error. It owns the **verb surface** — what each verb does at the operator's level — the `service` verbs that register the server with the platform's supervisor, and the **configuration composition root** (`src/config/`): the root document and its CLI-owned sections, discovery and auto-create, `.env`, credential generation and the `TINIO_STATE_DIR` parser, with the runtime crates' sections imported from their owners. It owns no control-plane mechanics (`tinio-api` owns the state file, the transports and the endpoints): what this crate does is reduce flags, environment and the config file to one resolution and hand each plane the inputs it expects.
 
 ## The verbs
 
@@ -44,6 +44,7 @@ tinio service <install|uninstall|start|stop|query> [DIR] [--name NAME] [--user]
 | `src/cli.rs` | the command line: every env-backed argument, the two-pass parse, and the provenance |
 | `src/run.rs` | the process entry point and the design's sequence |
 | `src/resolve/mod.rs`, `src/resolve/locate.rs`, `src/resolve/pg.rs` | root, mode, state directory and config resolution |
+| `src/config/` | the configuration composition root: the root document, the CLI-owned sections, discovery, `.env`, credentials and `TINIO_STATE_DIR` parsing |
 | `src/commands/start/` | the serving path: its flags, the management-plane selection, the §1 serving half, the backend seam, and the metrics adapter |
 | `src/commands/status.rs`, `src/commands/stop.rs` | the two client commands |
 | `src/commands/doctor/` | the offline diagnosis, its check list and the audit walk |

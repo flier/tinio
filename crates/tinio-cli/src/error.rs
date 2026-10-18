@@ -10,8 +10,8 @@ use handlebars::RenderError;
 #[cfg(feature = "api")]
 use crate::_api;
 use crate::{
-    _config, _core::storage, _fs::Error as FsError, _sandbox::Error as SandboxError,
-    _server::Error as ServerError,
+    _core::storage, _fs::Error as FsError, _sandbox::Error as SandboxError,
+    _server::Error as ServerError, _util::state::Error as StateError, config,
 };
 
 /// A CLI failure carrying its exit code.
@@ -39,7 +39,10 @@ pub enum Error {
     Io(#[from] io::Error),
     /// A configuration failure — exit code 1.
     #[error("configuration error: {0}")]
-    Config(#[from] _config::Error),
+    Config(#[from] config::Error),
+    /// A state-directory failure — exit code 1.
+    #[error("state error: {0}")]
+    State(#[from] StateError),
     /// A storage-contract failure — exit code 1.
     #[error("storage error: {0}")]
     Storage(#[from] storage::Error),
@@ -139,7 +142,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        _config::Error as ConfigError, _core::storage::Error::*, _util::testing::assert_send_sync,
+        _core::storage::Error::*,
+        _util::{state::Error as StateError, testing::assert_send_sync},
+        config::Error as ConfigError,
     };
 
     #[test]
@@ -151,6 +156,10 @@ mod tests {
             Error::Config(ConfigError::Missing("api".into())).exit_code(),
             1
         );
+        assert_eq!(
+            Error::State(StateError::Missing("home directory".into())).exit_code(),
+            1
+        );
         assert_eq!(Error::Storage(NoSuchBucket("data".into())).exit_code(), 1);
     }
 
@@ -160,6 +169,10 @@ mod tests {
             (Error::Usage("unknown flag".into()), "unknown flag"),
             (Error::Operational("port in use".into()), "port in use"),
             (Error::Io(IoError::other("gone")), "I/O error: gone"),
+            (
+                Error::State(StateError::Missing("home directory".into())),
+                "state error: missing required value: home directory",
+            ),
             (
                 Error::Storage(NoSuchKey("k".into())),
                 "storage error: no such object: `k`",

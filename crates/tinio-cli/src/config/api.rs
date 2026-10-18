@@ -4,8 +4,16 @@ use garde::Validate;
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
 
+fn reject_empty(message: &str, is_empty: bool) -> garde::Result {
+    if is_empty {
+        Err(garde::Error::new(message))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_non_empty_path(value: &Path, _context: &()) -> garde::Result {
-    super::reject_empty("path must not be empty", value.as_os_str().is_empty())
+    reject_empty("path must not be empty", value.as_os_str().is_empty())
 }
 
 /// Management-plane transports (`[api]`; each subsection is presence-gated:
@@ -20,7 +28,7 @@ fn validate_non_empty_path(value: &Path, _context: &()) -> garde::Result {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::api::Config;
+/// use tinio_cli::config::api::Config;
 ///
 /// let api = Config::default();
 /// #[cfg(unix)]
@@ -60,7 +68,7 @@ pub struct Config {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::api::Unix;
+/// use tinio_cli::config::api::Unix;
 ///
 /// let unix = Unix::default();
 /// assert!(unix.path.as_os_str().is_empty()); // default: tinio.sock
@@ -81,7 +89,7 @@ pub struct Unix {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::api::Pipe;
+/// use tinio_cli::config::api::Pipe;
 ///
 /// let pipe = Pipe::default();
 /// assert!(pipe.path.as_os_str().is_empty()); // default: derived tinio-<sha1>
@@ -115,7 +123,7 @@ pub struct Http {
 /// ```rust
 /// use std::path::PathBuf;
 ///
-/// use tinio_config::api::{Http, Https};
+/// use tinio_cli::config::api::{Http, Https};
 ///
 /// let https = Https {
 ///     http: Http {

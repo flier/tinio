@@ -5,12 +5,15 @@
 //! none — the single `[owner]`/`[[users]]` assembly resolves it
 //! (tinio-server's `identity::Identity::from_config`).
 
+#[cfg(feature = "config")]
 use garde::Validate;
+#[cfg(feature = "config")]
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
 
+#[cfg(feature = "config")]
 use super::validate_canonical_id;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "config"))]
 use super::validate_local_uid;
 use crate::_core::acl::{DEFAULT_OWNER_DISPLAY_NAME, OwnerId, default_owner_id};
 
@@ -21,29 +24,30 @@ use crate::_core::acl::{DEFAULT_OWNER_DISPLAY_NAME, OwnerId, default_owner_id};
 /// # Examples
 ///
 /// ```rust
-/// use tinio_config::Config;
+/// use tinio_server::identity::owner::Config;
 ///
 /// let config = Config::default();
-/// assert_eq!(config.owner().display_name, "tinio");
-/// assert_eq!(config.owner().canonical_id.len(), 64);
+/// assert_eq!(config.display_name, "tinio");
+/// assert_eq!(config.canonical_id.len(), 64);
 /// ```
-#[derive(Debug, Clone, PartialEq, SmartDefault, Serialize, Deserialize, Validate)]
-#[garde(allow_unvalidated)]
+#[derive(Debug, Clone, PartialEq, SmartDefault)]
+#[cfg_attr(feature = "config", derive(Serialize, Deserialize, Validate))]
+#[cfg_attr(feature = "config", garde(allow_unvalidated))]
 pub struct Config {
     /// The root user's canonical account ID (default `hex(SHA-256("tinio"))`).
-    #[serde(default = "default_canonical_id")]
+    #[cfg_attr(feature = "config", serde(default = "default_canonical_id"))]
     #[default(_code = "default_owner_id().as_str().to_string()")]
-    #[garde(custom(validate_canonical_id))]
+    #[cfg_attr(feature = "config", garde(custom(validate_canonical_id)))]
     pub canonical_id: String,
     /// The root user's presentation display name (default `"tinio"`).
-    #[serde(default = "default_display_name")]
+    #[cfg_attr(feature = "config", serde(default = "default_display_name"))]
     #[default(_code = "DEFAULT_OWNER_DISPLAY_NAME.to_string()")]
     pub display_name: String,
     /// The root user's files chown to this uid on unix (unix-only; a
     /// Windows config with the key set fails validation at parse). The
     /// field stays on every platform (the portable type); Windows arms
     /// the rule.
-    #[cfg_attr(windows, garde(custom(validate_local_uid)))]
+    #[cfg_attr(all(windows, feature = "config"), garde(custom(validate_local_uid)))]
     pub local_uid: Option<u32>,
 }
 
@@ -53,34 +57,34 @@ impl Config {
     /// written argument).
     #[expect(
         clippy::expect_used,
-        reason = "argued: `canonical_id` is validated at config parse — `validate_canonical_id` is this field's garde rule (`schema/mod.rs`) and runs inside `Config::parse`/`Config::load`, and the field's default route codes `default_owner_id()`; the `pub` field's remaining hole is a hand-built struct, and no in-repo production caller builds one (checked 2026-10-09)"
+        reason = "argued: `canonical_id` is validated at config parse — `validate_canonical_id` is this field's garde rule (`identity.rs`) and runs when the CLI's root document validates (`tinio_cli::config::Config::parse`/`load`), and the field's default route codes `default_owner_id()`; the `pub` field's remaining hole is a hand-built struct, and no in-repo production caller builds one (checked 2026-10-09)"
     )]
     pub fn resolved_canonical_id(&self) -> OwnerId {
         OwnerId::new(self.canonical_id.clone()).expect("canonical_id is validated at config parse")
     }
 }
 
+#[cfg(feature = "config")]
 fn default_canonical_id() -> String {
     default_owner_id().as_str().to_string()
 }
 
+#[cfg(feature = "config")]
 fn default_display_name() -> String {
     DEFAULT_OWNER_DISPLAY_NAME.to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::{
-        _core::acl::{DEFAULT_OWNER_DISPLAY_NAME, default_owner_id},
-        Config, Error,
-    };
+#[cfg(all(test, feature = "config"))]
+mod schema_tests {
+    use garde::Validate;
+
+    use super::*;
 
     #[test]
     fn owner_defaults_are_stable() {
         // Spec §6: canonical_id defaults to hex(SHA-256("tinio")), display
         // name to "tinio" — the core constants, the single source.
-        let config = Config::default();
-        let owner = config.owner();
+        let owner = Config::default();
         assert_eq!(owner.canonical_id, default_owner_id().as_str());
         assert_eq!(owner.display_name, DEFAULT_OWNER_DISPLAY_NAME);
         assert_eq!(
@@ -93,11 +97,11 @@ mod tests {
 
     #[test]
     fn owner_settings_apply_and_resolve() {
-        let config = Config::parse(
-            "version = 1\n[owner]\ncanonical_id = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\ndisplay_name = \"ops\"\n",
+        let owner: Config = toml::from_str(
+            "canonical_id = \"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100\"\ndisplay_name = \"ops\"\n",
         )
         .unwrap();
-        let owner = config.owner();
+        owner.validate().unwrap();
         assert_eq!(owner.display_name, "ops");
         assert_eq!(
             owner.resolved_canonical_id().as_str(),
@@ -110,17 +114,23 @@ mod tests {
         // Task 7 ruling: an owner configured with the anonymous canonical
         // ID would BE the anonymous principal (every unsigned request
         // would be its owner).
-        let err = Config::parse(
-            "version = 1\n[owner]\ncanonical_id = \"65a011a29cdf8ec533ec3d1ccaae921c\"",
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        let owner: Config =
+            toml::from_str("canonical_id = \"65a011a29cdf8ec533ec3d1ccaae921c\"").unwrap();
+        let err = owner.validate().unwrap_err();
         assert!(err.to_string().contains("anonymous"), "{err}");
     }
 
     #[test]
     fn owner_canonical_id_must_be_64_hex() {
-        let err = Config::parse("version = 1\n[owner]\ncanonical_id = \"not-hex\"").unwrap_err();
-        assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+        let owner: Config = toml::from_str("canonical_id = \"not-hex\"").unwrap();
+        assert!(owner.validate().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_local_uid_is_rejected_on_windows() {
+        let owner: Config = toml::from_str("local_uid = 1000").unwrap();
+        let err = owner.validate().unwrap_err();
+        assert!(err.to_string().contains("local_uid"), "{err}");
     }
 }

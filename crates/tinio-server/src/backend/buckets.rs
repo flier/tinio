@@ -37,7 +37,6 @@ use crate::{
     },
 };
 use crate::{
-    _config::s3::MAX_BUCKETS,
     _core::{
         acl, object,
         storage::{ListBucketsParams, Storage},
@@ -46,6 +45,7 @@ use crate::{
         S3Backend, clamp_page_size, map_backend_error,
         tags::{tag_set_from_tags, tags_from_tag_set},
     },
+    s3::MAX_BUCKETS,
 };
 
 /// The ListBuckets default page size when `max-buckets` is absent — the

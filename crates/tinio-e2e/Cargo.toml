@@ -36,6 +36,7 @@ tempfile = { workspace = true }
 toml = { workspace = true }
 
 tinio-api = { path = "../tinio-api", default-features = false }
+tinio-cli = { path = "../tinio-cli", default-features = false }
 tinio-core = { path = "../tinio-core" }
 tinio-fs = { path = "../tinio-fs" }
 tinio-mem = { path = "../tinio-mem" }

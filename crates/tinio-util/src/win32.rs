@@ -5,7 +5,7 @@
 //! plane's named-pipe create and the sandbox's ACE walk: the crate that held it for both
 //! (`tinio-winsec`) dissolved with the file descriptors it managed, and the wording moved here
 //! rather than being copied. The directory's readers are the sandbox's `icacls` oracle and the
-//! config crate's independent DACL test, which before this module each spelled their own
+//! CLI config root's independent DACL test, which before this module each spelled their own
 //! answer — one asking the kernel, one reading `%SystemRoot%`.
 //!
 //! **Attribution stays with each caller**: the sentence is returned alone, because a caller
@@ -61,7 +61,7 @@ pub fn error_message(call: &str, status: u32) -> String {
 /// selectable through the environment. **That is robustness rather than defence**: an actor
 /// who can set a process's environment is a local actor, and local actors are outside this
 /// feature's threat model, so what the rule buys is that the path cannot be wrong for an
-/// environment reason. Its readers are the sandbox's `icacls` oracle and the config crate's
+/// environment reason. Its readers are the sandbox's `icacls` oracle and the CLI config root's
 /// independent DACL test.
 ///
 /// **Infallible on purpose.** A system directory is far shorter than the buffer below, and a

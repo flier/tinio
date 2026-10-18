@@ -51,10 +51,10 @@ use std::{
 
 use common::{Wire, plant, send};
 use tempfile::TempDir;
-use tinio_config::state::home_state_dir;
 use tinio_core::{mode::AccessMode, storage::Storage};
 use tinio_fs::{FsOptions, FsStorage, testing::fs_options};
 use tinio_server::{Capabilities, DataPlane, PlaneConfig};
+use tinio_util::state::home_state_dir;
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 
 /// A scratch served root and a scratch home — never the real `$HOME`.
