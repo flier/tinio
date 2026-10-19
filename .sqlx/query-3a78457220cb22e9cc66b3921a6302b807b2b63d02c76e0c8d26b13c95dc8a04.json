@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM bucket_lifecycle WHERE bucket = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3a78457220cb22e9cc66b3921a6302b807b2b63d02c76e0c8d26b13c95dc8a04"
+}

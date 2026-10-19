@@ -48,7 +48,7 @@ use crate::{
     _core::{
         ETag, MultipartUpload, acl,
         bucket::{self, Name},
-        checksum, cors,
+        checksum, cors, lifecycle,
         meta::{
             BucketMeta, Metadata, ObjectMeta, UploadMeta, VersionMeta, bucket as bucket_row,
             object as object_row, upload as upload_row,
@@ -351,6 +351,74 @@ impl BucketMeta for Rows {
 
     async fn clear_cors(&self, bucket: &bucket::Name) -> Result<bool, <Self as Metadata>::Error> {
         <RedbMetadata as BucketMeta>::clear_cors(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn lifecycle(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Option<lifecycle::Config>, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::lifecycle(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn lifecycles(
+        &self,
+    ) -> Result<Vec<(bucket::Name, lifecycle::Config)>, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::lifecycles(&self.engine)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_lifecycle_or_create(
+        &self,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+        now: SystemTime,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::set_lifecycle_or_create(&self.engine, bucket, config, now)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::set_lifecycle(&self.engine, bucket, config)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn merge_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+        rules: &[lifecycle::Rule],
+    ) -> Result<lifecycle::Merged, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::merge_lifecycle(&self.engine, bucket, rules)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn merge_lifecycle_or_create(
+        &self,
+        bucket: &bucket::Name,
+        rules: &[lifecycle::Rule],
+        now: SystemTime,
+    ) -> Result<lifecycle::Merged, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::merge_lifecycle_or_create(&self.engine, bucket, rules, now)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn clear_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::clear_lifecycle(&self.engine, bucket)
             .await
             .map_err(Into::into)
     }

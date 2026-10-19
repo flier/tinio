@@ -58,7 +58,7 @@ use crate::_core::{
     blob::{BlobRef, BlockHash},
     bucket,
     content::{ContentEntry, ContentKey, ObjectContent, PublishId, StagedObject, stage_body},
-    cors,
+    cors, lifecycle,
     meta::{
         BucketMeta, Metadata, ObjectMeta, UploadMeta, bucket as bucket_row,
         object::{Identity, PartRow, Row},
@@ -132,6 +132,36 @@ fn pairs(tags: &object::Tags) -> Vec<(String, String)> {
     tags.iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
         .collect()
+}
+
+/// One valid lifecycle configuration: a single enabled rule expiring `prefix`
+/// after `days` days — the shape the lifecycle legs store. The shared fixture,
+/// so a model field added to `Rule` is edited here rather than in every store's
+/// tests.
+pub fn lifecycle_config_with(id: &str, prefix: Option<&str>, days: i32) -> lifecycle::Config {
+    lifecycle::Config {
+        rules: vec![lifecycle::Rule {
+            id: Some(id.to_owned()),
+            status: lifecycle::Status::Enabled,
+            filter: lifecycle::Filter {
+                prefix: prefix.map(str::to_owned),
+                ..lifecycle::Filter::default()
+            },
+            expiration: Some(lifecycle::Expiration {
+                days: Some(days),
+                date: None,
+                expired_object_delete_marker: None,
+            }),
+            noncurrent_version_expiration: None,
+            abort_incomplete_multipart_upload: None,
+        }],
+    }
+}
+
+/// The `logs/`, 30-day form of [`lifecycle_config_with`] — the fixture the
+/// contract legs share.
+pub fn lifecycle_config(id: &str) -> lifecycle::Config {
+    lifecycle_config_with(id, Some("logs/"), 30)
 }
 
 fn etag(value: &str) -> ETag {
@@ -1635,7 +1665,9 @@ fn chunk(index: usize, len: usize) -> Vec<u8> {
 }
 
 /// The bucket row's lifecycle: create-or-refuse, the existence-conditioned
-/// setters, the upserts, batch loads, the ordered listing and the removal.
+/// setters, the upserts, batch loads, the ordered listing, the removal and
+/// the lifecycle configuration's row (LC19: a rule never outlives its
+/// bucket).
 async fn bucket_legs<M>(store: &M)
 where
     M: Metadata,
@@ -1952,6 +1984,153 @@ where
 
     BucketMeta::remove(store, &name).await.unwrap();
     BucketMeta::remove(store, &absent).await.unwrap();
+
+    // The lifecycle configuration (LC5/LC6) keeps its row in a table of its
+    // own, keyed by bucket. The first three legs are **characterization** —
+    // they already held against the row and its four methods, and they are
+    // here so every backend pins that row's shape. The last two are LC19's
+    // coupling, and each was red before its own half of it landed.
+    let rules = lifecycle_config("conf-expire");
+    let alpha = bucket_name("conf-bucket-lifecycle-alpha");
+    let beta = bucket_name("conf-bucket-lifecycle-beta");
+    let gamma = bucket_name("conf-bucket-lifecycle-gamma");
+
+    // `a_lifecycle_row_round_trips` (characterization).
+    assert!(
+        store.lifecycle(&alpha).await.unwrap().is_none(),
+        "a bucket that never configured a rule has no row"
+    );
+    assert!(
+        !store.set_lifecycle(&alpha, &rules).await.unwrap(),
+        "set_lifecycle on a missing bucket writes nothing and answers false"
+    );
+    BucketMeta::create(store, &alpha, &bucket_at(t0()))
+        .await
+        .unwrap();
+    assert!(
+        store.set_lifecycle(&alpha, &rules).await.unwrap(),
+        "set_lifecycle on a recorded bucket answers the bucket's presence"
+    );
+    assert_eq!(
+        store.lifecycle(&alpha).await.unwrap(),
+        Some(rules.clone()),
+        "the configuration round-trips through its row"
+    );
+    assert!(
+        store.set_lifecycle(&alpha, &rules).await.unwrap(),
+        "an identical configuration is presence too, never a change signal"
+    );
+    assert_eq!(store.lifecycle(&alpha).await.unwrap(), Some(rules.clone()));
+
+    // `lifecycles_lists_only_configured_buckets` (characterization): the scan
+    // is the sweep's read, so it answers the configured buckets alone, in
+    // ascending name order. `beta` has a bucket row and no configuration, and
+    // `gamma` is configured after `alpha` while sorting above it.
+    let other = lifecycle_config("conf-expire-other");
+    BucketMeta::create(store, &beta, &bucket_at(t0()))
+        .await
+        .unwrap();
+    BucketMeta::create(store, &gamma, &bucket_at(t0()))
+        .await
+        .unwrap();
+    store.set_lifecycle(&gamma, &other).await.unwrap();
+    assert_eq!(
+        store.lifecycles().await.unwrap(),
+        vec![
+            (alpha.clone(), rules.clone()),
+            (gamma.clone(), other.clone()),
+        ],
+        "the scan lists the configured buckets alone, in ascending name order"
+    );
+
+    // `clear_lifecycle_is_idempotent_and_false_without_a_row`
+    // (characterization).
+    assert!(
+        store.clear_lifecycle(&beta).await.unwrap(),
+        "a recorded bucket that stores no configuration is still present"
+    );
+    assert!(store.clear_lifecycle(&gamma).await.unwrap());
+    assert!(store.lifecycle(&gamma).await.unwrap().is_none());
+    assert!(
+        store.clear_lifecycle(&gamma).await.unwrap(),
+        "clearing again is still presence, not change"
+    );
+    assert_eq!(
+        store.lifecycles().await.unwrap(),
+        vec![(alpha.clone(), rules.clone())],
+        "only the bucket that still stores a rule is listed"
+    );
+    let without_row = bucket_name("conf-bucket-lifecycle-absent");
+    assert!(
+        !store.clear_lifecycle(&without_row).await.unwrap(),
+        "clear_lifecycle answers false for a bucket with no row"
+    );
+    assert!(
+        !store.set_lifecycle(&without_row, &rules).await.unwrap(),
+        "…and set_lifecycle answers it too"
+    );
+    assert!(store.lifecycle(&without_row).await.unwrap().is_none());
+
+    // `set_lifecycle_or_create` (the lazy first-sight policy): a bucket with no
+    // row gains one and the configuration in the same write, so a
+    // directory-backed store's pre-existing bucket can be configured. The leg
+    // runs on every store, where it must be indistinguishable from the plain
+    // setter on an existing bucket.
+    let unsighted = bucket_name("conf-bucket-lifecycle-or-create");
+    store
+        .set_lifecycle_or_create(&unsighted, &rules, t0())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.created_at(&unsighted).await.unwrap(),
+        Some(t0()),
+        "the first-sight row carries `now`"
+    );
+    assert_eq!(
+        store.lifecycle(&unsighted).await.unwrap(),
+        Some(rules.clone())
+    );
+    BucketMeta::remove(store, &unsighted).await.unwrap();
+
+    // `create_clears_a_stale_lifecycle_row` (LC19). The row lives in a table of
+    // its own, so it does not inherit the bucket row's upsert on re-create: a
+    // row left behind by a bucket that vanished out of band must not turn a
+    // brand-new bucket into an expiring one.
+    let recreated = bucket_name("conf-bucket-lifecycle-create");
+    BucketMeta::create(store, &recreated, &bucket_at(t0()))
+        .await
+        .unwrap();
+    store.set_lifecycle(&recreated, &rules).await.unwrap();
+    BucketMeta::remove(store, &recreated).await.unwrap();
+    BucketMeta::create(store, &recreated, &bucket_at(t1()))
+        .await
+        .unwrap();
+    assert!(
+        store.lifecycle(&recreated).await.unwrap().is_none(),
+        "a brand-new bucket must not inherit the rules of the bucket it replaced (LC19)"
+    );
+
+    // `deleting_a_bucket_clears_its_rules` (LC19): the contract's delete takes
+    // the row its bucket guarded, in the same write.
+    let deleted = bucket_name("conf-bucket-lifecycle-delete");
+    BucketMeta::create(store, &deleted, &bucket_at(t0()))
+        .await
+        .unwrap();
+    store.set_lifecycle(&deleted, &rules).await.unwrap();
+    BucketMeta::remove(store, &deleted).await.unwrap();
+    assert!(
+        store.lifecycle(&deleted).await.unwrap().is_none(),
+        "a deleted bucket takes its lifecycle row with it (LC19)"
+    );
+    assert_eq!(
+        store.lifecycles().await.unwrap(),
+        vec![(alpha.clone(), rules.clone())],
+        "the deleted bucket is no longer listed either"
+    );
+
+    for bucket in [&alpha, &beta, &gamma, &recreated, &deleted] {
+        BucketMeta::remove(store, bucket).await.unwrap();
+    }
 }
 
 /// The object row's lifecycle: point reads and writes, the retained part list,

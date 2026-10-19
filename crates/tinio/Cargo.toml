@@ -34,6 +34,7 @@ full=[
     "api",
     "copy",
     "cors",
+    "lifecycle",
     "list-v1",
     "list-v2",
     "mem",
@@ -50,6 +51,7 @@ acl = ["tinio-server/acl"]
 api = ["dep:tinio-api", "tinio-server/api", "tinio-cli/api"]
 copy = ["tinio-server/copy"]
 cors = ["tinio-server/cors"]
+lifecycle = ["tinio-server/lifecycle", "tinio-cli/lifecycle"]
 list-v1 = ["tinio-server/list-v1"]
 list-v2 = ["tinio-server/list-v2"]
 mem = ["tinio-cli/mem"]

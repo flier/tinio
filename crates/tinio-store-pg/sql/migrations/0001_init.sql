@@ -198,6 +198,13 @@ CREATE TABLE IF NOT EXISTS bucket_versioning (
     state bucket_state NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS bucket_lifecycle (
+    bucket text COLLATE "C" PRIMARY KEY
+        REFERENCES buckets (name) ON DELETE CASCADE,
+    config text NOT NULL,
+    updated_at timestamptz NOT NULL
+);
+
 -- A version row is either an object version or a delete marker; the labels are
 -- `tinio_core::meta::version::Kind`'s wires, bound by that type's `sqlx`
 -- mapping (`lowercase`).

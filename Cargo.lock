@@ -4690,6 +4690,7 @@ dependencies = [
 name = "tinio-api"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "derive_more",
  "getrandom 0.4.3",
@@ -4762,6 +4763,7 @@ dependencies = [
 name = "tinio-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "daemonize",
  "dirs 7.0.0",
@@ -4772,6 +4774,7 @@ dependencies = [
  "getrandom 0.4.3",
  "handlebars",
  "hex",
+ "http",
  "humantime-serde",
  "parse-display",
  "rustix 1.1.4",
@@ -4789,6 +4792,7 @@ dependencies = [
  "tinio-api",
  "tinio-core",
  "tinio-fs",
+ "tinio-lifecycle",
  "tinio-mem",
  "tinio-pg",
  "tinio-sandbox",
@@ -4820,8 +4824,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "smart-default",
  "sqlx",
  "thiserror 2.0.20",
+ "time",
  "tinio-util",
  "tokio",
  "tracing",
@@ -4897,6 +4903,20 @@ dependencies = [
  "tracing",
  "uuid",
  "winapi-util",
+]
+
+[[package]]
+name = "tinio-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "smart-default",
+ "tinio-core",
+ "tinio-mem",
+ "tinio-util",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

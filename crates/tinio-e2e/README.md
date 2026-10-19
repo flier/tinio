@@ -8,7 +8,7 @@
 |---|---|
 | `tests/cucumber.rs` | The single cucumber binary (`harness = false`): installs the default tag filter and `fail_on_skipped()`. |
 | `tests/features/` | The `.feature` files, one per domain — the spec's executable form; `interop/` holds the external-client journeys. |
-| `tests/steps/` | The `World`, the `#[before]`/`#[after]` hooks, the domain step modules (`acl`, `buckets`, `cli`, `clients`, `common`, `conditions`, `doctor`, `errors`, `listing`, `multipart`, `objects`, `reserved_paths`, `select`, `versioning`) and `tag_filter.rs`, which composes the default filter. |
+| `tests/steps/` | The `World`, the `#[before]`/`#[after]` hooks, the domain step modules (`acl`, `buckets`, `cli`, `clients`, `common`, `conditions`, `doctor`, `errors`, `lifecycle`, `listing`, `multipart`, `objects`, `reserved_paths`, `select`, `versioning`) and `tag_filter.rs`, which composes the default filter. |
 | `tests/traceability.rs` | The spec↔tag cross-check — a plain-harness target with no cucumber involvement. |
 | `scripts/wsl-interop.sh` | One-command `@interop` run inside WSL2 (Linux-side aws-cli/rclone). |
 
@@ -35,6 +35,7 @@ The vocabulary the table leans on — scenario-level vs feature-level tags, the 
 | `@tagging-off` | `caps.tagging = false` — the six `?tagging` ops answer `NotImplemented`. |
 | `@cors` | The CORS scenario set (`cors.feature`, where it is also the feature-level tag); a selector only — no hook reads it, the capability toggle is `@cors-off`. |
 | `@cors-off` | `caps.cors = false` — the three `?cors` ops answer `NotImplemented`, and the preflight route is not registered. |
+| `@lifecycle` | The lifecycle corpus (`lifecycle.feature`, `lifecycle_cli.feature`, where it is also the feature-level tag): the `?lifecycle` trio and the pass (FR-042). A selector and a traceability tag — no exclusion axis names it. |
 | `@read-only` | `PlaneConfig::read_only` — every mutating operation answers `AccessDenied` (FR-023); an `@external` scenario spells the same mode on its spawned server (`--read-only`). |
 | `@acl` | The identity-wired ACL plane (`DataPlane::new_with_acl`, the config fixture's identity): the four ACL ops and the enforced authorization pipeline; the hook spawns this plane instead of the plain one. |
 | `@acl-off` | `caps.acl = false` on the legacy no-identity plane — the four ACL ops answer `NotImplemented`; `config_from_tags` reads it, and it is not `@acl`'s branch. |

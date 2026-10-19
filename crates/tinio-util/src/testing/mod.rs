@@ -1108,6 +1108,52 @@ async fn conformance_buckets<S: Storage>(storage: &S, b: &bucket::Name) {
     check(got.is_none(), "delete_bucket_cors must clear the config");
     storage.delete_bucket_cors(b).await.unwrap(); // idempotent
 
+    // Bucket lifecycle: a bucket that stores no configuration answers `None`
+    // on the read and accepts the delete (the contract's idempotent 204); a
+    // stored configuration round-trips until the delete clears it, and a
+    // second delete is still `Ok`. The configuration lives in a table of its
+    // own, so all three ops answer `NoSuchBucket` for a missing bucket — `get`
+    // included, which is the presence probe the row policy does not cover for
+    // a lazy store (R34).
+    check(
+        storage.get_bucket_lifecycle(b).await.unwrap().is_none(),
+        "a bucket with no lifecycle configuration must answer None",
+    );
+    storage.delete_bucket_lifecycle(b).await.unwrap();
+    let config = metadata::lifecycle_config("conform");
+    storage.put_bucket_lifecycle(b, &config).await.unwrap();
+    let got = storage.get_bucket_lifecycle(b).await.unwrap();
+    check(
+        got == Some(config.clone()),
+        "bucket lifecycle configuration must round-trip",
+    );
+    storage.delete_bucket_lifecycle(b).await.unwrap();
+    check(
+        storage.get_bucket_lifecycle(b).await.unwrap().is_none(),
+        "delete_bucket_lifecycle must clear the configuration",
+    );
+    storage.delete_bucket_lifecycle(b).await.unwrap(); // idempotent
+    let err = into_core_error(storage.get_bucket_lifecycle(&missing).await.unwrap_err());
+    check(
+        matches!(err, NoSuchBucket(_)),
+        "get_bucket_lifecycle on a missing bucket must be NoSuchBucket",
+    );
+    let err = into_core_error(
+        storage
+            .put_bucket_lifecycle(&missing, &config)
+            .await
+            .unwrap_err(),
+    );
+    check(
+        matches!(err, NoSuchBucket(_)),
+        "put_bucket_lifecycle on a missing bucket must be NoSuchBucket",
+    );
+    let err = into_core_error(storage.delete_bucket_lifecycle(&missing).await.unwrap_err());
+    check(
+        matches!(err, NoSuchBucket(_)),
+        "delete_bucket_lifecycle on a missing bucket must be NoSuchBucket",
+    );
+
     // Delete non-empty (a folder marker counts as content).
     let marker = object::key("dir/").unwrap();
     storage.put_object(b, &marker, body("")).await.unwrap();

@@ -26,6 +26,8 @@
 //! [`crate::bucket`], [`crate::object`], and [`crate::multipart`].
 
 use std::sync::Arc;
+#[cfg(feature = "testing")]
+use std::{collections::HashMap, sync::Mutex};
 
 use async_trait::async_trait;
 use redb::ReadableTable;
@@ -41,6 +43,7 @@ use crate::{
         Storage,
         bucket::Name,
         content::{ContentKey, ObjectContent, PublishId},
+        lifecycle,
         meta::BucketMeta,
         multipart, object,
         storage::{self, not_empty},
@@ -50,8 +53,9 @@ use crate::{
         NoGuard,
     },
     _store_redb::{
-        Driver, Error as StoreError, RedbContent, RedbMetadata, bucket as bucket_row, ensure_all,
-        object_meta, object_part, objects, part, part_checksum, part_data, part_meta, part_stamp,
+        Driver, Error as StoreError, RedbContent, RedbMetadata, bucket as bucket_row,
+        bucket_lifecycle, ensure_all, object_meta, object_part, objects, part, part_checksum,
+        part_data, part_meta, part_stamp,
         scan::{drain_pair, drain_triple, for_each_pair},
         store, upload, upload_checksum,
     },
@@ -109,6 +113,10 @@ pub struct MemoryStorage {
     /// configured limits and the shared total-byte counter live inside it
     /// (round 29: one accounting home).
     pub(crate) content: Arc<CountingContent<RedbContent>>,
+    /// Per-bucket count of `list_objects` calls — the `testing` feature's
+    /// observable, absent (no field, no branch) from a normal build.
+    #[cfg(feature = "testing")]
+    pub(crate) object_listings: Mutex<HashMap<Name, u64>>,
 }
 
 /// Optional resource limits for [`MemoryStorage`].
@@ -175,6 +183,8 @@ impl MemoryStorage {
             Ok(())
         })?;
         Ok(Self {
+            #[cfg(feature = "testing")]
+            object_listings: Mutex::new(HashMap::new()),
             db: handle,
             metadata,
             content: Arc::new(content),
@@ -253,6 +263,32 @@ impl MemoryStorage {
         self.content.total_bytes()
     }
 
+    /// How many `list_objects` calls this backend has served for `bucket` —
+    /// the `testing` feature's only observation of the object walk, so a
+    /// caller can prove which buckets were walked. A bucket never listed (or
+    /// whose listing was refused before the walk) reports 0. Test-only: with
+    /// the feature off the counter does not exist.
+    #[cfg(feature = "testing")]
+    pub fn object_listings(&self, bucket: &Name) -> u64 {
+        let counts = self
+            .object_listings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        counts.get(bucket).copied().unwrap_or(0)
+    }
+
+    /// Test hook: record one `list_objects` call for `bucket` (the counter
+    /// [`MemoryStorage::object_listings`] reads).
+    #[cfg(feature = "testing")]
+    pub(crate) fn record_object_listing(&self, bucket: &Name) {
+        *self
+            .object_listings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(bucket.clone())
+            .or_insert(0) += 1;
+    }
+
     /// The drop half of a refused publish's compensation: take the bytes this
     /// call published back out — but only while the key still holds them
     /// *and* still holds this call's publish: the tag the publish recorded
@@ -302,6 +338,15 @@ impl MemoryStorage {
 
 impl Storage for MemoryStorage {
     type Error = Error;
+}
+
+#[async_trait]
+impl storage::LifecycleRules for MemoryStorage {
+    async fn lifecycles(&self) -> Result<Vec<(Name, lifecycle::Config)>, storage::Error> {
+        <RedbMetadata as BucketMeta>::lifecycles(&self.metadata)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 /// The `Hooks` implementation mem's bucket receiver carries.
@@ -375,6 +420,10 @@ impl MemHooks {
                 return Err(Error::from(not_empty(&name)));
             }
             bucket_row::Table::open(txn)?.remove(&b)?;
+            // LC19: a rule never outlives its bucket. mem's delete path is this
+            // teardown (the 2026-10-08 ruling elided `remove_if_empty` into
+            // it), so the lifecycle row leaves in this same transaction.
+            bucket_lifecycle::Table::open(txn)?.drain_bucket(&b)?;
             // The bucket's stored state dies with it (spec 2026-10-03): the
             // object and upload planes' rows, mem's own part planes, and — under
             // the `versioning` feature — the version plane and the history

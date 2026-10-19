@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT config FROM bucket_lifecycle WHERE bucket = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "config",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bucket_lifecycle",
+            "name": "config"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "09eddab0297699f927c78f841bc597d561a524c76c8e72cfa982fb037e2fc21a"
+}

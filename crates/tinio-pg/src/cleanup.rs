@@ -34,8 +34,18 @@
 //! judge a block without the set — while the version rows it folds in arrive
 //! one page at a time.
 //!
-//! Three rules bind the module:
+//! Four rules bind the module:
 //!
+//! - **A governed bucket keeps its own clock** (LC21): in a run that builds the
+//!   lifecycle pass, a bucket whose stored lifecycle configuration carries
+//!   `NoncurrentVersionExpiration` is governed by its rule for that action, so this
+//!   module's `[s3] noncurrent_keep` / `noncurrent_expire_days` do not apply to it,
+//!   and `AbortIncompleteMultipartUpload` likewise displaces `[s3]
+//!   multipart_expire_days` for the serving pass's abandoned-upload stage
+//!   ([`PgCleanup::abort_stale_uploads`]). A bucket carrying neither rule keeps the
+//!   bucket-blind behaviour, and the rule is per action — never per bucket. **With
+//!   no pass nothing is governed** (LC23): the clocks then do their normal work on
+//!   every bucket, stored rules or not.
 //! - **A live chunk is never reclaimed, and neither is a publish in flight.**
 //!   A content row is live exactly when its `(bucket, kind, ckey, seq)` is the
 //!   head's `live_seq`. A non-live row is protected while its own
@@ -78,11 +88,13 @@ use futures::{StreamExt, stream};
 use tinio_blob::{LiveSet, Store};
 use tinio_core::{
     blob::BlockHash,
+    bucket,
     cleanup::{
         ActionStream, Cleanup, CleanupOptions, RepairAction, RepairActionLevel, RepairKind,
         retention_enabled, retires,
     },
-    meta::VersionMeta,
+    lifecycle,
+    meta::{BucketMeta, VersionMeta},
     object, storage,
 };
 
@@ -147,6 +159,16 @@ pub struct PgCleanup {
     /// The minimum age before a staged generation or an unreferenced block may
     /// be reclaimed (`[s3] block_grace_minutes`).
     grace: Duration,
+    /// The abandoned-upload timeout (`[s3] multipart_expire_days`): how long an
+    /// upload may sit untouched before [`Self::abort_stale_uploads`] removes it.
+    /// `None` leaves the stage off, so a default configuration keeps the
+    /// behavior it had before the lifecycle surface existed (LC21).
+    multipart_ttl: Option<Duration>,
+    /// Whether this run builds the lifecycle pass (`[s3] lifecycle`, LC23): the
+    /// condition under which a bucket's stored rules own the two actions above
+    /// (LC21). With no pass nothing is governed, so the clocks do their normal
+    /// work on every bucket, stored rules or not.
+    lifecycle_pass: bool,
 }
 
 impl PgCleanup {
@@ -176,6 +198,8 @@ impl PgCleanup {
             noncurrent_keep: 0,
             noncurrent_expire: Duration::ZERO,
             grace: DEFAULT_GRACE,
+            multipart_ttl: None,
+            lifecycle_pass: true,
         }
     }
 
@@ -211,6 +235,151 @@ impl PgCleanup {
     pub fn with_grace(mut self, grace: Duration) -> Self {
         self.grace = grace;
         self
+    }
+
+    /// Override the abandoned-upload timeout (`[s3] multipart_expire_days`) —
+    /// the age past which the serving pass aborts an upload. Constructor sugar,
+    /// in [`Self::with_grace`]'s shape.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn example(cleanup: tinio_pg::cleanup::PgCleanup) {
+    /// let cleanup = cleanup.with_multipart_ttl(Some(std::time::Duration::from_secs(86_400)));
+    /// # let _ = cleanup;
+    /// # }
+    /// ```
+    ///
+    /// The example only constructs the value; a serving run with it would
+    /// abort an upload left untouched for a day.
+    pub fn with_multipart_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.multipart_ttl = ttl;
+        self
+    }
+
+    /// Declare whether this run builds the lifecycle pass (`[s3] lifecycle`): with
+    /// none, no bucket is governed, so the retained clocks above do their normal
+    /// work on every bucket, stored rules or not (LC21, LC23). Constructor sugar,
+    /// in [`Self::with_grace`]'s shape; the default is `true`, the capability's
+    /// own default.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// # fn example(cleanup: tinio_pg::cleanup::PgCleanup) {
+    /// let cleanup = cleanup.with_lifecycle_pass(false);
+    /// # let _ = cleanup;
+    /// # }
+    /// ```
+    pub fn with_lifecycle_pass(mut self, pass: bool) -> Self {
+        self.lifecycle_pass = pass;
+        self
+    }
+
+    /// Abort the uploads abandoned past [`Self::with_multipart_ttl`]'s timeout
+    /// and answer how many went — the pg arm of the filesystem sweeper's
+    /// abandoned-upload stage (`[s3] multipart_expire_days`). No
+    /// [`Cleanup::repair`] kind runs it: a repair reclaims residue, while this is
+    /// the serving loop's, on the run's own shutdown channel (the fs sweeper's
+    /// stage, on the pg loop).
+    ///
+    /// **The age is the upload's latest activity**, `max(initiated_at, latest
+    /// part write)`, not the initiation alone: an upload whose last part landed
+    /// inside the timeout is being written, and the stage spares it however long
+    /// ago it was initiated. Those are the filesystem sweeper's own terms, so a
+    /// client uploading against either backend keeps its upload. The store's
+    /// page carries the rule (its `abort_stale_uploads` states the expression).
+    ///
+    /// **A governed bucket is skipped** (LC21): in a run that builds the lifecycle
+    /// pass, a bucket whose stored lifecycle configuration carries
+    /// `AbortIncompleteMultipartUpload` is governed by its rule for that action, so
+    /// the server's timeout does not apply to it. The question is
+    /// [`lifecycle::ActionOwners`], the same value the filesystem sweeper asks, so
+    /// the two backends cannot disagree about which bucket is governed. A rules
+    /// read that fails while the pass is built answers its error and aborts
+    /// nothing. **With no pass the timeout still reaches every upload** (LC23),
+    /// including when that read fails.
+    ///
+    /// A read-only store removes nothing — the mode's promise, read from the
+    /// store rather than from the caller.
+    pub async fn abort_stale_uploads(&self) -> Result<u64, Error> {
+        if self.multipart_ttl.is_none() {
+            return Ok(0);
+        }
+        let owners = match BucketMeta::lifecycles(&self.store).await {
+            Ok(configs) => lifecycle::ActionOwners::from_configs(&configs, self.lifecycle_pass),
+            Err(err) if !self.lifecycle_pass => {
+                tracing::warn!(
+                    %err,
+                    "lifecycle rules unreadable; the multipart timeout still applies"
+                );
+                lifecycle::ActionOwners::unread(false)
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let Some(governed) = owners.abort_excluded() else {
+            return Ok(0);
+        };
+        self.abort_with(&governed).await
+    }
+
+    /// The abandoned-upload stage over a governed set the caller already read:
+    /// the one-transaction abort, with the read-only and clock guards.
+    async fn abort_with(&self, governed: &[String]) -> Result<u64, Error> {
+        if !self.store.access().is_writable() {
+            return Ok(0);
+        }
+        // A clock below the timeout has no upload to judge: nothing was initiated
+        // before an instant that is not on the timeline.
+        let Some(ttl) = self.multipart_ttl else {
+            return Ok(0);
+        };
+        let Some(cutoff) = SystemTime::now().checked_sub(ttl) else {
+            return Ok(0);
+        };
+        Ok(self.store.abort_stale_uploads(cutoff, governed).await?)
+    }
+
+    /// The whole serving pass: the repair stages plus the abandoned-upload
+    /// stage, over **one** read of the rules table. The CLI's background loop
+    /// calls this; [`Self::repair`] and [`Self::abort_stale_uploads`] stay for
+    /// the doctor and for callers that want one stage alone. The
+    /// abandoned-upload stage runs only when [`Self::with_multipart_ttl`]
+    /// supplied a clock.
+    ///
+    /// An abandoned-upload failure is reported through the action stream rather
+    /// than failing the pass: the repair actions already collected are still
+    /// the caller's to drain, exactly as the two-call form answered them.
+    pub async fn pass(&self) -> Result<(ActionStream<Error>, u64), Error> {
+        let mut actions: Vec<Result<RepairAction, Error>> = Vec::new();
+        let remove = self.may_remove();
+        // A run with no lifecycle pass keeps the knobs when the rules cannot
+        // be read (LC23). A run that builds the pass still fails the pass: it
+        // must not judge a bucket by a knob its rule displaced.
+        let owners = match self.lifecycle_configs().await {
+            Ok(configs) => lifecycle::ActionOwners::from_configs(&configs, self.lifecycle_pass),
+            Err(err) if !self.lifecycle_pass => {
+                actions.push(Err(err));
+                lifecycle::ActionOwners::unread(false)
+            }
+            Err(err) => return Err(err),
+        };
+        self.reclaim_orphan_chunks(remove, &mut actions).await;
+        self.reclaim_orphan_parts(remove, &mut actions).await;
+        self.expire_versions(remove, &owners, &mut actions).await;
+        self.reclaim_blocks(remove, &mut actions).await;
+        let aborted = match (self.multipart_ttl.is_some(), owners.abort_excluded()) {
+            (false, _) | (true, None) => Ok(0),
+            (true, Some(governed)) => self.abort_with(&governed).await,
+        };
+        let aborted = match aborted {
+            Ok(aborted) => aborted,
+            Err(err) => {
+                actions.push(Err(err));
+                0
+            }
+        };
+        Ok((Box::pin(stream::iter(actions)), aborted))
     }
 
     /// Whether this run may remove rows: the caller did not ask for a report
@@ -312,6 +481,12 @@ impl PgCleanup {
         }
     }
 
+    /// The stored rules. The caller keeps its own read-error policy; this
+    /// helper owns the one place the rules table is read for the pass's stages.
+    async fn lifecycle_configs(&self) -> Result<Vec<(bucket::Name, lifecycle::Config)>, Error> {
+        Ok(BucketMeta::lifecycles(&self.store).await?)
+    }
+
     /// Expire the noncurrent versions past the retention thresholds.
     ///
     /// The store answers the history rows newest-first per key, one page at a
@@ -321,7 +496,16 @@ impl PgCleanup {
     /// until the page that carries its last row arrives. Each complete key is
     /// then one `VersionMeta::expire_many`, one durable commit per key rather
     /// than one per version.
-    async fn expire_versions(&self, remove: bool, actions: &mut Vec<Result<RepairAction, Error>>) {
+    ///
+    /// A bucket whose rules own this action is skipped (LC21). A pass that
+    /// cannot read the rules stands every bucket down; a run with no pass
+    /// does not (LC23).
+    async fn expire_versions(
+        &self,
+        remove: bool,
+        owners: &lifecycle::ActionOwners,
+        actions: &mut Vec<Result<RepairAction, Error>>,
+    ) {
         if !retention_enabled(self.noncurrent_keep, self.noncurrent_expire) {
             return; // the unset-key reading: keep every version
         }
@@ -347,9 +531,9 @@ impl PgCleanup {
                 .rposition(|row| row.bucket != last.bucket || row.key != last.key)
                 .map_or(0, |position| position + 1);
             held = run.split_off(start);
-            self.expire_run(&run, remove, now, actions).await;
+            self.expire_run(&run, remove, owners, now, actions).await;
         }
-        self.expire_run(&held, remove, now, actions).await;
+        self.expire_run(&held, remove, owners, now, actions).await;
     }
 
     /// Apply the retention rule to a run of history rows that begins and ends
@@ -358,19 +542,23 @@ impl PgCleanup {
         &self,
         rows: &[HistoryRow],
         remove: bool,
+        owners: &lifecycle::ActionOwners,
         now: SystemTime,
         actions: &mut Vec<Result<RepairAction, Error>>,
     ) {
         let mut index = 0;
         while index < rows.len() {
-            let bucket = rows[index].bucket.clone();
-            let key_wire = rows[index].key.clone();
+            let bucket = &rows[index].bucket;
+            let key_wire = &rows[index].key;
             let mut end = index + 1;
-            while end < rows.len() && rows[end].bucket == bucket && rows[end].key == key_wire {
+            while end < rows.len() && rows[end].bucket == *bucket && rows[end].key == *key_wire {
                 end += 1;
             }
             let history = &rows[index..end];
             index = end;
+            if !owners.knob_applies_noncurrent(bucket) {
+                continue; // LC21: the bucket's own rule owns this action
+            }
             let seqs: Vec<u64> = history
                 .iter()
                 .enumerate()
@@ -391,11 +579,11 @@ impl PgCleanup {
             }
             // A key the domain refuses cannot be addressed by an expiry, so
             // its rows keep their blocks and retire nothing.
-            let Ok(key) = object::key(&key_wire) else {
+            let Ok(key) = object::key(key_wire) else {
                 continue;
             };
             if remove {
-                match VersionMeta::expire_many(&self.store, &bucket, &key, &seqs).await {
+                match VersionMeta::expire_many(&self.store, bucket, &key, &seqs).await {
                     Ok(()) => actions.push(Ok(RepairAction {
                         level: RepairActionLevel::Warn,
                         description: format!(
@@ -509,7 +697,16 @@ impl Cleanup for PgCleanup {
         self.reclaim_orphan_chunks(remove, &mut actions).await;
         self.reclaim_orphan_parts(remove, &mut actions).await;
         if kind == RepairKind::Full {
-            self.expire_versions(remove, &mut actions).await;
+            // LC21: the stored rules, read once for the whole pass. A failed
+            // read stands the knobs down only when this run builds the pass.
+            let owners = match self.lifecycle_configs().await {
+                Ok(configs) => lifecycle::ActionOwners::from_configs(&configs, self.lifecycle_pass),
+                Err(err) => {
+                    actions.push(Err(err));
+                    lifecycle::ActionOwners::unread(self.lifecycle_pass)
+                }
+            };
+            self.expire_versions(remove, &owners, &mut actions).await;
             self.reclaim_blocks(remove, &mut actions).await;
         }
         Ok(Box::pin(stream::iter(actions)))
@@ -519,7 +716,7 @@ impl Cleanup for PgCleanup {
     ///
     /// The fs scanner's per-pass path reclaims stale bucket records and meta
     /// orphans; pg's residue is the orphan chunk and the upload-gone part, so
-    /// those two are what this answers. The retention pass and the block sweep
+    /// those are what this answers. The retention pass and the block sweep
     /// stay with [`Self::repair`] with [`RepairKind::Full`].
     ///
     /// **This is not the whole serving path's pass.** pg has no separate sweeper

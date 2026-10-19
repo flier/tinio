@@ -22,9 +22,10 @@ tinio-version = { workspace = true, optional = true }
 [features]
 default = []
 versioning = ["dep:tinio-version"]
+testing = []
 
 [dev-dependencies]
-tinio-mem = { path = ".", features = ["versioning"] }
+tinio-mem = { path = ".", features = ["versioning", "testing"] }
 tinio-util = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 

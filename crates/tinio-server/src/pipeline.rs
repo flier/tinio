@@ -121,18 +121,16 @@ pub enum Priority {
 #[derive(Debug, Clone, PartialEq, SmartDefault)]
 #[cfg_attr(feature = "config", derive(Serialize, Deserialize, Validate))]
 #[cfg_attr(feature = "config", garde(allow_unvalidated))]
+#[cfg_attr(feature = "config", serde(default))]
 pub struct Config {
     /// The IO pipeline (ETag computation: bounded file reads + hashing).
-    #[cfg_attr(feature = "config", serde(default))]
     #[cfg_attr(feature = "config", garde(dive))]
     pub io: Io,
     /// The removal pipeline (delete-bucket tombstone `remove_dir_all` —
     /// physically isolated from ETag compute, D-A).
-    #[cfg_attr(feature = "config", serde(default))]
     #[cfg_attr(feature = "config", garde(dive))]
     pub remove: Remove,
     /// The DB write pipeline (batched meta writes).
-    #[cfg_attr(feature = "config", serde(default))]
     #[cfg_attr(feature = "config", garde(dive))]
     pub db: Db,
 }
@@ -187,7 +185,9 @@ pub type Db = Queue<DEFAULT_DB_WORKERS, DB_WORKERS_MIN, DB_WORKERS_MAX>;
 
 /// The serde default of `workers` — the pipeline's own constant, never a
 /// round-trip through `Default` (F46: the serde defaults mirror the
-/// constants they exist to mirror).
+/// constants they exist to mirror). Serde's container-level `default`
+/// panics the derive on const generics, so this field keeps the per-field
+/// path.
 #[cfg(feature = "config")]
 fn default_workers<const DEFAULT_WORKERS: u8>() -> u8 {
     DEFAULT_WORKERS

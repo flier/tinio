@@ -9,14 +9,21 @@
 //! `noncurrent_expire_days`) followed by the block-store pass (reclaim
 //! the blocks no version row references, reap the bucket's own staging
 //! residue, and reclaim the block subtrees of buckets that no longer
-//! exist). Non-blocking: the sweep sleeps in bounded chunks and
+//! exist). **In a run that builds the lifecycle pass, a bucket whose stored
+//! lifecycle configuration carries `NoncurrentVersionExpiration` or
+//! `AbortIncompleteMultipartUpload` is governed by its rule for that action, so
+//! the `[s3]` knob beside it does not apply to that bucket** (LC21, per action);
+//! **with the pass off nothing is governed, so the knobs do their normal work on
+//! every bucket, stored rules or not** (LC23).
+//! Non-blocking: the sweep sleeps in bounded chunks and
 //! re-checks shutdown, so it never delays request handling or shutdown.
 //! Complements (does not replace) the event-driven `FsCleanup` startup
 //! repair.
 
 #[cfg(feature = "versioning")]
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::{
+    collections::HashSet,
     io::ErrorKind,
     path::Path,
     time::{Duration, SystemTime},
@@ -30,7 +37,6 @@ use crate::{
     _blob::{LiveSet, SweepCandidates, SweepReport},
     _core::{
         blob::{BlobRef, BlockHash},
-        bucket::Name,
         cleanup::{retention_enabled, retires},
         object,
     },
@@ -39,7 +45,12 @@ use crate::{
     metrics::{record_block_bytes, record_noncurrent_versions, record_sweep},
 };
 use crate::{
-    _util::pacing, backend::FsStorage, error::Error, fsutil::entries_of, path::TMP_DIR_NAME,
+    _core::{bucket::Name, lifecycle, multipart::DEFAULT_EXPIRE_DAYS, storage},
+    _util::pacing,
+    backend::FsStorage,
+    error::Error,
+    fsutil::entries_of,
+    path::TMP_DIR_NAME,
 };
 
 /// Sweep construction options (contracts/config.md `[s3]` TTLs and this
@@ -57,15 +68,18 @@ use crate::{
 /// assert_eq!(options.noncurrent_keep, 0, "unset: keep every version");
 /// assert_eq!(options.noncurrent_expire_days, 0, "unset: never expire");
 /// assert_eq!(options.block_grace, Duration::from_secs(600));
+/// assert!(options.lifecycle_pass, "the capability is on by default");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SmartDefault)]
 pub struct Options {
     /// Stale temp-file timeout (`[s3] temp_ttl_hours`).
     #[default(_code = "Duration::from_secs(24 * 3600)")]
     pub temp_ttl: Duration,
-    /// Abandoned-upload timeout (`[s3] multipart_expire_days`).
-    #[default(_code = "Duration::from_secs(7 * 24 * 3600)")]
-    pub multipart_ttl: Duration,
+    /// Abandoned-upload timeout (`[s3] multipart_expire_days`). `None` when the
+    /// operator did not write the key: the filesystem sweeper applies the
+    /// default via [`Options::multipart_ttl`], while pg's stage stays off.
+    #[default(_code = "None")]
+    pub multipart_ttl: Option<Duration>,
     /// How many noncurrent versions of a key to retain (`[s3]
     /// noncurrent_keep`; the newest N). `0` = keep every version, the safe
     /// reading of an unset key.
@@ -103,6 +117,23 @@ pub struct Options {
     /// capacity-planning signal, not a hard cap.
     #[default(_code = "0")]
     pub block_bytes_warn: u64,
+    /// Whether this run builds the lifecycle pass (`[s3] lifecycle`, LC23) — the
+    /// condition under which a bucket's stored rules take its two actions away
+    /// from the knobs beside them (LC21). With no pass nothing is governed, so
+    /// the knobs do their normal work on every bucket, stored rules or not;
+    /// `true` is the default because an absent `[s3]` section leaves the
+    /// capability on.
+    #[default(_code = "true")]
+    pub lifecycle_pass: bool,
+}
+
+impl Options {
+    /// The clock the filesystem sweeper applies: the explicit
+    /// `[s3] multipart_expire_days`, or seven days when the key was not written.
+    pub fn multipart_ttl(&self) -> Duration {
+        self.multipart_ttl
+            .unwrap_or(Duration::from_secs(DEFAULT_EXPIRE_DAYS * 24 * 3600))
+    }
 }
 
 /// Sweep cadence: one pass per hour. Not a config knob — the contract's
@@ -353,6 +384,16 @@ impl Sweeper {
     /// residue, and the block subtrees of buckets that no longer exist.
     /// Returns the counts.
     ///
+    /// **One owner per bucket per action (LC21).** The pass reads the stored
+    /// lifecycle rules once, at the top: a bucket whose configuration carries
+    /// `NoncurrentVersionExpiration` is governed by its rule for that action, so
+    /// `[s3] noncurrent_keep` / `noncurrent_expire_days` do not apply to it, and
+    /// `AbortIncompleteMultipartUpload` likewise displaces
+    /// `[s3] multipart_expire_days`. A bucket with neither rule keeps the
+    /// pre-lifecycle behaviour exactly — and so does every bucket when this run
+    /// builds no lifecycle pass (LC23): turning the capability off never stops the
+    /// knobs' retention.
+    ///
     /// Every pass ends with one low-frequency fragmentation evaluation
     /// (the stats call takes the write lock): over the `[storage.fs]
     /// compact_threshold_percent` threshold the `compact_needed` marker is
@@ -365,7 +406,18 @@ impl Sweeper {
         // skip the whole rest of the pass). The first error is reported
         // after every section ran.
         let mut first_error: Option<Error> = None;
-        if let Err(err) = self.sweep_versioned(&mut summary, now).await {
+        let governed = match self.governed_actions().await {
+            Ok(governed) => governed,
+            Err(err) => {
+                // A pass that cannot see the rules stands every bucket down
+                // rather than judge a governed bucket by the knob its rule
+                // displaced — unless this run builds no pass at all, whose
+                // knobs a rule was never going to displace (LC23).
+                first_error = first_error.or(Some(err));
+                lifecycle::ActionOwners::unread(self.options.lifecycle_pass)
+            }
+        };
+        if let Err(err) = self.sweep_versioned(&mut summary, now, &governed).await {
             first_error = first_error.or(Some(err));
         }
         if let Err(err) = self.sweep_orphan_blobs(&mut summary).await {
@@ -375,7 +427,7 @@ impl Sweeper {
             Ok(temps) => summary.temp_files += temps,
             Err(err) => first_error = first_error.or(Some(err)),
         }
-        match self.sweep_multipart(now).await {
+        match self.sweep_multipart(now, &governed).await {
             Ok(uploads) => summary.uploads = uploads,
             Err(err) => first_error = first_error.or(Some(err)),
         }
@@ -384,6 +436,21 @@ impl Sweeper {
             Some(err) => Err(err),
             None => Ok(summary),
         }
+    }
+
+    /// The buckets whose stored lifecycle configuration governs one of the
+    /// pass's two actions (LC21): one scan of the rules table, empty on every
+    /// root that never configured a rule, and empty for every bucket in a run
+    /// that builds no lifecycle pass (LC23).
+    async fn governed_actions(&self) -> Result<lifecycle::ActionOwners, Error> {
+        // A run that builds no pass governs nothing, so the scan is skipped.
+        if !self.options.lifecycle_pass {
+            return Ok(lifecycle::ActionOwners::from_configs(&[], false));
+        }
+        let configs = storage::LifecycleRules::lifecycles(&self.storage)
+            .await
+            .map_err(Error::from)?;
+        Ok(lifecycle::ActionOwners::from_configs(&configs, true))
     }
 
     /// Reclaim the block subtrees of buckets that are gone. `remove_bucket_state`
@@ -424,10 +491,15 @@ impl Sweeper {
     /// enabled or suspended. One bucket's failure is logged and the other
     /// buckets still run; the first error is reported after the loop.
     #[cfg(feature = "versioning")]
-    async fn sweep_versioned(&self, summary: &mut Summary, now: SystemTime) -> Result<(), Error> {
+    async fn sweep_versioned(
+        &self,
+        summary: &mut Summary,
+        now: SystemTime,
+        governed: &lifecycle::ActionOwners,
+    ) -> Result<(), Error> {
         let mut first_error: Option<Error> = None;
         for bucket in self.storage.versioned_buckets().await? {
-            if let Err(err) = self.sweep_bucket(&bucket, summary, now).await {
+            if let Err(err) = self.sweep_bucket(&bucket, summary, now, governed).await {
                 tracing::warn!(
                     bucket = %bucket,
                     error = %err,
@@ -475,8 +547,9 @@ impl Sweeper {
         bucket: &Name,
         summary: &mut Summary,
         now: SystemTime,
+        governed: &lifecycle::ActionOwners,
     ) -> Result<(), Error> {
-        let (plan, expired, epoch) = self.plan_bucket(bucket, now).await?;
+        let (plan, expired, epoch) = self.plan_bucket(bucket, now, governed).await?;
         summary.expired_versions += expired;
         summary.noncurrent_versions += plan.noncurrent.saturating_sub(expired as u64);
         let candidates = self
@@ -520,9 +593,10 @@ impl Sweeper {
         &self,
         bucket: &Name,
         now: SystemTime,
+        governed: &lifecycle::ActionOwners,
     ) -> Result<(BucketPlan, usize, u64), Error> {
         let guard = self.storage.lock_bucket_mutations(bucket).await;
-        let plan = self.plan_retention(bucket, now).await?;
+        let plan = self.plan_retention(bucket, now, governed).await?;
         let expired = self.apply_retirement(bucket, &plan.retire).await?;
         // Read last, still under the lock: every reference committed before
         // this point is inside `plan.live`, and every one after it bumps the
@@ -570,7 +644,12 @@ impl Sweeper {
     /// A build without the version machinery has no version rows and no
     /// block store: the versioned half is empty.
     #[cfg(not(feature = "versioning"))]
-    async fn sweep_versioned(&self, _summary: &mut Summary, _now: SystemTime) -> Result<(), Error> {
+    async fn sweep_versioned(
+        &self,
+        _summary: &mut Summary,
+        _now: SystemTime,
+        _governed: &lifecycle::ActionOwners,
+    ) -> Result<(), Error> {
         Ok(())
     }
 
@@ -597,12 +676,25 @@ impl Sweeper {
     /// stored string is not a valid object key cannot be expired (`expire`
     /// addresses a key), so its rows feed the live set but retire nothing.
     #[cfg(feature = "versioning")]
-    async fn plan_retention(&self, bucket: &Name, now: SystemTime) -> Result<BucketPlan, Error> {
+    async fn plan_retention(
+        &self,
+        bucket: &Name,
+        now: SystemTime,
+        governed: &lifecycle::ActionOwners,
+    ) -> Result<BucketPlan, Error> {
         let handle = self.storage.handle().clone();
         let scanned = bucket.clone();
-        let keep = self.options.noncurrent_keep;
-        let expire =
-            Duration::from_secs(self.options.noncurrent_expire_days.saturating_mul(86_400));
+        let (keep, expire) = if !governed.knob_applies_noncurrent(bucket) {
+            // LC21: the bucket's own rule owns this action, so the `[s3]`
+            // thresholds are not this pass's to apply to it. Both zero is the
+            // safe reading ("retire nothing"), the walk below unchanged.
+            (0, Duration::ZERO)
+        } else {
+            (
+                self.options.noncurrent_keep,
+                Duration::from_secs(self.options.noncurrent_expire_days.saturating_mul(86_400)),
+            )
+        };
         let scan = handle
             .read_blocking(move |txn| {
                 // The key's current slots, keyed the same way the rows below
@@ -717,10 +809,17 @@ impl Sweeper {
         sweep_stale_files(&dir, self.options.temp_ttl, "temp", now).await
     }
 
-    async fn sweep_multipart(&self, now: SystemTime) -> Result<usize, Error> {
+    async fn sweep_multipart(
+        &self,
+        now: SystemTime,
+        governed: &lifecycle::ActionOwners,
+    ) -> Result<usize, Error> {
         let uploads = self.storage.multipart_store().walk_uploads().await?;
         let mut removed = 0;
         for upload in uploads {
+            if !governed.knob_applies_abort(&upload.bucket) {
+                continue; // LC21: the bucket's own rule owns the abort
+            }
             let idle_since = self
                 .storage
                 .multipart_store()
@@ -729,7 +828,7 @@ impl Sweeper {
             let idle = idle_since.max(upload.initiated_at);
             if now
                 .duration_since(idle)
-                .map(|age| age >= self.options.multipart_ttl)
+                .map(|age| age >= self.options.multipart_ttl())
                 .unwrap_or(false)
             {
                 tracing::info!(
@@ -814,9 +913,12 @@ mod tests {
     use crate::{
         _core::{
             acl::Acl,
-            bucket, object,
+            bucket, lifecycle,
+            meta::BucketMeta,
+            object,
             storage::{BucketOps, MultipartOps},
         },
+        _store_redb::RedbMetadata,
         _util::testing::body,
         FsOptions,
         testutil::fs_options,
@@ -831,7 +933,7 @@ mod tests {
     fn old_ttl_options() -> Options {
         Options {
             temp_ttl: Duration::from_secs(60),
-            multipart_ttl: Duration::from_secs(60),
+            multipart_ttl: Some(Duration::from_secs(60)),
             ..Options::default()
         }
     }
@@ -1158,6 +1260,276 @@ mod tests {
         assert_eq!(left[0].seq, 2, "the version inside the window is kept");
     }
 
+    /// A one-rule lifecycle configuration carrying exactly the actions
+    /// `configure` sets — how the LC21 legs give a bucket a stored rule.
+    fn lifecycle_config(
+        status: lifecycle::Status,
+        configure: impl FnOnce(&mut lifecycle::Rule),
+    ) -> lifecycle::Config {
+        let mut rule = lifecycle::Rule {
+            id: None,
+            status,
+            filter: lifecycle::Filter::default(),
+            expiration: None,
+            noncurrent_version_expiration: None,
+            abort_incomplete_multipart_upload: None,
+        };
+        configure(&mut rule);
+        lifecycle::Config { rules: vec![rule] }
+    }
+
+    /// Store `config` as `bucket`'s lifecycle configuration — the row a pass
+    /// reads back once.
+    async fn store_lifecycle(
+        storage: &FsStorage,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+    ) {
+        let engine = storage.meta_store().engine();
+        <RedbMetadata as BucketMeta>::set_lifecycle(&engine, bucket, config)
+            .await
+            .unwrap();
+    }
+
+    /// The `NoncurrentVersionExpiration` action, at a threshold the server's
+    /// knob would beat.
+    #[cfg(feature = "versioning")]
+    fn noncurrent_rule(rule: &mut lifecycle::Rule) {
+        rule.noncurrent_version_expiration = Some(lifecycle::NoncurrentVersionExpiration {
+            noncurrent_days: Some(30),
+            newer_noncurrent_versions: None,
+        });
+    }
+
+    /// The `AbortIncompleteMultipartUpload` action, at a threshold the
+    /// server's knob would beat.
+    fn abort_rule(rule: &mut lifecycle::Rule) {
+        rule.abort_incomplete_multipart_upload = Some(lifecycle::AbortIncompleteMultipartUpload {
+            days_after_initiation: 7,
+        });
+    }
+
+    /// LC21: a bucket whose stored configuration carries
+    /// `NoncurrentVersionExpiration` is governed by its rule for that action,
+    /// so `[s3] noncurrent_keep` does not apply to it — a knob that retires a
+    /// version on every other bucket retires none here.
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_bucket_with_a_noncurrent_rule_keeps_its_versions_past_the_server_knob() {
+        let (_root, storage, b, key) = versioned_fixture().await;
+        assert_eq!(
+            history(&storage, &b, &key).len(),
+            2,
+            "two noncurrent versions to retire"
+        );
+        store_lifecycle(
+            &storage,
+            &b,
+            &lifecycle_config(lifecycle::Status::Enabled, noncurrent_rule),
+        )
+        .await;
+
+        let sweeper = Sweeper::new(
+            storage.clone(),
+            Options {
+                noncurrent_keep: 1,
+                ..Options::default()
+            },
+        );
+        let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
+
+        assert_eq!(
+            summary.expired_versions, 0,
+            "the bucket's own rule owns noncurrent retirement"
+        );
+        assert_eq!(
+            history(&storage, &b, &key).len(),
+            2,
+            "both history rows survive the server's keep budget"
+        );
+        assert_eq!(
+            summary.reclaimed_blocks, 0,
+            "both versions' blocks stay referenced"
+        );
+    }
+
+    /// A bucket holding one in-progress upload and an `Enabled` rule carrying
+    /// `AbortIncompleteMultipartUpload` — the abort action's two legs' fixture, which
+    /// differ only in whether the run builds the lifecycle pass.
+    async fn bucket_with_an_abort_rule_and_an_idle_upload()
+    -> (tempfile::TempDir, FsStorage, bucket::Name) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        storage
+            .create_multipart_upload(
+                &b,
+                &"big.bin".into(),
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        store_lifecycle(
+            &storage,
+            &b,
+            &lifecycle_config(lifecycle::Status::Enabled, abort_rule),
+        )
+        .await;
+        (root, storage, b)
+    }
+
+    /// LC21: `AbortIncompleteMultipartUpload` in a bucket's configuration takes
+    /// the abandoned-upload action away from `[s3] multipart_expire_days`.
+    #[tokio::test]
+    async fn a_bucket_with_an_abort_rule_is_not_swept_by_the_server_knob() {
+        let (_root, storage, b) = bucket_with_an_abort_rule_and_an_idle_upload().await;
+
+        let sweeper = Sweeper::new(storage.clone(), old_ttl_options());
+        // The server TTL is a minute and this clock is an hour on.
+        let far = SystemTime::now() + Duration::from_secs(3600);
+        let summary = sweeper.sweep_once(far).await.unwrap();
+
+        assert_eq!(
+            summary.uploads, 0,
+            "the bucket's own rule owns the abort for it"
+        );
+        assert_eq!(
+            storage
+                .multipart_store()
+                .list_uploads(&b)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the upload survives the server's TTL"
+        );
+    }
+
+    /// LC23: with the capability off nothing is governed, so the same bucket is swept
+    /// by `[s3] multipart_expire_days` like every other bucket — turning the pass off
+    /// must not stop retention.
+    #[tokio::test]
+    async fn a_bucket_with_an_abort_rule_is_swept_by_the_server_knob_when_the_pass_is_off() {
+        let (_root, storage, b) = bucket_with_an_abort_rule_and_an_idle_upload().await;
+
+        let sweeper = Sweeper::new(
+            storage.clone(),
+            Options {
+                lifecycle_pass: false,
+                ..old_ttl_options()
+            },
+        );
+        // The server TTL is a minute and this clock is an hour on.
+        let far = SystemTime::now() + Duration::from_secs(3600);
+        let summary = sweeper.sweep_once(far).await.unwrap();
+
+        assert_eq!(
+            summary.uploads, 1,
+            "no pass, so no rule takes the abort away from the knob"
+        );
+        assert!(
+            storage
+                .multipart_store()
+                .list_uploads(&b)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the idle upload is aborted by the server's TTL"
+        );
+    }
+
+    /// LC21 is **per action, never per bucket**: a bucket carrying only an
+    /// `Expiration` keeps the server's noncurrent behaviour.
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_bucket_with_an_expiration_rule_only_keeps_the_server_noncurrent_behaviour() {
+        let (_root, storage, b, key) = versioned_fixture().await;
+        store_lifecycle(
+            &storage,
+            &b,
+            &lifecycle_config(lifecycle::Status::Enabled, |rule| {
+                rule.expiration = Some(lifecycle::Expiration {
+                    days: Some(1),
+                    date: None,
+                    expired_object_delete_marker: None,
+                });
+            }),
+        )
+        .await;
+
+        let sweeper = Sweeper::new(
+            storage.clone(),
+            Options {
+                noncurrent_keep: 1,
+                ..Options::default()
+            },
+        );
+        let summary = sweeper.sweep_once(SystemTime::now()).await.unwrap();
+
+        assert_eq!(
+            summary.expired_versions, 1,
+            "an Expiration rule does not take the noncurrent action away"
+        );
+        assert_eq!(
+            history(&storage, &b, &key).len(),
+            1,
+            "the server's keep budget still retires"
+        );
+    }
+
+    /// A `Disabled` rule is stored and skipped, so it never stands the sweeper
+    /// down: only an `Enabled` rule carrying the action does (LC21).
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_disabled_rule_does_not_stand_the_sweeper_down() {
+        let (_root, storage, b, key) = versioned_fixture().await;
+        storage
+            .create_multipart_upload(
+                &b,
+                &"big.bin".into(),
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        store_lifecycle(
+            &storage,
+            &b,
+            &lifecycle_config(lifecycle::Status::Disabled, |rule| {
+                noncurrent_rule(rule);
+                abort_rule(rule);
+            }),
+        )
+        .await;
+
+        let sweeper = Sweeper::new(
+            storage.clone(),
+            Options {
+                noncurrent_keep: 1,
+                ..old_ttl_options()
+            },
+        );
+        let far = SystemTime::now() + Duration::from_secs(3600);
+        let summary = sweeper.sweep_once(far).await.unwrap();
+
+        assert_eq!(summary.expired_versions, 1, "the knob still retires");
+        assert_eq!(
+            history(&storage, &b, &key).len(),
+            1,
+            "the disabled rule took nothing away"
+        );
+        assert_eq!(summary.uploads, 1, "the knob still aborts");
+    }
+
     #[cfg(feature = "versioning")]
     #[tokio::test]
     async fn a_versioned_bucket_with_neither_threshold_retires_nothing() {
@@ -1359,7 +1731,10 @@ mod tests {
 
         // Phases 1 and 2 of a pass: the plan (with its epoch snapshot), then
         // the walk — which judges the block dead and past the grace.
-        let (plan, _, epoch) = sweeper.plan_bucket(&b, now).await.unwrap();
+        let (plan, _, epoch) = sweeper
+            .plan_bucket(&b, now, &lifecycle::ActionOwners::default())
+            .await
+            .unwrap();
         let candidates = storage
             .versions(&b)
             .blobs()

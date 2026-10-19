@@ -171,6 +171,10 @@ impl From<Error> for storage::Error {
             Error::Io(e) => storage::io(e),
             Error::InvalidPath(p) => storage::invalid_key(p.to_string_lossy().into_owned()),
             Error::Storage(e) => e,
+            // A read-only refusal keeps its kind across the conversion: the
+            // shared redb error's own projection already carries it (and its
+            // payload), so this delegates rather than re-deriving the marker.
+            Error::Database(DatabaseError::Redb(e)) if e.is_read_only() => e.into(),
             Error::Database(e) => storage::io(IoError::other(e)),
             Error::Pipeline(e) => storage::io(IoError::other(e)),
             Error::InvalidValue(_) | Error::RootNotDirectory(_) | Error::Invariant(_) => {
@@ -202,6 +206,7 @@ mod tests {
             pipeline::Error::{Dropped, ShutDown},
             storage::{COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT, Error::*},
         },
+        _store_redb,
         _util::testing::assert_send_sync,
         database::Error::{Redb, UnsupportedVersion},
     };
@@ -311,6 +316,17 @@ mod tests {
         );
         let core: storage::Error = err.into();
         assert_eq!(core.to_string(), "I/O error: internal error");
+    }
+
+    #[test]
+    fn a_read_only_database_refusal_keeps_its_marker() {
+        // The state database's read-only arm is the same refusal the engine
+        // projects, so the conversion must not flatten it into a generic I/O
+        // fault: the plane answers the contract's `403` by asking this marker.
+        let err: Error = database::Error::Redb(_store_redb::Error::ReadOnly).into();
+        assert!(err.is_read_only(), "the fs error knows it is read-only");
+        let core: storage::Error = err.into();
+        assert!(core.is_read_only(), "and the conversion keeps it: {core:?}");
     }
 
     #[test]

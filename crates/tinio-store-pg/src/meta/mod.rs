@@ -32,6 +32,8 @@ use crate::{
     store::PgStore,
 };
 
+mod lifecycle;
+
 pub mod bucket;
 pub mod object;
 pub mod upload;
@@ -102,20 +104,32 @@ where
         .collect()
 }
 
-/// Assert inside tx that bucket has a row, refusing with Error::NoSuchBucket
-/// when it does not.
+/// Whether the bucket has a row, taking that row's lock (FOR UPDATE).
 ///
-/// The read takes the row's lock (FOR UPDATE). A concurrent
-/// `remove_if_empty` or the store's own bucket teardown (`teardown_bucket`)
-/// locks this same row, then checks emptiness in a later statement of that
-/// transaction. This writer blocks until that delete commits or rolls back. A
-/// delete that was waiting on the lock sees this writer's committed object or
-/// upload, because the check is not the statement that waited.
-pub(crate) async fn assert_bucket_row(tx: &mut PgTx, bucket: &BucketName) -> Result<(), Error> {
+/// This is the answer, not a refusal: the caller decides for itself what an
+/// absent row means. The two lifecycle setters ask it because their table has
+/// no row for a bucket that stores no configuration, so `rows_affected` alone
+/// cannot tell that bucket from a missing one. A caller that owes the
+/// `NoSuchBucket` refusal asks [`assert_bucket_row`] instead.
+pub(crate) async fn bucket_row_present(tx: &mut PgTx, bucket: &BucketName) -> Result<bool, Error> {
     let present = sqlx::query_scalar!("SELECT 1 FROM buckets WHERE name = $1 FOR UPDATE", bucket)
         .fetch_optional(&mut **tx)
         .await?;
-    if present.is_none() {
+    Ok(present.is_some())
+}
+
+/// Assert inside tx that bucket has a row, refusing with Error::NoSuchBucket
+/// when it does not.
+///
+/// The read takes the row's lock (FOR UPDATE), which is what makes the
+/// assertion a guard for the write beside it. A concurrent `remove_if_empty`
+/// or the store's own bucket teardown (`teardown_bucket`) locks this same row,
+/// then checks emptiness in a later statement of that transaction. This writer
+/// blocks until that delete commits or rolls back. A delete that was waiting
+/// on the lock sees this writer's committed object or upload, because the
+/// check is not the statement that waited.
+pub(crate) async fn assert_bucket_row(tx: &mut PgTx, bucket: &BucketName) -> Result<(), Error> {
+    if !bucket_row_present(tx, bucket).await? {
         return Err(Error::NoSuchBucket(bucket.clone()));
     }
     Ok(())

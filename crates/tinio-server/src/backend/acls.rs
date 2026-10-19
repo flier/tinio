@@ -9,43 +9,17 @@
 //! `InvalidArgument`. The codec's self-heal (`Acl::from_grants_wire`)
 //! applies to stored-row decode only, never to request input.
 
-use base64::{Engine, engine::general_purpose::STANDARD};
 use s3s::{S3Result, dto, s3_error};
 
+/// Content-MD5 on the put-ACL ops (spec §5, review A7) — the shared AWS
+/// gate [`super::checksum::require_content_md5`].
+pub(crate) use super::checksum::require_content_md5;
 use crate::{
     _auth::canned::{
         GrantHeaders, canned_bucket_grants, canned_object_grants, expand_acl, grants_from_headers,
     },
     _core::acl::{ACL_GRANTS_MAX, Acl, AclGrants, Grant, Grantee, GroupUri, OwnerId, Permission},
 };
-
-/// Content-MD5 on the put-ACL ops (spec §5, review A7): required, AWS
-/// three-state behavior — missing → 400 `InvalidRequest` with the AWS
-/// message, malformed (not a well-formed 16-byte base64 digest) → 400
-/// `InvalidDigest`. Digest equality against the XML body is not
-/// verifiable here — s3s's deserializer consumes the body and
-/// `S3Request` retains no raw bytes (recorded deviation; AWS answers
-/// `BadDigest` for a mismatch, unreachable). Shared home for the CORS
-/// merge (2026-09-05-s3-cors-design.md owns the same helper).
-pub(crate) fn require_content_md5(md5: Option<&str>) -> S3Result<()> {
-    let md5 = md5.ok_or_else(|| {
-        s3_error!(
-            InvalidRequest,
-            "Missing required header for this request: Content-MD5"
-        )
-    })?;
-    let raw = STANDARD
-        .decode(md5)
-        .map_err(|_| s3_error!(InvalidDigest, "The Content-MD5 you specified is not valid"))?;
-    if raw.len() == 16 {
-        Ok(())
-    } else {
-        Err(s3_error!(
-            InvalidDigest,
-            "The Content-MD5 you specified is not valid"
-        ))
-    }
-}
 
 /// The fail-closed policy-Owner check (spec Decisions): an
 /// `AccessControlPolicy` body whose `Owner` does not match the row

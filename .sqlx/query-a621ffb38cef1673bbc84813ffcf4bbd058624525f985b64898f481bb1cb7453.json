@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"recent!\" FROM pg_stat_activity\nWHERE\n    datname = current_database()\n    AND pid <> pg_backend_pid()\n    AND query_start > now() - interval '400 milliseconds'\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "recent!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a621ffb38cef1673bbc84813ffcf4bbd058624525f985b64898f481bb1cb7453"
+}

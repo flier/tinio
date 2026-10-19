@@ -36,7 +36,8 @@
 //!    `object_meta` row, no `uploads` row, no live content generation — so a
 //!    writer that waited on the lock is seen;
 //! 3. the version rows, their index entries, the key slots, the versioning
-//!    state, the content chunks and the bucket row leave together.
+//!    state, the content chunks, the lifecycle row and the bucket row leave
+//!    together.
 //!
 //! A refusal rolls all of it back: the client gets `NotEmpty` and the bucket
 //! keeps every one of its rows, which is what makes a marker-only bucket

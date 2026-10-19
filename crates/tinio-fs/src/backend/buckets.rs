@@ -18,7 +18,7 @@ use crate::{
         BucketsListing, ListBucketsParams, acl,
         acl::{Acl, AclGrants},
         bucket::{self, Bucket},
-        cors, object,
+        cors, lifecycle, object,
         storage::{BucketOps, already_exists, no_such_bucket},
     },
     _ops::bucket::paginate_buckets,
@@ -481,6 +481,56 @@ impl BucketOps for FsStorage {
             .map_err(Error::from)
     }
 
+    async fn get_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<Option<lifecycle::Config>, Error> {
+        // Existence is the bucket directory, the `get_bucket_cors` shape; the
+        // configuration is the engine's, None when the bucket stores none.
+        self.ensure_bucket(name).await?;
+        self.ops()
+            .get_bucket_lifecycle(name)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn put_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+        config: &lifecycle::Config,
+    ) -> Result<(), Error> {
+        self.ensure_bucket(name).await?;
+        self.ops()
+            .put_bucket_lifecycle(name, config)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn merge_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+        rules: &[lifecycle::Rule],
+    ) -> Result<lifecycle::Merged, Error> {
+        self.ensure_bucket(name).await?;
+        self.ops()
+            .merge_bucket_lifecycle(name, rules)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn delete_bucket_lifecycle(&self, name: &bucket::Name) -> Result<(), Error> {
+        // `NoSuchBucket` for a missing bucket (the CORS shape, not the
+        // delete-tagging leniency); a bucket that stores none clears to the
+        // same state. The mutation lock is the `delete_bucket_cors` one, with
+        // its stated residual against a concurrent create's record write.
+        let _guard = self.lock_bucket_mutations(name).await;
+        self.ensure_bucket(name).await?;
+        self.ops()
+            .delete_bucket_lifecycle(name)
+            .await
+            .map_err(Error::from)
+    }
+
     async fn get_bucket_acl(&self, name: &bucket::Name) -> Result<Acl, Error> {
         // Existence is the bucket directory (`NoSuchBucket` when missing —
         // mirroring head_bucket); the ACL is the engine's lazy-row read: the
@@ -545,7 +595,7 @@ mod tests {
             version::State,
         },
         _store_redb::version as version_rows,
-        _util::testing::{assert_conformance, body, etag},
+        _util::testing::{assert_conformance, body, etag, metadata::lifecycle_config},
         database,
         testutil::{
             all_users_read_grant, other_owner_id, owner_id, storage, wait_for, wait_for_lock_waiter,
@@ -1188,6 +1238,13 @@ mod tests {
             .set_bucket_versioning(&b, State::Enabled)
             .await
             .unwrap();
+        // The bucket's lifecycle row (LC19). The fs bucket delete never
+        // reaches `BucketMeta::remove`, so this teardown is where the row has
+        // to leave — and `Cleanup`'s stale-bucket stage runs this same call.
+        storage
+            .put_bucket_lifecycle(&b, &lifecycle_config("one"))
+            .await
+            .unwrap();
         storage.put_object(&b, &k, body(b"one")).await.unwrap();
         storage.put_object(&b, &k, body(b"two")).await.unwrap();
         assert!(storage.blobs_dir().join("my-bucket").is_dir());
@@ -1209,6 +1266,11 @@ mod tests {
             storage.bucket_versioning(&b).await.unwrap(),
             Default::default(),
             "the bucket's versioning state is gone"
+        );
+        assert_eq!(
+            storage.get_bucket_lifecycle(&b).await.unwrap(),
+            None,
+            "the bucket's lifecycle row is gone (LC19)"
         );
         let drained = b.clone();
         let rows_left = storage
@@ -1435,6 +1497,142 @@ mod tests {
         assert!(matches!(err, NoSuchBucket(_)));
         let err: StorageError = storage.delete_bucket_cors(&ghost).await.unwrap_err().into();
         assert!(matches!(err, NoSuchBucket(_)));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_round_trips_and_needs_a_bucket() {
+        let (_root, storage) = storage();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let config = lifecycle_config("one");
+
+        assert_eq!(
+            storage.get_bucket_lifecycle(&b).await.unwrap(),
+            None,
+            "an unconfigured bucket answers None"
+        );
+        storage.put_bucket_lifecycle(&b, &config).await.unwrap();
+        assert_eq!(
+            storage.get_bucket_lifecycle(&b).await.unwrap(),
+            Some(config.clone()),
+            "the configuration round-trips"
+        );
+        // The bool is bucket presence, not change: an identical re-put is
+        // Ok, and so is a delete of a bucket that stores nothing.
+        storage.put_bucket_lifecycle(&b, &config).await.unwrap();
+        storage.delete_bucket_lifecycle(&b).await.unwrap();
+        assert_eq!(storage.get_bucket_lifecycle(&b).await.unwrap(), None);
+        storage.delete_bucket_lifecycle(&b).await.unwrap();
+
+        // The row's other elements survive the lifecycle writes.
+        let head = storage.head_bucket(&b).await.unwrap();
+        assert!(head.creation_time <= SystemTime::now());
+
+        // All three need a bucket: the CORS shape, not the delete-tagging
+        // idempotent Ok.
+        let ghost = bucket::name("ghost").unwrap();
+        let err: StorageError = storage
+            .get_bucket_lifecycle(&ghost)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, NoSuchBucket(_)));
+        let err: StorageError = storage
+            .put_bucket_lifecycle(&ghost, &config)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, NoSuchBucket(_)));
+        let err: StorageError = storage
+            .delete_bucket_lifecycle(&ghost)
+            .await
+            .unwrap_err()
+            .into();
+        assert!(matches!(err, NoSuchBucket(_)));
+    }
+
+    /// A directory planted before the API ever sighted it is still a bucket
+    /// (`BucketRow::Lazy`), so the lifecycle write must not answer
+    /// `NoSuchBucket` for it: the write records the first-sight row and the
+    /// configuration together, and the clear is idempotent on the row-less
+    /// state.
+    #[tokio::test]
+    async fn lifecycle_works_on_a_planted_bucket() {
+        let (root, storage) = storage();
+        let b = bucket::name("planted").unwrap();
+        fs::create_dir(root.path().join("planted")).unwrap();
+        let config = lifecycle_config("one");
+
+        assert_eq!(storage.get_bucket_lifecycle(&b).await.unwrap(), None);
+        storage.put_bucket_lifecycle(&b, &config).await.unwrap();
+        assert_eq!(
+            storage.get_bucket_lifecycle(&b).await.unwrap(),
+            Some(config),
+            "the planted bucket takes its configuration"
+        );
+        storage.delete_bucket_lifecycle(&b).await.unwrap();
+        assert_eq!(storage.get_bucket_lifecycle(&b).await.unwrap(), None);
+        storage
+            .delete_bucket_lifecycle(&b)
+            .await
+            .expect("a clear with nothing stored is idempotent on a lazy store");
+    }
+
+    /// FR-023 with LC18: a read-only run refuses both lifecycle writes, and the
+    /// refusal keeps the store's read-only marker through this crate's own
+    /// conversion — the plane's admin hands `storage::Error` to the router,
+    /// which answers the contract's `403` for that marker and nothing else.
+    #[tokio::test]
+    async fn a_read_only_run_refuses_a_lifecycle_write() {
+        use crate::{_core::mode::AccessMode, FsOptions, testutil::fs_options};
+
+        let root = tempfile::tempdir().unwrap();
+        let b = bucket::name("data").unwrap();
+        let config = lifecycle_config("one");
+        {
+            let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+            storage
+                .create_bucket(&b, None, &Acl::default_private(None))
+                .await
+                .unwrap();
+            storage.put_bucket_lifecycle(&b, &config).await.unwrap();
+        }
+
+        // The same root reopened read-only: the stored configuration is
+        // served, which is the half of LC18 that is not a refusal.
+        let storage = FsStorage::new(
+            root.path(),
+            FsOptions {
+                access: AccessMode::ReadOnly,
+                ..fs_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            storage.get_bucket_lifecycle(&b).await.unwrap(),
+            Some(config.clone()),
+            "a read-only run serves the stored configuration"
+        );
+
+        let refused = [
+            storage.put_bucket_lifecycle(&b, &config).await,
+            storage.delete_bucket_lifecycle(&b).await,
+        ];
+        for outcome in refused {
+            let err: StorageError = outcome.unwrap_err().into();
+            assert!(
+                err.is_read_only(),
+                "the store's read-only refusal must keep its marker across the conversion: {err:?}"
+            );
+        }
+        assert_eq!(
+            storage.get_bucket_lifecycle(&b).await.unwrap(),
+            Some(config),
+            "nothing was written: the configuration the refusal would have replaced still stands"
+        );
     }
 
     #[tokio::test]

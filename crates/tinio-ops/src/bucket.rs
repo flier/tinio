@@ -79,7 +79,7 @@ use crate::{
         acl::{Acl, AclGrants},
         bucket,
         content::ObjectContent,
-        cors,
+        cors, lifecycle,
         meta::{BucketMeta, Metadata, bucket as row},
         object,
         storage::{self, Error, UnorderedPager},
@@ -314,6 +314,16 @@ where
         }
     }
 
+    /// The presence decision alone: the row read whose answer is the
+    /// [`BucketRow`] policy's, with no payload to fabricate.
+    ///
+    /// # Errors
+    ///
+    /// `NoSuchBucket` when a guaranteed store has no row.
+    async fn present(&self, name: &bucket::Name) -> Result<(), Error> {
+        self.row_or(name, (), |_| ()).await
+    }
+
     /// The bucket's tag set (S3 GetBucketTagging).
     ///
     /// A row-less bucket follows the receiver's [`BucketRow`] policy: the lazy
@@ -426,6 +436,123 @@ where
     /// `NoSuchBucket` when the bucket has no row.
     pub async fn delete_bucket_cors(&self, name: &bucket::Name) -> Result<(), Error> {
         if !self.meta.clear_cors(name).await.map_err(projected)? {
+            return Err(storage::no_such_bucket(name));
+        }
+        Ok(())
+    }
+
+    /// The bucket's lifecycle configuration (S3 GetBucketLifecycleConfiguration),
+    /// `None` when it stores none.
+    ///
+    /// The configuration lives in a table of its own, not in the bucket row, so
+    /// this body takes **two** reads where the CORS read takes one: the row
+    /// policy's presence probe first — a missing bucket is `NoSuchBucket`, which
+    /// is the contract's obligation and what keeps the three backends' answers
+    /// identical — and then the configuration.
+    ///
+    /// # Errors
+    ///
+    /// `NoSuchBucket` when the store's row policy says the bucket is missing.
+    pub async fn get_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<Option<lifecycle::Config>, Error> {
+        // A lazy store's bucket is its directory, which the caller has already
+        // proved; only the guaranteed policy needs the row probe.
+        match self.bucket_row {
+            BucketRow::Lazy => {}
+            BucketRow::Guaranteed => self.present(name).await?,
+        }
+        self.meta.lifecycle(name).await.map_err(projected)
+    }
+
+    /// Replace the bucket's lifecycle configuration (S3
+    /// PutBucketLifecycleConfiguration — replace-all, no merge).
+    ///
+    /// The presence decision follows the receiver's [`BucketRow`] policy. A
+    /// guaranteed store takes the contract's own bool — bucket presence, not
+    /// change, so an identical re-write is `Ok` — inside the writing
+    /// transaction, with no first-sight write (S3 mandates the refusal). A lazy
+    /// store's bucket is its directory, so a row-less name is a bucket that
+    /// was never sighted: the configuration write records the row first, in
+    /// the same transaction ([`BucketMeta::set_lifecycle_or_create`]) — the
+    /// shape the tag and ACL first-sight writes already use.
+    ///
+    /// # Errors
+    ///
+    /// `NoSuchBucket` when a guaranteed store has no bucket row.
+    pub async fn put_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+        config: &lifecycle::Config,
+    ) -> Result<(), Error> {
+        match self.bucket_row {
+            BucketRow::Lazy => self
+                .meta
+                .set_lifecycle_or_create(name, config, SystemTime::now())
+                .await
+                .map_err(projected),
+            BucketRow::Guaranteed => {
+                if !self
+                    .meta
+                    .set_lifecycle(name, config)
+                    .await
+                    .map_err(projected)?
+                {
+                    return Err(storage::no_such_bucket(name));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Upsert `rules` into the stored configuration in the store's one
+    /// transaction (the seed's write, LC13). The presence decision is
+    /// [`BucketOps::put_bucket_lifecycle`]'s: a guaranteed store refuses a
+    /// missing bucket, a lazy store records the row on first sight, and
+    /// either way a merge [`lifecycle::Config::validate`] refuses is not
+    /// stored.
+    ///
+    /// # Errors
+    ///
+    /// `NoSuchBucket` when a guaranteed store has no bucket row.
+    pub async fn merge_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+        rules: &[lifecycle::Rule],
+    ) -> Result<lifecycle::Merged, Error> {
+        let merged = match self.bucket_row {
+            BucketRow::Lazy => self
+                .meta
+                .merge_lifecycle_or_create(name, rules, SystemTime::now())
+                .await
+                .map_err(projected)?,
+            BucketRow::Guaranteed => {
+                self.meta
+                    .merge_lifecycle(name, rules)
+                    .await
+                    .map_err(projected)?
+            }
+        };
+        match merged {
+            lifecycle::Merged::Absent => Err(storage::no_such_bucket(name)),
+            other => Ok(other),
+        }
+    }
+
+    /// Remove the bucket's lifecycle configuration (S3 DeleteBucketLifecycle):
+    /// idempotent on the stored configuration — a bucket that stores none
+    /// answers `Ok`, never `NoSuchLifecycleConfiguration` — and `NoSuchBucket`
+    /// for a guaranteed store with no bucket row. A lazy store's bucket is its
+    /// directory, so the clear is unconditionally idempotent there: no row is
+    /// exactly "stores none".
+    ///
+    /// # Errors
+    ///
+    /// `NoSuchBucket` when a guaranteed store has no bucket row.
+    pub async fn delete_bucket_lifecycle(&self, name: &bucket::Name) -> Result<(), Error> {
+        let cleared = self.meta.clear_lifecycle(name).await.map_err(projected)?;
+        if matches!(self.bucket_row, BucketRow::Guaranteed) && !cleared {
             return Err(storage::no_such_bucket(name));
         }
         Ok(())
@@ -557,6 +684,7 @@ mod tests {
     use std::time::SystemTime;
 
     use bytes::Bytes;
+    use tinio_util::testing::metadata::lifecycle_config_with;
 
     use crate::{
         _core::{
@@ -823,6 +951,42 @@ mod tests {
         ops.delete_bucket_cors(&name).await.unwrap();
         assert_eq!(ops.get_bucket_cors(&name).await.unwrap(), None);
         ops.delete_bucket_cors(&name).await.unwrap(); // idempotent
+    }
+
+    #[tokio::test]
+    async fn lifecycle_needs_a_bucket_and_round_trips() {
+        // The presence probe is the get's own: the configuration lives in a
+        // table of its own, so `lifecycle()` alone answers `None` for a ghost
+        // bucket — the guaranteed store must refuse, and the probe is what
+        // makes it.
+        let base = Base::new();
+        let name = bucket::name("data").unwrap();
+        let ghost = bucket::name("ghost").unwrap();
+        create(&base, BucketRow::Guaranteed, &name).await;
+        let ops = base.ops(BucketRow::Guaranteed);
+        let config = lifecycle_config_with("one", None, 30);
+
+        let refusals = [
+            ops.get_bucket_lifecycle(&ghost).await.unwrap_err(),
+            ops.put_bucket_lifecycle(&ghost, &config).await.unwrap_err(),
+            ops.delete_bucket_lifecycle(&ghost).await.unwrap_err(),
+        ];
+        for err in refusals {
+            assert!(matches!(err, StorageError::NoSuchBucket(_)), "{err:?}");
+        }
+
+        assert_eq!(ops.get_bucket_lifecycle(&name).await.unwrap(), None);
+        ops.put_bucket_lifecycle(&name, &config).await.unwrap();
+        assert_eq!(
+            ops.get_bucket_lifecycle(&name).await.unwrap(),
+            Some(config.clone())
+        );
+        // The bool is bucket presence, not change: an identical re-write and a
+        // clear of a bucket storing none are both `Ok`.
+        ops.put_bucket_lifecycle(&name, &config).await.unwrap();
+        ops.delete_bucket_lifecycle(&name).await.unwrap();
+        ops.delete_bucket_lifecycle(&name).await.unwrap();
+        assert_eq!(ops.get_bucket_lifecycle(&name).await.unwrap(), None);
     }
 
     #[tokio::test]

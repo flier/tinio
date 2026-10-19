@@ -1,16 +1,16 @@
 //! Configuration values the CLI parses: the root document and the machinery around it.
 //!
 //! The sections the CLI owns live here (`server`, `scanner`, `storage`, `api`, `s3`,
-//! `telemetry`); the sections a runtime crate owns are imported from their owner —
+//! `lifecycle`, `telemetry`); the sections a runtime crate owns are imported from their owner —
 //! `tinio_server::{log, pipeline, identity::{auth, owner, users}}` — and the root document
 //! composes both halves. Discovery ([`discover`]), `.env` loading ([`sources`]), credential
 //! generation ([`credentials`]), the state-directory parser ([`state`]) and the error type
 //! ([`Error`]) live here too: this module is the composition root.
 //!
-//! Module layout: [`api`], [`s3`], [`scanner`], [`server`], [`storage`], [`telemetry`] (the
-//! CLI-owned sections), [`discover`] (config discovery and the first-start auto-create),
-//! [`sources`] (`.env` loading), [`credentials`] (the generated `[auth]` pair), [`state`]
-//! (`TINIO_STATE_DIR` parsing) and [`Error`]. Validation is derive-driven
+//! Module layout: [`api`], [`s3`], [`scanner`], [`server`], [`storage`], [`lifecycle`],
+//! [`telemetry`] (the CLI-owned sections), [`discover`] (config discovery and the first-start
+//! auto-create), [`sources`] (`.env` loading), [`credentials`] (the generated `[auth]` pair),
+//! [`state`] (`TINIO_STATE_DIR` parsing) and [`Error`]. Validation is derive-driven
 //! ([`garde::Validate`] on every section); [`Config::parse`] runs it after deserialization and
 //! maps the report onto [`Error`].
 //!
@@ -21,6 +21,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::read_to_string,
     path::Path,
+    time::Duration,
 };
 
 use garde::Validate;
@@ -39,6 +40,7 @@ pub mod api;
 pub mod credentials;
 pub mod discover;
 mod error;
+pub mod lifecycle;
 pub mod s3;
 pub mod scanner;
 pub mod server;
@@ -131,6 +133,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[garde(dive)]
     pub storage: Option<storage::Config>,
+    /// The lifecycle pass's pacing and its seed (FR-042; absent = the
+    /// section's defaults, never "off" — `[s3] lifecycle` is the switch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[garde(dive)]
+    pub lifecycle: Option<lifecycle::Config>,
     /// The task pipelines (`[pipeline.io]` / `[pipeline.db]`; absent =
     /// defaults).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,7 +263,7 @@ impl Config {
     /// channel made explicit.
     ///
     /// Every presence-gated section whose absence is the default stays out —
-    /// `[log]`, `[s3]`, `[pipeline.*]`, `[owner]`, `[[users]]`, `[telemetry]`
+    /// `[log]`, `[s3]`, `[lifecycle]`, `[pipeline.*]`, `[owner]`, `[[users]]`, `[telemetry]`
     /// and the transports the run does not use are all `None` — so the file
     /// an operator opens is the shape `contracts/config.md` documents: the
     /// sections a run needs, and no others. The keys of the sections it does
@@ -404,6 +411,25 @@ fn validate_owner_and_users(config: &Config, _context: &()) -> garde::Result {
     Ok(())
 }
 
+/// The cadence floor ([`nonzero_duration`]): one second, the smallest cadence that still paces a
+/// loop rather than spinning it.
+const MIN_CADENCE: Duration = Duration::from_secs(1);
+
+/// A cadence floor: zero would spin the loop instead of pacing it.
+///
+/// `garde`'s `range` is numeric-only (a `Duration` does not implement `Bounds`), so the floor is
+/// a custom rule. It is the `[s3]` floors' reading — a zero is refused rather than read as an
+/// "unlimited" convention — for the keys that pace a background pass.
+pub(crate) fn nonzero_duration(value: &Duration, _context: &()) -> garde::Result {
+    if *value < MIN_CADENCE {
+        return Err(garde::Error::new(format!(
+            "{value:?} is below the {}s floor — a zero cadence would spin the loop instead of pacing it",
+            MIN_CADENCE.as_secs()
+        )));
+    }
+    Ok(())
+}
+
 /// `#[serde(flatten)]` buffers its fields, so `serde_ignored` never sees a key inside a
 /// flattened table (`[s3]`'s capability half, `[api.https]`'s `Http` half). Compare each
 /// present table's keys against the owning type's serialized default — every accepted key
@@ -414,21 +440,26 @@ fn collect_flattened_unknowns(
     document: &toml::Table,
     ignored: &mut BTreeSet<String>,
 ) -> Result<(), Error> {
-    let tables: [(&[&str], FlattenedKeySet); 2] = [
-        (&["s3"], || serialized_keys(&s3::Config::default())),
+    let tables: [(&[&str], FlattenedKeySet, &[&str]); 2] = [
+        (
+            &["s3"],
+            || serialized_keys(&s3::Config::default()),
+            s3::Config::OPTIONAL_KEYS,
+        ),
         (
             &["api", "https"],
             || serialized_keys(&api::Https::default()),
+            &[],
         ),
     ];
-    for (path, keys) in tables {
+    for (path, keys, optional) in tables {
         let Some(table) = table_at(document, path) else {
             continue;
         };
         let known = keys()?;
         let prefix = path.join(".");
         for key in table.keys() {
-            if !known.contains_key(key) {
+            if !known.contains_key(key) && !optional.contains(&key.as_str()) {
                 ignored.insert(format!("{prefix}.{key}"));
             }
         }

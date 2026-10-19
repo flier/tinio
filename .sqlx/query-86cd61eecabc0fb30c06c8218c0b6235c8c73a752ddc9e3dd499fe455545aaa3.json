@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"applied!\" FROM schema_version\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "applied!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "86cd61eecabc0fb30c06c8218c0b6235c8c73a752ddc9e3dd499fe455545aaa3"
+}

@@ -771,9 +771,13 @@ impl UploadMeta for PgStore {
     }
 
     async fn drain_upload(&self, bucket: &bucket::Name, upload_id: &str) -> Result<(), Error> {
-        sqlx::query_file!("sql/meta/upload/drain_upload.sql", bucket, upload_id)
-            .execute(self.pool())
-            .await?;
+        sqlx::query_file!(
+            "sql/meta/upload/drain_upload.sql",
+            bucket,
+            &[upload_id.to_owned()]
+        )
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 
@@ -789,9 +793,13 @@ impl UploadMeta for PgStore {
         // the delete.
         let mut tx = begin(self.pool()).await?;
         require_upload(&mut tx, bucket, upload_id, key).await?;
-        sqlx::query_file!("sql/meta/upload/drain_upload.sql", bucket, upload_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query_file!(
+            "sql/meta/upload/drain_upload.sql",
+            bucket,
+            &[upload_id.to_owned()]
+        )
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }

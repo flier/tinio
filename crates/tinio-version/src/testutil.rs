@@ -39,7 +39,7 @@ use crate::{
         bucket::{self, Name},
         checksum,
         content::{ContentEntry, ContentKey, ObjectContent, StagedObject},
-        cors,
+        cors, lifecycle,
         meta::{
             BucketMeta, Metadata, ObjectMeta, UploadMeta, VersionMeta, bucket as bucket_row,
             object as object_row, upload as upload_row,
@@ -111,6 +111,8 @@ struct Inner {
     index: Mutex<BTreeMap<(String, String, String), u64>>,
     /// The object rows the engine reads a version's metadata wires from.
     objects: Mutex<HashMap<(String, String), object_row::Row>>,
+    /// The bucket lifecycle configurations, keyed by bucket name.
+    lifecycle: Mutex<BTreeMap<String, lifecycle::Config>>,
     /// The content root; the double keeps its bytes in real files under it, so
     /// a test can read back what a publish landed.
     root: PathBuf,
@@ -382,6 +384,104 @@ impl BucketMeta for Fake {
 
     async fn clear_cors(&self, bucket: &bucket::Name) -> Result<bool, <Self as Metadata>::Error> {
         unimplemented!("the engine's double implements only the calls the engine makes")
+    }
+
+    async fn lifecycle(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Option<lifecycle::Config>, <Self as Metadata>::Error> {
+        Ok(self
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .get(bucket.as_ref())
+            .cloned())
+    }
+
+    async fn lifecycles(
+        &self,
+    ) -> Result<Vec<(bucket::Name, lifecycle::Config)>, <Self as Metadata>::Error> {
+        Ok(self
+            .inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(bucket, config)| {
+                // Keys are written from `&bucket::Name`, so an unparsable one
+                // cannot occur in the double; the scan still refuses to invent
+                // a bucket for it.
+                bucket::name(bucket.clone())
+                    .ok()
+                    .map(|name| (name, config.clone()))
+            })
+            .collect())
+    }
+
+    /// The double keeps no bucket rows, so every name it is asked about is a
+    /// bucket: both setters answer the presence `true`, never a change.
+    async fn set_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        self.set_lifecycle_or_create(bucket, config, SystemTime::now())
+            .await?;
+        Ok(true)
+    }
+
+    async fn set_lifecycle_or_create(
+        &self,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+        _now: SystemTime,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        // The double keeps no bucket rows: every name it is asked about is a
+        // bucket, so the or-create form is the plain write.
+        self.inner
+            .lifecycle
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), config.clone());
+        Ok(())
+    }
+
+    async fn merge_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+        rules: &[lifecycle::Rule],
+    ) -> Result<lifecycle::Merged, <Self as Metadata>::Error> {
+        self.merge_lifecycle_or_create(bucket, rules, SystemTime::now())
+            .await
+    }
+
+    async fn merge_lifecycle_or_create(
+        &self,
+        bucket: &bucket::Name,
+        rules: &[lifecycle::Rule],
+        _now: SystemTime,
+    ) -> Result<lifecycle::Merged, <Self as Metadata>::Error> {
+        let mut rows = self.inner.lifecycle.lock().unwrap();
+        let current = rows
+            .get(bucket.as_ref())
+            .cloned()
+            .unwrap_or(lifecycle::Config { rules: Vec::new() });
+        match current.apply_rules(rules) {
+            Ok(config) => {
+                rows.insert(bucket.to_string(), config);
+                Ok(lifecycle::Merged::Stored)
+            }
+            Err(invalid) => Ok(lifecycle::Merged::Refused(invalid)),
+        }
+    }
+
+    async fn clear_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        self.inner.lifecycle.lock().unwrap().remove(bucket.as_ref());
+        Ok(true)
     }
 
     async fn remove(&self, bucket: &bucket::Name) -> Result<(), <Self as Metadata>::Error> {

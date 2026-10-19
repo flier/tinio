@@ -863,6 +863,10 @@ impl ObjectOps for MemoryStorage {
 
     async fn list_objects(&self, params: ListObjectsParams) -> Result<ObjectListing, Error> {
         self.ensure_bucket(&params.bucket).await?;
+        // The walk is about to run; a bucket refused above never reaches it,
+        // so a failed listing counts nothing (`testing` feature only).
+        #[cfg(feature = "testing")]
+        self.record_object_listing(&params.bucket);
         // The page's objects all carry the bucket's state — one read for the
         // page, the carrier's value on every row (the engine takes the bit as
         // the parameter its plane-free body cannot read).
@@ -1193,6 +1197,29 @@ mod tests {
         assert!(page.common_prefixes.is_empty());
         assert!(!page.truncated);
         assert_eq!(page.next_start_after, None);
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn list_objects_counted_per_bucket_and_not_a_refused_listing() {
+        let (storage, bucket) = with_bucket().await;
+        let unlisted = bucket::name("never-listed").unwrap();
+        let missing = bucket::name("missing").unwrap();
+        assert_eq!(storage.object_listings(&bucket), 0);
+
+        storage
+            .list_objects(params(&bucket, "", None, None, 1000))
+            .await
+            .unwrap();
+        assert_eq!(storage.object_listings(&bucket), 1);
+        assert_eq!(storage.object_listings(&unlisted), 0);
+
+        // A refused bucket answers before the walk, so it counts nothing.
+        let refused = storage
+            .list_objects(params(&missing, "", None, None, 1000))
+            .await;
+        assert!(refused.is_err());
+        assert_eq!(storage.object_listings(&missing), 0);
     }
 
     #[tokio::test]

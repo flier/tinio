@@ -1,13 +1,13 @@
 WITH gone_parts AS (
-    DELETE FROM parts WHERE bucket = $1 AND upload_id = $2
+    DELETE FROM parts WHERE bucket = $1 AND upload_id = ANY ($2)
 ),
 
 gone_part_checksums AS (
-    DELETE FROM part_checksums WHERE bucket = $1 AND upload_id = $2
+    DELETE FROM part_checksums WHERE bucket = $1 AND upload_id = ANY ($2)
 ),
 
 gone_checksums AS (
-    DELETE FROM upload_checksums WHERE bucket = $1 AND upload_id = $2
+    DELETE FROM upload_checksums WHERE bucket = $1 AND upload_id = ANY ($2)
 )
 
-DELETE FROM uploads WHERE bucket = $1 AND upload_id = $2
+DELETE FROM uploads WHERE bucket = $1 AND upload_id = ANY ($2)

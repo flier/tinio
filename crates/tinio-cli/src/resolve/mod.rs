@@ -57,13 +57,6 @@ pub use locate::{
     resolve_root, resolve_state_dir, state_dir_candidates,
 };
 
-/// `[server] port`'s default — Minio's own (`contracts/cli.md:36`), and the port an
-/// `--address` without one gets. Read from the schema, which is the value's one definer, so the
-/// flag's default cannot drift from the config file's.
-fn default_port() -> u16 {
-    server::Config::default().port
-}
-
 /// The pipeline bundle this CLI builds: `tinio_server::pipeline::Pipelines` with its three
 /// lanes' output types spelled — the IO lane carries `tinio_fs`'s ETag tasks, and the removal
 /// and DB lanes the backend's unit results.
@@ -956,7 +949,7 @@ fn fold_flags(
     resolution: &mut Resolution,
 ) -> Result<(), Error> {
     let address = match &args.address {
-        Some(raw) => Some(authority_addr(raw, default_port())?),
+        Some(raw) => Some(authority_addr(raw, server::DEFAULT_PORT)?),
         None => None,
     };
     let (host_source, port_source) = if address.is_some() {

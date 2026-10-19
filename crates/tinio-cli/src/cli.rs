@@ -22,6 +22,8 @@ use std::{ffi::OsString, path::PathBuf};
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand, parser::ValueSource};
 use smart_default::SmartDefault;
 
+#[cfg(feature = "lifecycle")]
+use crate::commands::lifecycle;
 #[cfg(feature = "api")]
 use crate::commands::{status, stop};
 use crate::{
@@ -302,10 +304,12 @@ pub fn parse(argv: &[OsString]) -> Result<(Cli, ArgMatches), Error> {
 
 /// What the user asked for.
 ///
-/// **`Status` and `Stop` are compiled out with the `api` feature** (the `status` and
-/// `stop` sections say so; T055 asserts the same), so their variants sit behind
-/// `#[cfg(feature = "api")]`, and without it a client command is an unknown
-/// subcommand — clap's own usage error, exit 2.
+/// **`Status`, `Stop` and `Lifecycle` are compiled out with their own features** (the `status`
+/// and `stop` sections say so; T055 asserts the same), so their variants sit behind
+/// `#[cfg(feature = "api")]` and `#[cfg(feature = "lifecycle")]`, and without it a client
+/// command is an unknown subcommand — clap's own usage error, exit 2. **`Lifecycle` is `api`'s
+/// too**: the verbs speak the management plane's routes through `tinio-api`'s client, so a build
+/// with no plane has nothing for them to talk to.
 ///
 /// **`Doctor` deliberately does not**: it diagnoses the always-present layers (root, config,
 /// names, symlinks, free space, the `Cleanup` trait's private-state legs, the meta store), which
@@ -337,6 +341,9 @@ pub enum Command {
     /// Ask a running server to stop.
     #[cfg(feature = "api")]
     Stop(stop::Args),
+    /// Configure a bucket's lifecycle policy through a running server.
+    #[cfg(feature = "lifecycle")]
+    Lifecycle(lifecycle::Args),
     /// Diagnose a directory without a server.
     Doctor(doctor::Args),
     /// Manage the OS service that supervises a server.
@@ -439,6 +446,11 @@ impl Command {
             Self::Status(args) | Self::Stop(args) => {
                 client_discovery(args.dir.clone(), args.read_only, &args.env)
             }
+            #[cfg(feature = "lifecycle")]
+            Self::Lifecycle(args) => {
+                let dir = args.dir_args();
+                client_discovery(dir.dir.clone(), dir.read_only, &dir.env)
+            }
             Self::Doctor(args) => {
                 client_discovery(args.dir.dir.clone(), args.dir.read_only, &args.dir.env)
             }
@@ -470,8 +482,9 @@ mod tests {
     use crate::_util::{env::STATE_DIR_VAR, testing::assert_send_sync};
 
     /// The set of variables the parser may read is the contract's, and it is closed: an argument
-    /// reading anything else is a channel no document describes. Walked over every arm, so a new
-    /// subcommand cannot add one silently.
+    /// reading anything else is a channel no document describes. Walked over **every** arm at
+    /// every depth — `lifecycle`'s four verbs are subcommands of a subcommand, and their arguments
+    /// carry the same channels — so a new arm cannot add one silently, one level down included.
     #[test]
     fn the_parser_reads_no_undocumented_variable() {
         let documented = [
@@ -486,7 +499,14 @@ mod tests {
             SECRET_KEY_VAR,
             PG_DSN_VAR,
         ];
-        for command in Cli::command().get_subcommands() {
+        // A worklist rather than one `get_subcommands()`: a walk that stopped at the first level
+        // would promise coverage it no longer has.
+        let root = Cli::command();
+        let mut arms = vec![&root];
+        let mut visited = Vec::new();
+        while let Some(command) = arms.pop() {
+            arms.extend(command.get_subcommands());
+            visited.push(command.get_name());
             for arg in command.get_arguments() {
                 let Some(name) = arg.get_env() else { continue };
                 let name = name.to_string_lossy().into_owned();
@@ -498,6 +518,14 @@ mod tests {
                 );
             }
         }
+        // **The walk is not self-guarding**: a one-level version passed this suite while
+        // `lifecycle`'s four verbs went uninspected, which is how that hole arose. So the depth
+        // the walk promises is asserted, not assumed.
+        #[cfg(feature = "lifecycle")]
+        assert!(
+            visited.contains(&"ls"),
+            "the walk must reach a verb nested under `lifecycle`: {visited:?}"
+        );
         // `TINIO_SCANNER` and `TINIO_ANONYMOUS` are the contract's and are not the CLI's: the
         // first is `tinio-fs`'s own switch, the second US3's T087.
         assert!(!documented.contains(&"TINIO_SCANNER"));

@@ -21,6 +21,11 @@ const MAX_PART: u32 = 10_000;
 /// `EntityTooSmall` on completion). The final part has no minimum.
 pub const MIN_PART_BYTES: u64 = 5 * 1024 * 1024;
 
+/// The abandoned-upload timeout default (`[s3] multipart_expire_days`): seven
+/// days. One home for the value, shared by the config schema, the filesystem
+/// sweeper's options and the pg cleanup's constructor.
+pub const DEFAULT_EXPIRE_DAYS: u64 = 7;
+
 /// The S3 non-final-part minimum rule at complete: every part except the
 /// client list's last entry — the final part — must be at least
 /// [`MIN_PART_BYTES`]. One home for the rule, enforced authoritatively by

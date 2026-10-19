@@ -26,6 +26,11 @@ pub(crate) fn to_timestamp(time: SystemTime) -> OffsetDateTime {
     }
 }
 
+/// The unix milliseconds `parts.modified_at` stores.
+pub(crate) fn to_millis(time: SystemTime) -> i64 {
+    i64::try_from(to_nanos(time) / 1_000_000).unwrap_or(i64::MAX)
+}
+
 /// The domain instant a stored `timestamptz` names.
 ///
 /// A value before the epoch -- or past the domain wire's `u64` range -- reads

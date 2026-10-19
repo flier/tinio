@@ -22,7 +22,7 @@ use crate::{
         Bucket, BucketOps, BucketsListing, ListBucketsParams, acl,
         acl::{Acl, AclGrants},
         bucket::Name,
-        cors,
+        cors, lifecycle,
         meta::{ObjectMeta, UploadMeta},
         object, storage,
     },
@@ -131,6 +131,42 @@ impl BucketOps for MemoryStorage {
             .map_err(Error::from)
     }
 
+    async fn get_bucket_lifecycle(&self, name: &Name) -> Result<Option<lifecycle::Config>, Error> {
+        self.ops()
+            .get_bucket_lifecycle(name)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn put_bucket_lifecycle(
+        &self,
+        name: &Name,
+        config: &lifecycle::Config,
+    ) -> Result<(), Error> {
+        self.ops()
+            .put_bucket_lifecycle(name, config)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn merge_bucket_lifecycle(
+        &self,
+        name: &Name,
+        rules: &[lifecycle::Rule],
+    ) -> Result<lifecycle::Merged, Error> {
+        self.ops()
+            .merge_bucket_lifecycle(name, rules)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn delete_bucket_lifecycle(&self, name: &Name) -> Result<(), Error> {
+        self.ops()
+            .delete_bucket_lifecycle(name)
+            .await
+            .map_err(Error::from)
+    }
+
     async fn get_bucket_acl(&self, name: &Name) -> Result<Acl, Error> {
         self.ops().get_bucket_acl(name).await.map_err(Error::from)
     }
@@ -168,8 +204,8 @@ mod tests {
     use super::*;
     use crate::{
         _core::{CompletedPart, MultipartOps, ObjectOps, acl::Acl, object, storage::Error::*},
-        _store_redb::bucket,
-        _util::testing::body,
+        _store_redb::{bucket, bucket_lifecycle},
+        _util::testing::{body, metadata::lifecycle_config},
         testutil::{other_owner_id, owner_id},
     };
 
@@ -453,6 +489,39 @@ mod tests {
                 assert!(!left, "no {table} row survives the teardown");
             }
         }
+    }
+
+    /// LC19: mem's bucket delete is the teardown (the 2026-10-08 ruling elided
+    /// `remove_if_empty` into it), so the lifecycle row leaves in that same
+    /// write transaction.
+    #[tokio::test]
+    async fn a_bucket_teardown_drops_the_lifecycle_row() {
+        let storage = MemoryStorage::new().unwrap();
+        let bucket = name("data").unwrap();
+        storage
+            .create_bucket(&bucket, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let config = lifecycle_config("one");
+        storage
+            .put_bucket_lifecycle(&bucket, &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.get_bucket_lifecycle(&bucket).await.unwrap(),
+            Some(config)
+        );
+
+        storage.delete_bucket(&bucket).await.unwrap();
+
+        // Read raw: the accessor answers `NoSuchBucket` for a deleted bucket
+        // whatever the table holds.
+        let key = bucket.to_string();
+        let left = storage
+            .db
+            .read(move |txn| bucket_lifecycle::Table::open_readonly(txn)?.get(&key))
+            .unwrap();
+        assert!(left.is_none(), "the rule dies with the bucket (LC19)");
     }
 
     #[tokio::test]

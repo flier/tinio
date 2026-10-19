@@ -16,29 +16,25 @@ use smart_default::SmartDefault;
 /// ```
 #[derive(Debug, Clone, PartialEq, SmartDefault, Serialize, Deserialize, Validate)]
 #[garde(allow_unvalidated)]
+#[serde(default)]
 pub struct Config {
     /// Bind host (default `127.0.0.1`).
-    #[serde(default = "host")]
-    #[default = r#"127.0.0.1"#]
+    #[default(_code = "DEFAULT_HOST.to_owned()")]
     pub host: String,
     /// Bind port (default 9000; `0` = OS-assigned ephemeral).
-    #[serde(default = "port")]
-    #[default = 9000]
+    #[default(_code = "DEFAULT_PORT")]
     pub port: u16,
     /// Read-only mode (FR-023): reject all S3 writes, state relocates to
     /// `~/.tinio/roots/<hash>/`.
-    #[serde(default)]
     pub read_only: bool,
     /// Process confinement (`--sandbox`, `TINIO_SANDBOX`; FR-036, design
     /// decision 10).
-    #[serde(default)]
     pub sandbox: bool,
 }
 
-fn host() -> String {
-    Config::default().host
-}
+/// Default bind host: loopback, so an unconfigured server is not reachable off the host.
+const DEFAULT_HOST: &str = "127.0.0.1";
 
-fn port() -> u16 {
-    Config::default().port
-}
+/// Default bind port (Minio-compatible; `0` = OS-assigned ephemeral). Crate-visible because
+/// `resolve` takes it as the port an `--address` without one gets.
+pub(crate) const DEFAULT_PORT: u16 = 9000;

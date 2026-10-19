@@ -78,6 +78,8 @@ use tokio_rustls::{TlsAcceptor, rustls::ServerConfig, server::TlsStream};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA};
 
+#[cfg(feature = "lifecycle")]
+use crate::lifecycle::LifecycleAdmin;
 #[cfg(windows)]
 use crate::pipe;
 use crate::{
@@ -1348,13 +1350,15 @@ impl Transport {
 ///     stop,
 ///     gauges: None,
 ///     token: None,
+///     #[cfg(feature = "lifecycle")]
+///     lifecycle: None,
 /// };
 /// let plane = Plane::bind(options)?;
 /// plane.publish(9000)?;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub struct Options {
     /// The three-choose-one input, as `[api]` and the `--api*` flags resolved it.
     pub selection: Selection,
@@ -1389,6 +1393,16 @@ pub struct Options {
     /// answer). `None` is every plane that owns its `state` file, which is every unconfined run
     /// and every in-place platform — and it is what [`Plane::publish`] is for.
     pub token: Option<String>,
+    /// The lifecycle admin the plane's three `/buckets/{bucket}/lifecycle` routes are served
+    /// from, or `None` for a plane that does not serve them (LC14). **An input for the same
+    /// reason [`Options::gauges`] is**: only the caller holds the storage those routes read, and
+    /// `tinio-api` must not depend on the crate that owns it (cargo's cycle rule). A build
+    /// without the `lifecycle` feature has no field and no trait (LC15), and a run whose `[s3]
+    /// lifecycle` is off passes `None` (LC23) — both causes answer the three routes' `404`, so
+    /// nothing can replace a stored configuration the plane cannot serve.
+    #[cfg(feature = "lifecycle")]
+    #[debug("<injected>")]
+    pub lifecycle: Option<Arc<dyn LifecycleAdmin>>,
 }
 
 /// The `state` this plane serves under: the control channel's identity, the served root, and
@@ -1505,6 +1519,8 @@ impl SocketFile {
 ///     stop,
 ///     gauges: None,
 ///     token: None,
+///     #[cfg(feature = "lifecycle")]
+///     lifecycle: None,
 /// })?;
 /// plane.publish(9000)?;
 /// plane.serve(rx).await?;
@@ -1597,6 +1613,8 @@ impl Plane {
     ///         gauges: None,
     ///         // The launcher's token, when this plane is the child it confined.
     ///         token: None,
+    ///         #[cfg(feature = "lifecycle")]
+    ///         lifecycle: None,
     ///     },
     ///     &inherited,
     /// )?;
@@ -1731,6 +1749,8 @@ impl Plane {
     ///         gauges: None,
     ///         // The launcher's token, when this plane is the child it confined.
     ///         token: None,
+    ///         #[cfg(feature = "lifecycle")]
+    ///         lifecycle: None,
     ///     },
     ///     listener,
     /// )?;
@@ -1808,6 +1828,8 @@ impl Plane {
     ///     stop,
     ///     gauges: None,
     ///     token: None,
+    ///     #[cfg(feature = "lifecycle")]
+    ///     lifecycle: None,
     /// };
     /// // An empty list binds on every target, which is the arm this example can spell once — and
     /// // the argument macOS alone carries is spelled on the arm that has it.
@@ -1888,6 +1910,8 @@ impl Plane {
     ///     stop,
     ///     gauges: None,
     ///     token: None,
+    ///     #[cfg(feature = "lifecycle")]
+    ///     lifecycle: None,
     /// })?;
     /// plane.publish(9000)?;
     /// # Ok(())
@@ -1942,10 +1966,11 @@ impl Plane {
             }
             _ => None,
         };
-        let shared = Arc::new(
-            Context::new(state, options.host, transport.auth(), options.stop)
-                .with_gauges(options.gauges),
-        );
+        let context = Context::new(state, options.host, transport.auth(), options.stop)
+            .with_gauges(options.gauges);
+        #[cfg(feature = "lifecycle")]
+        let context = context.with_lifecycle(options.lifecycle);
+        let shared = Arc::new(context);
         Ok(Self {
             transport: Mutex::new(Some(transport)),
             shared,
@@ -1982,6 +2007,8 @@ impl Plane {
     ///     stop,
     ///     gauges: None,
     ///     token: None,
+    ///     #[cfg(feature = "lifecycle")]
+    ///     lifecycle: None,
     /// })?;
     /// // `/stop` sends on the very channel this awaits: the plane can end its own serve,
     /// // and the CLI's signal handlers flip the same one.
@@ -2031,6 +2058,8 @@ impl Plane {
     ///     stop,
     ///     gauges: None,
     ///     token: None,
+    ///     #[cfg(feature = "lifecycle")]
+    ///     lifecycle: None,
     /// })?;
     /// // The data plane's port, and the moment `status` can find this server.
     /// plane.publish(9000)?;
@@ -2082,6 +2111,8 @@ impl Plane {
     ///     stop,
     ///     gauges: None,
     ///     token: None,
+    ///     #[cfg(feature = "lifecycle")]
+    ///     lifecycle: None,
     /// })?;
     /// plane.publish(9000)?;
     /// plane.serve(rx).await?;
@@ -2265,6 +2296,7 @@ mod tests {
             target,
             method: Method::GET,
             token,
+            body: None,
         }
     }
 
@@ -2302,6 +2334,8 @@ mod tests {
             stop,
             gauges: None,
             token: None,
+            #[cfg(feature = "lifecycle")]
+            lifecycle: None,
         })
         .expect("a TCP bind needs no runtime")
     }
@@ -2551,6 +2585,8 @@ mod tests {
             stop,
             gauges: None,
             token: None,
+            #[cfg(feature = "lifecycle")]
+            lifecycle: None,
         })
         .expect("bind");
         assert!(path.exists(), "the bind created the socket file");
@@ -3007,6 +3043,8 @@ mod tests {
                 stop,
                 gauges: None,
                 token: None,
+                #[cfg(feature = "lifecycle")]
+                lifecycle: None,
             })
             .expect("bind"),
         );
@@ -3193,6 +3231,8 @@ mod tests {
                     stop: stop.clone(),
                     gauges,
                     token: None,
+                    #[cfg(feature = "lifecycle")]
+                    lifecycle: None,
                 })
                 .expect("the plane is built"),
             );
@@ -3330,6 +3370,7 @@ mod tests {
                 target,
                 method,
                 token,
+                body: None,
             },
         )
         .await
@@ -3358,6 +3399,7 @@ mod tests {
                 target,
                 method,
                 token,
+                body: None,
             },
         )
         .await
@@ -3544,6 +3586,8 @@ mod tests {
             stop,
             gauges: None,
             token: None,
+            #[cfg(feature = "lifecycle")]
+            lifecycle: None,
         });
         let err = refused.expect_err("a second instance is refused");
         assert!(
@@ -3576,6 +3620,8 @@ mod tests {
             stop: stop.clone(),
             gauges: None,
             token: None,
+            #[cfg(feature = "lifecycle")]
+            lifecycle: None,
         };
 
         for short in [

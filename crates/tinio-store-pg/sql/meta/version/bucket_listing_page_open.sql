@@ -1,18 +1,3 @@
--- bucket_listing_page.sql's sibling for a prefix with no upper bound: one
--- whose whole body is `U+10FFFF` characters, the last code point (which has no
--- successor), the empty prefix included. There is no string greater than all
--- the keys that start with such a prefix -- `U+10FFFF`, the largest code point,
--- may itself be extended -- so the statement spells no upper bound and `$2` is
--- the whole range. It is exact either way: every key at or above such a prefix
--- starts with it, because a key whose first differing character were smaller
--- would sort below the prefix and one greater cannot exist. `$5` is the prefix
--- and `starts_with` the definer that states it.
---
--- The rest is the bounded read's own shape, documented in
--- bucket_listing_page.sql: `$2` the scan's lower bound (never below the prefix,
--- never below the cursor -- which is also what makes each inner index scan of
--- the joins start at the cursor), `$3` the row inside `$2`'s key the read
--- resumes after, `$4` the cap.
 SELECT
     o.key,
     o.etag,

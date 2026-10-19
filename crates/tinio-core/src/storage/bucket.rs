@@ -7,7 +7,7 @@ use crate::{
     acl,
     acl::{Acl, AclGrants},
     bucket::{self, Bucket},
-    cors, object,
+    cors, lifecycle, object,
 };
 
 /// Parameters of a [`BucketOps::list_buckets`] call — the S3 listing
@@ -186,6 +186,50 @@ pub trait BucketOps: Send + Sync + 'static {
     /// `NoSuchBucket` when the bucket is missing; otherwise idempotent —
     /// deleting when no configuration is stored is `Ok`.
     async fn delete_bucket_cors(&self, name: &bucket::Name) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// The bucket's lifecycle configuration (S3
+    /// GetBucketLifecycleConfiguration). `NoSuchBucket` when the bucket is
+    /// missing; `None` when it stores no configuration.
+    async fn get_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<Option<lifecycle::Config>, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Replace the bucket's lifecycle configuration (S3
+    /// PutBucketLifecycleConfiguration — replace-all, no merge).
+    /// `NoSuchBucket` when the bucket is missing.
+    async fn put_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+        config: &lifecycle::Config,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Upsert `rules` into the bucket's stored configuration in one
+    /// transaction (the seed's write, LC13). `NoSuchBucket` when the bucket
+    /// is missing. A merged document the request path would refuse is
+    /// [`lifecycle::Merged::Refused`] and is not stored.
+    async fn merge_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+        rules: &[lifecycle::Rule],
+    ) -> Result<lifecycle::Merged, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Remove the bucket's lifecycle configuration (S3
+    /// DeleteBucketLifecycle). `NoSuchBucket` when the bucket is missing;
+    /// otherwise idempotent — deleting when no configuration is stored is
+    /// `Ok`.
+    async fn delete_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<(), <Self as Storage>::Error>
     where
         Self: Storage;
 

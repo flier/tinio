@@ -177,30 +177,24 @@ impl<'de> Deserialize<'de> for AccessFormat {
 #[derive(Debug, Clone, PartialEq, SmartDefault)]
 #[cfg_attr(feature = "config", derive(Serialize, Deserialize, Validate))]
 #[cfg_attr(feature = "config", garde(allow_unvalidated))]
+#[cfg_attr(feature = "config", serde(default))]
 pub struct Config {
     /// `error | warn | info | debug` (default `info`).
-    #[cfg_attr(feature = "config", serde(default))]
     pub verbosity: Verbosity,
     /// Access-log file name (relative to the state dir, or absolute).
-    #[cfg_attr(feature = "config", serde(default = "access_log"))]
-    #[default = r#"access.log"#]
+    #[default(_code = "DEFAULT_ACCESS_LOG.to_string()")]
     pub access_log: String,
     /// `combined | common | custom nginx-style string` (default `combined`).
-    #[cfg_attr(feature = "config", serde(default))]
     #[cfg_attr(feature = "config", garde(dive))]
     pub access_log_format: AccessFormat,
     /// `text | json` (default `text`; json defaults the file to `server.json`).
-    #[cfg_attr(feature = "config", serde(default))]
     pub server_log_format: Format,
     /// Server-log file (empty = stderr; daemon mode defaults it).
-    #[cfg_attr(feature = "config", serde(default))]
     pub server_log_file: String,
 }
 
-#[cfg(feature = "config")]
-fn access_log() -> String {
-    Config::default().access_log
-}
+/// Access-log file name. Default `access.log`.
+const DEFAULT_ACCESS_LOG: &str = "access.log";
 
 /// The access-log event target (the data-plane middleware emits events
 /// with this target).
@@ -810,6 +804,14 @@ mod tests {
 #[cfg(all(test, feature = "config"))]
 mod schema_tests {
     use super::*;
+
+    #[test]
+    fn absent_keys_take_the_struct_default() {
+        // The struct-level serde default is the only default path: an
+        // empty section lands on the `SmartDefault` values.
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config, Config::default());
+    }
 
     #[test]
     fn access_log_format_variables_validated() {

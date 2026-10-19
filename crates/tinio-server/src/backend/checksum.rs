@@ -20,7 +20,6 @@ use std::{
     task::{Context, Poll},
 };
 
-#[cfg(any(feature = "multipart", test))]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -43,6 +42,36 @@ use crate::_core::{
     checksum::{self, Algorithm},
     storage::Error as StorageError,
 };
+
+/// The AWS `Content-MD5` gate shared by the CORS, ACL and lifecycle PUTs: a
+/// missing header is `InvalidRequest`, a value that is not the standard
+/// base64 of 16 bytes is `InvalidDigest`. Digest equality against the body is
+/// unverifiable here (s3s consumes it; the recorded deviation).
+pub(crate) fn require_content_md5(md5: Option<&str>) -> S3Result<()> {
+    let md5 = md5.ok_or_else(missing_content_md5)?;
+    valid_content_md5(md5)
+}
+
+/// A present `Content-MD5` value must be the standard base64 of 16 bytes.
+pub(crate) fn valid_content_md5(md5: &str) -> S3Result<()> {
+    match STANDARD.decode(md5) {
+        Ok(raw) if raw.len() == 16 => Ok(()),
+        _ => Err(invalid_digest()),
+    }
+}
+
+/// The missing-header refusal, worded as AWS words it.
+pub(crate) fn missing_content_md5() -> S3Error {
+    s3_error!(
+        InvalidRequest,
+        "Missing required header for this request: Content-MD5"
+    )
+}
+
+/// The malformed-digest refusal.
+pub(crate) fn invalid_digest() -> S3Error {
+    s3_error!(InvalidDigest, "The Content-MD5 you specified is not valid")
+}
 
 /// The tee error mapping of the staging paths (a part upload or a plain
 /// PUT): a stream that ended in a checksum mismatch surfaces as

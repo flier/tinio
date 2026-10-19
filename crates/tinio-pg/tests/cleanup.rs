@@ -16,6 +16,7 @@ use tinio_core::{
     bucket,
     cleanup::{ActionStream, Cleanup, CleanupOptions, RepairAction, RepairKind},
     content::{ContentKey, ObjectContent, StagedObject},
+    lifecycle,
     meta::version::encode_blob,
     object,
     storage::{ListObjectsParams, ObjectOps},
@@ -895,6 +896,108 @@ async fn the_live_set_spans_every_page_of_the_version_scan() {
         0,
         "a block no version row names is reclaimed"
     );
+
+    db.drop_db().await;
+}
+
+/// LC21: a bucket whose stored configuration carries
+/// `NoncurrentVersionExpiration` is governed by its rule for that action, so
+/// `[s3] noncurrent_keep` does not apply to it — while a bucket that carries no
+/// such rule, and one whose rule is `Disabled`, retire by the knob in the same
+/// pass.
+#[tokio::test]
+async fn a_bucket_with_a_noncurrent_rule_keeps_its_versions_past_the_server_knob() {
+    if !require_dsn() {
+        return;
+    }
+    let db = TestDb::create().await.expect("a scratch database");
+    let pool = Pool::open(&db.dsn, 4).expect("a pool over the scratch database");
+    let store = PgStore::connect_with_pool(pool.clone(), Access::ReadWrite)
+        .await
+        .expect("a writable store (migrating the scratch database)");
+
+    let governed = "cleanup-governed";
+    let ungoverned = "cleanup-ungoverned";
+    let disabled = "cleanup-disabled";
+    for wire in [governed, ungoverned, disabled] {
+        query(
+            "INSERT INTO buckets (name, created, tags, acl, cors) \
+             VALUES ($1, now(), '{}'::jsonb, ROW(NULL::text, ARRAY[]::acl_grant[])::acl, '')",
+        )
+        .bind(wire)
+        .execute(&pool)
+        .await
+        .expect("the bucket row");
+        // Two history rows at a key with no current slot: a keep budget of one
+        // retires the older, which is what the server's knob says.
+        for (seq, id) in [(1_i64, "v1"), (2_i64, "v2")] {
+            query(
+                "INSERT INTO version_rows (bucket, key, seq, id, blob, size, etag, created, \
+                 became_noncurrent, kind, tags, checksum, acl) \
+                 VALUES ($1, 'v.txt', $2, $3, '', 0, 'planted', now(), 1, 'object', \
+                 '{}'::jsonb, '', ROW(NULL::text, ARRAY[]::acl_grant[])::acl)",
+            )
+            .bind(wire)
+            .bind(seq)
+            .bind(format!("{wire}-{id}"))
+            .execute(&pool)
+            .await
+            .expect("a planted version row");
+        }
+    }
+
+    // The governed bucket's rule, at a threshold the server's knob would beat —
+    // and the same rule `Disabled` on the third bucket, which governs nothing.
+    let config = |status| lifecycle::Config {
+        rules: vec![lifecycle::Rule {
+            id: None,
+            status,
+            filter: lifecycle::Filter::default(),
+            expiration: None,
+            noncurrent_version_expiration: Some(lifecycle::NoncurrentVersionExpiration {
+                noncurrent_days: Some(30),
+                newer_noncurrent_versions: None,
+            }),
+            abort_incomplete_multipart_upload: None,
+        }],
+    };
+    for (wire, config) in [
+        (governed, config(lifecycle::Status::Enabled)),
+        (disabled, config(lifecycle::Status::Disabled)),
+    ] {
+        query("INSERT INTO bucket_lifecycle (bucket, config, updated_at) VALUES ($1, $2, now())")
+            .bind(wire)
+            .bind(config.to_wire())
+            .execute(&pool)
+            .await
+            .expect("the lifecycle row");
+    }
+
+    let cleanup = PgCleanup::new(store.clone(), CleanupOptions::default()).with_retention(1, 0);
+    let actions = collect(cleanup.repair(RepairKind::Full).await.expect("a pass")).await;
+
+    assert_eq!(
+        count(
+            &pool,
+            governed,
+            "SELECT count(*) FROM version_rows WHERE bucket = $1"
+        )
+        .await,
+        2,
+        "the governed bucket's rule owns noncurrent retirement: {actions:?}"
+    );
+    for wire in [ungoverned, disabled] {
+        assert_eq!(
+            count(
+                &pool,
+                wire,
+                "SELECT count(*) FROM version_rows WHERE bucket = $1"
+            )
+            .await,
+            1,
+            "{wire} retires by the knob in the same pass"
+        );
+    }
 
     db.drop_db().await;
 }

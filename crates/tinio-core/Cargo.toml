@@ -17,20 +17,22 @@ md-5.workspace = true
 parse-display.workspace = true
 percent-encoding.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, optional = true }
+serde_json.workspace = true
 sha2.workspace = true
+smart-default.workspace = true
 sqlx = { workspace = true, optional = true, default-features = false, features = [
     "derive",
     "json",
     "postgres",
 ] }
 thiserror.workspace = true
+time.workspace = true
 tracing.workspace = true
 unicode-properties = { workspace = true, features = ["general-category"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [features]
-sqlx = ["dep:sqlx", "dep:serde_json"]
+sqlx = ["dep:sqlx"]
 
 [dev-dependencies]
 proptest.workspace = true

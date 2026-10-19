@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    h.bucket COLLATE \"C\" AS \"bucket!: bucket::Name\",\n    h.ckey COLLATE \"C\" AS \"ckey!\"\nFROM content_heads AS h\nWHERE\n    h.kind = 'part'::content_kind\n    AND h.ckey ~ '^p:[0-9a-f]+:[0-9]+$'\n    AND NOT EXISTS (\n        SELECT 1\n        FROM uploads AS u\n        WHERE\n            u.bucket = h.bucket\n            AND u.upload_id = convert_from(\n                decode(split_part(h.ckey, ':', 2), 'hex'),\n                'UTF8'\n            )\n    )\n    AND (\n        h.bucket > $1::text COLLATE \"C\"\n        OR (\n            h.bucket = $1::text COLLATE \"C\"\n            AND h.ckey > $2::text COLLATE \"C\"\n        )\n    )\nORDER BY h.bucket COLLATE \"C\", h.ckey COLLATE \"C\"\nLIMIT $3\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bucket!: bucket::Name",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "ckey!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "6f953bb9cd1fac92a0d43a881a3bd363d2eb1f4dc7e008f767de9ac830943c75"
+}

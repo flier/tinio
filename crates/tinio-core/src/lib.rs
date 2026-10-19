@@ -25,6 +25,7 @@ pub mod cleanup;
 pub mod content;
 pub mod cors;
 pub mod etag;
+pub mod lifecycle;
 pub mod meta;
 pub mod mode;
 pub mod multipart;

@@ -108,10 +108,10 @@ fn platform_clause(target_os: &str) -> String {
 /// `@external` umbrella (`@interop`/`@boto3`/`@mc`) unless the external opt-in
 /// is set; `@confinement`, which follows the [`Confinement`] state — the
 /// target's own default (excluded off macOS) when the variable is unset, and
-/// the explicit states forcing it in or out on every target; and `@pg`, always
-/// excluded from the default run (PG17) — the `@pg` pass is its own run, driven
-/// by an explicit `--tags` (which is also what sets `TINIO_E2E_BACKEND=pg`),
-/// and no other pass wants the DB-backed scenarios.
+/// the explicit states forcing it in or out on every target; and `@pg`,
+/// always excluded from the default run (PG17) — the `@pg` pass is its own run,
+/// driven by an explicit `--tags` (which is also what sets
+/// `TINIO_E2E_BACKEND=pg`), and no other pass wants the DB-backed scenarios.
 ///
 /// The target, the two opt-in flags and the confinement state are parameters
 /// rather than `cfg!`/env reads, so one function composes every host's filter
@@ -351,6 +351,21 @@ mod tests {
             assert!(
                 selected(target, &["@fs", "@cli"]),
                 "a neutral scenario on {target}"
+            );
+        }
+    }
+
+    /// The `@lifecycle` corpus is a subject of this suite like any other: no
+    /// axis names it, so every backend-neutral lifecycle scenario runs in the
+    /// default pass.
+    #[test]
+    fn the_lifecycle_corpus_runs_by_default() {
+        for target in ["linux", "macos", "windows"] {
+            let filter = default_filter(target, true, true, Confinement::Include);
+            assert!(!filter.contains("@lifecycle"), "the filter for {target}");
+            assert!(
+                selected(target, &["@lifecycle"]),
+                "a @lifecycle scenario on {target}"
             );
         }
     }

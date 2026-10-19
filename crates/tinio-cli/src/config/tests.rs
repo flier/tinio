@@ -93,6 +93,16 @@ fn full_config_round_trips() {
 
     [telemetry]
     otlp_endpoint = "http://127.0.0.1:4317"
+
+    [lifecycle]
+    delay = "5s"
+    cycle = "2h"
+
+    [[lifecycle.rules]]
+    bucket = "data"
+    id = "expire-logs"
+    prefix = "logs/"
+    expire_days = 30
 "#;
     let config = Config::parse(text).unwrap();
     assert_eq!(config.server.host, "0.0.0.0");
@@ -133,6 +143,11 @@ fn full_config_round_trips() {
         config.telemetry.as_ref().unwrap().otlp_endpoint,
         "http://127.0.0.1:4317"
     );
+    let lifecycle = config.lifecycle.as_ref().unwrap();
+    assert_eq!(lifecycle.delay, Duration::from_secs(5));
+    assert_eq!(lifecycle.cycle, Duration::from_secs(2 * 3600));
+    assert_eq!(lifecycle.rules.len(), 1);
+    assert_eq!(lifecycle.rules[0].id, "expire-logs");
 
     // Round-trip through TOML preserves everything.
     let again = Config::parse(&config.to_toml().unwrap()).unwrap();
@@ -173,6 +188,7 @@ fn one_document_carries_capability_sweep_scanner_and_telemetry_keys() {
     select = false
     acl = false
     versioning = false
+    lifecycle = false
     select_concurrency = 2
     select_stack_bytes = 33554432
     sig_v2 = true
@@ -186,6 +202,16 @@ fn one_document_carries_capability_sweep_scanner_and_telemetry_keys() {
 
     [telemetry]
     otlp_endpoint = "http://127.0.0.1:4317"
+
+    [lifecycle]
+    delay = "5s"
+    cycle = "2h"
+
+    [[lifecycle.rules]]
+    bucket = "data"
+    id = "expire-logs"
+    prefix = "logs/"
+    expire_days = 30
 "#;
     let config = Config::parse(text).unwrap();
 
@@ -204,11 +230,16 @@ fn one_document_carries_capability_sweep_scanner_and_telemetry_keys() {
     assert!(!s3.capabilities.select);
     assert!(!s3.capabilities.acl);
     assert!(!s3.capabilities.versioning);
+    assert!(
+        !s3.capabilities.lifecycle,
+        "the lifecycle capability's key is `[s3] lifecycle` — the one switch for the three \
+         operations, the pass and the seed"
+    );
     assert_eq!(s3.capabilities.select_concurrency, 2);
     assert_eq!(s3.capabilities.select_stack_bytes, 33_554_432);
     assert!(s3.sig_v2);
     assert_eq!(s3.temp_ttl_hours, 2);
-    assert_eq!(s3.multipart_expire_days, 4);
+    assert_eq!(s3.multipart_expire_days, Some(4));
     assert_eq!(s3.noncurrent_keep, 3);
     assert_eq!(s3.noncurrent_expire_days, 30);
     assert_eq!(s3.block_grace_minutes, 45);
@@ -323,11 +354,9 @@ fn version_must_be_one() {
 
 #[test]
 fn partial_sections_keep_field_defaults() {
-    // A present section that omits a key must still deserialize the
-    // SmartDefault value. (A bare `#[serde(default)]` would use the field
-    // type's Default — `[storage.fs] follow_symlinks = false` used to
-    // yield compact_threshold_percent = 0 and fail garde; `[s3]
-    // multipart = false` used to disable every other toggle.)
+    // A present section that omits a key takes the section's `Default` (the
+    // container-level `#[serde(default)]`), so `[s3] multipart = false` leaves
+    // every other toggle on.
     let config = Config::parse("version = 1\n[server]").unwrap();
     assert_eq!(config.server.host, "127.0.0.1");
     assert_eq!(config.server.port, 9000);
@@ -342,7 +371,8 @@ fn partial_sections_keep_field_defaults() {
             && s3.capabilities.delete_objects
     );
     assert_eq!(s3.temp_ttl_hours, 24);
-    assert_eq!(s3.multipart_expire_days, 7);
+    assert_eq!(s3.multipart_expire_days, None);
+    assert_eq!(s3.multipart_expire_days(), 7);
 
     // An empty `[s3]` section falls back to every serde default
     // helper (the toggle defaults must match `Config::default`).
@@ -378,6 +408,58 @@ fn partial_sections_keep_field_defaults() {
     assert_eq!(pipeline.io, Io::default());
     assert_eq!(pipeline.remove, Remove::default());
     assert_eq!(pipeline.db, Db::default());
+}
+
+/// Probe 1 (non-flattened): a present section that omits a key takes the section's
+/// `SmartDefault` value, not the field type's `Default`.
+#[test]
+fn an_empty_section_keeps_the_smart_default_values() {
+    let config = Config::parse("version = 1\n[server]").unwrap();
+    assert_eq!(config.server.host, "127.0.0.1");
+    assert_eq!(config.server.port, 9000);
+    assert!(!config.server.read_only && !config.server.sandbox);
+
+    let config = Config::parse("version = 1\n[scanner]").unwrap();
+    let scanner = config.scanner.as_ref().unwrap();
+    assert_eq!(scanner.delay, 10.0);
+    assert_eq!(scanner.max_wait, Duration::from_secs(15));
+
+    let config = Config::parse("version = 1\n[api.http]").unwrap();
+    let http = config.api.as_ref().unwrap().http.as_ref().unwrap();
+    assert_eq!(http.host, "127.0.0.1");
+    assert_eq!(http.port, 9001);
+
+    let config = Config::parse("version = 1\n[storage.fs]").unwrap();
+    let fs = &config.storage.as_ref().unwrap().fs;
+    assert_eq!(fs.compact_threshold_percent, 20);
+    assert_eq!(fs.meta_batch_size, DEFAULT_META_BATCH_SIZE);
+    assert!(!fs.follow_symlinks);
+
+    let config = Config::parse("version = 1\n[storage.pg]").unwrap();
+    assert_eq!(config.pg_section().unwrap().pool, 8);
+
+    // A key that is written still overrides the default.
+    let config = Config::parse("version = 1\n[server]\nport = 9100").unwrap();
+    assert_eq!(config.server.port, 9100);
+    assert_eq!(config.server.host, "127.0.0.1");
+}
+
+/// Probe 2 (flattened): `[s3]` is one table across two owners, so the capability half is
+/// reached through `#[serde(flatten)]` — an absent capability key must still take the
+/// `SmartDefault` toggle (`true`), never the field type's `Default` (`false`).
+#[test]
+fn a_partial_s3_section_keeps_the_capability_defaults() {
+    let config = Config::parse("version = 1\n[s3]\nsig_v2 = false").unwrap();
+    let capabilities = &config.s3.as_ref().unwrap().capabilities;
+    assert!(capabilities.multipart);
+    assert_eq!(capabilities.max_buckets, 10_000);
+
+    // A write toggle still overrides, and the absent ones keep their default.
+    let config = Config::parse("version = 1\n[s3]\nmultipart = false\nmax_buckets = 5").unwrap();
+    let capabilities = &config.s3.as_ref().unwrap().capabilities;
+    assert!(!capabilities.multipart);
+    assert_eq!(capabilities.max_buckets, 5);
+    assert!(capabilities.copy_object && capabilities.versioning);
 }
 
 #[test]
@@ -750,7 +832,25 @@ fn a_zero_sweep_ttl_is_refused() {
         Config::parse("version = 1\n[s3]\ntemp_ttl_hours = 1\nmultipart_expire_days = 1").unwrap();
     let s3 = config.s3.unwrap();
     assert_eq!(s3.temp_ttl_hours, 1);
-    assert_eq!(s3.multipart_expire_days, 1);
+    assert_eq!(s3.multipart_expire_days, Some(1));
+}
+
+#[test]
+fn a_zero_scanner_cadence_is_refused() {
+    // `cycle` and `max_wait` pace the scanner, so a zero would spin it instead of pacing it:
+    // both carry the 1s floor (`config::nonzero_duration`), unlike `delay`'s own zero.
+    for key in ["max_wait", "cycle"] {
+        let text = format!("version = 1\n[scanner]\n{key} = \"0s\"");
+        let err = Config::parse(&text).unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "{text}: {err}");
+        assert!(err.to_string().contains(key), "{text}: {err}");
+    }
+    // The floor itself parses.
+    let config =
+        Config::parse("version = 1\n[scanner]\nmax_wait = \"1s\"\ncycle = \"1s\"").unwrap();
+    let scanner = config.scanner.as_ref().unwrap();
+    assert_eq!(scanner.max_wait, Duration::from_secs(1));
+    assert_eq!(scanner.cycle, Duration::from_secs(1));
 }
 
 #[test]

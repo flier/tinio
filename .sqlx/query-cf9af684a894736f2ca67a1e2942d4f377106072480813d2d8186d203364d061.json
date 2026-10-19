@@ -1,0 +1,79 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT\n    c.bucket COLLATE \"C\" AS \"bucket!: bucket::Name\",\n    c.kind AS \"kind: ContentKind\",\n    c.ckey COLLATE \"C\" AS \"ckey!\",\n    c.seq\nFROM content AS c\nWHERE\n    c.published <= now() - ($1::bigint * interval '1 second')\n    AND NOT EXISTS (\n        SELECT 1\n        FROM content_heads AS h\n        WHERE\n            h.bucket = c.bucket AND h.kind = c.kind\n            AND h.ckey = c.ckey\n            AND (\n                h.live_seq = c.seq\n                OR (\n                    h.next_seq = c.seq\n                    AND (\n                        h.allocated_at > now() - (\n                            $1::bigint * interval '1 second'\n                        )\n                        OR EXISTS (\n                            SELECT 1\n                            FROM content AS fresh\n                            WHERE\n                                fresh.bucket = c.bucket\n                                AND fresh.kind = c.kind\n                                AND fresh.ckey = c.ckey\n                                AND fresh.seq = c.seq\n                                AND fresh.published > now() - (\n                                    $1::bigint * interval '1 second'\n                                )\n                        )\n                    )\n                )\n            )\n    )\n    AND (c.bucket, c.kind, c.ckey, c.seq) > (\n        $2::text COLLATE \"C\",\n        $3::content_kind,\n        $4::text COLLATE \"C\",\n        $5::bigint\n    )\nORDER BY c.bucket COLLATE \"C\", c.kind, c.ckey COLLATE \"C\", c.seq\nLIMIT $6\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bucket!: bucket::Name",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "kind: ContentKind",
+        "type_info": {
+          "Custom": {
+            "name": "content_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "part"
+              ]
+            }
+          }
+        },
+        "origin": {
+          "Table": {
+            "table": "content",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "ckey!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "content",
+            "name": "seq"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        {
+          "Custom": {
+            "name": "content_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "part"
+              ]
+            }
+          }
+        },
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      null,
+      false
+    ]
+  },
+  "hash": "cf9af684a894736f2ca67a1e2942d4f377106072480813d2d8186d203364d061"
+}

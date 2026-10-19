@@ -41,6 +41,8 @@ mod conditions;
 #[cfg(feature = "cors")]
 pub(crate) mod cors;
 mod errors;
+#[cfg(feature = "lifecycle")]
+pub(crate) mod lifecycle;
 mod locks;
 pub(crate) mod ops;
 mod s3;

@@ -1,0 +1,67 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    r.bucket,\n    r.key,\n    r.seq,\n    r.blob\nFROM version_rows AS r\nWHERE\n    (r.bucket, r.key) > ($1::text COLLATE \"C\", $2::text COLLATE \"C\")\n    OR (\n        r.bucket = $1::text COLLATE \"C\"\n        AND r.key = $2::text COLLATE \"C\"\n        AND r.seq > $3::bigint\n    )\nORDER BY r.bucket COLLATE \"C\", r.key COLLATE \"C\", r.seq\nLIMIT $4\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bucket",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "bucket"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "blob",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "blob"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "7ed1be26a7bd48a1e420eeb4d7b64bd7c7180749f5df85c91fd54a49c6fc5573"
+}

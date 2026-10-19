@@ -55,7 +55,23 @@ pub fn document() -> OpenApiSchema {
     )]
     struct Api;
 
-    Api::openapi()
+    // The three lifecycle routes exist only in a build that carries them (LC14, LC15), so the
+    // document lists them only there: the paths are merged rather than listed above, because a
+    // `paths(...)` list cannot carry a `cfg` and a schema naming a route the plane does not serve
+    // would be the lie the feature gate exists to prevent.
+    #[cfg(feature = "lifecycle")]
+    #[derive(OpenApi)]
+    #[openapi(paths(
+        crate::lifecycle::lifecycle_get_doc,
+        crate::lifecycle::lifecycle_put_doc,
+        crate::lifecycle::lifecycle_delete_doc
+    ))]
+    struct LifecycleApi;
+
+    let document = Api::openapi();
+    #[cfg(feature = "lifecycle")]
+    let document = document.merge_from(LifecycleApi::openapi());
+    document
 }
 
 struct TokenScheme;
@@ -131,5 +147,19 @@ mod tests {
             text.contains("X-Tinio-Token"),
             "the token scheme is documented"
         );
+    }
+
+    /// LC14 mirrors the three routes in the document — and LC15 says only a build that registers
+    /// them does, which is why this leg carries the same feature gate as the routes.
+    #[cfg(feature = "lifecycle")]
+    #[test]
+    fn the_openapi_document_lists_the_three_paths() {
+        let schema = serde_json::to_value(super::document()).expect("the document is JSON");
+        let lifecycle = schema["paths"]
+            .get("/buckets/{bucket}/lifecycle")
+            .expect("the three routes are listed");
+        for method in ["get", "put", "delete"] {
+            assert!(lifecycle.get(method).is_some(), "{method} is listed");
+        }
     }
 }

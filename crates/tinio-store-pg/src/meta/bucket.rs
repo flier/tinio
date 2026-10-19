@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use crate::{
     _core::{
         acl::{Acl, AclGrants, OwnerId},
-        bucket, cors,
+        bucket, cors, lifecycle,
         meta::{
             BucketMeta,
             bucket::{Row as BucketRow, decode_cors},
@@ -149,6 +149,7 @@ impl BucketMeta for PgStore {
 
     async fn create(&self, bucket: &bucket::Name, row: &BucketRow) -> Result<(), Error> {
         let acl = acl_composite(row.owner.as_ref(), &row.acl.grants);
+        let mut tx = begin(self.pool()).await?;
         let inserted = query_file!(
             "sql/meta/bucket/create.sql",
             bucket,
@@ -157,11 +158,13 @@ impl BucketMeta for PgStore {
             acl as _,
             cors_wire(row.cors.as_ref())
         )
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
+            tx.rollback().await?;
             return Err(Error::AlreadyExists(bucket.clone()));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -187,6 +190,7 @@ impl BucketMeta for PgStore {
 
     async fn record_full(&self, bucket: &bucket::Name, row: &BucketRow) -> Result<(), Error> {
         let acl = acl_composite(row.owner.as_ref(), &row.acl.grants);
+        let mut tx = begin(self.pool()).await?;
         query_file!(
             "sql/meta/bucket/record_full.sql",
             bucket,
@@ -195,8 +199,9 @@ impl BucketMeta for PgStore {
             acl as _,
             cors_wire(row.cors.as_ref())
         )
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -288,10 +293,58 @@ impl BucketMeta for PgStore {
         Ok(written.rows_affected() > 0)
     }
 
+    async fn lifecycle(&self, bucket: &bucket::Name) -> Result<Option<lifecycle::Config>, Error> {
+        super::lifecycle::get(self, bucket).await
+    }
+
+    async fn lifecycles(&self) -> Result<Vec<(bucket::Name, lifecycle::Config)>, Error> {
+        super::lifecycle::list(self).await
+    }
+
+    async fn set_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+    ) -> Result<bool, Error> {
+        super::lifecycle::set(self, bucket, config).await
+    }
+
+    async fn merge_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+        rules: &[lifecycle::Rule],
+    ) -> Result<lifecycle::Merged, Error> {
+        super::lifecycle::merge(self, bucket, rules).await
+    }
+
+    async fn merge_lifecycle_or_create(
+        &self,
+        bucket: &bucket::Name,
+        rules: &[lifecycle::Rule],
+        now: SystemTime,
+    ) -> Result<lifecycle::Merged, Error> {
+        super::lifecycle::merge_or_create(self, bucket, rules, now).await
+    }
+
+    async fn set_lifecycle_or_create(
+        &self,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+        now: SystemTime,
+    ) -> Result<(), Error> {
+        super::lifecycle::set_or_create(self, bucket, config, now).await
+    }
+
+    async fn clear_lifecycle(&self, bucket: &bucket::Name) -> Result<bool, Error> {
+        super::lifecycle::clear(self, bucket).await
+    }
+
     async fn remove(&self, bucket: &bucket::Name) -> Result<(), Error> {
+        let mut tx = begin(self.pool()).await?;
         query!("DELETE FROM buckets WHERE name = $1", bucket)
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 

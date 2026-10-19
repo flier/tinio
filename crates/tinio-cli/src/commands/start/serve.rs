@@ -20,7 +20,7 @@ use super::serving::pg_pass;
 use super::serving::{fs_cleanup, multipart_grace_for, scanner_options};
 use super::{
     Args, Prepared, Ready, Served,
-    serving::{ServingBackend, scanner_options_for, sweep_options_for},
+    serving::{ServingBackend, lifecycle_pass, scanner_options_for, sweep_options_for},
 };
 #[cfg(feature = "versioning")]
 use crate::_fs::FsStorage;
@@ -407,12 +407,6 @@ where
         async move { plane.serve(stop).await }
     });
     let data = tokio::spawn(data.serve(listener, stop.clone()));
-    let background = tokio::spawn(storage.background(
-        stop.clone(),
-        access,
-        sweep_options_for(&resolution),
-        scanner_options_for(&resolution, access),
-    ));
 
     #[cfg(feature = "api")]
     // **A launched child never writes `state`.** Its launcher does, and the reason is the same on
@@ -450,6 +444,24 @@ where
     notify::ready(); // READY=1, inert off systemd
     #[cfg(unix)]
     notify::watchdog();
+
+    // **The background passes start here, after readiness, and the lifecycle seed is why**
+    // (LC13): the seed writes a stored configuration at the first pass, and `contracts/config.md`
+    // promises it never runs before readiness, so a client that is told the server is ready never
+    // reads a configuration the seed is still writing. Spawning before these lines made the two
+    // orders a scheduling race, not a rule.
+    //
+    // **The lifecycle pass is the run's or none** ([`lifecycle_pass`]): `[s3] lifecycle = false`
+    // and a read-only run both answer `None`, so neither the pass nor its seed is built (LC11,
+    // LC18, LC23).
+    let lifecycle = lifecycle_pass(&resolution, &caps, access);
+    let background = tokio::spawn(storage.background(
+        stop.clone(),
+        access,
+        sweep_options_for(&resolution),
+        scanner_options_for(&resolution, access),
+        lifecycle,
+    ));
 
     // **No metrics ticker here**, and that is deliberate rather than an omission. The scrape's
     // cadence and the storage scan's schedule belong to the plane: its `serve` spawns the
@@ -695,7 +707,11 @@ fn background_arm(name: &str, outcome: Result<(), JoinError>) -> Result<(), Erro
 /// Narrowed to the [`Resolution`] rather than the `Option<Config>` the example took: the
 /// resolution always carries a parsed config, so the absent-section case is the only branch
 /// left.
-fn capabilities_for(resolution: &Resolution) -> Capabilities {
+///
+/// **`pub(super)` for the management plane's own reader** (`run::open_management_plane`):
+/// `[s3] lifecycle = false` injects no admin (LC23), and a second spelling of "which
+/// capabilities this run carries" is exactly how the plane and the data plane would disagree.
+pub(super) fn capabilities_for(resolution: &Resolution) -> Capabilities {
     match resolution.config.s3.as_ref() {
         Some(s3) => s3.capabilities,
         None => Capabilities::default(),

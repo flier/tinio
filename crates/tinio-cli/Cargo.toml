@@ -6,6 +6,7 @@ description = "Command-line interface for tinio: server/start, status, stop, doc
 publish = false
 
 [dependencies]
+async-trait.workspace = true
 clap = { workspace = true, features = [
     "derive",
     "env",
@@ -23,6 +24,7 @@ garde = { workspace = true, features = ["derive", "url"] }
 getrandom.workspace = true
 handlebars.workspace = true
 hex.workspace = true
+http.workspace = true
 humantime-serde.workspace = true
 parse-display.workspace = true
 secrecy.workspace = true
@@ -48,6 +50,7 @@ tracing.workspace = true
 tinio-api = { workspace = true, optional = true }
 tinio-core.workspace = true
 tinio-fs.workspace = true
+tinio-lifecycle = { workspace = true, optional = true }
 tinio-mem = { workspace = true, optional = true }
 tinio-pg = { workspace = true, optional = true }
 tinio-sandbox.workspace = true
@@ -77,6 +80,7 @@ windows-sys = { workspace = true, features = [
 [features]
 default = ["api", "mem", "sandbox", "versioning"]
 api = ["dep:tinio-api"]
+lifecycle = ["api", "dep:tinio-lifecycle", "tinio-api/lifecycle"]
 mem = ["dep:tinio-mem"]
 pg = ["dep:tinio-pg"]
 sandbox = ["api"]

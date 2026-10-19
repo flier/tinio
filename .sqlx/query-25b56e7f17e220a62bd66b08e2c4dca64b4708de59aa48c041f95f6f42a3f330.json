@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE content\nSET seq = $5\nWHERE\n    bucket = $1\n    AND kind = $2\n    AND ckey = $3\n    AND seq = $4\n    AND chunk_no BETWEEN $6 AND $7\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        {
+          "Custom": {
+            "name": "content_kind",
+            "kind": {
+              "Enum": [
+                "object",
+                "part"
+              ]
+            }
+          }
+        },
+        "Text",
+        "Int8",
+        "Int8",
+        "Int4",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "25b56e7f17e220a62bd66b08e2c4dca64b4708de59aa48c041f95f6f42a3f330"
+}

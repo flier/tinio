@@ -211,7 +211,7 @@ impl FsCleanup {
             storage: storage.clone(),
             dry_run: options.dry_run,
             access: options.access,
-            multipart_grace: Options::default().multipart_ttl,
+            multipart_grace: Options::default().multipart_ttl(),
         }
     }
 

@@ -19,3 +19,4 @@ Always-loaded pointers. Each named doc = source of truth for its branch — do n
 - **Issue tracker** — in-repo: task rows + plan checkboxes. `docs/agents/issue-tracker.md`.
 - **Triage labels** — five canonical roles, label = role name. `docs/agents/triage-labels.md`.
 - **Domain docs** — single-context, root `CONTEXT.md`. `docs/agents/domain.md`.
+- **Execution** — every search names a repo path (no `/`, `~`, drive root); unknown API → compile a `target/` probe. `docs/agents/execution.md`.

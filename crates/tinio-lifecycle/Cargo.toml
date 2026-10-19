@@ -1,0 +1,34 @@
+[package]
+name = "tinio-lifecycle"
+version.workspace = true
+edition.workspace = true
+description = "The S3 object lifecycle pass for tinio: one stateless sweep over the storage contract, generic over every backend"
+publish = false
+
+[dependencies]
+smart-default.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+tinio-core.workspace = true
+tinio-util.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+tinio-mem = { workspace = true, features = ["testing", "versioning"] }
+
+[lints.clippy]
+absolute_paths = "warn"
+allow_attributes = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_used = "warn"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -263,6 +263,57 @@ MinIO — the reference OSS implementation — documents the same non-compliance
 
 **The requirements this section is the contract for.** FR-037: the bucket versioning states, the three operations, the version response headers, and the overwrite/supersede behavior — `versioning.feature`'s overwrite journey plus the `Get`/`PutBucketVersioning` round-trip handler tests. FR-038: delete markers — the plain delete's marker, the plain read's `404` with the marker disclosed, the `405` for a marker-addressed read, the version-addressed delete, the marker-stacking rule — `versioning.feature`'s marker journey plus the handler suite's `405` journey. FR-039: the fail-open guard — a version-addressed request is refused, never answered from the current version — `versioning.feature`'s `@versioning-off` journey, the handler suite's toggle-off journey and the `GetObjectAttributes` leg (the guard's refusal when versioning is unavailable; with it available the op answers from the addressed version's row — the addressing paragraph above). FR-040: the suspended-bucket null-version write — in-place replacement, the pre-suspension version retrievable, the write answering a version id — `versioning.feature`'s suspended journey. FR-041: null-version addressing by its literal — `versioning.feature`'s `?versionId=null` journey plus the handler suite's control leg. FR-023 (amended 2026-10-03): the read-only run serves the recorded version history from the root's own database — `versioning.feature`'s `@cli` read-only journey.
 
+## Lifecycle (FR-042)
+
+(spec FR-042; design `docs/superpowers/specs/2026-10-18-s3-object-lifecycle-design.md` — the design owns the pass and the evaluation rules, this section is the protocol contract.) A bucket's lifecycle configuration is a stored bucket subresource in the CORS shape (§Bucket CORS): one document per bucket, replaced whole, served back, and enforced by a background pass. All three operations ride `?lifecycle` on the bucket path — AWS documents no `?lifecycle-configuration` query, and the deprecated v1 API shares the one string with the v2 API, distinguished by request shape; this backend serves the v2 shape and accepts the v1 rule-level `Prefix` (below).
+
+| Operation | Request | Answer |
+|---|---|---|
+| `GetBucketLifecycleConfiguration` | `GET /<bucket>?lifecycle` | `200` with the stored `LifecycleConfiguration`; `404 NoSuchLifecycleConfiguration` when the bucket stores none |
+| `PutBucketLifecycleConfiguration` | `PUT /<bucket>?lifecycle` | `200` with an empty body; replaces the bucket's whole configuration |
+| `DeleteBucketLifecycle` | `DELETE /<bucket>?lifecycle` | `204` with an empty body |
+
+A missing bucket answers `404 NoSuchBucket` on all three — the bucket-existence check is the storage's. An existing bucket that stores no configuration still answers `204` to `DELETE`: the delete is idempotent, as on the CORS surface.
+
+### Accepted elements
+
+`LifecycleConfiguration` carries at most 1,000 `Rule` entries.
+
+| Element | Members and limits |
+|---|---|
+| `Rule` | `ID` (optional, ≤ 255 chars, unique within the configuration), `Status` (`Enabled`/`Disabled`), a filter or the legacy rule-level `Prefix`, ≥ 1 action — several actions in one rule are legal |
+| `Rule/Filter` | exactly one of `Prefix`, `Tag` (`Key` + `Value`), `ObjectSizeGreaterThan`, `ObjectSizeLessThan`, `And`; an **empty or absent** filter matches every object (a `NewerNoncurrentVersions` rule needs one that selects something; see Refusals) |
+| `Rule/Filter/And` | ≥ 2 predicates, at most one `Prefix`, unique `Tag` keys — combining predicates needs the wrapper, a size range included |
+| `Rule/Prefix` | the legacy rule-level prefix, accepted only when the rule carries no `Filter` |
+| `Rule/Expiration` | `Days` (≥ 1), `Date` (ISO 8601 at midnight UTC — a date in the past is accepted and takes effect at the next pass), or `ExpiredObjectDeleteMarker` |
+| `Rule/NoncurrentVersionExpiration` | `NoncurrentDays` (≥ 1) and/or `NewerNoncurrentVersions` (`1..=100`, which requires a `Filter` that selects something — an absent or empty `<Filter/>` is refused) |
+| `Rule/AbortIncompleteMultipartUpload` | `DaysAfterInitiation` (≥ 1); the rule's filter applies, and a size predicate matches the bytes already uploaded (one part walk per upload) |
+
+Size predicates are non-negative and bounded by the object ceiling (50 TB), and `ObjectSizeGreaterThan` is below `ObjectSizeLessThan`.
+
+A tag filter on a `NoncurrentVersionExpiration` is accepted, as AWS accepts it, and **evaluated per version against that version's own tags** (design LC10): the version path reads each version's tags — one storage read per noncurrent version per pass, over the walk the listing's page size already bounds. Tags are per-version on AWS too (`GET ?tagging&versionId=…` serves one version's tag set), so this reads a version's own; the recorded divergence is the **`null` version**, which carries none here — no read is spent on it and the direction is retain, so a tag-filtered rule never removes one.
+
+### Refusals
+
+Two error classes, split by cause:
+
+| Class | Cause |
+|---|---|
+| `400 MalformedXML` | the document does not match the published schema — two predicates at the top of a `Filter`, an `And` with fewer than two, or both a `Filter` and a legacy `Prefix` |
+| `400 InvalidRequest` | every semantic violation, naming the offending rule's `ID` |
+
+The semantic set: more than 1,000 `Rule` entries; duplicate `ID`s; a rule with no action; `ExpiredObjectDeleteMarker` with `Days` or `Date`; `Days` and `Date` in one `Expiration`; `Days` below 1; a `Date` not at midnight UTC; `NewerNoncurrentVersions` outside `1..=100`; `ExpiredObjectDeleteMarker` or `AbortIncompleteMultipartUpload` in a rule whose filter uses tags; `NewerNoncurrentVersions` whose `Filter` selects everything (absent or empty — the model's `is_everything`); size predicates negative, out of order or beyond the object ceiling.
+
+`Transition` and `NoncurrentVersionTransition` are refused with `400 InvalidRequest` naming that the server has no storage tiers.
+
+### Checksum
+
+A `PUT` requires a checksum — `Content-MD5` or any `x-amz-checksum-*` header or trailer, algorithm-agnostic. A missing value answers `400 InvalidRequest`; a value that is not a 16-byte base64 digest answers `400 InvalidDigest`; both store nothing. **A digest mismatch is not verified in this framework version**: s3s's deserializer consumes the request body before the handler runs and `S3Request` retains no raw bytes, so AWS's `BadDigest` arm is unreachable here. The CORS and ACL surfaces carry the same recorded deviation; all three gain the check together if the framework ever exposes the bytes.
+
+### Gating
+
+The three operations are gated twice (`[s3] lifecycle`, default on; the `lifecycle` cargo feature), and a disabled capability answers `NotImplemented` on all three and runs no pass (`contracts/config.md` owns the switch). A read-only run refuses the two writes with `AccessDenied` — they are write rows of the operation table — and serves the `GET`.
+
 ## Object namespace
 
 ### Folder markers

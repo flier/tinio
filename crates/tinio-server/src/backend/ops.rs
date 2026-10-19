@@ -41,7 +41,7 @@
 //! operation's dtos (`E0308`) fails to compile.
 //!
 //! The compile-time strip and the runtime refusal are one fact at two layers,
-//! and the strip is a function of the capability — verified across all 39
+//! and the strip is a function of the capability — verified across all 42
 //! operations against the handlers' own `#[cfg]` attributes. So the row
 //! states the feature once, and the consumers derive the attribute. A
 //! capability with no cargo feature (`tagging`, `delete_objects`) is written
@@ -82,6 +82,9 @@ macro_rules! tinio_s3_ops {
                 #[handler(op_get_bucket_cors)]
                 #[gated(cors: "cors")]
                 fn get_bucket_cors (GetBucketCorsInput) -> GetBucketCorsOutput;
+                #[handler(op_get_bucket_lifecycle)]
+                #[gated(lifecycle: "lifecycle")]
+                fn get_bucket_lifecycle_configuration (GetBucketLifecycleConfigurationInput) -> GetBucketLifecycleConfigurationOutput;
                 #[handler(op_get_bucket_acl)]
                 #[gated(acl: "acl")]
                 fn get_bucket_acl (GetBucketAclInput) -> GetBucketAclOutput;
@@ -136,6 +139,12 @@ macro_rules! tinio_s3_ops {
                 #[handler(op_delete_bucket_cors)]
                 #[gated(cors: "cors")]
                 fn delete_bucket_cors (DeleteBucketCorsInput) -> DeleteBucketCorsOutput;
+                #[handler(op_put_bucket_lifecycle)]
+                #[gated(lifecycle: "lifecycle")]
+                fn put_bucket_lifecycle_configuration (PutBucketLifecycleConfigurationInput) -> PutBucketLifecycleConfigurationOutput;
+                #[handler(op_delete_bucket_lifecycle)]
+                #[gated(lifecycle: "lifecycle")]
+                fn delete_bucket_lifecycle (DeleteBucketLifecycleInput) -> DeleteBucketLifecycleOutput;
                 #[handler(op_put_bucket_acl)]
                 #[gated(acl: "acl")]
                 fn put_bucket_acl (PutBucketAclInput) -> PutBucketAclOutput;
@@ -193,7 +202,7 @@ pub(crate) use tinio_s3_ops;
 /// Two properties, deliberately built two ways:
 ///
 /// - [`table_ops`] carries the derived `#[cfg]`, so it is what *this* build
-///   compiles (measured on this table: 39 names under `--all-features`, 23
+///   compiles (measured on this table: 42 names under `--all-features`, 23
 ///   under `--no-default-features --features multipart`, 17 under
 ///   `--no-default-features`). It is a subset check against the table, never
 ///   an equality with a file.
@@ -273,12 +282,12 @@ tinio_s3_ops!(op_names);
 mod tests {
     use super::*;
 
-    /// The twenty-one mutating operations, written out from the design's
+    /// The twenty-three mutating operations, written out from the design's
     /// `Kind` column and the plan's table, in sorted order so it compares
     /// directly with the sorted group. The independent side of
     /// [`table_groups_operations_by_whether_they_mutate`], which is why it
     /// is spelled out rather than read back from the table it pins.
-    const WRITE_OPS: [&str; 21] = [
+    const WRITE_OPS: [&str; 23] = [
         "abort_multipart_upload",
         "complete_multipart_upload",
         "copy_object",
@@ -286,12 +295,14 @@ mod tests {
         "create_multipart_upload",
         "delete_bucket",
         "delete_bucket_cors",
+        "delete_bucket_lifecycle",
         "delete_bucket_tagging",
         "delete_object",
         "delete_object_tagging",
         "delete_objects",
         "put_bucket_acl",
         "put_bucket_cors",
+        "put_bucket_lifecycle_configuration",
         "put_bucket_tagging",
         "put_bucket_versioning",
         "put_object",
@@ -301,6 +312,35 @@ mod tests {
         "upload_part",
         "upload_part_copy",
     ];
+
+    /// The three lifecycle rows, in table order — the one group whose cargo
+    /// feature is the whole fact: present with it, stripped without it. The
+    /// `#[gated(…)]` feature becomes the `#[cfg]` of the generated dispatch
+    /// arms, so a stripped build has no arm to answer with and s3s's trait
+    /// default answers instead.
+    const LIFECYCLE_OPS: [&str; 3] = [
+        "delete_bucket_lifecycle",
+        "get_bucket_lifecycle_configuration",
+        "put_bucket_lifecycle_configuration",
+    ];
+
+    #[cfg(feature = "lifecycle")]
+    #[test]
+    fn the_lifecycle_rows_come_with_their_feature() {
+        for op in LIFECYCLE_OPS {
+            assert!(table_ops().contains(&op), "{op} is not compiled");
+        }
+    }
+
+    /// The other side: the feature off is three rows fewer, not three rows
+    /// answering.
+    #[cfg(not(feature = "lifecycle"))]
+    #[test]
+    fn the_lifecycle_rows_are_stripped_without_their_feature() {
+        for op in LIFECYCLE_OPS {
+            assert!(!table_ops().contains(&op), "{op} is compiled");
+        }
+    }
 
     /// The table's read/write split, pinned against [`WRITE_OPS`].
     ///
@@ -318,7 +358,7 @@ mod tests {
         writes.sort();
         assert_eq!(writes, WRITE_OPS);
         // The two groups partition the table, so the read group is exactly
-        // the other eighteen rows: no row in both, none in neither. A row
+        // the other nineteen rows: no row in both, none in neither. A row
         // listed twice inside one group, or in both groups, breaks the
         // sorted comparison below; a row duplicated in the table itself is
         // `table_has_no_duplicates`'s to catch.

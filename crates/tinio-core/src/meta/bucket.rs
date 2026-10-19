@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use super::Metadata;
 use crate::{
     acl::{self, Acl, Grant, Grantee, GroupUri, OwnerId, Permission},
-    bucket, cors, object, percent,
+    bucket, cors, lifecycle, object, percent,
     storage::{from_nanos, to_nanos},
 };
 
@@ -188,8 +188,8 @@ pub fn decode_cors(wire: &str) -> Option<cors::Config> {
     (!config.rules.is_empty()).then_some(config)
 }
 
-/// Bucket rows: the creation time, the tag set, the owner and ACL elements and
-/// the CORS configuration.
+/// Bucket rows: the creation time, the tag set, the owner and ACL elements, the
+/// CORS configuration and the lifecycle configuration (a table of its own).
 ///
 /// # Examples
 ///
@@ -259,6 +259,12 @@ pub trait BucketMeta: Send + Sync + 'static {
     /// concurrent create cannot be raced (review item 10 — `create_bucket`'s
     /// already-exists outcome had no atomic home). `record_full` is the
     /// unconditional upsert.
+    ///
+    /// **The bucket's lifecycle row is cleared in the same write** (design
+    /// 2026-10-18, LC19): the configuration lives in a table of its own, which
+    /// does not inherit this row's upsert on re-create, so a row left behind
+    /// by a bucket that vanished out of band must not silently expire the new
+    /// bucket's objects.
     async fn create(
         &self,
         bucket: &bucket::Name,
@@ -277,7 +283,9 @@ pub trait BucketMeta: Send + Sync + 'static {
     where
         Self: Metadata;
 
-    /// Upsert the whole row.
+    /// Upsert the whole row, clearing the bucket's lifecycle row in the same
+    /// write — the lazy policy's re-create path, with the same LC19 rule as
+    /// [`BucketMeta::create`].
     async fn record_full(
         &self,
         bucket: &bucket::Name,
@@ -391,7 +399,101 @@ pub trait BucketMeta: Send + Sync + 'static {
     where
         Self: Metadata;
 
-    /// Remove the bucket row (idempotent).
+    /// The bucket's lifecycle configuration, or `None` when it stores none
+    /// (an absent row, or a wire that does not decode — the read path's
+    /// self-heal, never an error and never "retain everything").
+    async fn lifecycle(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Option<lifecycle::Config>, <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// Every recorded lifecycle configuration, in ascending bucket-name
+    /// order. One scan of a table that is empty on a root that never
+    /// configured a rule — the sweep's read.
+    ///
+    /// A row whose stored name is not a bucket name is discarded with one
+    /// warning rather than failing the walk: the table is written only with
+    /// validated names, so an undecodable one is corruption, and the healing
+    /// read is the corruption policy the stored wire already follows.
+    async fn lifecycles(
+        &self,
+    ) -> Result<Vec<(bucket::Name, lifecycle::Config)>, <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// Replace the lifecycle configuration. Same presence outcome as
+    /// [`BucketMeta::set_tags`] and **not a change signal**: an identical
+    /// configuration answers `Ok(true)` too, so only a missing bucket
+    /// answers `Ok(false)`.
+    async fn set_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+    ) -> Result<bool, <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// Replace the lifecycle configuration, inserting a first-sight bucket row
+    /// at `now` when the store has none — the create-or-update twin of
+    /// [`BucketMeta::set_lifecycle`], the row insert and the configuration
+    /// write decided and committed in **one transaction**.
+    ///
+    /// The lazy first-sight policy of a backend whose buckets outlive their
+    /// rows (`tinio-fs`'s pre-existing directory): there a missing row is not
+    /// an error, so the configuration write also records the bucket. The
+    /// `tinio-ops` body chooses this method for exactly that row policy; a
+    /// guaranteed store keeps [`BucketMeta::set_lifecycle`] and its refusal.
+    async fn set_lifecycle_or_create(
+        &self,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+        now: SystemTime,
+    ) -> Result<(), <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// Upsert `rules` into the bucket's stored configuration, in the one
+    /// transaction that reads it (LC13). Same presence outcome as
+    /// [`BucketMeta::set_lifecycle`]: a missing bucket writes nothing and
+    /// answers [`lifecycle::Merged::Absent`]. A merged document
+    /// [`Config::validate`](lifecycle::Config::validate) refuses is
+    /// [`lifecycle::Merged::Refused`] and is not stored.
+    async fn merge_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+        rules: &[lifecycle::Rule],
+    ) -> Result<lifecycle::Merged, <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// [`BucketMeta::merge_lifecycle`] for a lazy store: a first-sight bucket
+    /// row is recorded with the merged configuration, in the same transaction,
+    /// and only when the merge validates. A refusal writes neither the row
+    /// nor the configuration.
+    async fn merge_lifecycle_or_create(
+        &self,
+        bucket: &bucket::Name,
+        rules: &[lifecycle::Rule],
+        now: SystemTime,
+    ) -> Result<lifecycle::Merged, <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// Clear the lifecycle configuration (idempotent). Same presence outcome
+    /// as [`BucketMeta::set_lifecycle`]: a bucket that stores no
+    /// configuration answers `Ok(true)`.
+    async fn clear_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<bool, <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// Remove the bucket row **and its lifecycle row** (idempotent): a rule
+    /// never outlives the bucket it was written for (design 2026-10-18,
+    /// LC19).
     async fn remove(&self, bucket: &bucket::Name) -> Result<(), <Self as Metadata>::Error>
     where
         Self: Metadata;
@@ -399,7 +501,8 @@ pub trait BucketMeta: Send + Sync + 'static {
     /// Remove the bucket row only when no object row and no upload row names
     /// it: the TOCTOU-free delete. A missing row projects to
     /// [`crate::storage::Error::NoSuchBucket`], a non-empty bucket to
-    /// [`crate::storage::Error::NotEmpty`].
+    /// [`crate::storage::Error::NotEmpty`]. The bucket's lifecycle row leaves
+    /// with it, as for [`BucketMeta::remove`].
     async fn remove_if_empty(&self, bucket: &bucket::Name) -> Result<(), <Self as Metadata>::Error>
     where
         Self: Metadata;

@@ -27,6 +27,11 @@ use crate::_api::{
 use crate::_core::storage::Storage;
 #[cfg(feature = "api")]
 use crate::daemon;
+#[cfg(feature = "lifecycle")]
+use crate::{
+    _api::lifecycle::LifecycleAdmin,
+    _core::{bucket, lifecycle, storage::Error as StorageError},
+};
 use crate::{
     _fs::{Error as FsError, FsStorage},
     _sandbox::{Adopted, Attribution, Child, Refused, disarm_signal_relay, supervise},
@@ -509,6 +514,66 @@ pub fn run(
     // k is `run::on_runtime`'s: no runtime is created anywhere in this module.
 }
 
+/// The management plane's lifecycle admin (LC14): the three `/buckets/{bucket}/lifecycle` routes
+/// are served from it, so the plane carries this run's storage handle without `tinio-api` ever
+/// depending on the crate that owns one.
+///
+/// **The bucket name is the storage contract's own** (`bucket::Name`), so a name the contract
+/// rejects is refused before a store sees it; the plane maps the store's `AccessDenied` to `403`
+/// (a read-only run) and its `NoSuchBucket` to `404`.
+#[cfg(feature = "lifecycle")]
+struct StorageAdmin<S> {
+    storage: S,
+}
+
+#[cfg(feature = "lifecycle")]
+#[async_trait::async_trait]
+impl<S: Storage + Send + Sync> LifecycleAdmin for StorageAdmin<S> {
+    async fn get(&self, bucket: &bucket::Name) -> Result<Option<lifecycle::Config>, StorageError> {
+        self.storage
+            .get_bucket_lifecycle(bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn put(
+        &self,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+    ) -> Result<(), StorageError> {
+        self.storage
+            .put_bucket_lifecycle(bucket, config)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn delete(&self, bucket: &bucket::Name) -> Result<(), StorageError> {
+        self.storage
+            .delete_bucket_lifecycle(bucket)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+/// The plane's lifecycle admin, or `None` when this run injects none (LC23): `[s3] lifecycle =
+/// false` turns off the three operations **and** the plane's routes, because rules that can be
+/// edited but never run are the surprise that ruling removed. The capability is read through
+/// [`serve::capabilities_for`](super::serve::capabilities_for) — the same reader the data plane
+/// and the pass use — so the three cannot disagree about this run's answer.
+#[cfg(feature = "lifecycle")]
+fn lifecycle_admin<S: Storage + Clone + Send + Sync + 'static>(
+    storage: &S,
+    resolution: &Resolution,
+) -> Option<Arc<dyn LifecycleAdmin>> {
+    super::serve::capabilities_for(resolution)
+        .lifecycle
+        .then(|| {
+            Arc::new(StorageAdmin {
+                storage: storage.clone(),
+            }) as Arc<dyn LifecycleAdmin>
+        })
+}
+
 /// The management plane over `storage` — the control channel that is the plane's
 /// single-instance gate, bound before the repair runs (design decision 12).
 ///
@@ -562,6 +627,8 @@ where
         // running and discoverable. `None` is every run that owns its own `state`: the unconfined
         // ones, and the in-place platforms.
         token: adopted.and_then(|adopted| adopted.token().map(str::to_owned)),
+        #[cfg(feature = "lifecycle")]
+        lifecycle: lifecycle_admin(storage, resolution),
     };
     // **A launcher already bound the control channel, and this process serves on what it
     // inherited** (`Adopted::controls`). Windows' reason is identity: the launcher's pipes carry
@@ -914,6 +981,8 @@ mod tests {
 
     use super::*;
     use crate::_sandbox::{Attribution, Child, Terminal};
+    #[cfg(feature = "lifecycle")]
+    use crate::{_fs::testing, _server::Capabilities};
 
     /// A confined child that exits with `code` and relays nothing.
     ///
@@ -1400,6 +1469,48 @@ mod tests {
         assert!(
             sandbox::refuse_pg_under_confinement(&Request { channel: None }, Backend::Pg).is_none(),
             "a pg run that asked for no confinement is not refused"
+        );
+    }
+
+    /// **LC23's plane half**: `[s3] lifecycle = false` injects no admin, so the three
+    /// `/buckets/{bucket}/lifecycle` routes answer the `404` a stripped build's do and nothing can
+    /// replace a stored configuration the run will never enforce. The same document with the
+    /// capability on injects one, so the switch — never a missing storage — is what the assertion
+    /// sees.
+    #[cfg(feature = "lifecycle")]
+    #[tokio::test]
+    async fn a_disabled_capability_injects_no_lifecycle_admin() {
+        let dir = TempDir::new().expect("a scratch root");
+        let storage = FsStorage::new(dir.path(), testing::fs_options()).expect("a storage");
+        let resolution = |lifecycle: bool| Resolution {
+            pg_root: None,
+            root: PathBuf::from("/srv/data"),
+            config: Config {
+                s3: Some(config::s3::Config {
+                    capabilities: Capabilities {
+                        lifecycle,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            identity: Default::default(),
+            config_text: String::new(),
+            config_path: PathBuf::from("/srv/data/.tinio/.tinio.toml"),
+            read_only: false,
+            state_dir: PathBuf::from("/srv/data/.tinio"),
+            state_dir_override: None,
+            config_error: None,
+        };
+        assert!(
+            lifecycle_admin(&storage, &resolution(true)).is_some(),
+            "the capability on injects the admin the plane's routes need"
+        );
+        assert!(
+            lifecycle_admin(&storage, &resolution(false)).is_none(),
+            "a disabled capability injects no admin: rules editable but never run are the \
+             surprise the ruling removes"
         );
     }
 }

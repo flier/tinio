@@ -1,0 +1,74 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    r.bucket AS \"bucket: bucket::Name\",\n    r.key,\n    r.seq,\n    r.became_noncurrent,\n    (extract(EPOCH FROM r.created) * 1000000000)::bigint AS \"created_nanos!\"\nFROM version_rows AS r\nLEFT JOIN current_slots AS s ON s.bucket = r.bucket AND s.key = r.key\nWHERE\n    (\n        (s.seq IS NOT NULL AND s.seq <> r.seq)\n        OR r.became_noncurrent <> 0\n    )\n    AND (\n        (r.bucket, r.key) > ($1::text COLLATE \"C\", $2::text COLLATE \"C\")\n        OR (\n            r.bucket = $1::text COLLATE \"C\"\n            AND r.key = $2::text COLLATE \"C\"\n            AND r.seq < $3::bigint\n        )\n    )\nORDER BY r.bucket COLLATE \"C\", r.key COLLATE \"C\", r.seq DESC\nLIMIT $4\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bucket: bucket::Name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "bucket"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "became_noncurrent",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "version_rows",
+            "name": "became_noncurrent"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_nanos!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "685e96219dc4f3849a5cd705235552b36b4b5fdb8ebc7d470bd8c7cfca900904"
+}

@@ -49,6 +49,8 @@ tinio-util = { path = "../tinio-util", features = ["testing"] }
 rustix = { workspace = true, features = ["process"] }
 
 [features]
+default = ["lifecycle"]
+lifecycle = ["tinio-server/lifecycle"]
 parquet = ["tinio-server/select-parquet"]
 pg = ["dep:tinio-pg", "dep:sqlx", "tinio-pg/versioning", "tinio-pg/testing"]
 

@@ -76,6 +76,18 @@ pub async fn server_encoding(pool: &Pool) -> Result<String, Error> {
 /// The inspecting role's own privileges (PG6), from
 /// `sql/diagnostics/role_privileges.sql`.
 ///
+/// The probe scopes to the **store's bookkeeping table**, not the session's `search_path`:
+/// `current_schema()` answers for whichever schema the session resolves first, so a session
+/// opened with `options=-c search_path=…` that does not name the store's schema read zero rows,
+/// `bool_or` answered NULL, the `coalesce` printed `false`, and the diagnosis certified a role it
+/// had not looked at (the 2026-10-13 review). Every schema holding a `schema_version` table is a
+/// schema this store owns relations in, and [`RolePrivileges::schemas`] names them all, so a
+/// reader can see what was checked.
+///
+/// The relation kinds are the ones a role could still write through: an ordinary table, a
+/// partitioned table, a view (DML on an automatically updatable view writes through to its base
+/// table) and a foreign table.
+///
 /// # Examples
 ///
 /// Against a live server this prints the inspecting role, the schemas the probe scoped to and

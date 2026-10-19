@@ -65,6 +65,8 @@ pub use range::ByteRange;
 pub use time::{from_nanos, now_nanos, to_nanos};
 pub use version::{VersionOps, marker_has_no_metadata, rename_allowed};
 
+use crate::{bucket::Name, lifecycle};
+
 /// The write-lock histogram bucket upper bounds, microseconds
 /// (pipeline-spec.md §4): `<10, <100, <1k, <5k, <20k, <100k, >100k`. A
 /// duration `d` lands in bucket `i` where `bounds[i-1] <= d < bounds[i]`
@@ -78,6 +80,38 @@ pub const WRITE_LOCK_BUCKET_BOUNDS_US: [u64; 6] = [10, 100, 1_000, 5_000, 20_000
 /// The write-lock histogram bucket count: one per bound plus the open
 /// overflow bucket (`>100k µs`).
 pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
+
+/// The lifecycle-rule read the background pass needs beyond the S3 surface:
+/// every stored configuration in one scan. The pass intersects it with
+/// [`BucketOps::list_buckets`] so a row whose bucket vanished out of band is
+/// unreachable (design LC19).
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::{
+///     bucket, lifecycle,
+///     storage::{Error, LifecycleRules},
+/// };
+///
+/// struct NoRules;
+///
+/// #[async_trait::async_trait]
+/// impl LifecycleRules for NoRules {
+///     async fn lifecycles(&self) -> Result<Vec<(bucket::Name, lifecycle::Config)>, Error> {
+///         Ok(Vec::new())
+///     }
+/// }
+/// ```
+#[async_trait::async_trait]
+pub trait LifecycleRules: Send + Sync {
+    /// Every stored lifecycle configuration, in ascending bucket-name order.
+    ///
+    /// # Errors
+    ///
+    /// The backend's read failure, projected onto the contract error.
+    async fn lifecycles(&self) -> Result<Vec<(Name, lifecycle::Config)>, Error>;
+}
 
 /// The storage backend contract: the aggregation of [`BucketOps`],
 /// [`ObjectOps`], [`MultipartOps`], and [`VersionOps`].
@@ -136,7 +170,7 @@ pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 /// (`ignore`: a runnable example would require dev-depending on a backend
 /// crate, which would create a dependency cycle with `tinio-mem`.)
 pub trait Storage:
-    Send + Sync + 'static + BucketOps + ObjectOps + MultipartOps + VersionOps
+    Send + Sync + 'static + BucketOps + ObjectOps + MultipartOps + VersionOps + LifecycleRules
 {
     /// The backend error type, shared across all operation categories.
     ///

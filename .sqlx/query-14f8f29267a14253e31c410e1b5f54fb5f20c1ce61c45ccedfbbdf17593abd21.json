@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO blocks (hash, seq, chunk, len, published) VALUES (\n    'not-a-hex-address', 0, ''::bytea, 1, now()\n)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "14f8f29267a14253e31c410e1b5f54fb5f20c1ce61c45ccedfbbdf17593abd21"
+}

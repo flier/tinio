@@ -6,6 +6,7 @@ description = "Management plane for tinio: axum router, control-channel transpor
 publish = false
 
 [dependencies]
+async-trait.workspace = true
 axum.workspace = true
 derive_more = { workspace = true, features = ["debug"] }
 getrandom.workspace = true
@@ -43,7 +44,8 @@ tinio-core.workspace = true
 tinio-util.workspace = true
 
 [features]
-default = ["openapi", "tls"]
+default = ["lifecycle", "openapi", "tls"]
+lifecycle = []
 openapi = ["dep:utoipa"]
 tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
 

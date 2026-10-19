@@ -15,6 +15,7 @@ Every crate carries its own README; those are the detail, this is the index.
 | [`tinio-core`](crates/tinio-core/README.md) | The `Storage` contract: domain errors, the trait, the four persistence contracts, key validation |
 | [`tinio-version`](crates/tinio-version/README.md) | The shared version state machine: supersede, materialize, expire |
 | [`tinio-ops`](crates/tinio-ops/README.md) | The S3 operation bodies the backends share, written once over the persistence contracts |
+| [`tinio-lifecycle`](crates/tinio-lifecycle/README.md) | The S3 object lifecycle pass: the stateless background sweep over the storage contract |
 | [`tinio-blob`](crates/tinio-blob/README.md) | Content-addressed block engine: blobs by SHA-256, deduplicated, swept by live set |
 | [`tinio-store-redb`](crates/tinio-store-redb/README.md) | The shared redb table layer and the state-database driver |
 | [`tinio-store-pg`](crates/tinio-store-pg/README.md) | The four persistence contracts over PostgreSQL: migrations, the driver pool, the content and block planes |

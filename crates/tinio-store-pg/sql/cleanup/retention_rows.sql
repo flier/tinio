@@ -1,10 +1,3 @@
--- One keyset page of the retention scan: `$1`..`$3` are the cursor -- the last
--- `(bucket, key, seq)` the previous page returned, exclusive -- and `$4` the
--- page size, so a pass holds one page of the version relation rather than every
--- history row in the store. The order is newest-first per key, which the
--- reader's retention rule needs (position 0 is the newest), so a page boundary
--- can fall inside a key and the caller must not judge that key until it has the
--- key's last row.
 SELECT
     r.bucket AS "bucket: bucket::Name",
     r.key,

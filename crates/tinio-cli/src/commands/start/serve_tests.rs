@@ -7,6 +7,8 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+#[cfg(feature = "lifecycle")]
+use super::lifecycle_pass;
 use super::{
     Resolution, fs_cleanup, multipart_grace_for, scanner_options, scanner_options_for, stopping,
     sweep, sweep_options_for,
@@ -20,8 +22,10 @@ use crate::_core::{
     storage::{BucketOps, VersionOps},
     version::State,
 };
-#[cfg(feature = "versioning")]
+#[cfg(any(feature = "versioning", feature = "lifecycle"))]
 use crate::_server::Capabilities;
+#[cfg(feature = "lifecycle")]
+use crate::config::lifecycle;
 use crate::{
     _core::mode::AccessMode,
     _fs::{FsStorage, testing},
@@ -192,7 +196,7 @@ fn resolution(s3: Option<s3::Config>) -> Resolution {
 fn the_sweep_options_carry_the_resolved_ttl_and_retention_keys() {
     let options = sweep_options_for(&resolution(Some(s3::Config {
         temp_ttl_hours: 6,
-        multipart_expire_days: 2,
+        multipart_expire_days: Some(2),
         noncurrent_keep: 3,
         noncurrent_expire_days: 30,
         block_grace_minutes: 45,
@@ -205,7 +209,7 @@ fn the_sweep_options_carry_the_resolved_ttl_and_retention_keys() {
     );
     assert_eq!(
         options.multipart_ttl,
-        Duration::from_secs(2 * 24 * 3600),
+        Some(Duration::from_secs(2 * 24 * 3600)),
         "the config's days are the sweeper's seconds"
     );
     assert_eq!(options.noncurrent_keep, 3);
@@ -219,9 +223,17 @@ fn the_sweep_options_carry_the_resolved_ttl_and_retention_keys() {
     // Without an `[s3]` section every default applies, and the versioning keys' defaults are
     // the safe reading: keep every noncurrent version, never expire by age, ten minutes'
     // grace — beside the sweeper's 24 h temp and 7 d multipart TTLs.
+    // Without an `[s3]` section every knob keeps its default, but the pass flag is
+    // the capability's own answer rather than the sweeper's: a build without the
+    // `lifecycle` feature runs no pass, so nothing is governed and the knobs work
+    // on every bucket (LC23).
+    let defaults = sweep_options_for(&resolution(None));
     assert_eq!(
-        sweep_options_for(&resolution(None)),
-        sweep::Options::default()
+        defaults,
+        sweep::Options {
+            lifecycle_pass: cfg!(feature = "lifecycle"),
+            ..sweep::Options::default()
+        }
     );
 }
 
@@ -292,11 +304,70 @@ fn scanner_options_for_reads_the_resolved_scanner_section() {
     assert!(!absent.enabled);
 }
 
+/// A resolution whose `[lifecycle]` section declares one seed rule — the document both gate
+/// legs read, so neither answer can be the empty section's.
+#[cfg(feature = "lifecycle")]
+fn resolution_with_a_seed() -> Resolution {
+    let mut resolution = resolution(Some(s3::Config::default()));
+    resolution.config.lifecycle = Some(lifecycle::Config {
+        rules: vec![lifecycle::Rule {
+            bucket: "data".to_owned(),
+            id: "expire-logs".to_owned(),
+            prefix: None,
+            expire_days: Some(30),
+            noncurrent_expire_days: None,
+            abort_incomplete_days: None,
+        }],
+        ..Default::default()
+    });
+    resolution
+}
+
+/// **LC11's read-only half**: a read-only run builds no pass, so the seed does not write the state
+/// dir the mode promises to leave alone. The writable leg asserts the same document does build
+/// one, so the `None` is the mode's answer rather than the fixture's.
+#[cfg(feature = "lifecycle")]
+#[test]
+fn a_read_only_run_builds_no_pass() {
+    let resolution = resolution_with_a_seed();
+    let caps = Capabilities::default();
+    assert!(
+        lifecycle_pass(&resolution, &caps, AccessMode::ReadOnly).is_none(),
+        "a read-only run writes nothing, so it builds no pass and applies no seed"
+    );
+    let (_, seeds) = lifecycle_pass(&resolution, &caps, AccessMode::ReadWrite)
+        .expect("the same document builds the pass when the run may write");
+    assert_eq!(
+        seeds.len(),
+        1,
+        "and the seed the read-only run skipped is right there"
+    );
+}
+
+/// **LC23's whole-switch half**: `[s3] lifecycle = false` builds neither the pass nor the seed, so
+/// a disabled capability never seeds a stored configuration it will never enforce.
+#[cfg(feature = "lifecycle")]
+#[test]
+fn a_disabled_capability_builds_no_pass_and_no_seed() {
+    let resolution = resolution_with_a_seed();
+    let disabled = Capabilities {
+        lifecycle: false,
+        ..Capabilities::default()
+    };
+    assert!(
+        lifecycle_pass(&resolution, &disabled, AccessMode::ReadWrite).is_none(),
+        "the capability off is no pass and no seed"
+    );
+    assert!(
+        lifecycle_pass(&resolution, &Capabilities::default(), AccessMode::ReadWrite).is_some(),
+        "the same document with the capability on builds one — the switch is what answered"
+    );
+}
+
 /// The startup repair hands the cleanup the resolved `[s3] multipart_expire_days` as its
 /// orphan-upload grace: the very value the sweeper's `multipart_ttl` carries, so the repair
 /// can no longer judge orphans by the hardcoded 7-day default while the sweeper honours the
-/// configured clock.
-///
+/// configured clock.///
 /// **The built cleanup is asserted, not only the value.** `repair` runs whatever
 /// [`fs_cleanup`] returns; a test over [`multipart_grace_for`] alone pins the converted
 /// value but not whether it is chained onto that cleanup at all, which is the half a
@@ -307,7 +378,7 @@ fn the_startup_repair_grace_is_the_resolved_multipart_expiry() {
     let storage = FsStorage::new(dir.path(), testing::fs_options()).unwrap();
 
     let configured = resolution(Some(s3::Config {
-        multipart_expire_days: 2,
+        multipart_expire_days: Some(2),
         ..Default::default()
     }));
     assert_eq!(
@@ -538,11 +609,16 @@ fn drop_test_db(db: TestDb) {
 
 /// **The pg background pass runs the whole serving sweep** (PG7): this is the leg that proves a
 /// served pg instance reclaims on a cadence, not only at startup, and that it runs **what the
-/// filesystem sweeper runs** — so `[s3] noncurrent_keep` / `noncurrent_expire_days` are not
-/// inert on a served pg instance. After one pass: a planted orphan chunk is gone (the residue
-/// scan), the older of two noncurrent versions is gone while the newest is spared (the
-/// retention), and a block no row references is gone (the block sweep). The read-only arm
+/// filesystem sweeper runs** — so `[s3] noncurrent_keep` / `noncurrent_expire_days` and
+/// `[s3] multipart_expire_days` are not inert on a served pg instance. After one pass: a planted
+/// orphan chunk is gone (the residue scan), the older of two noncurrent versions is gone while the
+/// newest is spared (the retention), a block no row references is gone (the block sweep), and an
+/// upload initiated past the timeout is gone (the abandoned-upload stage). The read-only arm
 /// builds no pass at all (a long delay is not slept).
+///
+/// **The stop is the stage's stop too**: the pass is asked to stop while it owns the abandoned-upload
+/// stage, and the bound below is what proves the loop — the one channel the filesystem sweeper's
+/// own loop reads — ends on that ask rather than on its cycle.
 ///
 /// Skipped without `TINIO_PG_DSN` (PG8). A synchronised `#[test]`, for the round-trip leg's
 /// reason: the pass needs a runtime, the storage takes PG12's ownership guard (which lives on
@@ -564,7 +640,7 @@ fn the_pg_background_pass_runs_the_residue_retention_and_block_stages() {
     drop_test_db(db);
 }
 
-/// The pass leg's body: plant all three shapes the pass must handle, drive a pass with an
+/// The pass leg's body: plant all four shapes the pass must handle, drive a pass with an
 /// injected tick, watch them go, then prove the read-only arm sleeps nothing. Returns the
 /// scratch database so the caller can drop it after the runtime is gone.
 #[cfg(all(feature = "pg", feature = "api"))]
@@ -578,10 +654,11 @@ async fn run_pg_pass_leg() -> TestDb {
         .await
         .expect("construct the writable pg backend");
 
-    // **The three shapes the serving pass must handle** — the residue the fs scanner reclaims,
-    // and the retention and block sweep the fs *sweeper* runs: an orphan chunk (a `content` row
-    // no head names, stamped past the grace), two noncurrent version rows at one key, and a
-    // block no row references.
+    // **The four shapes the serving pass must handle** — the residue the fs scanner reclaims,
+    // the retention and block sweep the fs *sweeper* runs, and the abandoned-upload stage on the
+    // same loop: an orphan chunk (a `content` row no head names, stamped past the grace), two
+    // noncurrent version rows at one key, a block no row references, and an upload initiated
+    // two hours ago.
     let pool = PgPool::connect(&dsn).await.expect("the planting pool");
     for stmt in [
         "INSERT INTO buckets (name, created, tags, acl, cors) \
@@ -593,6 +670,9 @@ async fn run_pg_pass_leg() -> TestDb {
         "INSERT INTO blocks (hash, seq, chunk, len, published) \
          VALUES ('0000000000000000000000000000000000000000000000000000000000000abc', 0, \
          '\\x00'::bytea, 1, now() - interval '1 hour')",
+        "INSERT INTO uploads (bucket, upload_id, key, initiated_at, tags, acl) \
+         VALUES ('cli-pass', 'planted-upload', 'big.bin', now() - interval '2 hours', \
+         '{}'::jsonb, ROW(NULL::text, ARRAY[]::acl_grant[])::acl)",
     ] {
         pool.execute(stmt).await.expect("plant a residue row");
     }
@@ -616,7 +696,8 @@ async fn run_pg_pass_leg() -> TestDb {
     // the leg tests the pass rather than the constant. The cycle is long, so a second pass
     // never races the assertions. The retention options are the leg's own — `keep = 1` so the
     // retention stage actually runs (`0` is the "keep every version" reading and returns
-    // early), `expire = 0` so only the keep budget decides.
+    // early), `expire = 0` so only the keep budget decides — and so is the abandoned-upload
+    // timeout: one hour, so the two-hour-old upload is past it.
     let (stopper, shutdown) = watch::channel(false);
     let pass = tokio::spawn(pg_pass(
         storage.clone(),
@@ -626,6 +707,7 @@ async fn run_pg_pass_leg() -> TestDb {
             noncurrent_keep: 1,
             noncurrent_expire_days: 0,
             block_grace: Duration::from_secs(600),
+            multipart_ttl: Some(Duration::from_secs(3600)),
             ..Default::default()
         },
         Duration::from_millis(20),
@@ -690,6 +772,13 @@ async fn run_pg_pass_leg() -> TestDb {
         rows(&pool, "SELECT count(*) FROM blocks").await,
         0,
         "the unreferenced block is reclaimed, not merely reported"
+    );
+    // …and the **abandoned-upload stage** ran on the same loop: the upload initiated two hours
+    // ago is gone, past the leg's one-hour `[s3] multipart_expire_days`.
+    assert_eq!(
+        rows(&pool, "SELECT count(*) FROM uploads").await,
+        0,
+        "the abandoned upload is aborted by the pass"
     );
 
     // **The read-only arm builds no pass**: with the delay set to an hour, the pass returns at

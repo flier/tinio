@@ -133,12 +133,13 @@ pub fn open_read_only(state_dir: &Path) -> Result<ReadOnlyDatabase, Error> {
     let version = {
         let txn = db.begin_read()?;
         // The shared read-only handle, not a raw `open_table`: the
-        // missing-table stand-in is scoped to the three version tables
-        // (`TableDef::MAY_BE_ABSENT`, spec 2026-10-03), and `state` is not
-        // one of them — a missing `STATE` table propagates redb's error
-        // through the same arm the raw open used to raise, so the bypass
-        // had nothing left to bypass (a database with no `STATE` table is
-        // not one this build wrote, not one whose metadata is empty).
+        // missing-table stand-in is scoped to the three version tables and
+        // `bucket_lifecycle` (`TableDef::MAY_BE_ABSENT`, spec 2026-10-03 and
+        // spec 2026-10-18), and `state` is not one of them — a missing `STATE`
+        // table propagates redb's error through the same arm the raw open used
+        // to raise, so the bypass had nothing left to bypass (a database with
+        // no `STATE` table is not one this build wrote, not one whose
+        // metadata is empty).
         let table = state::Table::open_readonly(&txn)?;
         table.version()?
     };
@@ -243,10 +244,10 @@ mod tests {
     }
 
     /// The on-disk byte-format contract: a freshly opened `meta.redb`
-    /// contains exactly the eleven shared store tables plus the fs-local
+    /// contains exactly the twelve shared store tables plus the fs-local
     /// `state` table, and nothing else (shared-store-table-layer
     /// 2026-09-03 Goal 4 / spec §4 byte-format guard — this crate's own
-    /// `ensure_all` test pins the eleven shared names; this pins the full
+    /// `ensure_all` test pins the twelve shared names; this pins the full
     /// schema the driver's open creates). Moved from tinio-fs's
     /// `database/open.rs`, 2026-10-01/2026-10-03.
     #[test]
@@ -263,6 +264,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "bucket_lifecycle",
                 "bucket_versioning",
                 "buckets",
                 "object_meta",

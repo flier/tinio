@@ -21,6 +21,7 @@ pub mod common;
 pub mod conditions;
 pub mod doctor;
 pub mod errors;
+pub mod lifecycle;
 pub mod listing;
 pub mod multipart;
 pub mod objects;
@@ -153,6 +154,10 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
         // four ACL ops (the legacy no-identity plane, like the other
         // off-mode scenarios).
         caps.acl = false;
+        // The lifecycle plan's capability-off leg (Task 6): off answers
+        // NotImplemented on the three lifecycle operations through the
+        // gate, not through s3s's trait default.
+        caps.lifecycle = false;
     }
     if tagged("acl-off") {
         // The @acl-off scenarios' own toggle: same semantics as the

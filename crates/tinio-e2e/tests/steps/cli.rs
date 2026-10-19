@@ -1143,7 +1143,10 @@ fn child_environment(cli: &Cli) -> Vec<(OsString, OsString)> {
 }
 
 /// A step's docstring (`"""`-delimited in the feature), trimmed of the newline the block adds.
-fn docstring(step: &Step) -> String {
+///
+/// `pub(super)` for the modules that spell a body as a docstring — the lifecycle steps' XML
+/// document — so the trimming rule has one home rather than a copy per module.
+pub(super) fn docstring(step: &Step) -> String {
     step.docstring()
         .map(|text| text.trim_matches('\n'))
         .unwrap_or_default()
@@ -1379,6 +1382,7 @@ async fn scrape(cli: &Cli) -> String {
         target: "/metrics",
         method: Method::GET,
         token: metrics_token(control, &state),
+        body: None,
     };
     let deadline = Instant::now() + PUBLISH_SETTLE;
     let response = loop {

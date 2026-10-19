@@ -105,14 +105,13 @@ pub struct Pipe {
 
 #[derive(Debug, Clone, PartialEq, SmartDefault, Serialize, Deserialize, Validate)]
 #[garde(allow_unvalidated)]
+#[serde(default)]
 pub struct Http {
     /// Bind host (default `127.0.0.1`).
-    #[serde(default = "host")]
-    #[default = r#"127.0.0.1"#]
+    #[default(_code = "DEFAULT_HOST.to_owned()")]
     pub host: String,
     /// Bind port (default 9001).
-    #[serde(default = "port")]
-    #[default = 9001]
+    #[default(_code = "DEFAULT_PORT")]
     pub port: u16,
 }
 
@@ -153,10 +152,9 @@ pub struct Https {
     pub key: PathBuf,
 }
 
-fn host() -> String {
-    Http::default().host
-}
+/// Default bind host: loopback, so an unconfigured listener is not reachable off the host.
+const DEFAULT_HOST: &str = "127.0.0.1";
 
-fn port() -> u16 {
-    Http::default().port
-}
+/// Default management-plane port (beside the data plane's 9000). Crate-visible because
+/// `commands::start::api` takes it as the `--api-http`/`--api-https` authority's port.
+pub(crate) const DEFAULT_PORT: u16 = 9001;

@@ -350,6 +350,10 @@ impl CreateStatement {
     }
 }
 
+/// Create a scratch database from one of the harness's `CREATE DATABASE` shapes.
+///
+/// `template0` is the only template that accepts a locale clause, which is why every shape names
+/// it.
 async fn create_database(
     maintenance: &str,
     name: &str,

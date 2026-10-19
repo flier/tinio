@@ -15,11 +15,6 @@ use crate::{
     resolve::{Resolution, authority_addr, bind_addr},
 };
 
-/// The TCP management transports' default port (`contracts/cli.md`), from the schema.
-fn default_api_port() -> u16 {
-    api::Http::default().port
-}
-
 /// The CLI's half of the plane's transport rule (decision 7): the resolved `[api]` plus the
 /// `--api*` flags, as plan A's `Selection`.
 ///
@@ -144,7 +139,7 @@ fn api_from_flags(resolution: &Resolution, flags: &ApiFlags) -> Result<Selection
                     selection.local = Some(LocalForm::Pipe(rest.to_string()));
                 }
             }
-            "http" => selection.http = Some(authority_addr(rest, default_api_port())?),
+            "http" => selection.http = Some(authority_addr(rest, api::DEFAULT_PORT)?),
             "https" => {
                 // Decision 17 / `contracts/cli.md:53`: `https://` in a build without `tls` is a
                 // **usage** error (exit 2). The scheme is the flag's, and the build cannot serve
@@ -159,7 +154,7 @@ fn api_from_flags(resolution: &Resolution, flags: &ApiFlags) -> Result<Selection
                 }
                 #[cfg(feature = "tls")]
                 {
-                    let addr = authority_addr(rest, default_api_port())?;
+                    let addr = authority_addr(rest, api::DEFAULT_PORT)?;
                     // The pair comes from the flags, then from the config's own `[api.https]`;
                     // an https transport without a pair is `contracts/config.md:151`'s refusal.
                     let configured = resolution

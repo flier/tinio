@@ -5,13 +5,15 @@
 //! `state` and the drain stay in [`serve`](super::serve::serve): they are the same for every
 //! backend.
 
+#[cfg(feature = "lifecycle")]
+use std::sync::Arc;
 use std::{fmt::Display, future::ready, time::Duration};
 
 use futures::{StreamExt, future::BoxFuture};
 use tokio::sync::watch;
 
-#[cfg(feature = "versioning")]
-use crate::_server::Capabilities;
+#[cfg(feature = "lifecycle")]
+use crate::_lifecycle::{Options as LifecycleOptions, Runner, Seed, SystemClock};
 use crate::{
     _core::{
         cleanup::{ActionStream, Cleanup, CleanupOptions, RepairAction, RepairKind},
@@ -22,6 +24,7 @@ use crate::{
         FsCleanup, FsStorage, Scanner, ScannerOptions,
         sweep::{self, Sweeper},
     },
+    _server::Capabilities,
     config,
     resolve::Resolution,
 };
@@ -31,11 +34,61 @@ use crate::{
     _util::pacing::sleep_checked,
 };
 
+/// What a run's lifecycle pass is built from (LC13, LC22): the `[lifecycle]` pacing and the seed
+/// its first cycle applies.
+#[cfg(feature = "lifecycle")]
+pub(super) type LifecyclePass = (LifecycleOptions, Vec<Seed>);
+/// A build without the `lifecycle` feature: the shared signature carries no work.
+#[cfg(not(feature = "lifecycle"))]
+pub(super) type LifecyclePass = ();
+
+/// Whether this run builds the lifecycle pass: the feature, the capability and
+/// the access mode, read once so the pass and the sweeper cannot disagree.
+fn builds_lifecycle_pass(caps: &Capabilities, access: AccessMode) -> bool {
+    cfg!(feature = "lifecycle") && caps.lifecycle && !access.is_read_only()
+}
+
+/// The lifecycle pass a run builds, or `None` when it builds none — **the one gate** (LC11,
+/// LC23). `[s3] lifecycle = false` turns off the pass and its seed together, so a disabled
+/// capability does not seed a stored configuration it will never enforce, and a read-only run
+/// writes nothing, so it builds no pass over the state dir it promises to leave alone (LC18).
+pub(super) fn lifecycle_pass(
+    resolution: &Resolution,
+    caps: &Capabilities,
+    access: AccessMode,
+) -> Option<LifecyclePass> {
+    #[cfg(feature = "lifecycle")]
+    {
+        builds_lifecycle_pass(caps, access).then(|| config::lifecycle::options(resolution))
+    }
+    #[cfg(not(feature = "lifecycle"))]
+    {
+        let _ = (resolution, caps, access);
+        None
+    }
+}
+
+/// One lifecycle pass as a future: the file's seed once, then the pass's own loop (LC13). The
+/// seed precedes the first pass, so a rule the file declares is enforced from the first cycle.
+#[cfg(feature = "lifecycle")]
+async fn seeded<S: Storage + Clone>(
+    storage: S,
+    (options, seeds): LifecyclePass,
+    stop: watch::Receiver<bool>,
+) {
+    let runner = Runner::new(Arc::new(storage), options, Arc::new(SystemClock), stop);
+    runner.seed(&seeds).await;
+    runner.run().await;
+}
+
 /// The pg `Cleanup` handle both the startup repair and the background pass run — **one construction
 /// so the two judge residue by the same configured clock**: `[s3] noncurrent_keep`/
-/// `noncurrent_expire_days` reach `with_retention` and `[s3] block_grace_minutes` reaches
-/// `with_grace`. The write capability is the store's own (`PgCleanup` reads `PgStore::access`), so
-/// a read-only store removes nothing even if a pass is built over it.
+/// `noncurrent_expire_days` reach `with_retention`, `[s3] block_grace_minutes` reaches `with_grace`
+/// and a written `[s3] multipart_expire_days` reaches `with_multipart_ttl` (the
+/// abandoned-upload stage [`pg_pass`] runs, enabled only when the operator wrote the key; an
+/// absent key supplies `None`, which leaves the stage off). The write capability is the store's
+/// own (`PgCleanup` reads `PgStore::access`), so a read-only store removes nothing even if a pass
+/// is built over it.
 #[cfg(feature = "pg")]
 fn pg_cleanup(storage: &PgStorage, sweep: sweep::Options, access: AccessMode) -> PgCleanup {
     PgCleanup::new(
@@ -47,6 +100,8 @@ fn pg_cleanup(storage: &PgStorage, sweep: sweep::Options, access: AccessMode) ->
     )
     .with_retention(sweep.noncurrent_keep, sweep.noncurrent_expire_days)
     .with_grace(sweep.block_grace)
+    .with_multipart_ttl(sweep.multipart_ttl)
+    .with_lifecycle_pass(sweep.lifecycle_pass)
 }
 
 /// How long after readiness the pg background pass runs its **first** pass — the filesystem
@@ -85,14 +140,24 @@ const PG_PASS_CHUNK: Duration = Duration::from_secs(15);
 /// exits on `stop`), sleeps in [`PG_PASS_CHUNK`] steps so a stop is honoured inside that chunk, and
 /// is awaited under [`BACKGROUND_BOUND`](super::serve::BACKGROUND_BOUND) on the shutdown path.
 ///
+/// **The abandoned-upload stage is on this loop too** ([`PgCleanup::abort_stale_uploads`]): when
+/// the operator wrote `[s3] multipart_expire_days`, an upload idle past it is aborted here,
+/// exactly as the fs sweeper aborts one on its own cadence, so that knob is not inert on a served
+/// pg instance and a bucket whose stored lifecycle rules carry an abort action is left to them
+/// (LC21). A default configuration keeps the behavior it had before this stage existed. The stage
+/// runs beside
+/// [`Cleanup::repair`] rather than inside it on purpose: a repair reclaims residue, while this is
+/// the serving sweep's, so `doctor --fix` — the other `RepairKind::Full` caller — does not abort an
+/// operator's uploads. Its failure is a warning and the next pass retries, like a repair stage's.
+///
 /// **A read-only instance builds no pass**, exactly as the fs passes do not: the mode's promise is
 /// to write nothing, and this pass's whole purpose is to remove rows. The gate is the run's access
 /// mode, read before the first sleep so the task completes at once rather than after a delay (the
 /// leg that pins it reads that: a read-only pass under a long delay returns immediately).
 ///
 /// **`delay` and `cycle` are parameters rather than the constants directly** so a test can inject a
-/// tick and watch a planted orphan, an expired version and a dead block go within it; the serving
-/// path names [`PG_PASS_DELAY`] and [`PG_PASS_CYCLE`].
+/// tick and watch a planted orphan, an expired version, a dead block and an abandoned upload go
+/// within it; the serving path names [`PG_PASS_DELAY`] and [`PG_PASS_CYCLE`].
 #[cfg(feature = "pg")]
 pub(super) async fn pg_pass(
     storage: PgStorage,
@@ -112,17 +177,27 @@ pub(super) async fn pg_pass(
         if *stop.borrow() {
             return;
         }
-        let _ = drain_actions(
-            cleanup.repair(RepairKind::Full).await,
-            PG_PASS_WARNINGS,
-            |action| {
-                tracing::info!(
-                    description = %action.description,
-                    "the pg background pass reclaimed residue"
-                );
-            },
-        )
-        .await;
+        match cleanup.pass().await {
+            Ok((actions, aborted)) => {
+                drain_actions(Ok(actions), PG_PASS_WARNINGS, |action| {
+                    tracing::info!(
+                        description = %action.description,
+                        "the pg background pass reclaimed residue"
+                    );
+                })
+                .await;
+                if aborted > 0 {
+                    tracing::info!(
+                        aborted,
+                        "the pg background pass aborted abandoned multipart uploads"
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(
+                error = %err,
+                "the pg background pass could not run; the next pass retries"
+            ),
+        }
         wait = cycle;
     }
 }
@@ -296,14 +371,21 @@ pub(super) trait ServingBackend: Storage + Clone + Send + Sync + 'static {
 
     /// The background passes on the serving half's shutdown channel. Default: none (returns at
     /// once) — a backend whose residue is not a filesystem directory serves no scanner or sweeper.
+    ///
+    /// **The lifecycle pass is part of this future, never a task of its own** (LC11): each arm
+    /// joins it with its own work, so a stop ends it on the same channel and the shutdown path's
+    /// bound covers it. The parameter is the run's pass ([`lifecycle_pass`]) or `None` when the
+    /// run builds none (LC23, and every read-only run); a build without the `lifecycle` feature
+    /// has neither the parameter nor the pass (LC15).
     fn background(
         &self,
         stop: watch::Receiver<bool>,
         access: AccessMode,
         sweep: sweep::Options,
         scanner: ScannerOptions,
+        lifecycle: Option<LifecyclePass>,
     ) -> BoxFuture<'static, ()> {
-        let _ = (stop, access, sweep, scanner);
+        let _ = (stop, access, sweep, scanner, lifecycle);
         Box::pin(ready(()))
     }
 }
@@ -335,6 +417,7 @@ impl ServingBackend for FsStorage {
         access: AccessMode,
         sweep: sweep::Options,
         scanner: ScannerOptions,
+        lifecycle: Option<LifecyclePass>,
     ) -> BoxFuture<'static, ()> {
         Box::pin(scanner_and_sweeper(
             self.clone(),
@@ -342,6 +425,7 @@ impl ServingBackend for FsStorage {
             access,
             sweep,
             scanner,
+            lifecycle,
         ))
     }
 }
@@ -379,15 +463,28 @@ impl ServingBackend for PgStorage {
         access: AccessMode,
         sweep: sweep::Options,
         _scanner: ScannerOptions,
+        lifecycle: Option<LifecyclePass>,
     ) -> BoxFuture<'static, ()> {
-        Box::pin(pg_pass(
-            self.clone(),
-            stop,
-            access,
-            sweep,
-            PG_PASS_DELAY,
-            PG_PASS_CYCLE,
-        ))
+        let storage = self.clone();
+        Box::pin(async move {
+            let residue = pg_pass(
+                storage.clone(),
+                stop.clone(),
+                access,
+                sweep,
+                PG_PASS_DELAY,
+                PG_PASS_CYCLE,
+            );
+            #[cfg(feature = "lifecycle")]
+            if let Some(pass) = lifecycle {
+                let pass = seeded(storage, pass, stop);
+                let (_, _) = tokio::join!(residue, pass);
+                return;
+            }
+            #[cfg(not(feature = "lifecycle"))]
+            let _ = lifecycle;
+            residue.await
+        })
     }
 }
 
@@ -410,15 +507,16 @@ pub(super) fn fs_cleanup(storage: &FsStorage, resolution: &Resolution) -> FsClea
     .with_multipart_grace(multipart_grace_for(resolution))
 }
 
-/// The two background passes, on the serving half's one shutdown channel.
+/// The backend's background passes, on the serving half's one shutdown channel — the scanner and
+/// the sweeper, and the lifecycle pass when this run builds one (LC11).
 ///
-/// Both loops exit when `stop` flips, and this future completes only when **both** have — which
-/// is what makes awaiting it the guarantee the shutdown sequence needs: no pass is mid-flight
-/// when the pipelines are shut down, so a pass cannot keep enqueueing after them and hit
-/// `Err(ShutDown)` on enqueue (a spurious "scanner pass failed" warning at stop).
+/// Every loop exits when `stop` flips, and this future completes only when **all** of them have —
+/// which is what makes awaiting it the guarantee the shutdown sequence needs: no pass is
+/// mid-flight when the pipelines are shut down, so a pass cannot keep enqueueing after them and
+/// hit `Err(ShutDown)` on enqueue (a spurious "scanner pass failed" warning at stop).
 ///
 /// **That guarantee belongs to the awaits that run to completion, and the serving half bounds
-/// its own** (`BACKGROUND_BOUND`): both loops re-check the channel only *between* chunks — the
+/// its own** (`BACKGROUND_BOUND`): each loop re-checks the channel only *between* chunks — the
 /// scanner's pacing sleeps in `max_wait` steps (`tinio_util::pacing::sleep_checked`) — so a
 /// chunk up to 15 s long is what the bound is there to interrupt, and it does so on an ordinary
 /// graceful stop. A pass abandoned that way which then enqueues into a shut-down pipeline hits
@@ -426,7 +524,9 @@ pub(super) fn fs_cleanup(storage: &FsStorage, resolution: &Resolution) -> FsClea
 /// drops it. Nothing is lost: the work a pass does is idempotent and resumes on the next start.
 ///
 /// **A read-only run builds neither pass.** The early return below skips both, before any
-/// `Scanner` is constructed. The scanner's purpose is to pre-warm ETags by *writing* rows, and a
+/// `Scanner` is constructed — and the lifecycle pass with them, because its own gate answers
+/// `None` for a read-only run ([`lifecycle_pass`]), so the seed cannot write either. The
+/// scanner's purpose is to pre-warm ETags by *writing* rows, and a
 /// read-only run reads the rows instead (the read paths recompute what they cannot hit without
 /// writing it back, FR-023 amended); the sweeper's pass removes `<state-dir>/tmp` and
 /// `multipart/` residue and writes the retention/compaction rows, and in this mode the state dir
@@ -442,7 +542,10 @@ async fn scanner_and_sweeper(
     access: AccessMode,
     sweep_options: sweep::Options,
     scanner_options: ScannerOptions,
+    lifecycle: Option<LifecyclePass>,
 ) {
+    #[cfg(not(feature = "lifecycle"))]
+    let _ = lifecycle;
     if access.is_read_only() {
         // Read-only mode builds neither pass (see the doc above): the scanner
         // would only repeat what listings recompute on demand, and the
@@ -450,7 +553,16 @@ async fn scanner_and_sweeper(
         return;
     }
     let scanner = Scanner::new(storage.clone(), scanner_options);
-    let sweeper = Sweeper::new(storage, sweep_options);
+    let sweeper = Sweeper::new(storage.clone(), sweep_options);
+    #[cfg(feature = "lifecycle")]
+    if let Some(pass) = lifecycle {
+        let (_, _, _) = tokio::join!(
+            scanner.run(stop.clone()),
+            sweeper.run(stop.clone()),
+            seeded(storage, pass, stop),
+        );
+        return;
+    }
     let (_, _) = tokio::join!(scanner.run(stop.clone()), sweeper.run(stop));
 }
 
@@ -494,17 +606,32 @@ pub(super) fn scanner_options_for(resolution: &Resolution, access: AccessMode) -
 /// 1 is the parser's) — and `block_bytes_warn` (bytes; 0 = off), the block store's size warning
 /// threshold. Without an `[s3]` section every default applies, which is what an absent section
 /// means everywhere else.
+///
+/// **`lifecycle_pass` is the same answer [`lifecycle_pass`] gates the pass on** — `[s3] lifecycle`
+/// as this build honours it — so the sweeper's owner-per-action decision cannot disagree with the
+/// pass it stands down for (LC21, LC23). A build without the `lifecycle` feature builds no pass
+/// whatever the key says, so no bucket is governed there either.
 pub(super) fn sweep_options_for(resolution: &Resolution) -> sweep::Options {
+    let pass = builds_lifecycle_pass(
+        &super::serve::capabilities_for(resolution),
+        AccessMode::from(resolution.read_only),
+    );
     match resolution.config.s3.as_ref() {
         Some(s3) => sweep::Options {
             temp_ttl: Duration::from_secs(s3.temp_ttl_hours.saturating_mul(3600)),
-            multipart_ttl: Duration::from_secs(s3.multipart_expire_days.saturating_mul(24 * 3600)),
+            multipart_ttl: s3
+                .multipart_expire_days
+                .map(|days| Duration::from_secs(days.saturating_mul(24 * 3600))),
             noncurrent_keep: s3.noncurrent_keep,
             noncurrent_expire_days: s3.noncurrent_expire_days,
             block_grace: Duration::from_secs(s3.block_grace_minutes.saturating_mul(60)),
             block_bytes_warn: s3.block_bytes_warn,
+            lifecycle_pass: pass,
         },
-        None => sweep::Options::default(),
+        None => sweep::Options {
+            lifecycle_pass: pass,
+            ..sweep::Options::default()
+        },
     }
 }
 
@@ -514,5 +641,5 @@ pub(super) fn sweep_options_for(resolution: &Resolution) -> sweep::Options {
 /// Without an `[s3]` section the sweeper's default (7 days) applies, which is exactly what
 /// [`FsCleanup::new`] would have used on its own.
 pub(super) fn multipart_grace_for(resolution: &Resolution) -> Duration {
-    sweep_options_for(resolution).multipart_ttl
+    sweep_options_for(resolution).multipart_ttl()
 }

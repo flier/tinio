@@ -15,12 +15,13 @@ use redb::WriteTransaction;
 
 use crate::{
     _core::{
-        acl, bucket, cors,
+        acl, bucket, cors, lifecycle,
         meta::{BucketMeta, bucket as row},
         object, storage,
     },
     Error, RedbMetadata,
     bucket::{BucketRow, Table as BucketTable},
+    bucket_lifecycle::Table as LifecycleTable,
     object_meta::Table as MetaTable,
     upload::Table as UploadTable,
 };
@@ -55,11 +56,40 @@ async fn recorded(
     Ok(store.created_at(bucket).await?.is_some())
 }
 
+/// Read the lifecycle row, upsert `rules`, validate, and write, in the
+/// caller's transaction. `create_at` records a first-sight bucket row when
+/// the store has none (the lazy policy); without it a missing bucket is
+/// [`lifecycle::Merged::Absent`] and nothing is written. A refusal writes
+/// neither row.
+fn merge_row(
+    txn: &mut WriteTransaction,
+    row: &str,
+    rules: &[lifecycle::Rule],
+    create_at: Option<SystemTime>,
+) -> Result<lifecycle::Merged, Error> {
+    let present = BucketTable::open(txn)?.exists(row)?;
+    if !present && create_at.is_none() {
+        return Ok(lifecycle::Merged::Absent);
+    }
+    let current = LifecycleTable::open(txn)?.get(row)?.unwrap_or(lifecycle::Config {
+        rules: Vec::new(),
+    });
+    let config = match current.apply_rules(rules) {
+        Ok(config) => config,
+        Err(invalid) => return Ok(lifecycle::Merged::Refused(invalid)),
+    };
+    if let Some(now) = create_at.filter(|_| !present) {
+        BucketTable::open(txn)?.put_full(row, &BucketRow::at(now))?;
+    }
+    LifecycleTable::open(txn)?.set(row, &config)?;
+    Ok(lifecycle::Merged::Stored)
+}
+
 /// The existence-conditioned setter's write half: the table op reports
 /// whether it changed the row, `write_if` drops the transaction without a
 /// commit when it did not (the no-fsync arm), and [`recorded`] breaks the
 /// tie between "the row is there and already said this" and "there is no
-/// row". One home for the three steps the four setters share; only the
+/// row". One home for the three steps the six setters share; only the
 /// table call differs.
 async fn set_if<F>(store: &RedbMetadata, bucket: &bucket::Name, op: F) -> Result<bool, Error>
 where
@@ -146,11 +176,19 @@ impl BucketMeta for RedbMetadata {
         let stored = stored_row(row);
         self.driver
             .write(move |txn| {
-                let mut table = BucketTable::open(txn)?;
-                if table.exists(&key)? {
-                    return Err(Error::Refused(storage::already_exists(&name)));
+                {
+                    let mut table = BucketTable::open(txn)?;
+                    if table.exists(&key)? {
+                        return Err(Error::Refused(storage::already_exists(&name)));
+                    }
+                    table.put_full(&key, &stored)?;
                 }
-                table.put_full(&key, &stored)
+                // LC19: the configuration row is cleared in the same write as
+                // the bucket row. A table of its own does not inherit the
+                // bucket row's upsert, so a row left behind by a bucket that
+                // vanished out of band would otherwise expire the new bucket's
+                // objects.
+                LifecycleTable::open(txn)?.drain_bucket(&key)
             })
             .await
     }
@@ -170,7 +208,13 @@ impl BucketMeta for RedbMetadata {
         let bucket = bucket.to_string();
         let stored = stored_row(row);
         self.driver
-            .write(move |txn| BucketTable::open(txn)?.put_full(&bucket, &stored))
+            .write(move |txn| {
+                BucketTable::open(txn)?.put_full(&bucket, &stored)?;
+                // LC19, the `create` drain's twin: this is the lazy policy's
+                // re-create (a store whose buckets outlive their rows adopts
+                // an existing record the same way).
+                LifecycleTable::open(txn)?.drain_bucket(&bucket)
+            })
             .await
     }
 
@@ -312,10 +356,130 @@ impl BucketMeta for RedbMetadata {
         .await
     }
 
+    async fn lifecycle(&self, bucket: &bucket::Name) -> Result<Option<lifecycle::Config>, Error> {
+        let bucket = bucket.to_string();
+        self.driver
+            .read(move |txn| LifecycleTable::open_readonly(txn)?.get(&bucket))
+    }
+
+    async fn lifecycles(&self) -> Result<Vec<(bucket::Name, lifecycle::Config)>, Error> {
+        // A whole-table walk: the decode and the allocation run on the
+        // blocking pool (the driver's own rule for traversals).
+        self.driver
+            .read_blocking(|txn| {
+                let table = LifecycleTable::open_readonly(txn)?;
+                let mut out = Vec::new();
+                table.for_each(|bucket, config| {
+                    match bucket::name(bucket.to_owned()) {
+                        Ok(name) => out.push((name, config)),
+                        Err(err) => tracing::warn!(
+                            %err,
+                            bucket,
+                            "discarding a lifecycle row under an invalid bucket name"
+                        ),
+                    }
+                    Ok(())
+                })?;
+                Ok(out)
+            })
+            .await
+    }
+
+    async fn set_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+    ) -> Result<bool, Error> {
+        let row = bucket.to_string();
+        let config = config.clone();
+        // The bucket row is the presence decision, taken inside the writing
+        // transaction: a missing bucket writes nothing and answers `false`.
+        set_if(self, bucket, move |txn| {
+            let present = BucketTable::open(txn)?.exists(&row)?;
+            if !present {
+                return Ok(None);
+            }
+            LifecycleTable::open(txn)?.set(&row, &config)?;
+            Ok(Some(()))
+        })
+        .await
+    }
+
+    async fn merge_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+        rules: &[lifecycle::Rule],
+    ) -> Result<lifecycle::Merged, Error> {
+        let row = bucket.to_string();
+        let rules = rules.to_vec();
+        // One transaction: the row this reads is the row the upsert writes,
+        // so a configuration stored between the two cannot be overwritten by
+        // the snapshot (LC13).
+        self.driver
+            .write(move |txn| merge_row(txn, &row, &rules, None))
+            .await
+    }
+
+    async fn merge_lifecycle_or_create(
+        &self,
+        bucket: &bucket::Name,
+        rules: &[lifecycle::Rule],
+        now: SystemTime,
+    ) -> Result<lifecycle::Merged, Error> {
+        let row = bucket.to_string();
+        let rules = rules.to_vec();
+        self.driver
+            .write(move |txn| merge_row(txn, &row, &rules, Some(now)))
+            .await
+    }
+
+    async fn set_lifecycle_or_create(
+        &self,
+        bucket: &bucket::Name,
+        config: &lifecycle::Config,
+        now: SystemTime,
+    ) -> Result<(), Error> {
+        let row = bucket.to_string();
+        let config = config.clone();
+        // One transaction: a first-sight bucket row is recorded WITH the
+        // configuration, so no reader sees a bare row, and an existing row's
+        // elements ride untouched.
+        self.driver
+            .write_if(move |txn| -> Result<Option<()>, Error> {
+                {
+                    let mut table = BucketTable::open(txn)?;
+                    if !table.exists(&row)? {
+                        table.put_full(&row, &BucketRow::at(now))?;
+                    }
+                }
+                LifecycleTable::open(txn)?.set(&row, &config)?;
+                Ok(Some(()))
+            })
+            .await
+            .map(|_| ())
+    }
+
+    async fn clear_lifecycle(&self, bucket: &bucket::Name) -> Result<bool, Error> {
+        let row = bucket.to_string();
+        set_if(self, bucket, move |txn| {
+            let present = BucketTable::open(txn)?.exists(&row)?;
+            if !present {
+                return Ok(None);
+            }
+            LifecycleTable::open(txn)?.drain_bucket(&row)?;
+            Ok(Some(()))
+        })
+        .await
+    }
+
     async fn remove(&self, bucket: &bucket::Name) -> Result<(), Error> {
         let bucket = bucket.to_string();
         self.driver
-            .write(move |txn| BucketTable::open(txn)?.remove(&bucket))
+            .write(move |txn| {
+                BucketTable::open(txn)?.remove(&bucket)?;
+                // LC19: the rule dies with the bucket, in the same write.
+                LifecycleTable::open(txn)?.drain_bucket(&bucket)
+            })
             .await
     }
 
@@ -337,7 +501,9 @@ impl BucketMeta for RedbMetadata {
                 if objects || uploads {
                     return Err(Error::Refused(storage::not_empty(&name)));
                 }
-                BucketTable::open(txn)?.remove(&key)
+                BucketTable::open(txn)?.remove(&key)?;
+                // LC19: the rule dies with the bucket, in the same write.
+                LifecycleTable::open(txn)?.drain_bucket(&key)
             })
             .await
     }
@@ -347,17 +513,19 @@ impl BucketMeta for RedbMetadata {
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use tinio_util::testing::metadata::assert_bucket_meta_conformance;
+    use tinio_util::testing::metadata::{assert_bucket_meta_conformance, lifecycle_config};
 
     use crate::{
         _core::{
             acl::{Acl, AclGrants, OwnerId},
             bucket, cors,
             etag::ETag,
+            lifecycle,
             meta::{BucketMeta, bucket as row},
             object, storage,
         },
         Error, RedbMetadata,
+        bucket_lifecycle::Table as LifecycleTable,
         object_meta::{self, Stored},
     };
 
@@ -392,6 +560,18 @@ mod tests {
             .collect()
     }
 
+    /// Plant a lifecycle row through the raw table handle — the state a bucket
+    /// that vanished out of band leaves behind, which no contract call can
+    /// write (the setter refuses a bucket with no row).
+    async fn plant(store: &RedbMetadata, bucket: &str, config: lifecycle::Config) {
+        let bucket = bucket.to_owned();
+        store
+            .driver()
+            .write(move |txn| LifecycleTable::open(txn)?.set(&bucket, &config))
+            .await
+            .unwrap();
+    }
+
     /// One valid object row to plant for the occupancy probe.
     fn held_row() -> Stored {
         Stored {
@@ -414,6 +594,79 @@ mod tests {
     async fn bucket_meta_conforms() {
         let store = RedbMetadata::in_memory().unwrap();
         assert_bucket_meta_conformance(&store).await;
+    }
+
+    /// The lifecycle setters answer bucket presence, never change: an
+    /// identical re-write and a clear on a bucket that stores none both
+    /// answer `true`, and only a missing bucket answers `false`.
+    #[tokio::test]
+    async fn the_lifecycle_setters_answer_bucket_presence() {
+        let store = RedbMetadata::in_memory().unwrap();
+        let name = bucket::name("lifecycle").unwrap();
+        let config = lifecycle_config("expire-logs");
+
+        // No bucket row: nothing is written and both setters answer `false`.
+        assert!(!store.set_lifecycle(&name, &config).await.unwrap());
+        assert!(store.lifecycle(&name).await.unwrap().is_none());
+        assert!(!store.clear_lifecycle(&name).await.unwrap());
+        assert!(store.lifecycles().await.unwrap().is_empty());
+
+        store.create(&name, &row::Row::at(t(1))).await.unwrap();
+        assert!(store.set_lifecycle(&name, &config).await.unwrap());
+        assert_eq!(store.lifecycle(&name).await.unwrap(), Some(config.clone()));
+        assert!(
+            store.set_lifecycle(&name, &config).await.unwrap(),
+            "an identical configuration is still presence"
+        );
+        assert_eq!(
+            store.lifecycles().await.unwrap(),
+            vec![(name.clone(), config)]
+        );
+        assert!(store.clear_lifecycle(&name).await.unwrap());
+        assert!(store.lifecycle(&name).await.unwrap().is_none());
+        assert!(
+            store.clear_lifecycle(&name).await.unwrap(),
+            "a bucket that stores no configuration is still present"
+        );
+        assert!(store.lifecycles().await.unwrap().is_empty());
+    }
+
+    /// LC19's other half, which the shared suite cannot reach: once `remove`
+    /// drains the row no contract call leaves a stale one behind, so the plant
+    /// is raw. Both creation paths clear it in the write that lands the bucket
+    /// row, and `remove_if_empty` drains it exactly as `remove` does.
+    #[tokio::test]
+    async fn the_creation_paths_clear_a_stale_lifecycle_row() {
+        let store = RedbMetadata::in_memory().unwrap();
+        let name = bucket::name("stale-lifecycle").unwrap();
+        let key = name.to_string();
+
+        plant(&store, &key, lifecycle_config("expire-logs")).await;
+        store.create(&name, &row::Row::at(t(1))).await.unwrap();
+        assert!(
+            store.lifecycle(&name).await.unwrap().is_none(),
+            "create clears the stale row in the write that lands the bucket row"
+        );
+
+        plant(&store, &key, lifecycle_config("expire-logs")).await;
+        store.record_full(&name, &row::Row::at(t(2))).await.unwrap();
+        assert!(
+            store.lifecycle(&name).await.unwrap().is_none(),
+            "record_full (the lazy policy's re-create) clears it too"
+        );
+
+        assert!(
+            store
+                .set_lifecycle(&name, &lifecycle_config("expire-logs"))
+                .await
+                .unwrap()
+        );
+        store.remove_if_empty(&name).await.unwrap();
+        assert!(
+            store.lifecycle(&name).await.unwrap().is_none(),
+            "remove_if_empty takes the rule with the bucket"
+        );
+        assert!(store.row(&name).await.unwrap().is_none());
     }
 
     /// The refusals D22 pins that the bucket leg alone cannot reach:

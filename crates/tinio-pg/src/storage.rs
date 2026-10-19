@@ -27,7 +27,7 @@ use tinio_core::{
     bucket::{self, Bucket},
     checksum,
     content::ContentKey,
-    cors,
+    cors, lifecycle,
     meta::{BucketMeta, UploadMeta, VersionMeta, bucket::Row as MetaBucket},
     multipart::{self, CompletedPart, ObjectPart, PartNumber},
     object,
@@ -353,6 +353,15 @@ impl Storage for PgStorage {
 }
 
 #[async_trait]
+impl storage::LifecycleRules for PgStorage {
+    async fn lifecycles(&self) -> Result<Vec<(bucket::Name, lifecycle::Config)>, storage::Error> {
+        BucketMeta::lifecycles(self.store())
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[async_trait]
 impl BucketOps for PgStorage {
     async fn create_bucket(
         &self,
@@ -453,6 +462,48 @@ impl BucketOps for PgStorage {
         self.writable(Subject::Bucket(name))?;
         self.buckets()
             .delete_bucket_cors(name)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn get_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<Option<lifecycle::Config>, Error> {
+        self.buckets()
+            .get_bucket_lifecycle(name)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn put_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+        config: &lifecycle::Config,
+    ) -> Result<(), Error> {
+        self.writable(Subject::Bucket(name))?;
+        self.buckets()
+            .put_bucket_lifecycle(name, config)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn merge_bucket_lifecycle(
+        &self,
+        name: &bucket::Name,
+        rules: &[lifecycle::Rule],
+    ) -> Result<lifecycle::Merged, Error> {
+        self.writable(Subject::Bucket(name))?;
+        self.buckets()
+            .merge_bucket_lifecycle(name, rules)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn delete_bucket_lifecycle(&self, name: &bucket::Name) -> Result<(), Error> {
+        self.writable(Subject::Bucket(name))?;
+        self.buckets()
+            .delete_bucket_lifecycle(name)
             .await
             .map_err(Error::from)
     }

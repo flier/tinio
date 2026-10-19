@@ -1,6 +1,6 @@
 //! The cleanup scans over pg's own tables (PG7).
 //!
-//! The six statements under `sql/cleanup/` live in this crate because they read **this crate's**
+//! The eight statements under `sql/cleanup/` live in this crate because they read **this crate's**
 //! tables — `content`, `content_heads`, `uploads`, `version_rows`, `current_slots` — which is
 //! the same reason [`PgStore::live_len`](crate::PgStore::live_len) lives here: a statement's home
 //! is the crate that owns the schema it reads. `tinio-pg`'s `Cleanup` keeps the **policy** —
@@ -10,7 +10,9 @@
 //! None of these is a contract operation: the four persistence contracts carry no cleanup
 //! surface, so the scans are the store's own, exactly as `live_len` is. The three content/version
 //! scans are reads; the two reclamations are removals, and the caller's `dry_run` decides between
-//! them.
+//! them. The abandoned-upload pair is the **sweeper's**, not the repair's: a page of `uploads`
+//! rows named by [`PgStore::abort_stale_uploads`] and one drain per bucket, with no `dry_run` to
+//! reach it — a serving pass either may remove rows (a writable store) or does not run at all.
 //!
 //! # The bound, and what a pass costs
 //!
@@ -40,7 +42,12 @@
 //! - the **live-reference** scan is a plain `Index Scan using version_rows_pkey` over the version
 //!   primary key's own order: 1 024 rows in 0.32 ms and 171 buffers, no sort at all;
 //! - the **part-head** scan keeps `content_heads_pkey`'s index-only scan under its regex-derived
-//!   index condition and stops after 1 024 rows in 0.76 ms and 33 buffers;
+//!   index condition and stops after 1 024 rows in 0.76 ms and 33 buffers. The cursor there is
+//!   spelled as scalar comparisons rather than a row comparison for exactly that: the regex above
+//!   already gives the plan an index condition on `(kind, ckey)`, and the scalar form keeps the
+//!   index-only scan taking the cursor as a filter — 33 buffers and 0.5 ms for a page measured on
+//!   its own — where the row comparison made the planner sort a sequential scan instead. The
+//!   **live-reference** scan spells its cursor the same way over `version_rows_pkey`;
 //! - the **orphan-chunk** scan is the one whose plan the keyset does not improve: the age
 //!   predicate is non-selective in a steady-state store (every row older than the grace matches)
 //!   and PostgreSQL estimates the `NOT EXISTS` anti-join pessimistically, so the planner keeps
@@ -60,13 +67,20 @@
 //! statements, not a second unbounded scan: a caller that must not hold the whole answer (the
 //! policy's fix pass, whose removals are per page) streams the pages instead.
 
-use std::{pin::Pin, time::Duration};
+use std::{
+    pin::Pin,
+    time::{Duration, SystemTime},
+};
 
 use futures::{Stream, StreamExt, stream};
 use sqlx::{PgPool, query_file, query_file_as};
 use tinio_core::{blob::BlobRef, bucket, meta::version::decode_blob};
 
-use crate::{Error, PgStore, content::ContentKind};
+use crate::{
+    Error, PgStore,
+    content::ContentKind,
+    timestamp::{to_millis, to_timestamp},
+};
 
 /// How many rows one page of a cleanup scan reads, and how many rows one batched removal takes.
 ///
@@ -112,6 +126,14 @@ pub struct OrphanChunk {
     pub ckey: String,
     /// The generation's sequence.
     pub seq: i64,
+}
+
+/// One abandoned upload the scan names: the bucket it is stored under and its identifier, the
+/// two elements the drain binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleUpload {
+    bucket: String,
+    upload_id: String,
 }
 
 /// One staged part whose `uploads` row is gone.
@@ -368,6 +390,10 @@ impl PgStore {
     /// The stream is lazy: it reads a page per poll and ends when a page comes back short. An
     /// `Err` item ends it after the error.
     ///
+    /// The row's own `published` stamp is what keeps a publish in flight out of the sweep, so the
+    /// window is never weakened to a bare age: at a zero grace a just-stamped row would read as an
+    /// orphan.
+    ///
     /// # Examples
     ///
     /// ```ignore
@@ -433,13 +459,15 @@ impl PgStore {
     ///
     /// The delete names the scan's keys and then applies the scan's predicate
     /// again, with the same `grace`. A generation that became live after the
-    /// scan, or whose rows were rewritten inside the grace window, stays: an
-    /// in-place publish does not change the sequence, and a head deleted and
-    /// allocated again can reuse one, so the scan's key alone is not proof the
-    /// rows are still residue. The two predicates of the scan's grace window
-    /// are repeated here — the row's own `published` stamp and the head's
-    /// `allocated_at` — so the delete is safe on its own, whatever the store
-    /// served between the two phases.
+    /// scan, or whose rows were rewritten inside the grace window, stays: a
+    /// generation the flip made live must not lose its bytes — the head row and
+    /// the ETag stay, so deleting its chunks would leave a served object whose
+    /// content is gone. An in-place publish does not change the sequence, and a
+    /// head deleted and allocated again can reuse one, so the scan's key alone
+    /// is not proof the rows are still residue. The two predicates of the scan's
+    /// grace window are repeated here — the row's own `published` stamp and the
+    /// head's `allocated_at` — so the delete is safe on its own, whatever the
+    /// store served between the two phases.
     pub async fn reclaim_orphan_chunks(
         &self,
         rows: &[OrphanChunk],
@@ -519,6 +547,77 @@ impl PgStore {
             .execute(self.pool())
             .await?;
         Ok(done.rows_affected())
+    }
+
+    /// Abort the uploads idle before `cutoff` and answer how many went — the abandoned-upload
+    /// pass, whose policy is `tinio-pg`'s `[s3] multipart_expire_days`.
+    ///
+    /// **Idle is the latest activity of the upload**, `max(initiated_at, latest part write)`: a
+    /// `parts.modified_at` newer than the row's own `initiated_at` is a client still uploading,
+    /// and it spares the upload however old the initiation is. That is the rule
+    /// `tinio-fs`'s sweeper applies (`sweep::Sweeper::sweep_multipart` reads
+    /// `MultipartStore::idle_since` beside the row's `initiated_at`), restated in the page's own
+    /// predicate, so one timeout cannot cut an upload off on pg that it spares on the filesystem.
+    /// A part row an older writer left with the `0` sentinel reads as the unix epoch, which
+    /// `max` loses to every `initiated_at` — the same "no activity recorded yet" answer as an
+    /// upload with no parts at all.
+    ///
+    /// A bucket in `governed` is never read: its stored lifecycle configuration carries
+    /// `AbortIncompleteMultipartUpload`, so its own rule decides when an upload of it is abandoned
+    /// and this timeout does not apply (LC21).
+    ///
+    /// One page of rows is read, then each bucket the page names drains its own identifiers in
+    /// **one statement** — the four deletes [`UploadMeta::drain_upload`] runs, keyed by the page's
+    /// array instead — so one bucket's abort is one transaction and a page that fails part way
+    /// leaves no upload whose parts are gone. The rows a page drains no longer match the page's
+    /// predicate, so the loop needs no cursor: the next page is new rows, and an empty page ends
+    /// it.
+    ///
+    /// No upload row is locked first, unlike [`UploadMeta::drain_upload_checked`]: the age
+    /// predicate is read from the page, and the identifiers that page names are what the drain
+    /// binds, so a `put_part` that commits after the page was read loses its upload to the drain
+    /// and leaves its part rows as the orphan-part scan's residue
+    /// ([`Self::reclaim_orphan_parts`]). That is the window the filesystem sweeper has too — it
+    /// reads the latest part write, then aborts — and locking the row would close it for neither.
+    ///
+    /// [`UploadMeta::drain_upload`]: tinio_core::meta::UploadMeta::drain_upload
+    /// [`UploadMeta::drain_upload_checked`]: tinio_core::meta::UploadMeta::drain_upload_checked
+    pub async fn abort_stale_uploads(
+        &self,
+        cutoff: SystemTime,
+        governed: &[String],
+    ) -> Result<u64, Error> {
+        let mut aborted = 0;
+        loop {
+            // One page of uploads idle past the cutoff, minus the governed buckets' (`$2`; an
+            // empty array binds nothing, since `x <> ALL('{}')` is true). The statement carries
+            // the idle rule, so no caller can read an upload's age from `initiated_at` alone:
+            // the later of initiation and the latest part write must be before the cutoff.
+            let page = query_file_as!(
+                StaleUpload,
+                "sql/cleanup/stale_uploads.sql",
+                to_timestamp(cutoff),
+                to_millis(cutoff),
+                governed,
+                CLEANUP_BATCH_ROWS
+            )
+            .fetch_all(self.pool())
+            .await?;
+            if page.is_empty() {
+                return Ok(aborted);
+            }
+            // The page is ordered by bucket, so one bucket's identifiers are one contiguous run.
+            for run in page.chunk_by(|a, b| a.bucket == b.bucket) {
+                let bucket = run[0].bucket.as_str();
+                let uploads: Vec<String> = run.iter().map(|row| row.upload_id.clone()).collect();
+                // The four tables an abort drains, for the run's identifiers at once: one
+                // statement is one transaction, so no upload of the page keeps its parts.
+                let done = query_file!("sql/meta/upload/drain_upload.sql", bucket, &uploads)
+                    .execute(self.pool())
+                    .await?;
+                aborted = aborted.saturating_add(done.rows_affected());
+            }
+        }
     }
 
     /// The version rows that are history — a row whose slot points somewhere

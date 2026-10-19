@@ -15,7 +15,6 @@
 
 use std::sync::Arc;
 
-use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header};
 use s3s::{Body, S3Error, S3Request, S3Response, S3Result, dto, path, route::S3Route, s3_error};
 
@@ -55,7 +54,7 @@ impl<S: Storage> S3Backend<S> {
         req: S3Request<dto::PutBucketCorsInput>,
     ) -> S3Result<S3Response<dto::PutBucketCorsOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
-        validate_content_md5(req.input.content_md5.as_deref())?;
+        super::checksum::require_content_md5(req.input.content_md5.as_deref())?;
         let config = cors_config_from_dto(req.input.cors_configuration)?;
         self.storage
             .put_bucket_cors(&bucket, &config)
@@ -297,35 +296,6 @@ pub(crate) fn apply_cors_headers(headers: &mut HeaderMap, rule: &cors::Rule, ori
         "Access-Control-Request-Method",
     ] {
         headers.append(header::VARY, HeaderValue::from_static(v));
-    }
-}
-
-/// Content-MD5 on PutBucketCors, AWS three-state (grilling Q8): missing →
-/// 400 InvalidRequest with the verified AWS message; malformed (not
-/// 16-byte base64) → 400 InvalidDigest; digest equality vs the XML body is
-/// unverifiable here (s3s consumes the body — recorded deviation, AWS's
-/// BadDigest path unreachable).
-/// NOTE (coordination): the ACL plan's A7 ruled "missing OR malformed →
-/// InvalidDigest" for the put-ACL ops; when ACL merges, its helper is
-/// aligned to this three-state behavior (or this helper is made shared
-/// with the AWS behavior) — one-line change at that merge.
-fn validate_content_md5(md5: Option<&str>) -> S3Result<()> {
-    let md5 = md5.ok_or_else(|| {
-        s3_error!(
-            InvalidRequest,
-            "Missing required header for this request: Content-MD5"
-        )
-    })?;
-    let raw = STANDARD
-        .decode(md5)
-        .map_err(|_| s3_error!(InvalidDigest, "The Content-MD5 you specified is not valid"))?;
-    if raw.len() == 16 {
-        Ok(())
-    } else {
-        Err(s3_error!(
-            InvalidDigest,
-            "The Content-MD5 you specified is not valid"
-        ))
     }
 }
 

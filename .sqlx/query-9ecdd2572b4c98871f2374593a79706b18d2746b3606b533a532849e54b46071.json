@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT ckey, live_len AS \"live_len!\" FROM content_heads\nWHERE\n    bucket = $1\n    AND kind = 'object'::content_kind\n    AND live_seq IS NOT NULL\n    AND ckey >= $2\n    AND ckey < $3\n    AND ckey > $4\n    AND starts_with(ckey, $2)\nORDER BY ckey COLLATE \"C\"\nLIMIT $5\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ckey",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "content_heads",
+            "name": "ckey"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "live_len!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "content_heads",
+            "name": "live_len"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "9ecdd2572b4c98871f2374593a79706b18d2746b3606b533a532849e54b46071"
+}

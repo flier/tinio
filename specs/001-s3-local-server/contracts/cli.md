@@ -2,7 +2,7 @@
 
 **Branch**: `001-s3-local-server` | **Date**: 2026-08-21
 
-Systemd-style lifecycle commands (spec FR-007, design review) with Minio-compatible invocation. No data commands — bucket/object operations are performed directly on the filesystem. Binary: `tinio` (thin `main` in the facade crate → `tinio_cli::run()`).
+Systemd-style lifecycle commands (spec FR-007, design review) with Minio-compatible invocation. No data commands — bucket/object operations are performed directly on the filesystem; `tinio lifecycle` (below) is the one exception: it configures a server-side policy through the management plane and touches no bucket or object. Binary: `tinio` (thin `main` in the facade crate → `tinio_cli::run()`).
 
 ## Global
 
@@ -83,6 +83,28 @@ tinio stop [DIR] [--read-only]
 - `--read-only` resolves the mode exactly as the server does, and therefore the candidate pair this command searches (as `status` above).
 - Exit 1 with message if no running server is found.
 - Present only in builds with the `api` cargo feature (default on); builds without it do not expose this subcommand.
+
+### `tinio lifecycle`
+
+```
+tinio lifecycle ls <BUCKET>
+tinio lifecycle add <BUCKET> --id ID [--prefix P] [--expire-days N] [--noncurrent-days N] [--abort-days N]
+tinio lifecycle rm <BUCKET>
+tinio lifecycle put <BUCKET> FILE
+```
+
+Bucket lifecycle configuration (FR-042) — **FR-007's one exception** to "no data commands": the verbs configure a server-side policy through the management plane's `GET`/`PUT`/`DELETE /buckets/{bucket}/lifecycle` routes, and never create, read, write or delete a bucket or an object. No S3 client is added to the CLI, and the CLI never opens a backend store — the running server owns it, so a root with no server answers the usual no-server refusal.
+
+| Verb | Meaning |
+|---|---|
+| `ls <BUCKET>` | Print the bucket's stored configuration (the plane's JSON) |
+| `add <BUCKET> --id ID …` | Upsert one rule by `--id`: `--prefix`, `--expire-days` (`Expiration.Days`), `--noncurrent-days` (`NoncurrentVersionExpiration.NoncurrentDays`), `--abort-days` (`AbortIncompleteMultipartUpload.DaysAfterInitiation`) |
+| `rm <BUCKET>` | Delete the bucket's whole configuration |
+| `put <BUCKET> FILE` | Replace the whole configuration with the model read from `FILE` |
+
+Every verb also takes the root and the mode exactly as `status` and `stop` do — `[DIR]`, `--read-only`, and the `DirArgs` environment channels (`TINIO_STATE_DIR`, the credential pair) — so a verb asked about a root asks the server that serves it. `add` **replaces** the rule carrying that id — an action its flags do not name is dropped with it — and leaves every other rule untouched: the id is the merge key, and a field merge would silently keep an action the operator did not restate.
+
+`add`'s flags cover the Days-based actions only — a `Date`, an `ExpiredObjectDeleteMarker` or a `NewerNoncurrentVersions` is expressed by `put`, whose body is the whole stored model. The verbs speak the plane's JSON (the stored model, one spelling for both management surfaces); the S3 subresource speaks the framework's XML (`contracts/s3-surface.md` §Lifecycle). A server with `[s3] lifecycle = false` does not register the plane's routes, so every verb reports the capability as disabled (`contracts/config.md`). The verbs exist only in a build carrying the `lifecycle` cargo feature, like the plane's routes: a build without it does not expose this subcommand.
 
 ### `tinio doctor`
 

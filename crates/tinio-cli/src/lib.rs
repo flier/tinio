@@ -19,6 +19,9 @@ pub extern crate tinio_api as _api;
 pub extern crate tinio_core as _core;
 #[doc(hidden)]
 pub extern crate tinio_fs as _fs;
+#[cfg(feature = "lifecycle")]
+#[doc(hidden)]
+pub extern crate tinio_lifecycle as _lifecycle;
 #[cfg(feature = "mem")]
 #[doc(hidden)]
 pub extern crate tinio_mem as _mem;

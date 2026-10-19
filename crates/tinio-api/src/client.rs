@@ -98,13 +98,14 @@ async fn dial_pipe(name: &str) -> Result<NamedPipeClient, Error> {
     }
 }
 
-/// One management request: the path, the method and the token to present.
+/// One management request: the path, the method, the token to present and the body.
 ///
-/// The three travel together because every dialer needs all three: [`get_local`], [`get_http`],
-/// [`exchange`] and `request` each take one value rather than a positional triple, so a call
-/// site cannot transpose the target and the method, and the token cannot be left behind when a
-/// signature grows. Named `Call` rather than `Request` because this module also builds
-/// `hyper::Request`s in [`exchange`], and two `Request`s in one file is one name too many.
+/// The four travel together because every dialer needs what the request is: [`get_local`],
+/// [`get_http`], [`exchange`] and `request` each take one value rather than a positional list,
+/// so a call site cannot transpose the target and the method, and the token cannot be left
+/// behind when a signature grows. Named `Call` rather than `Request` because this module also
+/// builds `hyper::Request`s in [`exchange`], and two `Request`s in one file is one name too
+/// many.
 ///
 /// # Examples
 ///
@@ -118,9 +119,11 @@ async fn dial_pipe(name: &str) -> Result<NamedPipeClient, Error> {
 ///     target: "/metrics",
 ///     method: Method::GET,
 ///     token: None,
+///     body: None,
 /// };
 /// assert_eq!(scrape.target, "/metrics");
 /// assert!(scrape.token.is_none());
+/// assert!(scrape.body.is_none());
 /// ```
 #[derive(Debug, Clone)]
 pub struct Call<'a> {
@@ -130,6 +133,13 @@ pub struct Call<'a> {
     pub method: Method,
     /// The token to present in `X-Tinio-Token`; `None` sends no such header.
     pub token: Option<&'a str>,
+    /// The request body; `None` sends none.
+    ///
+    /// **The one body this client sends is the lifecycle model's JSON** (LC17: the plane's body
+    /// and the stored row are one shape), so the header follows the body rather than travelling
+    /// beside it — [`exchange`] sets `content-type: application/json` whenever there is one, and
+    /// a `PUT` without that header answers `415` before a byte of the model is looked at (R19).
+    pub body: Option<&'a str>,
 }
 
 /// A response as the client hands it over: status line plus body text.
@@ -217,11 +227,17 @@ fn control(state: &State) -> Result<Control, Error> {
 /// The call this module's three CLI-shaped entry points ([`probe`], [`status`], [`stop`]) make
 /// against `state`'s own channel: the target and method are the caller's, and the token is the
 /// one `state` carries, because that channel is the plane's own.
-fn call_for<'a>(state: &'a State, target: &'a str, method: Method) -> Call<'a> {
+fn call_for<'a>(
+    state: &'a State,
+    target: &'a str,
+    method: Method,
+    body: Option<&'a str>,
+) -> Call<'a> {
     Call {
         target,
         method,
         token: Some(state.token.expose_secret().as_str()),
+        body,
     }
 }
 
@@ -258,7 +274,7 @@ fn call_for<'a>(state: &'a State, target: &'a str, method: Method) -> Call<'a> {
 /// # }
 /// ```
 pub async fn probe(state: &State) -> bool {
-    request(state, call_for(state, "/status", Method::GET))
+    request(state, call_for(state, "/status", Method::GET, None))
         .await
         .is_ok()
 }
@@ -301,7 +317,7 @@ pub async fn status(state_dir: &Path) -> Result<Report, Error> {
             status: None,
         });
     };
-    match request(&state, call_for(&state, "/status", Method::GET)).await {
+    match request(&state, call_for(&state, "/status", Method::GET, None)).await {
         Ok(raw) if raw.status == 200 => {
             // The contract's body or nothing (R29). A `200` carrying something else came from a
             // server that is not this plane — a garbled answer is not a running *tinio* server
@@ -364,12 +380,57 @@ pub async fn stop(state_dir: &Path) -> Result<(), Error> {
             "no running server for this root".to_string(),
         ));
     };
-    let raw = request(&state, call_for(&state, "/stop", Method::POST)).await?;
+    let raw = request(&state, call_for(&state, "/stop", Method::POST, None)).await?;
     if raw.status == 202 {
         Ok(())
     } else {
         Err(Error::Transport(format!("/stop answered {}", raw.status)))
     }
+}
+
+/// One request to the channel `state` names, with `state`'s own token: what
+/// `contracts/cli.md` §`tinio lifecycle` needs and the three entry points above do not.
+///
+/// **The seam the lifecycle verbs speak through.** Their four requests are the plane's three
+/// `/buckets/{bucket}/lifecycle` routes with a method, a target and — for `PUT` — a body, and
+/// the channel, the token rule and the three dialers are this module's, so there is no second
+/// client beside it. The token is `call_for`'s: `state`'s, because the channel is the plane's
+/// own, and a caller cannot present one of its own or leave it behind. **The answer is the
+/// plane's, unread** — what a `404`, a `403` or a `400 {"rule","reason"}` means is the caller's
+/// to print, and this function decides nothing about it (LC8).
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::Path;
+///
+/// use http::Method;
+/// use tinio_api::{client::send, state::State};
+///
+/// # async fn run() -> Result<(), tinio_api::Error> {
+/// # let state = State::new("tinio.sock", Some(9000), Path::new("/srv/data"))?;
+/// let answer = send(&state, "/buckets/photos/lifecycle", Method::GET, None).await?;
+/// // `200` carries the stored configuration; `404` says this bucket stores none.
+/// assert!(answer.status == 200 || answer.status == 404);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The example is `no_run` because it needs a live channel; a running server
+/// answers `200` with the stored configuration, or `404` when the bucket
+/// stores none.
+///
+/// # Errors
+///
+/// The dial failures `request` answers: a channel that nothing answers on, a busy pipe pool
+/// ([`Error::Busy`]), and a request this transport could not complete.
+pub async fn send(
+    state: &State,
+    target: &str,
+    method: Method,
+    body: Option<&str>,
+) -> Result<RawResponse, Error> {
+    request(state, call_for(state, target, method, body)).await
 }
 
 /// One request over an explicit unix socket path — the seam the transport tests use, and the
@@ -396,6 +457,7 @@ pub async fn stop(state_dir: &Path) -> Result<(), Error> {
 ///         target: "/status",
 ///         method: Method::GET,
 ///         token: Some("the token from `state`"),
+///         body: None,
 ///     },
 /// )
 /// .await?;
@@ -439,6 +501,7 @@ pub async fn get_local(path: &Path, call: Call<'_>) -> Result<RawResponse, Error
 ///         target: "/metrics",
 ///         method: Method::GET,
 ///         token: None,
+///         body: None,
 ///     },
 /// )
 /// .await?;
@@ -531,6 +594,7 @@ async fn request(state: &State, call: Call<'_>) -> Result<RawResponse, Error> {
 ///         target: "/status",
 ///         method: Method::GET,
 ///         token: None,
+///         body: None,
 ///     },
 /// )
 /// .await?;
@@ -546,6 +610,7 @@ where
         target,
         method,
         token,
+        body,
     } = call;
     let (mut sender, connection) = http1::handshake(io)
         .await
@@ -560,8 +625,14 @@ where
     if let Some(token) = token {
         builder = builder.header("x-tinio-token", token);
     }
+    // The header follows the body (see [`Call::body`]): every body this client sends is the
+    // lifecycle model's JSON, and a `PUT` without this header is refused `415` by the plane's
+    // extractor before the model is read.
+    if body.is_some() {
+        builder = builder.header("content-type", "application/json");
+    }
     let request = builder
-        .body(String::new())
+        .body(body.unwrap_or_default().to_owned())
         .map_err(|err| Error::Transport(format!("request: {err}")))?;
 
     let response = sender
@@ -793,5 +864,99 @@ mod tests {
             report.state.is_some(),
             "the state file it read is still the caller's to report"
         );
+    }
+
+    /// **The client's half of R19, end to end.** The lifecycle `PUT` that carries a body reaches
+    /// the plane's extractor with `content-type: application/json`, which is what the answer says:
+    /// without the header the same request is refused `415` before a byte of the model is looked
+    /// at. The `204` is therefore the assertion the missing header fails, and the plane's own
+    /// router tests (which set the header by hand) are the other half of the pair.
+    #[cfg(feature = "lifecycle")]
+    #[tokio::test]
+    async fn a_put_with_a_body_carries_the_json_content_type() {
+        use std::sync::Mutex;
+
+        use crate::{
+            _core::{bucket, lifecycle, storage},
+            lifecycle::LifecycleAdmin,
+        };
+
+        /// The plane's admin in miniature: one stored configuration.
+        #[derive(Default)]
+        struct Admin {
+            stored: Mutex<Option<lifecycle::Config>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LifecycleAdmin for Admin {
+            async fn get(
+                &self,
+                _bucket: &bucket::Name,
+            ) -> Result<Option<lifecycle::Config>, storage::Error> {
+                Ok(self.stored.lock().expect("not poisoned").clone())
+            }
+
+            async fn put(
+                &self,
+                _bucket: &bucket::Name,
+                config: &lifecycle::Config,
+            ) -> Result<(), storage::Error> {
+                *self.stored.lock().expect("not poisoned") = Some(config.clone());
+                Ok(())
+            }
+
+            async fn delete(&self, _bucket: &bucket::Name) -> Result<(), storage::Error> {
+                *self.stored.lock().expect("not poisoned") = None;
+                Ok(())
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let dir = TempDir::new().expect("temp dir");
+        let state =
+            State::new(addr.to_string(), Some(9000), Path::new("/srv/data")).expect("state");
+        state.write(dir.path()).expect("write");
+        let (tx, stop) = watch::channel(false);
+        let shared = Arc::new(
+            Context::new(state, "127.0.0.1", Auth::for_bind(addr), tx)
+                .with_lifecycle(Some(Arc::new(Admin::default()))),
+        );
+        let serving = tokio::spawn(serve_tcp(listener, shared, stop));
+
+        // The token is the plane's own, so the client reads it off the state file it published.
+        let state = State::read(dir.path())
+            .expect("read")
+            .expect("a published state file");
+        let config = lifecycle::Config {
+            rules: vec![lifecycle::Rule {
+                id: Some("logs".to_string()),
+                status: lifecycle::Status::Enabled,
+                filter: lifecycle::Filter::default(),
+                expiration: Some(lifecycle::Expiration {
+                    days: Some(30),
+                    date: None,
+                    expired_object_delete_marker: None,
+                }),
+                noncurrent_version_expiration: None,
+                abort_incomplete_multipart_upload: None,
+            }],
+        };
+        let answer = send(
+            &state,
+            "/buckets/photos/lifecycle",
+            Method::PUT,
+            Some(&config.to_wire()),
+        )
+        .await
+        .expect("the put reaches the plane");
+        assert_eq!(
+            answer.status, 204,
+            "a body without `content-type: application/json` is refused 415: {}",
+            answer.body
+        );
+
+        serving.abort();
     }
 }

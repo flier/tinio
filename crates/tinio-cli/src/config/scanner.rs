@@ -4,6 +4,8 @@ use garde::Validate;
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
 
+use super::nonzero_duration;
+
 /// The background ETag scanner (`[scanner]`; presence = on, FR-024).
 ///
 /// Keys are Minio-aligned (`mc admin config set myminio scanner ...`).
@@ -21,30 +23,32 @@ use smart_default::SmartDefault;
 /// ```
 #[derive(Debug, Clone, PartialEq, SmartDefault, Serialize, Deserialize, Validate)]
 #[garde(allow_unvalidated)]
+#[serde(default)]
 pub struct Config {
     /// Seconds between scan iterations (pacing/throttle), >= 0.
-    #[serde(default = "delay")]
     #[garde(range(min = 0.0))]
-    #[default = 10.0]
+    #[default(_code = "DEFAULT_DELAY")]
     pub delay: f64,
-    /// Max time to wait for a scan slot when throttled.
-    #[serde(default = "max_wait", with = "humantime_serde")]
-    #[default(_code = "Duration::from_secs(15)")]
+    /// Max time to wait for a scan slot when throttled. Floored at 1s by
+    /// the parser (`config::nonzero_duration`): a zero wait would spin the
+    /// pacing loop instead of yielding to request traffic.
+    #[serde(with = "humantime_serde")]
+    #[garde(custom(nonzero_duration))]
+    #[default(_code = "DEFAULT_MAX_WAIT")]
     pub max_wait: Duration,
-    /// Full-tree scan cycle (re-scan for out-of-band changes).
-    #[serde(default = "cycle", with = "humantime_serde")]
-    #[default(_code = "Duration::from_secs(24 * 60 * 60)")]
+    /// Full-tree scan cycle (re-scan for out-of-band changes). The same 1s
+    /// floor as `max_wait`: a zero cycle re-scans the tree back to back.
+    #[serde(with = "humantime_serde")]
+    #[garde(custom(nonzero_duration))]
+    #[default(_code = "DEFAULT_CYCLE")]
     pub cycle: Duration,
 }
 
-fn delay() -> f64 {
-    Config::default().delay
-}
+/// Default seconds between scan iterations.
+const DEFAULT_DELAY: f64 = 10.0;
 
-fn max_wait() -> Duration {
-    Config::default().max_wait
-}
+/// Default max time to wait for a scan slot when throttled.
+const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(15);
 
-fn cycle() -> Duration {
-    Config::default().cycle
-}
+/// Default full-tree scan cycle (re-scan for out-of-band changes).
+const DEFAULT_CYCLE: Duration = Duration::from_secs(24 * 60 * 60);

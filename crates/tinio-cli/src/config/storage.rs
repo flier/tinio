@@ -93,16 +93,15 @@ pub struct Config {
 /// ```
 #[derive(Debug, Clone, PartialEq, SmartDefault, Serialize, Deserialize, Validate)]
 #[garde(allow_unvalidated)]
+#[serde(default)]
 pub struct Fs {
     /// Follow symlinks in the storage root (default `false`: access never
     /// resolves through a link and listings exclude link entries — a link
     /// inside a bucket cannot escape the storage root).
-    #[serde(default)]
     #[default(_code = "DEFAULT_FOLLOW_SYMLINKS")]
     pub follow_symlinks: bool,
     /// Compact trigger: the fragmentation percentage at which the state
     /// database is compacted at startup (5..=90).
-    #[serde(default = "compact_threshold_percent")]
     #[default(_code = "DEFAULT_COMPACT_THRESHOLD_PERCENT")]
     #[garde(
         range(
@@ -115,14 +114,12 @@ pub struct Fs {
     /// producers flush one write-pipeline batch once it holds this many
     /// entries (pipeline-spec.md Q5/Q6; default from the task-2.5
     /// `set_batch` benchmark knee).
-    #[serde(default = "meta_batch_size")]
     #[default(_code = "DEFAULT_META_BATCH_SIZE")]
     #[garde(range(min = META_BATCH_SIZE_MIN, max = META_BATCH_SIZE_MAX))]
     pub meta_batch_size: u16,
     /// Meta-batch byte threshold (1024..=16 MiB): the producers flush once
     /// the estimated batch size (≈ 56 B + key length per entry) reaches
     /// this (pipeline-spec.md Q5).
-    #[serde(default = "meta_batch_bytes")]
     #[default(_code = "DEFAULT_META_BATCH_BYTES")]
     #[garde(range(min = META_BATCH_BYTES_MIN, max = META_BATCH_BYTES_MAX))]
     pub meta_batch_bytes: u32,
@@ -155,18 +152,6 @@ fn validate_positive_option(value: &Option<u64>, _context: &()) -> garde::Result
         ));
     }
     Ok(())
-}
-
-fn compact_threshold_percent() -> u8 {
-    Fs::default().compact_threshold_percent
-}
-
-fn meta_batch_size() -> u16 {
-    Fs::default().meta_batch_size
-}
-
-fn meta_batch_bytes() -> u32 {
-    Fs::default().meta_batch_bytes
 }
 
 #[cfg(test)]

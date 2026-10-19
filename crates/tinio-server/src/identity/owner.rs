@@ -33,14 +33,13 @@ use crate::_core::acl::{DEFAULT_OWNER_DISPLAY_NAME, OwnerId, default_owner_id};
 #[derive(Debug, Clone, PartialEq, SmartDefault)]
 #[cfg_attr(feature = "config", derive(Serialize, Deserialize, Validate))]
 #[cfg_attr(feature = "config", garde(allow_unvalidated))]
+#[cfg_attr(feature = "config", serde(default))]
 pub struct Config {
     /// The root user's canonical account ID (default `hex(SHA-256("tinio"))`).
-    #[cfg_attr(feature = "config", serde(default = "default_canonical_id"))]
     #[default(_code = "default_owner_id().as_str().to_string()")]
     #[cfg_attr(feature = "config", garde(custom(validate_canonical_id)))]
     pub canonical_id: String,
     /// The root user's presentation display name (default `"tinio"`).
-    #[cfg_attr(feature = "config", serde(default = "default_display_name"))]
     #[default(_code = "DEFAULT_OWNER_DISPLAY_NAME.to_string()")]
     pub display_name: String,
     /// The root user's files chown to this uid on unix (unix-only; a
@@ -62,16 +61,6 @@ impl Config {
     pub fn resolved_canonical_id(&self) -> OwnerId {
         OwnerId::new(self.canonical_id.clone()).expect("canonical_id is validated at config parse")
     }
-}
-
-#[cfg(feature = "config")]
-fn default_canonical_id() -> String {
-    default_owner_id().as_str().to_string()
-}
-
-#[cfg(feature = "config")]
-fn default_display_name() -> String {
-    DEFAULT_OWNER_DISPLAY_NAME.to_string()
 }
 
 #[cfg(all(test, feature = "config"))]

@@ -43,6 +43,11 @@ pub const MIGRATION_TABLE: &str = "schema_version";
 
 /// The DDL that records an applied migration. It is created outside the
 /// migration list so version 1 can record itself.
+///
+/// `checksum` is sha-384 of the migration's own text, hex-rendered, recorded by the runner as it
+/// applies the step (R5). Its `DEFAULT ''` is for a row written by hand (a test's planted version)
+/// and never matches an embedded digest, so a row that does not record one is refused rather than
+/// trusted.
 pub(crate) const VERSION_TABLE_SQL: &str = include_str!("../sql/store/version_table.sql");
 
 /// The checksum this binary records for the migration at `version`, as hex, or

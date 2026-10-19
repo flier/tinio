@@ -1,8 +1,9 @@
 //! Management plane for tinio.
 //!
 //! The optional management surface (feature `api`, default on at the facade):
-//! axum router with `/status`, `/stop`, `/metrics`, `/openapi.json`, token
-//! authentication, control-channel transports (unix socket on Linux/macOS,
+//! axum router with `/status`, `/stop`, `/metrics`, `/openapi.json` (and the
+//! three `/buckets/{bucket}/lifecycle` routes under the `lifecycle` feature),
+//! token authentication, control-channel transports (unix socket on Linux/macOS,
 //! Windows named pipe, optional TCP HTTP/HTTPS), the state file with
 //! single-instance enforcement, and the status/stop client used by the CLI.
 //!
@@ -16,6 +17,8 @@ extern crate tinio_util as _util;
 pub mod bind;
 pub mod client;
 mod error;
+#[cfg(feature = "lifecycle")]
+pub mod lifecycle;
 pub mod metrics;
 #[cfg(feature = "openapi")]
 pub mod openapi;

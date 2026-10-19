@@ -30,6 +30,7 @@ use crate::_util::secret::Secret;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, SmartDefault, Serialize, Deserialize, Validate)]
 #[garde(allow_unvalidated)]
+#[serde(default)]
 pub struct Config {
     /// The connection string (`TINIO_PG_DSN` overrides it). Held as [`Secret`], so a rendering
     /// of this section redacts it.
@@ -37,7 +38,6 @@ pub struct Config {
     pub dsn: Option<Secret>,
     /// The driver pool's size (PG9; default 8 — `tinio-store-pg`'s own
     /// `DEFAULT_POOL_SIZE`, spelled here because this crate cannot depend on the store).
-    #[serde(default = "pool")]
     #[default(_code = "DEFAULT_POOL_SIZE")]
     #[garde(range(min = 1))]
     pub pool: u32,
@@ -46,8 +46,3 @@ pub struct Config {
 /// The `[storage.pg] pool` default (PG9): the store's own pool size, so a run that omits the key
 /// and one that pins 8 open the same number of connections.
 pub const DEFAULT_POOL_SIZE: u32 = 8;
-
-/// The pool-size serde default (see [`DEFAULT_POOL_SIZE`]).
-fn pool() -> u32 {
-    DEFAULT_POOL_SIZE
-}

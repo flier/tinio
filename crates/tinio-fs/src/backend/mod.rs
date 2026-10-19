@@ -68,7 +68,8 @@ use crate::{
     _core::{
         ETag, acl,
         bucket::{Name, name},
-        checksum,
+        checksum, lifecycle,
+        meta::BucketMeta,
         mode::AccessMode,
         object, pipeline,
         storage::{
@@ -84,8 +85,9 @@ use crate::{
         ObjectOps as EngineObjectOps,
     },
     _store_redb::{
-        RedbMetadata, bucket, bucket_versioning, decode_acl_wire, decode_owner_wire, object_meta,
-        object_part, upload, version as version_rows, version_index,
+        RedbMetadata, bucket, bucket_lifecycle, bucket_versioning, decode_acl_wire,
+        decode_owner_wire, object_meta, object_part, upload, version as version_rows,
+        version_index,
     },
     _util::{lockmap, path::contains_under_any_spelling},
     backend::version::stamp_superseded,
@@ -1009,9 +1011,10 @@ impl FsStorage {
     }
 
     /// Delete the whole derived state of a bucket — the `BUCKETS` row, the
-    /// `OBJECT_META` / `OBJECT_PARTS` / `UPLOADS` / `PARTS` ranges, and the
-    /// version tables (`VERSIONS`, `VERSION_INDEX`, `BUCKET_VERSIONING`) —
-    /// in one write transaction (meta-redb-spec G2: a bucket's state dies
+    /// `OBJECT_META` / `OBJECT_PARTS` / `UPLOADS` / `PARTS` ranges, the
+    /// version tables (`VERSIONS`, `VERSION_INDEX`, `BUCKET_VERSIONING`) and
+    /// the bucket's lifecycle row (`BUCKET_LIFECYCLE`, LC19) — in one write
+    /// transaction (meta-redb-spec G2: a bucket's state dies
     /// atomically), then drop the bucket's block subtree
     /// (`<state-dir>/blobs/<bucket>/` — the content-addressed blocks of its
     /// superseded versions). The bucket directory itself is removed by the
@@ -1057,6 +1060,11 @@ impl FsStorage {
                     let mut state = bucket_versioning::Table::open(txn)?;
                     state.drain_bucket(&bucket)?;
                 }
+                // LC19: a rule never outlives its bucket. The bucket delete
+                // here never reaches `BucketMeta::remove`, so this teardown is
+                // the one place the row can leave (and the stale-bucket stage
+                // of `Cleanup`, which runs this same call, gets its half).
+                bucket_lifecycle::Table::open(txn)?.drain_bucket(&bucket)?;
                 drain_bucket_uploads(txn, &bucket)?;
                 Ok(())
             })
@@ -1202,6 +1210,15 @@ impl FsStorage {
 
 impl Storage for FsStorage {
     type Error = Error;
+}
+
+#[async_trait::async_trait]
+impl storage::LifecycleRules for FsStorage {
+    async fn lifecycles(&self) -> Result<Vec<(Name, lifecycle::Config)>, storage::Error> {
+        <RedbMetadata as BucketMeta>::lifecycles(&self.meta_store().engine())
+            .await
+            .map_err(Into::into)
+    }
 }
 
 impl FsStorage {

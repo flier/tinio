@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM blocks\nWHERE hash = $1 AND seq = $2\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "05af0d32ab5d649a74553c0929a473039af7e7569a55d896497c4f794fcd1a46"
+}

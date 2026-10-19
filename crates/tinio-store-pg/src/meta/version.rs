@@ -667,6 +667,13 @@ impl PgStore {
     /// The statement is `sql/meta/version/bucket_listing_page.sql`, or its sibling
     /// `bucket_listing_page_open.sql` for a prefix with no upper bound; `limit` is the caller's
     /// page plus one probe, so a chunk is at most one page's worth of rows.
+    ///
+    /// Both `version_rows` joins carry `$2` in their `ON` clause, and so does `current_slots`: it
+    /// is a no-op there — a row's key is its object row's key, which `$2` already bounds, and a
+    /// `LEFT JOIN` keeps an unmatched object row either way — and it is what lets each inner
+    /// index scan start at the cursor. Without it the planner merges the joins over the bucket's
+    /// whole ranges, and a page 50k keys into the bucket reads every row before it: 205k buffers
+    /// against this bound's few thousand.
     async fn version_rows_chunk(
         &self,
         bucket: &bucket::Name,

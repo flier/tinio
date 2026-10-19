@@ -10,10 +10,6 @@ gone_chunks AS (
     RETURNING 1
 )
 
--- The head row stays (R2): `next_seq` moves past the drained generation, so a
--- generation id is never reused and a stage that outlived the drain cannot
--- splice its tail into the next writer's rows. `live_seq` clears in the same
--- statement as the chunks, so no reader sees a live head whose run is gone.
 UPDATE content_heads AS h
 SET
     live_seq = NULL,

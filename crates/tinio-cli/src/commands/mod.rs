@@ -13,6 +13,8 @@
 //! either half is exactly the drift the rule exists to prevent.
 
 pub mod doctor;
+#[cfg(feature = "lifecycle")]
+pub mod lifecycle;
 pub mod start;
 #[cfg(feature = "api")]
 pub mod status;
@@ -349,9 +351,17 @@ mod tests {
     /// The environment-only channels are **hidden everywhere they appear**, which is what makes
     /// the contracts' flag columns true: the environment is the documented channel, and a secret
     /// typed on a command line is visible in the process table.
+    ///
+    /// Walked at **every depth**: `lifecycle`'s four verbs are subcommands of a subcommand, and
+    /// each flattens the same `DirArgs` — one level would leave their copies uninspected.
     #[test]
     fn the_environment_only_channels_are_hidden_on_every_arm() {
-        for command in Cli::command().get_subcommands() {
+        let root = Cli::command();
+        let mut arms = vec![&root];
+        let mut visited = Vec::new();
+        while let Some(command) = arms.pop() {
+            arms.extend(command.get_subcommands());
+            visited.push(command.get_name());
             for arg in command.get_arguments() {
                 let hidden_channel = matches!(
                     arg.get_env().map(|name| name.to_string_lossy().into_owned()),
@@ -364,12 +374,20 @@ mod tests {
                 if hidden_channel {
                     assert!(
                         arg.is_hide_set(),
-                        "`{}` carries an environment-only channel and must be hidden",
+                        "`{} {}` carries an environment-only channel and must be hidden",
+                        command.get_name(),
                         arg.get_id()
                     );
                 }
             }
         }
+        // **The walk is not self-guarding**: a one-level version passed this suite while
+        // `lifecycle`'s four verbs went uninspected. So the depth the walk promises is asserted.
+        #[cfg(feature = "lifecycle")]
+        assert!(
+            visited.contains(&"ls"),
+            "the walk must reach a verb nested under `lifecycle`: {visited:?}"
+        );
     }
 
     #[test]

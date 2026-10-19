@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO content_heads\n(bucket, kind, ckey, next_seq, live_seq, live_len)\nVALUES (\n    $1, 'object', 'o:', 1, 1, 0\n)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8db22e4b5236ce6e8da813cf74bc94142432b592ead76a40f0aee31476095c73"
+}

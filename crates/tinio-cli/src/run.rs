@@ -8,6 +8,8 @@ use std::{env, ffi::OsString, future::Future, iter, process::ExitCode};
 use either::{Either, Left, Right};
 use tokio::runtime::Builder;
 
+#[cfg(feature = "lifecycle")]
+use crate::commands::lifecycle;
 #[cfg(feature = "api")]
 use crate::commands::{status, stop};
 use crate::{
@@ -134,6 +136,8 @@ fn try_run() -> Result<ExitCode, Error> {
                 Command::Status(args) => on_runtime(status::run(args, located)),
                 #[cfg(feature = "api")]
                 Command::Stop(args) => on_runtime(stop::run(args, located)),
+                #[cfg(feature = "lifecycle")]
+                Command::Lifecycle(args) => on_runtime(lifecycle::run(args, located)),
                 // Not feature-gated, and `cli::Command`'s doc is why: `doctor` diagnoses the
                 // always-present layers, so only the parts of it that need the plane are.
                 Command::Doctor(args) => on_runtime(doctor::run(args, located)),

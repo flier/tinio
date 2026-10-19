@@ -40,7 +40,7 @@ use crate::{
         blob::BlobRef,
         bucket, checksum,
         content::{ContentEntry, ContentKey, ObjectContent, PublishId, StagedObject},
-        cors, meta, multipart, object,
+        cors, lifecycle, meta, multipart, object,
         storage::{self, BodyStream},
         version::{Id, State},
     },
@@ -373,6 +373,13 @@ forward!(meta::BucketMeta {
     set_grants_or_create(bucket: &bucket::Name, grants: &acl::AclGrants, now: SystemTime) -> Result<(), RowError>;
     set_cors(bucket: &bucket::Name, config: &cors::Config) -> Result<bool, RowError>;
     clear_cors(bucket: &bucket::Name) -> Result<bool, RowError>;
+    lifecycle(bucket: &bucket::Name) -> Result<Option<lifecycle::Config>, RowError>;
+    lifecycles() -> Result<Vec<(bucket::Name, lifecycle::Config)>, RowError>;
+    set_lifecycle(bucket: &bucket::Name, config: &lifecycle::Config) -> Result<bool, RowError>;
+    set_lifecycle_or_create(bucket: &bucket::Name, config: &lifecycle::Config, now: SystemTime) -> Result<(), RowError>;
+    merge_lifecycle(bucket: &bucket::Name, rules: &[lifecycle::Rule]) -> Result<lifecycle::Merged, RowError>;
+    merge_lifecycle_or_create(bucket: &bucket::Name, rules: &[lifecycle::Rule], now: SystemTime) -> Result<lifecycle::Merged, RowError>;
+    clear_lifecycle(bucket: &bucket::Name) -> Result<bool, RowError>;
     remove(bucket: &bucket::Name) -> Result<(), RowError>;
     remove_if_empty(bucket: &bucket::Name) -> Result<(), RowError>;
 });

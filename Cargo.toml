@@ -103,6 +103,7 @@ tinio-blob = { path = "crates/tinio-blob" }
 tinio-cli = { path = "crates/tinio-cli", default-features = false }
 tinio-core = { path = "crates/tinio-core" }
 tinio-fs = { path = "crates/tinio-fs" }
+tinio-lifecycle = { path = "crates/tinio-lifecycle", default-features = false }
 tinio-mem = { path = "crates/tinio-mem" }
 tinio-ops = { path = "crates/tinio-ops" }
 tinio-pg = { path = "crates/tinio-pg" }

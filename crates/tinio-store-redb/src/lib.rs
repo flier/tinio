@@ -23,6 +23,7 @@ use crate::_core::meta::Metadata;
 
 mod acl;
 pub mod bucket;
+pub mod bucket_lifecycle;
 pub mod bucket_versioning;
 pub mod compact;
 pub mod content;
@@ -140,7 +141,7 @@ impl Metadata for RedbMetadata {
     type Error = Error;
 }
 
-/// Create the eleven shared tables inside a write transaction
+/// Create the twelve shared tables inside a write transaction
 /// (idempotent). Backends create their local tables in the same
 /// transaction alongside.
 pub fn ensure_all(txn: &mut redb::WriteTransaction) -> Result<(), Error> {
@@ -155,6 +156,7 @@ pub fn ensure_all(txn: &mut redb::WriteTransaction) -> Result<(), Error> {
     version::Table::ensure(txn)?;
     version_index::Table::ensure(txn)?;
     bucket_versioning::Table::ensure(txn)?;
+    bucket_lifecycle::Table::ensure(txn)?;
     Ok(())
 }
 
@@ -175,7 +177,7 @@ mod tests {
     fn assert_same<A: Same<B>, B>() {}
 
     #[test]
-    fn ensure_all_creates_exactly_the_eleven_tables_idempotently() {
+    fn ensure_all_creates_exactly_the_twelve_tables_idempotently() {
         let db = Database::builder()
             .create_with_backend(InMemoryBackend::new())
             .unwrap();
@@ -200,6 +202,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "bucket_lifecycle",
                 "bucket_versioning",
                 "buckets",
                 "object_meta",
