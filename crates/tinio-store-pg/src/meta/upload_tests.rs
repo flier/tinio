@@ -3,6 +3,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[cfg(test)]
+use tinio_util::testing::part_number;
 use tokio::time::sleep;
 
 use crate::{
@@ -11,7 +13,7 @@ use crate::{
         acl::Acl,
         bucket, checksum,
         meta::{UploadMeta, upload::Row as UploadRow},
-        multipart::{self, PartNumber},
+        multipart::PartNumber,
         object,
         storage::{group_and_paginate_unordered, uploads_order},
     },
@@ -19,7 +21,6 @@ use crate::{
     tests::fixtures::{ETAG_A, bucket_row, key, name, scratch, tags},
     timestamp::{unix_micros, unix_seconds as at},
 };
-
 const ETAG_B: &str = "0cc175b9c0f1b6a831c399e269772661";
 
 /// The host clock in unix milliseconds, for the leg that bounds a stored
@@ -48,7 +49,7 @@ async fn stamp_of(store: &PgStore, bucket: &bucket::Name, upload_id: &str, numbe
 }
 
 fn part(number: u32) -> PartNumber {
-    multipart::part_number(number).expect("a valid part number")
+    part_number(number)
 }
 
 fn state(upload_id: &str, target: &object::Key) -> UploadRow {

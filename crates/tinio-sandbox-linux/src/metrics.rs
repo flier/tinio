@@ -26,14 +26,10 @@
 //! `specs/001-s3-local-server/data-model.md`'s `## Metrics` owns the name list, and
 //! `contracts/management-api.md` owns the exposition.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every error a registration can answer is about these families' own names — prometheus 0.14's `RegistryCore::register` refuses a name the process-global default registry already holds (`AlreadyReg`) or holds with a different label set or help string (`Msg`) — from one `LazyLock` site each a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics` owns; a collision is a source-level mistake the registry refuses here, not a runtime condition, and `LazyLock::new` has no `Result` to return it through (design 2026-10-09 D2d). The module's tests read the three names back out of the gathered exposition, so a registration that did not land fails a test."
-)]
-
 use std::sync::LazyLock;
 
 use prometheus::{IntGauge, IntGaugeVec, register_int_gauge, register_int_gauge_vec};
+use tinio_util::metrics::RegisteredExt;
 
 use crate::{Resolved, Seccomp};
 
@@ -75,7 +71,7 @@ static READ_ONLY_ARM: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         "The read-only mechanism a run's exposures landed (1 for the arm taken, by arm)",
         &["arm"]
     )
-    .expect("register tinio_sandbox_read_only_arm")
+    .registered("tinio_sandbox_read_only_arm")
 });
 
 /// Whether the seccomp filter was skipped because this architecture has no syscall table
@@ -88,7 +84,7 @@ static SECCOMP_SKIPPED: LazyLock<IntGauge> = LazyLock::new(|| {
         "tinio_sandbox_seccomp_skipped",
         "Whether the seccomp filter was skipped: 1 when this architecture has no syscall table, 0 when it landed"
     )
-    .expect("register tinio_sandbox_seccomp_skipped")
+    .registered("tinio_sandbox_seccomp_skipped")
 });
 
 /// The confinement model this process resolved and applied — `1` for the model in use, by
@@ -104,7 +100,7 @@ static MODEL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         "The confinement model this run resolved and applied (1 for the model in use, by model)",
         &["model"]
     )
-    .expect("register tinio_sandbox_model")
+    .registered("tinio_sandbox_model")
 });
 
 /// Record the model the resolution chose, where it chooses it.
@@ -112,6 +108,8 @@ static MODEL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 /// **`Unavailable` records nothing**: no model ran, the run is refused, and the refusal is the
 /// caller's answer — a sample for a mechanism that confined nothing would be the wrong fact.
 pub(crate) fn record_model(resolved: Resolved) {
+    #[cfg(test)]
+    let _g = test_lock::writer();
     let model = match resolved {
         Resolved::UserNamespace => "user-namespace",
         Resolved::Root => "root",
@@ -133,33 +131,36 @@ pub(crate) fn record_model(resolved: Resolved) {
 /// after either record ends the run (design §11's fail-closed), and a run that ended serves no
 /// `/metrics` for a scrape to read.
 pub(crate) fn record_read_only_arm(arm: ReadOnlyArm) {
+    #[cfg(test)]
+    let _g = test_lock::writer();
     READ_ONLY_ARM.with_label_values(&[arm.label()]).set(1);
 }
 
 /// Record what the seccomp install decided — the state `Seccomp` is returned as, recorded where
 /// it is decided so the value a caller reads and the value `/metrics` reports are one answer.
 pub(crate) fn record_seccomp(state: Seccomp) {
+    #[cfg(test)]
+    let _g = test_lock::writer();
     SECCOMP_SKIPPED.set(i64::from(matches!(state, Seccomp::SkippedUnsupportedArch)));
 }
 
+/// The metric statics are process-global (the prometheus default registry), so an exact-value
+/// test races every other test's writes. The serialization is the shared cfg(test)-only writer
+/// lock every other metrics module uses: every write takes it, and an exact-assert test takes
+/// the window for its whole assert region. Production call sites compile the lock away.
+#[cfg(test)]
+pub(crate) use tinio_util::testing::metrics::test_lock;
+
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Mutex};
+    use std::fs;
 
     use tempfile::tempdir;
-
-    use super::*;
-
-    /// Serializes the tests that assert an exact value of either family — the statics are
-    /// process-global (the prometheus default registry), so a parallel test that records the
-    /// other answer between this one's write and its gather would clobber the assertion. Two
-    /// tests disagree about `tinio_sandbox_seccomp_skipped` by construction (`1` skipped, `0`
-    /// installed), and both are worth having.
-    static FAMILIES: Mutex<()> = Mutex::new(());
-
     /// The exposition the management plane serves, as the CLI's adapter produces it: the default
     /// registry, text-encoded.
-    use tinio_util::testing::metrics::{assert_registered, exposition};
+    use tinio_util::testing::metrics::{assert_registered, exposition, test_lock};
+
+    use super::*;
 
     /// Both families render their values, and **neither carries a value the run holds as a
     /// secret** (the sandbox review's STD-01: a control token reaching CI logs).
@@ -171,7 +172,7 @@ mod tests {
     /// no label at all — and this is the rendered half that a future free-text field would fail.
     #[test]
     fn the_families_render_their_values_and_no_token() {
-        let _guard = FAMILIES.lock().expect("the family lock");
+        let _window = test_lock::window();
         // The state directory as a confined run leaves it: `state` holds the control token
         // (`tinio-api`'s `State::write`), beside the access log and the metadata store.
         let state = tempdir().expect("a state directory");
@@ -214,7 +215,7 @@ mod tests {
     /// both, which is what makes the family readable for such a run instead of a race.
     #[test]
     fn each_arm_is_its_own_sample() {
-        let _guard = FAMILIES.lock().expect("the family lock");
+        let _window = test_lock::window();
         record_read_only_arm(ReadOnlyArm::Remount);
         record_read_only_arm(ReadOnlyArm::Overlay);
         let text = exposition();
@@ -232,7 +233,7 @@ mod tests {
     /// turns the request into one of the two before this is recorded.
     #[test]
     fn the_model_gauge_names_the_resolved_mechanism() {
-        let _guard = FAMILIES.lock().expect("the family lock");
+        let _window = test_lock::window();
         record_model(Resolved::Root);
         let text = exposition();
         assert!(
@@ -245,7 +246,7 @@ mod tests {
     /// "the network cut landed" rather than an absence it has to interpret.
     #[test]
     fn an_installed_filter_reports_zero() {
-        let _guard = FAMILIES.lock().expect("the family lock");
+        let _window = test_lock::window();
         record_seccomp(Seccomp::Installed);
         assert!(exposition().contains("tinio_sandbox_seccomp_skipped 0"));
     }

@@ -15,6 +15,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::instrument;
 
+use super::write_metrics::MetricsStorage;
 #[cfg(feature = "api")]
 use crate::_core::storage::WriteLockSnapshot;
 #[cfg(feature = "lifecycle")]
@@ -353,6 +354,13 @@ pub(super) trait ServingBackend: Storage + Clone + Send + Sync + 'static {
     /// grace), so a repair judges residue by the same configured clock the backend's passes do.
     type Repair: Cleanup;
 
+    /// The backend behind the write-failure recorder, which the data plane is built over. The
+    /// repair, the background passes and the metrics scan keep the raw backend.
+    type Metrics: Storage;
+
+    /// Wrap this backend for the data plane's write-failure recording.
+    fn metrics_storage(&self) -> Self::Metrics;
+
     /// The startup repair (design decision 12's post-bind step): **best-effort by contract**
     /// (`failure-handling.md` §3) — every stage is warned rather than propagated, because the
     /// backend's own recovery covers whatever residue a failed stage leaves behind, and a server
@@ -395,7 +403,12 @@ pub(super) trait ServingBackend: Storage + Clone + Send + Sync + 'static {
     #[cfg(feature = "api")]
     fn metrics_reader(&self, pipelines: &Pipelines, stop: watch::Receiver<bool>) -> JoinHandle<()> {
         let this = self.clone();
-        super::reader::spawn(pipelines, self.clone(), move || this.write_lock_stats(), stop)
+        super::reader::spawn(
+            pipelines,
+            self.clone(),
+            move || this.write_lock_stats(),
+            stop,
+        )
     }
 
     /// The post-repair block verification (the `versioning` feature). Default: nothing.
@@ -435,7 +448,12 @@ pub(super) trait ServingBackend: Storage + Clone + Send + Sync + 'static {
 }
 
 impl ServingBackend for FsStorage {
+    type Metrics = MetricsStorage<FsStorage>;
     type Repair = FsCleanup;
+
+    fn metrics_storage(&self) -> Self::Metrics {
+        MetricsStorage::<FsStorage>::new(self.clone())
+    }
 
     fn repair_cleanup(&self, resolution: &Resolution) -> FsCleanup {
         fs_cleanup(self, resolution)
@@ -481,7 +499,12 @@ impl ServingBackend for FsStorage {
 
 #[cfg(feature = "pg")]
 impl ServingBackend for PgStorage {
+    type Metrics = MetricsStorage<PgStorage>;
     type Repair = PgCleanup;
+
+    fn metrics_storage(&self) -> Self::Metrics {
+        MetricsStorage::<PgStorage>::new(self.clone())
+    }
 
     /// The pg cleanup carries the same configured clocks the background pass runs
     /// ([`pg_cleanup`]): the resolved `[s3] noncurrent_keep`/`noncurrent_expire_days` reach

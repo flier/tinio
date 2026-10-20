@@ -12,14 +12,10 @@
 //! list. Additive only: every family here is a new name, and nothing changes
 //! an existing one.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every registration in this module answers a duplicate or mismatched family at source level, not a runtime condition — one `LazyLock` site per family runs once per process, the registry refuses `AlreadyReg`/`Msg`, and `LazyLock::new` has no `Result` to return it through (design 2026-10-09 D2d); one exception for the module, not one per family"
-)]
-
 use std::sync::LazyLock;
 
 use prometheus::{IntCounter, IntGauge, register_int_counter, register_int_gauge};
+use tinio_util::metrics::RegisteredExt;
 
 use crate::sweep::Summary;
 
@@ -30,7 +26,7 @@ static RECLAIMED_BLOCKS: LazyLock<IntCounter> = LazyLock::new(|| {
         "tinio_storage_blocks_reclaimed_total",
         "Block files reclaimed by the block sweep, cumulative"
     )
-    .expect("register tinio_storage_blocks_reclaimed_total")
+    .registered("tinio_storage_blocks_reclaimed_total")
 });
 
 /// Bytes reclaimed by the block sweep, cumulative over the process's passes.
@@ -39,7 +35,7 @@ static RECLAIMED_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
         "tinio_storage_bytes_reclaimed_total",
         "Bytes reclaimed by the block sweep, cumulative"
     )
-    .expect("register tinio_storage_bytes_reclaimed_total")
+    .registered("tinio_storage_bytes_reclaimed_total")
 });
 
 /// Noncurrent versions retained across the versioned buckets, as the last
@@ -50,7 +46,7 @@ static NONCURRENT_VERSIONS: LazyLock<IntGauge> = LazyLock::new(|| {
         "tinio_storage_noncurrent_versions",
         "Noncurrent versions retained across versioned buckets, as of the last sweep pass"
     )
-    .expect("register tinio_storage_noncurrent_versions")
+    .registered("tinio_storage_noncurrent_versions")
 });
 
 /// Total bytes held by the versioned buckets' block stores, as the last sweep
@@ -63,7 +59,7 @@ static BLOCK_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
         "tinio_storage_block_bytes",
         "Bytes held by the versioned buckets' block stores, as of the last sweep pass"
     )
-    .expect("register tinio_storage_block_bytes")
+    .registered("tinio_storage_block_bytes")
 });
 
 /// Stored blocks that failed verification against their own name, cumulative
@@ -74,7 +70,7 @@ static BLOCKS_CORRUPT: LazyLock<IntCounter> = LazyLock::new(|| {
         "tinio_storage_blocks_corrupt_total",
         "Stored blocks that failed verification against their own content hash, cumulative"
     )
-    .expect("register tinio_storage_blocks_corrupt_total")
+    .registered("tinio_storage_blocks_corrupt_total")
 });
 
 /// Record one sweep pass's reclamation: the counters add the pass's blocks and

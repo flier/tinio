@@ -15,6 +15,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 tinio-core.workspace = true
+tinio-util.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true

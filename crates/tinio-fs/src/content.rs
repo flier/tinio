@@ -37,12 +37,10 @@ use crate::{
         object,
         storage::{self, BodyStream, BucketOps, ByteRange, access_denied},
     },
-    _util::metrics::WriteOp,
     Error,
     backend::{
         FsStorage, Publication, StagedBytes, bucket_is_empty, prune_parents, remove_object_file,
     },
-    error::record_failed_write,
     fsutil,
     listing::WalkedFile,
     write::StagedFile,
@@ -54,6 +52,7 @@ use crate::{
 /// and single state-database handle through one `Arc`, so two content
 /// handles over the same store share every lock and pipeline. No field
 /// lives on [`FsStorage`], which keeps the two planes acyclic.
+
 #[derive(Debug, Clone)]
 pub struct FsContent {
     storage: Arc<FsStorage>,
@@ -283,7 +282,7 @@ impl ObjectContent for FsContent {
         skip(self, staged),
         fields(
             bucket = %bucket,
-            op = if key.is_part() { "part" } else { "object" },
+            op = key.kind_label(),
         )
     )]
     async fn publish(
@@ -410,11 +409,11 @@ impl ObjectContent for FsContent {
         skip(self),
         fields(
             bucket = %bucket,
-            op = if key.is_part() { "part" } else { "object" },
+            op = key.kind_label(),
         )
     )]
     async fn remove(&self, bucket: &bucket::Name, key: &ContentKey) -> Result<(), Error> {
-        let result = match key {
+        match key {
             ContentKey::Object(key) => {
                 // Idempotent: an absent bucket or object is a no-op, like
                 // the row-backed plane's removal of an absent row.
@@ -436,11 +435,7 @@ impl ObjectContent for FsContent {
                     Err(err) => Err(err.into()),
                 }
             }
-        };
-        if let Err(err) = &result {
-            record_failed_write(WriteOp::Delete, err);
         }
-        result
     }
 
     #[instrument(

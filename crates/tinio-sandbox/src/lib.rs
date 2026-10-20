@@ -372,13 +372,9 @@ pub fn apply_self_confinement(adopted: &Adopted) -> Result<Option<Applied>> {
         macos_apply(adopted)
             .map(|applied| {
                 applied.map(|applied| Applied {
-                    // The platform's enum as the wire spelling, which is the name the launch
-                    // payload carried and the one an operator reads in the event. The literals
-                    // match `Mechanism`'s `Display` (pinned by that crate's round-trip test).
-                    mechanism: match applied.mechanism {
-                        tinio_sandbox_macos::Mechanism::SandboxExec => "sandbox-exec",
-                        tinio_sandbox_macos::Mechanism::SandboxInit => "sandbox-init",
-                    },
+                    // The platform's enum as the wire spelling — the one definer the macOS
+                    // crate's `Display` and parser already share.
+                    mechanism: applied.mechanism.name(),
                     rules: applied.rules,
                     params: applied.params,
                 })

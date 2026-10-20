@@ -28,11 +28,6 @@
 //! assert!(!prometheus::default_registry().gather().is_empty());
 //! ```
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every error these registrations can answer is about a family's own name — the process-global default registry refuses a name it already holds, or holds with a different label set or help. Each name has one registration site here, a `LazyLock` whose closure runs once per process, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns (the write-lock descriptors are built from two fixed literals before registering); a collision is a source-level mistake, not a runtime condition, so the refusal is the collision detection — `LazyLock::new` has no `Result` to return it through (design 2026-10-09 D2d); the `registers_all_families` test reads the names back out of the gathered exposition, so a registration that did not land fails a test."
-)]
-
 use std::{
     collections::HashMap,
     future::Future,
@@ -49,7 +44,7 @@ use prometheus::{
     register_int_gauge, register_int_gauge_vec,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, dto};
-use tinio_util::status_label;
+use tinio_util::{metrics::RegisteredExt, status_label};
 use tracing::{field, instrument};
 
 use crate::{
@@ -60,8 +55,6 @@ use crate::{
     backend::ops::tinio_s3_ops,
 };
 
-
-
 /// S3 data-plane operations, by operation and status.
 pub static S3_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
@@ -69,7 +62,7 @@ pub static S3_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "S3 data-plane operations, by operation and status",
         &["op", "status"]
     )
-    .expect("register tinio_s3_operations_total")
+    .registered("tinio_s3_operations_total")
 });
 /// S3 operation durations, by operation.
 pub static S3_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
@@ -78,7 +71,7 @@ pub static S3_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
         "S3 operation durations, by operation",
         &["op"]
     )
-    .expect("register tinio_s3_operation_duration_seconds")
+    .registered("tinio_s3_operation_duration_seconds")
 });
 /// S3 wire errors, by operation and error code.
 pub static S3_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -87,7 +80,7 @@ pub static S3_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "S3 wire errors, by operation and error code",
         &["op", "code"]
     )
-    .expect("register tinio_s3_errors_total")
+    .registered("tinio_s3_errors_total")
 });
 /// Bucket count (full-scan, TTL-cached 30 s; management plane, T075).
 pub static STORAGE_BUCKETS: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -95,7 +88,7 @@ pub static STORAGE_BUCKETS: LazyLock<IntGauge> = LazyLock::new(|| {
         "tinio_storage_buckets",
         "Number of buckets (full-scan, TTL-cached 30 s)"
     )
-    .expect("register tinio_storage_buckets")
+    .registered("tinio_storage_buckets")
 });
 /// Object count (full-scan, TTL-cached 30 s; management plane, T075).
 pub static STORAGE_OBJECTS: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -103,7 +96,7 @@ pub static STORAGE_OBJECTS: LazyLock<IntGauge> = LazyLock::new(|| {
         "tinio_storage_objects",
         "Number of objects (full-scan, TTL-cached 30 s)"
     )
-    .expect("register tinio_storage_objects")
+    .registered("tinio_storage_objects")
 });
 /// Total object bytes (full-scan, TTL-cached 30 s; management plane, T075).
 pub static STORAGE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -111,7 +104,7 @@ pub static STORAGE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
         "tinio_storage_bytes",
         "Total object bytes (full-scan, TTL-cached 30 s)"
     )
-    .expect("register tinio_storage_bytes")
+    .registered("tinio_storage_bytes")
 });
 /// Bytes streamed into storage.
 pub static STORAGE_UPLOAD_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
@@ -119,7 +112,7 @@ pub static STORAGE_UPLOAD_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
         "tinio_storage_upload_bytes_total",
         "Bytes streamed into storage"
     )
-    .expect("register tinio_storage_upload_bytes_total")
+    .registered("tinio_storage_upload_bytes_total")
 });
 /// Bytes streamed out of storage.
 pub static STORAGE_DOWNLOAD_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
@@ -127,7 +120,7 @@ pub static STORAGE_DOWNLOAD_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
         "tinio_storage_download_bytes_total",
         "Bytes streamed out of storage"
     )
-    .expect("register tinio_storage_download_bytes_total")
+    .registered("tinio_storage_download_bytes_total")
 });
 /// Objects written, by operation (put, copy, multipart-complete).
 pub static STORAGE_OBJECTS_UPLOADED: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -136,7 +129,7 @@ pub static STORAGE_OBJECTS_UPLOADED: LazyLock<IntCounterVec> = LazyLock::new(|| 
         "Objects written to storage, by operation",
         &["op"]
     )
-    .expect("register tinio_storage_objects_uploaded_total")
+    .registered("tinio_storage_objects_uploaded_total")
 });
 /// Objects deleted from storage.
 pub static STORAGE_OBJECTS_DELETED: LazyLock<IntCounter> = LazyLock::new(|| {
@@ -144,7 +137,7 @@ pub static STORAGE_OBJECTS_DELETED: LazyLock<IntCounter> = LazyLock::new(|| {
         "tinio_storage_objects_deleted_total",
         "Objects deleted from storage"
     )
-    .expect("register tinio_storage_objects_deleted_total")
+    .registered("tinio_storage_objects_deleted_total")
 });
 /// Multipart uploads currently in progress.
 pub static STORAGE_MULTIPART_IN_PROGRESS: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -152,7 +145,7 @@ pub static STORAGE_MULTIPART_IN_PROGRESS: LazyLock<IntGauge> = LazyLock::new(|| 
         "tinio_storage_multipart_in_progress",
         "Multipart uploads currently in progress"
     )
-    .expect("register tinio_storage_multipart_in_progress")
+    .registered("tinio_storage_multipart_in_progress")
 });
 /// Tasks currently queued in a pipeline, by pipeline (io/db).
 pub static PIPELINE_QUEUE_DEPTH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -161,7 +154,7 @@ pub static PIPELINE_QUEUE_DEPTH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         "Tasks currently queued in a pipeline, by pipeline",
         &["pipeline"]
     )
-    .expect("register tinio_pipeline_queue_depth")
+    .registered("tinio_pipeline_queue_depth")
 });
 /// Tasks currently executing in a pipeline, by pipeline (io/db).
 pub static PIPELINE_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
@@ -170,7 +163,7 @@ pub static PIPELINE_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         "Tasks currently executing in a pipeline, by pipeline",
         &["pipeline"]
     )
-    .expect("register tinio_pipeline_in_flight")
+    .registered("tinio_pipeline_in_flight")
 });
 /// The pipeline families' bucket bounds: one scale for task duration and enqueue wait.
 const TASK_DURATION_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0];
@@ -183,7 +176,7 @@ pub static PIPELINE_TASK_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
         &["pipeline"],
         TASK_DURATION_BUCKETS.to_vec(),
     )
-    .expect("register tinio_pipeline_task_duration_seconds")
+    .registered("tinio_pipeline_task_duration_seconds")
 });
 /// Pipeline task outcomes, by pipeline and outcome (`ok` | `error` | `panic`).
 pub static PIPELINE_TASKS: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -192,7 +185,7 @@ pub static PIPELINE_TASKS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Pipeline task outcomes, by pipeline and outcome",
         &["pipeline", "outcome"]
     )
-    .expect("register tinio_pipeline_tasks_total")
+    .registered("tinio_pipeline_tasks_total")
 });
 /// Time a task waited between enqueue and the worker picking it up, by pipeline.
 pub static PIPELINE_ENQUEUE_WAIT: LazyLock<HistogramVec> = LazyLock::new(|| {
@@ -202,7 +195,7 @@ pub static PIPELINE_ENQUEUE_WAIT: LazyLock<HistogramVec> = LazyLock::new(|| {
         &["pipeline"],
         TASK_DURATION_BUCKETS.to_vec(),
     )
-    .expect("register tinio_pipeline_enqueue_wait_seconds")
+    .registered("tinio_pipeline_enqueue_wait_seconds")
 });
 /// The write-lock duration histograms (pipeline-spec.md §4): the
 /// `wait` and `total` distributions of every write transaction,
@@ -210,9 +203,8 @@ pub static PIPELINE_ENQUEUE_WAIT: LazyLock<HistogramVec> = LazyLock::new(|| {
 /// with the default registry — the registry holds its own copy of
 /// the descriptors).
 pub static WRITE_LOCK_HISTOGRAMS: LazyLock<WriteLockHistograms> = LazyLock::new(|| {
-    let histograms =
-        WriteLockHistograms::new().expect("build the write-lock histogram descriptors");
-    register(Box::new(histograms.clone())).expect("register the write-lock histogram families");
+    let histograms = WriteLockHistograms::new().registered("the write-lock histogram descriptors");
+    register(Box::new(histograms.clone())).registered("the write-lock histogram families");
     histograms
 });
 
@@ -294,7 +286,7 @@ fn record(
 }
 
 /// Record a completed S3 data-plane operation.
-pub fn record_s3_operation(op: &str, status: u16, duration: Duration) {
+pub fn record_s3_operation(op: &'static str, status: u16, duration: Duration) {
     #[cfg(test)]
     let _g = test_lock::writer();
     let mut label = itoa::Buffer::new();
@@ -560,7 +552,7 @@ mod tests {
             util_metrics::WriteFailureKind::Io,
         );
         util_metrics::record_pass_duration(util_metrics::Pass::FsSweep, Duration::ZERO);
-        util_metrics::record_pass_failure(util_metrics::Pass::FsSweep, util_metrics::Section::Tmp);
+        util_metrics::record_fs_pass_failure(util_metrics::FsSection::Tmp);
         util_metrics::record_read_only(util_metrics::Backend::Fs, false);
         util_metrics::record_corrupt_rows(util_metrics::Backend::Fs, 0);
         // The pipeline families: the histograms need one sample each to be gathered.

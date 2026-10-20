@@ -31,6 +31,7 @@ use tinio_core::{
 /// assert!(message.contains("pg_dump"));
 /// assert!(message.contains("never drop and rebuild"));
 /// ```
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A connection attempt failed. The message is redacted and names the

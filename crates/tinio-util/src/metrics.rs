@@ -19,13 +19,13 @@
 //! use std::time::Duration;
 //!
 //! use tinio_util::metrics::{
-//!     Backend, Pass, Section, WriteFailureKind, WriteOp, record_corrupt_rows,
-//!     record_pass_duration, record_pass_failure, record_read_only, record_write_failure,
+//!     Backend, FsSection, Pass, WriteFailureKind, WriteOp, record_corrupt_rows,
+//!     record_fs_pass_failure, record_pass_duration, record_read_only, record_write_failure,
 //! };
 //!
 //! record_write_failure(Backend::Fs, WriteOp::Put, WriteFailureKind::Io);
 //! record_pass_duration(Pass::FsSweep, Duration::from_millis(5));
-//! record_pass_failure(Pass::FsSweep, Section::Tmp);
+//! record_fs_pass_failure(FsSection::Tmp);
 //! record_read_only(Backend::Fs, false);
 //! record_corrupt_rows(Backend::Fs, 1);
 //! assert!(!prometheus::default_registry().gather().is_empty());
@@ -48,43 +48,61 @@ pub const PASS_DURATION_BUCKETS: &[f64] = &[
 ];
 
 /// The registered families.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: every error a registration can answer is about this family's own name — the process-global default registry refuses a name it already holds or holds with a different label set or help. Each name has one registration site in the repo (this `LazyLock`, whose closure runs once per process) against the spec's family list; a collision is a source-level mistake, not a runtime condition, and `LazyLock::new` has no `Result` to return it through. The module's test reads all five names back out of the gathered exposition, so a registration that did not land fails a test."
-)]
 static FAMILIES: LazyLock<Families> = LazyLock::new(|| Families {
     write_failures: register_int_counter_vec!(
         "tinio_storage_write_failures_total",
         "Storage writes refused or failed, by backend, operation and failure kind",
         &["backend", "op", "kind"]
     )
-    .expect("register tinio_storage_write_failures_total"),
+    .registered("tinio_storage_write_failures_total"),
     pass_duration: register_histogram_vec!(
         "tinio_storage_pass_duration_seconds",
         "Background storage pass durations, by pass",
         &["pass"],
         PASS_DURATION_BUCKETS.to_vec()
     )
-    .expect("register tinio_storage_pass_duration_seconds"),
+    .registered("tinio_storage_pass_duration_seconds"),
     pass_failures: register_int_counter_vec!(
         "tinio_storage_pass_failures_total",
         "Background storage pass failures, by pass and failing section",
         &["pass", "section"]
     )
-    .expect("register tinio_storage_pass_failures_total"),
+    .registered("tinio_storage_pass_failures_total"),
     read_only: register_int_gauge_vec!(
         "tinio_storage_read_only",
         "Whether a backend serves read-only (1) or read-write (0), by backend",
         &["backend"]
     )
-    .expect("register tinio_storage_read_only"),
+    .registered("tinio_storage_read_only"),
     corrupt_rows: register_int_counter_vec!(
         "tinio_storage_corrupt_rows_total",
         "Stored rows that failed domain validation, by backend",
         &["backend"]
     )
-    .expect("register tinio_storage_corrupt_rows_total"),
+    .registered("tinio_storage_corrupt_rows_total"),
 });
+
+/// Registration helper: a duplicate or malformed family name is a source-level
+/// collision, so the process refuses it at start-up instead of carrying a
+/// wrong label set.
+pub trait RegisteredExt<T> {
+    /// Unwrap a registration, panicking with the family name on a collision.
+    fn registered(self, name: &'static str) -> T;
+}
+
+impl<T> RegisteredExt<T> for Result<T, prometheus::Error> {
+    #[track_caller]
+    fn registered(self, name: &'static str) -> T {
+        #[expect(
+            clippy::panic,
+            reason = "argued: a duplicate family name is a source-level collision, not a runtime condition; the process cannot serve a wrong label set"
+        )]
+        match self {
+            Ok(value) => value,
+            Err(err) => panic!("register {name}: {err}"),
+        }
+    }
+}
 
 /// The five families, held together so one `LazyLock` runs the five
 /// registrations.
@@ -232,9 +250,9 @@ impl Pass {
     }
 }
 
-/// The failing stage of a background pass — the closed `section` label.
+/// The failing stage of the filesystem sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Section {
+pub enum FsSection {
     /// Lifecycle rules.
     Rules,
     /// Versioned rows.
@@ -245,10 +263,45 @@ pub enum Section {
     Tmp,
     /// Multipart uploads.
     Multipart,
+}
+
+impl FsSection {
+    /// The label value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rules => "rules",
+            Self::Versioned => "versioned",
+            Self::OrphanBlobs => "orphan_blobs",
+            Self::Tmp => "tmp",
+            Self::Multipart => "multipart",
+        }
+    }
+}
+
+/// The failing stage of the block sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobSection {
     /// The block walk.
     Walk,
     /// The removal phase.
     Remove,
+}
+
+impl BlobSection {
+    /// The label value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Walk => "walk",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+/// The failing stage of the PostgreSQL cleanup pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgSection {
+    /// Lifecycle rules.
+    Rules,
     /// The uploads phase.
     Uploads,
     /// The chunks phase.
@@ -261,17 +314,11 @@ pub enum Section {
     Blocks,
 }
 
-impl Section {
+impl PgSection {
     /// The label value.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Rules => "rules",
-            Self::Versioned => "versioned",
-            Self::OrphanBlobs => "orphan_blobs",
-            Self::Tmp => "tmp",
-            Self::Multipart => "multipart",
-            Self::Walk => "walk",
-            Self::Remove => "remove",
             Self::Uploads => "uploads",
             Self::Chunks => "chunks",
             Self::Parts => "parts",
@@ -332,19 +379,25 @@ impl Drop for PassTimer {
     }
 }
 
-/// Record one failed section of a background pass.
-///
-/// # Examples
-///
-/// ```rust
-/// use tinio_util::metrics::{Pass, Section, record_pass_failure};
-///
-/// record_pass_failure(Pass::PgCleanup, Section::Blocks);
-/// ```
-pub fn record_pass_failure(pass: Pass, section: Section) {
+/// Record one failed section of the filesystem sweep.
+pub fn record_fs_pass_failure(section: FsSection) {
+    record_pass_failure(Pass::FsSweep, section.as_str());
+}
+
+/// Record one failed section of the block sweep.
+pub fn record_blob_pass_failure(section: BlobSection) {
+    record_pass_failure(Pass::BlobSweep, section.as_str());
+}
+
+/// Record one failed section of the PostgreSQL cleanup pass.
+pub fn record_pg_pass_failure(section: PgSection) {
+    record_pass_failure(Pass::PgCleanup, section.as_str());
+}
+
+fn record_pass_failure(pass: Pass, section: &'static str) {
     FAMILIES
         .pass_failures
-        .with_label_values(&[pass.as_str(), section.as_str()])
+        .with_label_values(&[pass.as_str(), section])
         .inc();
 }
 
@@ -399,7 +452,7 @@ mod tests {
     fn the_five_families_render_their_recorded_values() {
         record_write_failure(Backend::Fs, WriteOp::Put, WriteFailureKind::Io);
         record_pass_duration(Pass::BlobSweep, Duration::from_millis(250));
-        record_pass_failure(Pass::BlobSweep, Section::Walk);
+        record_blob_pass_failure(BlobSection::Walk);
         record_read_only(Backend::Fs, true);
         record_corrupt_rows(Backend::Fs, 2);
 

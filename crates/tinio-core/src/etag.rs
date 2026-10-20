@@ -38,6 +38,7 @@ use crate::multipart::PartInfo;
 ///
 /// assert!("not-a-hex-etag".parse::<ETag>().is_err());
 /// ```
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Display, Deref)]
 #[display("{}", self.as_str())]
 pub enum ETag {

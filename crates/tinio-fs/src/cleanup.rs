@@ -30,6 +30,8 @@ use futures::StreamExt;
 use futures::stream;
 #[cfg(feature = "versioning")]
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use tinio_util::testing::part_number;
 use tokio::fs;
 
 #[cfg(feature = "versioning")]
@@ -1113,7 +1115,7 @@ mod tests {
             acl::Acl,
             bucket,
             meta::version::Stored,
-            multipart, object,
+            object,
             pipeline::InlineRunner,
             storage::{BucketOps, ObjectOps},
         },
@@ -1454,14 +1456,7 @@ mod tests {
             .unwrap();
         storage
             .multipart_store()
-            .put_part(
-                &b,
-                &k,
-                &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
-                body(b"x"),
-                None,
-            )
+            .put_part(&b, &k, &upload.upload_id, part_number(1), body(b"x"), None)
             .await
             .unwrap();
         // Corrupt the stored key out-of-band: the validated view no
@@ -1561,14 +1556,7 @@ mod tests {
         // without any idle grace.
         storage
             .multipart_store()
-            .put_part(
-                &b,
-                &k,
-                &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
-                body(b"x"),
-                None,
-            )
+            .put_part(&b, &k, &upload.upload_id, part_number(1), body(b"x"), None)
             .await
             .unwrap();
         let live_dir = state.path().join("multipart/live").join(&upload.upload_id);

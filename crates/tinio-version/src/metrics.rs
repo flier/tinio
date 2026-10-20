@@ -9,19 +9,13 @@
 //! The registry is process-global, so the management plane renders this family
 //! without this crate knowing it; the record call is the only write path.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
-
 use std::sync::LazyLock;
 
-use parse_display::Display;
 use prometheus::{IntCounterVec, register_int_counter_vec};
+use tinio_util::metrics::RegisteredExt;
 
 /// One supersede outcome — the family's closed `result` label set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
-#[display(style = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// Committed on the first attempt, or nothing was current to move.
     Ok,
@@ -49,7 +43,7 @@ static SUPERSEDES: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Version supersedes by result",
         &["result"]
     )
-    .expect("register tinio_storage_supersede_total")
+    .registered("tinio_storage_supersede_total")
 });
 
 /// Record one supersede outcome: exactly one sample per `supersede_with` call

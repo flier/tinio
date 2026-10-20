@@ -29,9 +29,7 @@ use redb::{Database, ReadTransaction, WriteTransaction};
 use tokio::task::{JoinError, spawn_blocking};
 
 use crate::{
-    _core::storage::{
-        WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS, WriteLockSnapshot,
-    },
+    _core::storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS, WriteLockSnapshot},
     compact::{needs_compact, snapshot},
     error::Error,
     open::{open, open_read_only},
@@ -518,11 +516,11 @@ mod tests {
 
     use io::Error as IoError;
     use redb::Database;
+    use tinio_util::testing::spans::one_named;
     use tokio::{runtime::Builder, sync::oneshot, time::timeout};
     use tracing::Level;
 
     use super::*;
-    use tinio_util::testing::spans::one_named;
     use crate::{
         _core::{bucket::name, object},
         bucket, object_meta, open, state,

@@ -22,18 +22,13 @@
 //! reader stays single-flight by construction — one task, scanning sequentially — so a scrape
 //! flood cannot multiply scans, and a stalled scan cannot fail a request.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every registration in this module answers a duplicate or mismatched family at source level, not a runtime condition — one `LazyLock` site per family runs once per process, the registry refuses `AlreadyReg`/`Msg`, and `LazyLock::new` has no `Result` to return it through (design 2026-10-09 D2d); one exception for the module, not one per family"
-)]
-
 use std::{sync::LazyLock, time::Duration};
 
 use prometheus::{
     Encoder, HistogramVec, IntCounterVec, IntGauge, TextEncoder, default_registry,
     register_histogram_vec, register_int_counter_vec, register_int_gauge,
 };
-use tinio_util::status_label;
+use tinio_util::{metrics::RegisteredExt, status_label};
 
 use crate::Error;
 
@@ -44,7 +39,7 @@ pub(crate) static HTTP_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "HTTP requests served by the management plane, by method and status",
         &["method", "status"]
     )
-    .expect("register tinio_http_requests_total")
+    .registered("tinio_http_requests_total")
 });
 /// HTTP request durations, by method.
 pub(crate) static HTTP_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
@@ -53,7 +48,7 @@ pub(crate) static HTTP_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
         "HTTP request durations, by method",
         &["method"]
     )
-    .expect("register tinio_http_request_duration_seconds")
+    .registered("tinio_http_request_duration_seconds")
 });
 /// HTTP requests currently being served.
 pub(crate) static HTTP_IN_FLIGHT: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -61,7 +56,7 @@ pub(crate) static HTTP_IN_FLIGHT: LazyLock<IntGauge> = LazyLock::new(|| {
         "tinio_http_in_flight",
         "HTTP requests currently being served"
     )
-    .expect("register tinio_http_in_flight")
+    .registered("tinio_http_in_flight")
 });
 
 /// The six verbs a management transport serves; any other token collapses to
@@ -151,9 +146,21 @@ pub fn render() -> Result<String, Error> {
 
 #[cfg(test)]
 mod tests {
-    use tinio_util::testing::metrics::exposition;
+    use tinio_util::testing::metrics::{assert_registered, exposition};
 
     use super::*;
+
+    /// The per-crate gate: every family this module declares is registered once.
+    #[test]
+    fn the_three_http_families_register_once() {
+        let _in_flight = InFlightGuard::new();
+        record_http_request("GET", 596, Duration::from_millis(1));
+        assert_registered(&[
+            "tinio_http_requests_total",
+            "tinio_http_request_duration_seconds",
+            "tinio_http_in_flight",
+        ]);
+    }
 
     #[test]
     fn unknown_methods_share_one_label() {

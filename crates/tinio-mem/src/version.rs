@@ -143,6 +143,7 @@ use crate::{_core::storage::VersionOps, storage::MemoryStorage};
 /// The feature-off `VersionOps`: the trait's default bodies own every answer
 /// (the refusal class for the nine, `Unversioned` for `bucket_versioning`),
 /// so there is nothing to write here and nothing to forget.
+
 #[cfg(not(feature = "versioning"))]
 impl VersionOps for MemoryStorage {}
 

@@ -13,14 +13,10 @@
 //! A name recorded here renders as
 //! `tinio_storage_read_heals_total{kind="object_row"}`.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every error a registration can answer is about this family's own name — the process-global default registry refuses a name it already holds or holds with a different label set or help. The name has one registration site in the repo (this `LazyLock`, whose closure runs once per process) against the spec's family list; a collision is a source-level mistake, not a runtime condition, and `LazyLock::new` has no `Result` to return it through. The module's test reads the name back out of the gathered exposition, so a registration that did not land fails a test."
-)]
-
 use std::sync::LazyLock;
 
 use prometheus::{IntCounterVec, register_int_counter_vec};
+use tinio_util::metrics::RegisteredExt;
 
 /// The registered family.
 static FAMILY: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -29,7 +25,7 @@ static FAMILY: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Rows a read path healed against the content, by healed row kind",
         &["kind"]
     )
-    .expect("register tinio_storage_read_heals_total")
+    .registered("tinio_storage_read_heals_total")
 });
 
 /// The closed kind of row a read path healed.

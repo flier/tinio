@@ -16,7 +16,7 @@ use tracing::instrument;
 
 use crate::{
     _core::blob::{BlobRef, BlockHash, BlockStore, Entry},
-    _util::metrics::{Pass, PassTimer, Section, record_pass_failure},
+    _util::metrics::{BlobSection, Pass, PassTimer, record_blob_pass_failure},
     Error,
 };
 
@@ -287,7 +287,7 @@ impl<S: BlockStore> super::Store<S> {
         let mut walk = match self.blocks().walk(None).await {
             Ok(walk) => walk,
             Err(err) => {
-                record_pass_failure(Pass::BlobSweep, Section::Walk);
+                record_blob_pass_failure(BlobSection::Walk);
                 return Err(Error::Storage(err.into()));
             }
         };
@@ -295,7 +295,7 @@ impl<S: BlockStore> super::Store<S> {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
-                    record_pass_failure(Pass::BlobSweep, Section::Walk);
+                    record_blob_pass_failure(BlobSection::Walk);
                     return Err(Error::Storage(err.into()));
                 }
             };
@@ -377,7 +377,7 @@ impl<S: BlockStore> super::Store<S> {
                     // work to do, and a transient sharing violation clears
                     // on its own.
                     report.failed += 1;
-                    record_pass_failure(Pass::BlobSweep, Section::Remove);
+                    record_blob_pass_failure(BlobSection::Remove);
                     tracing::warn!(
                         hash = %entry.hash,
                         error = %err,

@@ -25,14 +25,14 @@
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
     time::Instant,
 };
 
 use axum::{
     Json, Router,
     extract::{Request, State as AxumState},
-    http::{HeaderMap, Method, StatusCode},
+    http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -40,7 +40,7 @@ use axum::{
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
-use tracing::{Span, field, instrument};
+use tracing::{Span, callsite::DefaultCallsite, dispatcher, field, instrument, metadata};
 #[cfg(feature = "openapi")]
 use utoipa::openapi::OpenApi as OpenApiSchema;
 
@@ -510,10 +510,30 @@ async fn observe_http(request: Request, next: Next) -> Response {
     let start = Instant::now();
     let _in_flight = metrics::InFlightGuard::new();
     let method = request.method().clone();
-    let path = request.uri().path().to_owned();
-    let response = api_request(method.clone(), path, request, next).await;
+    // The path exists only for the request span's field: a filtered-out span pays no allocation.
+    let path = request_span_enabled().then(|| request.uri().path().to_owned());
+    let response = api_request(method.as_str(), path, request, next).await;
     metrics::record_http_request(method.as_str(), response.status().as_u16(), start.elapsed());
     response
+}
+
+/// The static callsite of the request span's allocation gate: checked against the live
+/// dispatcher, never `tracing::enabled!`'s frozen first appraisal.
+static REQUEST_SPAN_CALLSITE: LazyLock<&'static DefaultCallsite> = LazyLock::new(|| {
+    tracing::callsite! {
+        name: "tinio.api.request",
+        kind: metadata::Kind::SPAN,
+        target: "tinio::api",
+        level: tracing::Level::INFO,
+        fields: (method, path, status),
+    }
+});
+
+/// Whether the management request span is enabled — the gate on the per-request path allocation.
+#[inline]
+fn request_span_enabled() -> bool {
+    use tracing::Callsite;
+    dispatcher::get_default(|d| d.enabled(REQUEST_SPAN_CALLSITE.metadata()))
 }
 
 #[instrument(
@@ -521,9 +541,9 @@ async fn observe_http(request: Request, next: Next) -> Response {
     target = "tinio::api",
     name = "tinio.api.request",
     skip_all,
-    fields(method = %method, path = %path, status = field::Empty, close_line = false)
+    fields(method = %method, path = %path.as_deref().unwrap_or("-"), status = field::Empty, close_line = false)
 )]
-async fn api_request(method: Method, path: String, request: Request, next: Next) -> Response {
+async fn api_request(method: &str, path: Option<String>, request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     Span::current().record("status", u64::from(response.status().as_u16()));
     response

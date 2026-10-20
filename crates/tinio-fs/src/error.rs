@@ -21,6 +21,8 @@ use std::{
 };
 
 use garde::{Error as GardeError, Path as GardePath, Report};
+#[cfg(test)]
+use tinio_util::testing::object_key;
 
 use crate::{
     _core::{pipeline, storage},
@@ -221,7 +223,6 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
-            object,
             pipeline::Error::{Dropped, ShutDown},
             storage::{COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT, Error::*},
         },
@@ -254,7 +255,7 @@ mod tests {
             (Error::InvalidPath("a/../b".into()), "invalid path: a/../b"),
             (invalid_value(report), "invalid options:"),
             (
-                Error::Storage(NoSuchKey(object::key("x").expect("a valid object key"))),
+                Error::Storage(NoSuchKey(object_key("x"))),
                 "no such object: `x`",
             ),
             (

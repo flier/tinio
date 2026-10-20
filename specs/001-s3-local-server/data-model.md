@@ -123,7 +123,7 @@ State transitions: `stopped` → `starting` (bind port + control channel, write 
 
 ## Metrics (read-only views, not persisted)
 
-One in-memory Prometheus registry, process-global and reset on restart; `/metrics` renders it. Bucket, object and byte gauges come from one reader task's 30 s full scan — never a request scan. One declaring crate per family, the observer: the HTTP families move from `tinio-server` to `tinio-api` (the crate rendering `/metrics`, whose management router's one middleware observes them); the five versioning families stay in `tinio-fs`; the five cross-backend storage families are declared once in `tinio-util`, the crate every backend links. Renames are breaking: no alias, nothing grandfathered.
+The five versioning families below are declared only in a build with the `versioning` feature (an accepted exception to the no-hidden-families rule). One in-memory Prometheus registry, process-global and reset on restart; `/metrics` renders it. Bucket, object and byte gauges come from one reader task's 30 s full scan — never a request scan. One declaring crate per family, the observer: the HTTP families move from `tinio-server` to `tinio-api` (the crate rendering `/metrics`, whose management router's one middleware observes them); the five versioning families stay in `tinio-fs`; the five cross-backend storage families are declared once in `tinio-util`, the crate every backend links. Renames are breaking: no alias, nothing grandfathered.
 
 | Family | Type | Labels | Unit | Owner | Rationale |
 |---|---|---|---|---|---|

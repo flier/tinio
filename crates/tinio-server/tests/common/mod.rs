@@ -62,7 +62,7 @@
 use std::{
     env, fs,
     io::{self, BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpStream as StdTcpStream},
+    net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream},
     path::{Path, PathBuf},
     process::Child,
     sync::mpsc,
@@ -72,12 +72,20 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
-use tinio_core::acl::DEFAULT_ROOT_ACCESS_KEY;
+use tinio_core::{
+    BucketOps,
+    acl::{Acl, DEFAULT_ROOT_ACCESS_KEY},
+    bucket,
+};
+use tinio_mem::MemoryStorage;
 use tinio_sandbox::Event;
+use tinio_server::{Capabilities, DataPlane};
 use tinio_util::testing::{frame_line, wait_timeout_secs};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
+    sync::watch,
+    task::JoinHandle,
     time::sleep,
 };
 
@@ -91,6 +99,70 @@ pub const SECRET_KEY: &str = "minioadmin";
 /// against the bound address — so the value is the signer's to choose
 /// (`data.rs`'s acl test picks the same one).
 pub const HOST: &str = "localhost";
+
+/// An in-process data plane over a fresh mem backend, bound to an ephemeral loopback port.
+///
+/// The shape the span/OTel legs share: mem storage with one `data` bucket, a bound listener, the
+/// plane spawned on this runtime, and a [`Plane`] handle that owns the stop channel and the join.
+pub async fn spawn_plane() -> Plane {
+    let plane = DataPlane::new(mem_storage().await, Capabilities::default());
+    spawn_plane_with(plane).await
+}
+
+/// [`spawn_plane`] with the static credential pair the auth leg drives an unknown key through.
+pub async fn spawn_plane_with_auth(access_key: &'static str, secret: &'static str) -> Plane {
+    let plane = DataPlane::new_with_auth(
+        mem_storage().await,
+        Capabilities::default(),
+        access_key,
+        secret,
+    );
+    spawn_plane_with(plane).await
+}
+
+/// A mem backend with the `data` bucket every fixture request addresses.
+async fn mem_storage() -> MemoryStorage {
+    let storage = MemoryStorage::new().expect("mem storage");
+    let name = bucket::name("data").expect("bucket name");
+    storage
+        .create_bucket(&name, None, &Acl::default_private(None))
+        .await
+        .expect("bucket");
+    storage
+}
+
+/// The running plane: its address, the shutdown sender and the serve task's join handle.
+pub struct Plane {
+    /// The loopback address the listener bound.
+    pub addr: SocketAddr,
+    shutdown: watch::Sender<bool>,
+    handle: JoinHandle<()>,
+}
+
+impl Plane {
+    /// Flip the shutdown channel and wait for the accept loop to end.
+    pub async fn stop(self) {
+        let _ = self.shutdown.send(true);
+        self.handle.await.expect("the accept loop ends on the stop");
+    }
+}
+
+/// Bind and spawn the plane, turning a serve failure into the same panic the legs asserted.
+async fn spawn_plane_with(plane: DataPlane) -> Plane {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (shutdown, rx) = watch::channel(false);
+    let handle = tokio::spawn(async move {
+        plane.serve(listener, rx).await.expect("the plane serves");
+    });
+    Plane {
+        addr,
+        shutdown,
+        handle,
+    }
+}
 
 /// A raw HTTP response: the status and the de-chunked body.
 pub struct Wire {

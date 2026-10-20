@@ -13,7 +13,6 @@ use std::time::Duration;
 use futures::StreamExt;
 use tinio_core::{
     blob::{BlobRef, BlockHash},
-    bucket,
     cleanup::{ActionStream, Cleanup, CleanupOptions, RepairAction, RepairKind},
     content::{ContentKey, ObjectContent, StagedObject},
     lifecycle,
@@ -32,7 +31,7 @@ use tinio_pg::{
     Access, Error, PgStorage,
     cleanup::PgCleanup,
 };
-use tinio_util::testing::hex;
+use tinio_util::testing::{bucket_name, hex};
 
 /// Drain an action stream into the actions it reported.
 async fn collect(actions: ActionStream<Error>) -> Vec<RepairAction> {
@@ -87,7 +86,7 @@ async fn planted_orphans_report_in_a_dry_run_and_the_fix_reclaims_them() {
         .await
         .expect("a writable store (migrating the scratch database)");
 
-    let bucket = bucket::name("cleanup-leg").expect("a valid bucket name");
+    let bucket = bucket_name("cleanup-leg");
     let wire = "cleanup-leg";
     let part_ckey = format!("p:{}:0001", hex(b"gone-upload"));
     let dead_block = BlockHash::of(b"dead-block").to_hex();

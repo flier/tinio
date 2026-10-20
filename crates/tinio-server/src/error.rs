@@ -6,6 +6,9 @@
 
 use std::io;
 
+#[cfg(test)]
+use tinio_util::testing::bucket_name;
+
 use crate::_core::storage;
 
 /// A server failure: startup or S3-mapping.
@@ -40,10 +43,7 @@ mod tests {
     use prometheus::Error as PrometheusError;
 
     use super::*;
-    use crate::{
-        _core::{bucket, storage::Error::*},
-        _util::testing::assert_send_sync,
-    };
+    use crate::{_core::storage::Error::*, _util::testing::assert_send_sync};
 
     #[test]
     fn displays_variants() {
@@ -53,9 +53,7 @@ mod tests {
                 "I/O error: port in use",
             ),
             (
-                Error::Storage(NoSuchBucket(
-                    bucket::name("data").expect("a valid bucket name"),
-                )),
+                Error::Storage(NoSuchBucket(bucket_name("data"))),
                 "storage error: no such bucket: `data`",
             ),
             (

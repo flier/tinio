@@ -29,6 +29,8 @@ use std::{
 };
 
 use smart_default::SmartDefault;
+#[cfg(test)]
+use tinio_util::testing::{object_key, part_number};
 use tokio::{fs, sync::watch};
 use tracing::instrument;
 
@@ -49,7 +51,7 @@ use crate::{
 use crate::{
     _core::{lifecycle, multipart::DEFAULT_EXPIRE_DAYS, storage},
     _util::{
-        metrics::{Pass, PassTimer, Section, record_pass_failure},
+        metrics::{FsSection, Pass, PassTimer, record_fs_pass_failure},
         pacing,
     },
     backend::FsStorage,
@@ -428,30 +430,30 @@ impl Sweeper {
                 // rather than judge a governed bucket by the knob its rule
                 // displaced — unless this run builds no pass at all, whose
                 // knobs a rule was never going to displace (LC23).
-                record_pass_failure(Pass::FsSweep, Section::Rules);
+                record_fs_pass_failure(FsSection::Rules);
                 first_error = first_error.or(Some(err));
                 lifecycle::ActionOwners::unread(self.options.lifecycle_pass)
             }
         };
         if let Err(err) = self.sweep_versioned(&mut summary, now, &governed).await {
-            record_pass_failure(Pass::FsSweep, Section::Versioned);
+            record_fs_pass_failure(FsSection::Versioned);
             first_error = first_error.or(Some(err));
         }
         if let Err(err) = self.sweep_orphan_blobs(&mut summary).await {
-            record_pass_failure(Pass::FsSweep, Section::OrphanBlobs);
+            record_fs_pass_failure(FsSection::OrphanBlobs);
             first_error = first_error.or(Some(err));
         }
         match self.sweep_tmp(now).await {
             Ok(temps) => summary.temp_files += temps,
             Err(err) => {
-                record_pass_failure(Pass::FsSweep, Section::Tmp);
+                record_fs_pass_failure(FsSection::Tmp);
                 first_error = first_error.or(Some(err));
             }
         }
         match self.sweep_multipart(now, &governed).await {
             Ok(uploads) => summary.uploads = uploads,
             Err(err) => {
-                record_pass_failure(Pass::FsSweep, Section::Multipart);
+                record_fs_pass_failure(FsSection::Multipart);
                 first_error = first_error.or(Some(err));
             }
         }
@@ -939,7 +941,7 @@ mod tests {
             acl::Acl,
             bucket, lifecycle,
             meta::BucketMeta,
-            multipart, object,
+            object,
             storage::{BucketOps, MultipartOps},
         },
         _store_redb::RedbMetadata,
@@ -1392,7 +1394,7 @@ mod tests {
         storage
             .create_multipart_upload(
                 &b,
-                &object::key("big.bin").expect("a valid object key"),
+                &object_key("big.bin"),
                 None,
                 object::Tags::empty(),
                 None,
@@ -1517,7 +1519,7 @@ mod tests {
         storage
             .create_multipart_upload(
                 &b,
-                &object::key("big.bin").expect("a valid object key"),
+                &object_key("big.bin"),
                 None,
                 object::Tags::empty(),
                 None,
@@ -1843,7 +1845,7 @@ mod tests {
         storage
             .create_multipart_upload(
                 &b,
-                &object::key("big.bin").expect("a valid object key"),
+                &object_key("big.bin"),
                 None,
                 object::Tags::empty(),
                 None,
@@ -1895,7 +1897,7 @@ mod tests {
         let upload = storage
             .create_multipart_upload(
                 &b,
-                &object::key("big.bin").expect("a valid object key"),
+                &object_key("big.bin"),
                 None,
                 object::Tags::empty(),
                 None,
@@ -1906,9 +1908,9 @@ mod tests {
         storage
             .upload_part(
                 &b,
-                &object::key("big.bin").expect("a valid object key"),
+                &object_key("big.bin"),
                 &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
+                part_number(1),
                 body(b"x"),
                 None,
             )

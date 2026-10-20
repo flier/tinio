@@ -23,13 +23,14 @@ use crate::{bucket, etag, object};
 ///     storage::{self, Error::*},
 /// };
 ///
-/// let err = NoSuchBucket(bucket::name("data").expect("a valid bucket name"));
+/// let err = NoSuchBucket(tinio_util::testing::bucket_name("data"));
 /// assert_eq!(err.to_string(), "no such bucket: `data`");
 ///
 /// // I/O errors convert into the domain error transparently.
 /// let io_err: storage::Error = io::Error::new(io::ErrorKind::NotFound, "gone").into();
 /// assert!(matches!(io_err, Io(_)));
 /// ```
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The referenced bucket does not exist.

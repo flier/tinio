@@ -68,13 +68,9 @@ use crate::{
     _store_redb::{
         RedbMetadata, object_part, part, part_checksum, part_stamp, upload, upload_checksum,
     },
-    _util::{
-        lockmap::{Guard, Map},
-        metrics::WriteOp,
-    },
+    _util::lockmap::{Guard, Map},
     Error,
     database::{self, Driver},
-    error::record_failed_write,
     fsutil,
     fsutil::ok_if_missing,
     path::MULTIPART_DIR_NAME,
@@ -503,14 +499,12 @@ impl Store {
         if let Err(err) = fs::create_dir_all(&dir).await {
             let _ = fs::remove_file(&temp).await;
             let err = Error::from(err);
-            record_failed_write(WriteOp::Part, &err);
             return Err(err);
         }
         let part = part_path(&dir, n);
         if let Err(err) = fs::rename(&temp, &part).await {
             let _ = fs::remove_file(&temp).await;
             let err = Error::from(err);
-            record_failed_write(WriteOp::Part, &err);
             return Err(err);
         }
         // The contract's `put_part` re-checks the upload INSIDE the
@@ -533,7 +527,6 @@ impl Store {
             let _ = fs::remove_file(&part).await;
             let _ = fs::remove_dir(&dir).await;
             let err = database::map_contract_error(err);
-            record_failed_write(WriteOp::Part, &err);
             return Err(err);
         }
         // The part file's own stat; the digest committed atomically with the

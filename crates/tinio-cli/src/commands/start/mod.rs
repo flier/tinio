@@ -17,6 +17,7 @@ mod reader;
 mod run;
 mod serve;
 mod serving;
+mod write_metrics;
 
 use std::process::ExitCode;
 

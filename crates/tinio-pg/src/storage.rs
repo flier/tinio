@@ -47,32 +47,11 @@ use tinio_ops::{
 use crate::version::{Plane, plane};
 use crate::{
     _store_pg::{Access, PgStore, content::PgStaged, pool::Pool, store::OWNERSHIP_RECHECK},
-    _util::metrics::{Backend, WriteFailureKind, WriteOp, record_read_only, record_write_failure},
+    _util::metrics::{Backend, record_read_only},
     Config, Error,
     hooks::PgHooks,
     readonly::Subject,
 };
-
-/// Book one failed write into the shared cross-backend family and hand the
-/// failure on: `op` stays in that family's vocabulary (`put`, `part`,
-/// `delete`), so pg joins fs's and mem's series, and a write that failed is
-/// counted once.
-fn write_failed<E: Into<Error>>(op: WriteOp, err: E) -> Error {
-    let err = err.into();
-    record_write_failure(Backend::Pg, op, write_failure_kind(&err));
-    err
-}
-
-/// A read-only session refuses writes as `ReadOnlyFilesystem` (the store's
-/// `25006` projection); every other failure is `io`. The predicate is the
-/// contract's own, so this backend and the filesystem's classify alike.
-fn write_failure_kind(err: &Error) -> WriteFailureKind {
-    if err.is_read_only() {
-        WriteFailureKind::ReadOnly
-    } else {
-        WriteFailureKind::Io
-    }
-}
 
 /// The pg backend: the `Storage` categories over one store and its pool.
 ///
@@ -371,7 +350,7 @@ impl PgStorage {
         self.store
             .teardown_bucket(name)
             .await
-            .map_err(|err| write_failed(WriteOp::Delete, err))?;
+            .map_err(Error::from)?;
         Ok(())
     }
 }
@@ -410,7 +389,7 @@ impl BucketOps for PgStorage {
         };
         BucketMeta::create(&*self.store, name, &row)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))?;
+            .map_err(Error::from)?;
         Ok(())
     }
 
@@ -424,7 +403,7 @@ impl BucketOps for PgStorage {
         self.buckets()
             .delete_bucket(name)
             .await
-            .map_err(|err| write_failed(WriteOp::Delete, err))?;
+            .map_err(Error::from)?;
         self.teardown_bucket(name).await
     }
 
@@ -456,7 +435,7 @@ impl BucketOps for PgStorage {
         self.buckets()
             .put_bucket_tags(name, tags)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))
+            .map_err(Error::from)
     }
 
     async fn delete_bucket_tags(&self, name: &bucket::Name) -> Result<(), Error> {
@@ -464,7 +443,7 @@ impl BucketOps for PgStorage {
         self.buckets()
             .delete_bucket_tags(name)
             .await
-            .map_err(|err| write_failed(WriteOp::Delete, err))
+            .map_err(Error::from)
     }
 
     async fn get_bucket_cors(&self, name: &bucket::Name) -> Result<Option<cors::Config>, Error> {
@@ -483,7 +462,7 @@ impl BucketOps for PgStorage {
         self.buckets()
             .put_bucket_cors(name, config)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))
+            .map_err(Error::from)
     }
 
     async fn delete_bucket_cors(&self, name: &bucket::Name) -> Result<(), Error> {
@@ -491,7 +470,7 @@ impl BucketOps for PgStorage {
         self.buckets()
             .delete_bucket_cors(name)
             .await
-            .map_err(|err| write_failed(WriteOp::Delete, err))
+            .map_err(Error::from)
     }
 
     async fn get_bucket_lifecycle(
@@ -513,7 +492,7 @@ impl BucketOps for PgStorage {
         self.buckets()
             .put_bucket_lifecycle(name, config)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))
+            .map_err(Error::from)
     }
 
     async fn merge_bucket_lifecycle(
@@ -525,7 +504,7 @@ impl BucketOps for PgStorage {
         self.buckets()
             .merge_bucket_lifecycle(name, rules)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))
+            .map_err(Error::from)
     }
 
     async fn delete_bucket_lifecycle(&self, name: &bucket::Name) -> Result<(), Error> {
@@ -533,7 +512,7 @@ impl BucketOps for PgStorage {
         self.buckets()
             .delete_bucket_lifecycle(name)
             .await
-            .map_err(|err| write_failed(WriteOp::Delete, err))
+            .map_err(Error::from)
     }
 
     async fn get_bucket_acl(&self, name: &bucket::Name) -> Result<Acl, Error> {
@@ -548,7 +527,7 @@ impl BucketOps for PgStorage {
         self.buckets()
             .put_bucket_acl(name, grants)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))
+            .map_err(Error::from)
     }
 }
 
@@ -571,7 +550,7 @@ impl ObjectOps for PgStorage {
         self.objects()
             .stage_body(bucket, key, body, tee, carried)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))
+            .map_err(Error::from)
     }
 
     async fn commit_object(
@@ -585,9 +564,7 @@ impl ObjectOps for PgStorage {
     ) -> Result<object::Info, Error> {
         self.writable(Subject::Key(key))?;
         Self::refuse_reserved(key)?;
-        self.commit_put(bucket, key, staged, tags, owner, acl)
-            .await
-            .map_err(|err| write_failed(WriteOp::Put, err))
+        self.commit_put(bucket, key, staged, tags, owner, acl).await
     }
 
     async fn get_object(
@@ -674,7 +651,7 @@ impl ObjectOps for PgStorage {
             .objects()
             .rename_object(bucket, src, dst)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))?;
+            .map_err(Error::from)?;
         self.fill_version_facts(bucket, dst, &mut info).await?;
         Ok(info)
     }
@@ -707,17 +684,13 @@ impl ObjectOps for PgStorage {
         // A bucket that records versions creates a delete marker. The branch
         // lives with the version plane, so this body is the same call in every
         // build; a stripped build's answer is `None` and the plain delete runs.
-        if let Some(marker) = self
-            .delete_if_versioned(bucket, key)
-            .await
-            .map_err(|err| write_failed(WriteOp::Delete, err))?
-        {
+        if let Some(marker) = self.delete_if_versioned(bucket, key).await? {
             return Ok(marker);
         }
         self.objects()
             .delete_object(bucket, key)
             .await
-            .map_err(|err| write_failed(WriteOp::Delete, err))
+            .map_err(Error::from)
     }
 
     async fn get_object_tags(
@@ -742,7 +715,7 @@ impl ObjectOps for PgStorage {
             .objects()
             .put_object_tags(bucket, key, tags)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))?;
+            .map_err(Error::from)?;
         self.fill_tag_facts(bucket, key, &mut answer).await?;
         Ok(answer)
     }
@@ -757,7 +730,7 @@ impl ObjectOps for PgStorage {
             .objects()
             .delete_object_tags(bucket, key)
             .await
-            .map_err(|err| write_failed(WriteOp::Delete, err))?;
+            .map_err(Error::from)?;
         self.fill_tag_facts(bucket, key, &mut answer).await?;
         Ok(answer)
     }
@@ -779,7 +752,7 @@ impl ObjectOps for PgStorage {
         self.objects()
             .put_object_acl(bucket, key, grants)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))
+            .map_err(Error::from)
     }
 
     async fn list_objects(&self, params: ListObjectsParams) -> Result<ObjectListing, Error> {
@@ -834,7 +807,7 @@ impl MultipartOps for PgStorage {
         self.parts()
             .create_multipart_upload(bucket, key, checksum, tags, owner, acl)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))
+            .map_err(Error::from)
     }
 
     async fn get_multipart_upload(
@@ -862,7 +835,7 @@ impl MultipartOps for PgStorage {
         self.parts()
             .upload_part(bucket, key, upload_id, part_number, body, checksum)
             .await
-            .map_err(|err| write_failed(WriteOp::Part, err))
+            .map_err(Error::from)
     }
 
     async fn list_parts(&self, params: ListPartsParams) -> Result<PartsListing, Error> {
@@ -977,7 +950,6 @@ impl MultipartOps for PgStorage {
         self.writable(Subject::Key(key))?;
         self.finish_multipart_upload(bucket, key, upload_id, parts, checksum)
             .await
-            .map_err(|err| write_failed(WriteOp::Put, err))
     }
 
     async fn abort_multipart_upload(
@@ -997,7 +969,7 @@ impl MultipartOps for PgStorage {
         self.parts()
             .abort_multipart_upload(bucket, key, upload_id)
             .await
-            .map_err(|err| write_failed(WriteOp::Delete, err))?;
+            .map_err(Error::from)?;
         let removed: Vec<ContentKey> = stored
             .iter()
             .map(|row| {

@@ -2,6 +2,9 @@
 
 use std::io::Error as IoError;
 
+#[cfg(test)]
+use tinio_util::testing::object_key;
+
 use crate::_core::{blob, storage};
 
 /// A block-engine failure.
@@ -49,14 +52,11 @@ mod tests {
     use std::io;
 
     use super::*;
-    use crate::_core::{
-        object,
-        storage::{self, Error as StorageError},
-    };
+    use crate::_core::storage::{self, Error as StorageError};
 
     #[test]
     fn a_storage_error_passes_through_the_projection_unchanged() {
-        let contract = storage::no_such_key(&object::key("missing").expect("a valid object key"));
+        let contract = storage::no_such_key(&object_key("missing"));
         let expected = contract.to_string();
         let err: StorageError = Error::Storage(contract).into();
         assert_eq!(err.to_string(), expected);

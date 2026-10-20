@@ -8,6 +8,9 @@
 
 use std::io::{self, Error as IoError};
 
+#[cfg(test)]
+use tinio_util::testing::{bucket_name, object_key};
+
 use crate::_core::{bucket, etag, object, storage, storage::Error::*};
 
 /// An in-memory backend failure.
@@ -21,7 +24,7 @@ use crate::_core::{bucket, etag, object, storage, storage::Error::*};
 /// use tinio_core::{bucket, storage, storage::Error::*};
 /// use tinio_mem::Error;
 ///
-/// let err: Error = NoSuchBucket(bucket::name("data").expect("a valid bucket name")).into();
+/// let err: Error = NoSuchBucket(tinio_util::testing::bucket_name("data")).into();
 /// assert!(matches!(err, Error::Storage(NoSuchBucket(_))));
 /// ```
 #[derive(Debug, thiserror::Error)]
@@ -212,14 +215,8 @@ mod tests {
     #[test]
     fn displays_wrapped_contract_errors() {
         let cases: [(storage::Error, &str); 4] = [
-            (
-                NoSuchBucket(bucket::name("data").expect("a valid bucket name")),
-                "no such bucket: `data`",
-            ),
-            (
-                NoSuchKey(object::key("a.txt").expect("a valid object key")),
-                "no such object: `a.txt`",
-            ),
+            (NoSuchBucket(bucket_name("data")), "no such bucket: `data`"),
+            (NoSuchKey(object_key("a.txt")), "no such object: `a.txt`"),
             (
                 InvalidRange {
                     range: ByteRange::From(10),
@@ -237,7 +234,7 @@ mod tests {
 
     #[test]
     fn contract_errors_convert_into_backend() {
-        let err: Error = NoSuchBucket(bucket::name("data").expect("a valid bucket name")).into();
+        let err: Error = NoSuchBucket(bucket_name("data")).into();
         assert!(matches!(err, Error::Storage(NoSuchBucket(_))));
 
         let err: Error = InvalidPartNumber(0).into();

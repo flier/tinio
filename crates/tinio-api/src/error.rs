@@ -12,6 +12,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use tinio_util::testing::object_key;
 
 use crate::_core::storage;
 
@@ -135,10 +137,7 @@ mod tests {
     use io::Error as IoError;
 
     use super::*;
-    use crate::{
-        _core::{object, storage::Error::*},
-        _util::testing::assert_send_sync,
-    };
+    use crate::{_core::storage::Error::*, _util::testing::assert_send_sync};
 
     #[test]
     fn maps_to_status_codes() {
@@ -150,10 +149,7 @@ mod tests {
             Error::Busy("\\\\.\\pipe\\tinio-x: busy".into()).status(),
             500
         );
-        assert_eq!(
-            Error::Storage(NoSuchKey(object::key("k").expect("a valid object key"))).status(),
-            500
-        );
+        assert_eq!(Error::Storage(NoSuchKey(object_key("k"))).status(), 500);
     }
 
     #[test]
@@ -207,9 +203,7 @@ mod tests {
             "internal server error"
         );
         assert_eq!(
-            Error::Storage(NoSuchKey(object::key("k").expect("a valid object key")))
-                .body()
-                .error,
+            Error::Storage(NoSuchKey(object_key("k"))).body().error,
             "internal server error"
         );
     }

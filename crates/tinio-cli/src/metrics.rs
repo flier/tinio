@@ -17,17 +17,13 @@
 //! The registry is process-global, so the management plane renders this family without this
 //! module knowing it; [`record`] is the only write path.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: the one registration this module owns answers only errors about its own name — the process-global default registry refuses a name it already holds, or holds with a different label set or help. The name has one registration site in the repo (a `LazyLock` whose closure runs once per process) against the family list in `specs/001-s3-local-server/data-model.md` §Metrics; a collision is a source-level mistake rather than a runtime condition, and `LazyLock::new` has no `Result` to return it through. The module's tests read the name back out of the gathered exposition, so a registration that did not land fails a test."
-)]
-
 use std::{
     sync::LazyLock,
     time::{Duration, Instant},
 };
 
 use prometheus::{HistogramVec, register_histogram_vec};
+use tinio_util::metrics::RegisteredExt;
 
 /// The startup phases `tinio_cli_startup_seconds` labels — the `phase` domain's whole set.
 ///
@@ -81,7 +77,7 @@ static STARTUP_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
         &["phase"],
         STARTUP_BUCKETS.to_vec(),
     )
-    .expect("register tinio_cli_startup_seconds")
+    .registered("tinio_cli_startup_seconds")
 });
 
 /// A phase's clock: one sample on drop.

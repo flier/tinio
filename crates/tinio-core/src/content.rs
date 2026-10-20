@@ -85,6 +85,11 @@ impl ContentKey {
     pub fn is_part(&self) -> bool {
         matches!(self, Self::Part { .. })
     }
+
+    /// The `op`/`kind` span label: `part` for a staged part, `object` for an object key.
+    pub fn kind_label(&self) -> &'static str {
+        if self.is_part() { "part" } else { "object" }
+    }
 }
 
 /// One entry of a content walk or a content probe: the **object** key, its

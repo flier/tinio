@@ -1149,8 +1149,7 @@ mod tests {
                 .in_scope(|| tracing::info!(target: "tinio::storage", "inside"));
             tracing::info_span!(target: "tinio::http", "request", close_line = false)
                 .in_scope(|| {});
-            tracing::info_span!(target: "tinio::api", "status", close_line = false)
-                .in_scope(|| {});
+            tracing::info_span!(target: "tinio::api", "status", close_line = false).in_scope(|| {});
         });
         let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         assert_eq!(logged.matches("span closed").count(), 1, "{logged}");

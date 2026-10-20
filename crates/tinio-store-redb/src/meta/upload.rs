@@ -544,7 +544,7 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use tinio_util::testing::metadata::assert_upload_meta_conformance;
+    use tinio_util::testing::{metadata::assert_upload_meta_conformance, part_number};
 
     use crate::{
         _core::{
@@ -555,7 +555,7 @@ mod tests {
                 UploadMeta,
                 upload::{PartRow, Row},
             },
-            multipart, object, storage,
+            object, storage,
         },
         Error, RedbMetadata,
         part::Table as PartTable,
@@ -595,7 +595,7 @@ mod tests {
                 &bucket,
                 &key,
                 "conf-refuse-1",
-                multipart::part_number(1u32).expect("a valid part number"),
+                part_number(1u32),
                 &etag,
                 None,
             )
@@ -633,7 +633,7 @@ mod tests {
                 &bucket,
                 &other,
                 "conf-refuse-1",
-                multipart::part_number(1u32).expect("a valid part number"),
+                part_number(1u32),
                 &etag,
                 None,
             )
@@ -647,11 +647,7 @@ mod tests {
         // Neither refusal wrote a part row.
         assert!(
             store
-                .list_parts(
-                    &bucket,
-                    "conf-refuse-1",
-                    multipart::part_number(1u32).expect("a valid part number")
-                )
+                .list_parts(&bucket, "conf-refuse-1", part_number(1u32))
                 .await
                 .unwrap()
                 .is_empty(),
@@ -702,14 +698,7 @@ mod tests {
             .unwrap();
         for number in [1u32, 2, 3] {
             store
-                .put_part(
-                    &bucket,
-                    &key,
-                    upload_id,
-                    multipart::part_number(number).expect("a valid part number"),
-                    &etag,
-                    None,
-                )
+                .put_part(&bucket, &key, upload_id, part_number(number), &etag, None)
                 .await
                 .unwrap();
         }
@@ -815,35 +804,17 @@ mod tests {
             .unwrap();
 
         store
-            .put_part(
-                &bucket,
-                &key,
-                upload_id,
-                multipart::part_number(1u32).expect("a valid part number"),
-                &etag,
-                None,
-            )
+            .put_part(&bucket, &key, upload_id, part_number(1u32), &etag, None)
             .await
             .unwrap();
         thread::sleep(Duration::from_millis(1_100));
         store
-            .put_part(
-                &bucket,
-                &key,
-                upload_id,
-                multipart::part_number(2u32).expect("a valid part number"),
-                &etag,
-                None,
-            )
+            .put_part(&bucket, &key, upload_id, part_number(2u32), &etag, None)
             .await
             .unwrap();
 
         let rows = store
-            .list_parts(
-                &bucket,
-                upload_id,
-                multipart::part_number(1u32).expect("a valid part number"),
-            )
+            .list_parts(&bucket, upload_id, part_number(1u32))
             .await
             .unwrap();
         assert_eq!(
@@ -873,10 +844,7 @@ mod tests {
                 &bucket,
                 &key,
                 upload_id,
-                &[
-                    multipart::part_number(1u32).expect("a valid part number"),
-                    multipart::part_number(2u32).expect("a valid part number"),
-                ],
+                &[part_number(1u32), part_number(2u32)],
             )
             .await
             .unwrap()
@@ -912,46 +880,24 @@ mod tests {
             .unwrap();
 
         store
-            .put_part(
-                &bucket,
-                &key,
-                upload_id,
-                multipart::part_number(1u32).expect("a valid part number"),
-                &etag,
-                None,
-            )
+            .put_part(&bucket, &key, upload_id, part_number(1u32), &etag, None)
             .await
             .unwrap();
         let first = served_stamps(
             &store
-                .list_parts(
-                    &bucket,
-                    upload_id,
-                    multipart::part_number(1u32).expect("a valid part number"),
-                )
+                .list_parts(&bucket, upload_id, part_number(1u32))
                 .await
                 .unwrap(),
             initiated_at,
         );
         thread::sleep(Duration::from_millis(200));
         store
-            .put_part(
-                &bucket,
-                &key,
-                upload_id,
-                multipart::part_number(1u32).expect("a valid part number"),
-                &etag,
-                None,
-            )
+            .put_part(&bucket, &key, upload_id, part_number(1u32), &etag, None)
             .await
             .unwrap();
 
         let rows = store
-            .list_parts(
-                &bucket,
-                upload_id,
-                multipart::part_number(1u32).expect("a valid part number"),
-            )
+            .list_parts(&bucket, upload_id, part_number(1u32))
             .await
             .unwrap();
         assert_eq!(rows.len(), 1, "a re-upload upserts the one part row");
@@ -1120,14 +1066,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_part(
-                &bucket,
-                &key,
-                upload_id,
-                multipart::part_number(1u32).expect("a valid part number"),
-                &etag,
-                None,
-            )
+            .put_part(&bucket, &key, upload_id, part_number(1u32), &etag, None)
             .await
             .unwrap();
         let err = store
@@ -1140,11 +1079,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .list_parts(
-                    &bucket,
-                    upload_id,
-                    multipart::part_number(1u32).expect("a valid part number")
-                )
+                .list_parts(&bucket, upload_id, part_number(1u32))
                 .await
                 .unwrap()
                 .len(),
@@ -1169,11 +1104,7 @@ mod tests {
         );
         assert!(
             store
-                .list_parts(
-                    &bucket,
-                    upload_id,
-                    multipart::part_number(1u32).expect("a valid part number")
-                )
+                .list_parts(&bucket, upload_id, part_number(1u32))
                 .await
                 .unwrap()
                 .is_empty(),

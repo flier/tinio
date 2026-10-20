@@ -9,6 +9,8 @@ use std::{
 };
 
 use redb::{Database, ReadableDatabase, backends::InMemoryBackend};
+#[cfg(test)]
+use tinio_util::testing::object_key;
 use tokio::{fs, time};
 
 use super::*;
@@ -32,7 +34,6 @@ use crate::{
     database::{self, StateTable},
     testutil::fs_options,
 };
-
 #[test]
 fn compact_threshold_percent_is_validated() {
     let root = tempfile::tempdir().unwrap();
@@ -93,17 +94,10 @@ async fn read_only_state_relocation_keeps_root_clean() {
         .await
         .unwrap();
     storage
-        .put_object(
-            &b,
-            &object::key("a.txt").expect("a valid object key"),
-            body(b"hello"),
-        )
+        .put_object(&b, &object_key("a.txt"), body(b"hello"))
         .await
         .unwrap();
-    let head = storage
-        .head_object(&b, &object::key("a.txt").expect("a valid object key"))
-        .await
-        .unwrap();
+    let head = storage.head_object(&b, &object_key("a.txt")).await.unwrap();
     assert_eq!(head.size, 5);
     // All private state lives under the state dir.
     assert!(state.join("meta.redb").exists());
@@ -130,7 +124,7 @@ async fn read_only_state_relocation_keeps_root_clean() {
 async fn planted_read_only_root() -> (tempfile::TempDir, Name, object::Key, object::Tags) {
     let root = tempfile::tempdir().unwrap();
     let b = name("data").unwrap();
-    let key: object::Key = object::key("notes.txt").expect("a valid object key");
+    let key: object::Key = object_key("notes.txt");
     let tags = object::Tags::from_pairs([("planted".to_owned(), "yes".to_owned())]).unwrap();
     {
         let storage = FsStorage::new(root.path(), fs_options()).unwrap();
@@ -275,7 +269,7 @@ async fn a_versioned_write_fails_when_the_row_write_fails() {
         },
     )
     .unwrap();
-    let key: object::Key = object::key("fresh.txt").expect("a valid object key");
+    let key: object::Key = object_key("fresh.txt");
 
     // The enabled bucket records versions: the id it would answer is only
     // real once the row is durable, so the PUT reports the failure.
@@ -316,7 +310,7 @@ async fn a_read_only_store_over_a_root_with_no_database_degrades_to_an_empty_vie
         .await
         .unwrap();
     let b = name("data").unwrap();
-    let key: object::Key = object::key("a.txt").expect("a valid object key");
+    let key: object::Key = object_key("a.txt");
 
     let storage = FsStorage::new(
         root.path(),
@@ -364,7 +358,7 @@ async fn read_only_uses_the_roots_own_state_dir_whatever_is_configured() {
         .await
         .unwrap();
     let b = name("data").unwrap();
-    let key: object::Key = object::key("a.txt").expect("a valid object key");
+    let key: object::Key = object_key("a.txt");
     for configured in [None, Some(home.path().join("relocated"))] {
         let storage = FsStorage::new(
             root.path(),
@@ -1063,16 +1057,12 @@ async fn state_dir_holds_only_redb_tmp_multipart_and_blobs() {
         .await
         .unwrap();
     storage
-        .put_object(
-            &b,
-            &object::key("hello.txt").expect("a valid object key"),
-            body(b"hello"),
-        )
+        .put_object(&b, &object_key("hello.txt"), body(b"hello"))
         .await
         .unwrap();
 
     // Multipart lifecycle leaves part files only.
-    let key = object::key("big.bin").expect("a valid object key");
+    let key = object_key("big.bin");
     let upload = storage
         .create_multipart_upload(
             &b,
@@ -1115,11 +1105,7 @@ async fn state_dir_holds_only_redb_tmp_multipart_and_blobs() {
         .await
         .unwrap();
     storage
-        .put_object(
-            &b,
-            &object::key("hello.txt").expect("a valid object key"),
-            body(b"hello again"),
-        )
+        .put_object(&b, &object_key("hello.txt"), body(b"hello again"))
         .await
         .unwrap();
     assert!(
@@ -1162,17 +1148,10 @@ async fn deleting_meta_redb_self_heals() {
         .await
         .unwrap();
     storage
-        .put_object(
-            &b,
-            &object::key("a.txt").expect("a valid object key"),
-            body(b"hello"),
-        )
+        .put_object(&b, &object_key("a.txt"), body(b"hello"))
         .await
         .unwrap();
-    let head = storage
-        .head_object(&b, &object::key("a.txt").expect("a valid object key"))
-        .await
-        .unwrap();
+    let head = storage.head_object(&b, &object_key("a.txt")).await.unwrap();
     assert_eq!(head.size, 5);
     drop(storage);
 
@@ -1180,13 +1159,10 @@ async fn deleting_meta_redb_self_heals() {
     fs::remove_file(state_dir.join("meta.redb")).await.unwrap();
     let storage = FsStorage::new(root.path(), fs_options_in(&state_dir)).unwrap();
     // The object is still served — the ETag is recomputed on demand.
-    let head = storage
-        .head_object(&b, &object::key("a.txt").expect("a valid object key"))
-        .await
-        .unwrap();
+    let head = storage.head_object(&b, &object_key("a.txt")).await.unwrap();
     assert_eq!(head.size, 5);
     let content = storage
-        .get_object(&b, &object::key("a.txt").expect("a valid object key"), None)
+        .get_object(&b, &object_key("a.txt"), None)
         .await
         .unwrap();
     let body = read_body(content.body).await.unwrap();

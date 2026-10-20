@@ -591,7 +591,7 @@ impl Child {
             Err(_) => metrics::Exit::Error,
         };
         metrics::record_exit(outcome);
-        Span::current().record("outcome", field::display(outcome));
+        Span::current().record("outcome", outcome.as_str());
         // The child's own answer, which is what a stuck launcher needs to see:
         // an exit code that arrived, or the platform error that stopped one.
         match &status {

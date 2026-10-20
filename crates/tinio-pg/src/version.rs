@@ -30,6 +30,7 @@
 ///
 /// [`Landed::Slot`] includes the row. A moved slot whose row did not land is
 /// not a state this undo sees.
+
 #[derive(Clone, Copy)]
 pub(crate) enum Landed {
     /// The publish landed. The row write did not.
@@ -958,13 +959,12 @@ mod enabled {
 mod tests {
     use tinio_core::{
         acl::Acl,
-        bucket,
         meta::VersionMeta,
         object,
         storage::{BucketOps, ObjectOps, VersionOps},
         version::State,
     };
-    use tinio_util::testing::body;
+    use tinio_util::testing::{body, bucket_name};
 
     use crate::{
         _store_pg::{pool::Pool, test_support::TestDb},
@@ -994,7 +994,7 @@ mod tests {
         .await
         .expect("a writable store over the scratch database");
 
-        let bucket = bucket::name("delete-stamp").expect("a valid bucket name");
+        let bucket = bucket_name("delete-stamp");
         let key = object::key("stamped.txt").expect("a valid key");
         let acl = Acl::default_private(None);
         storage

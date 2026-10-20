@@ -9,6 +9,7 @@
     reason = "test support: a test proves the public paths"
 )]
 
+use tinio_util::testing::bucket_name;
 mod support;
 
 use std::{sync::Arc, time::Duration};
@@ -70,7 +71,7 @@ async fn the_engine_waits_for_the_per_upload_part_lock() {
     let storage = PgStorage::connect(&scratch_config(&db), Access::ReadWrite)
         .await
         .expect("a writable store over the scratch database");
-    let bucket = bucket::name("part-lock-waits").expect("a valid bucket name");
+    let bucket = bucket_name("part-lock-waits");
     let upload_id = upload(&storage, &bucket).await.expect("the upload");
     let key = object::key("locked.bin").expect("a valid key");
 
@@ -133,7 +134,7 @@ async fn concurrent_same_part_writes_keep_the_row_agreed_with_its_generation() {
             .expect("a writable store over the scratch database"),
     );
     let second = Arc::clone(&first);
-    let bucket = bucket::name("part-lock-agrees").expect("a valid bucket name");
+    let bucket = bucket_name("part-lock-agrees");
     let upload_id = upload(&first, &bucket).await.expect("the upload");
     let key = object::key("locked.bin").expect("a valid key");
 

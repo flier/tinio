@@ -624,7 +624,7 @@ where
         skip(self, staged, releasing),
         fields(
             bucket = %bucket,
-            op = if key.is_part() { "part" } else { "object" },
+            op = key.kind_label(),
             bytes = staged.len,
             key = field::Empty,
         )
@@ -839,7 +839,7 @@ where
         skip(self, staged),
         fields(
             bucket = %bucket,
-            op = if key.is_part() { "part" } else { "object" },
+            op = key.kind_label(),
             bytes = staged.len,
             key = field::Empty,
         )
@@ -872,7 +872,7 @@ where
         skip(self, staged, id),
         fields(
             bucket = %bucket,
-            op = if key.is_part() { "part" } else { "object" },
+            op = key.kind_label(),
             bytes = staged.len,
             key = field::Empty,
         )
@@ -902,7 +902,7 @@ where
         skip(self, range),
         fields(
             bucket = %bucket,
-            op = if key.is_part() { "part" } else { "object" },
+            op = key.kind_label(),
             key = field::Empty,
         )
     )]
@@ -929,7 +929,7 @@ where
         skip(self),
         fields(
             bucket = %bucket,
-            op = if key.is_part() { "part" } else { "object" },
+            op = key.kind_label(),
             key = field::Empty,
         )
     )]

@@ -37,6 +37,8 @@
 // `ObjectOps` trait method (the unix fast path never does).
 use std::{io::ErrorKind, sync::Arc};
 
+#[cfg(test)]
+use tinio_util::testing::part_number;
 use tokio::fs;
 
 use super::{Error, FsHooks, FsStorage};
@@ -579,7 +581,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
+                part_number(1),
                 Box::pin(stream::iter(vec![
                     Ok::<_, io::Error>(Bytes::from_static(b"x")),
                     Err(io::Error::other("boom")),
@@ -721,14 +723,7 @@ mod tests {
             .unwrap();
         for i in 1..=5u32 {
             storage
-                .upload_part(
-                    &b,
-                    &k,
-                    &upload.upload_id,
-                    multipart::part_number(i).expect("a valid part number"),
-                    body(b"x"),
-                    None,
-                )
+                .upload_part(&b, &k, &upload.upload_id, part_number(i), body(b"x"), None)
                 .await
                 .unwrap();
         }
@@ -1008,7 +1003,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
+                part_number(1),
                 body(b"hello"),
                 None,
             )
@@ -1080,7 +1075,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
+                part_number(1),
                 body(first.clone()),
                 Some(checksum_tee(checksum::Algorithm::Md5, &md5_wire(&first))),
             )
@@ -1091,7 +1086,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                multipart::part_number(2).expect("a valid part number"),
+                part_number(2),
                 body(b"world"),
                 Some(checksum_tee(checksum::Algorithm::Md5, &md5_wire(b"world"))),
             )
@@ -1158,7 +1153,7 @@ mod tests {
                 &b,
                 &k,
                 &upload2.upload_id,
-                multipart::part_number(3).expect("a valid part number"),
+                part_number(3),
                 body(b"tail"),
                 None,
             )
@@ -1213,7 +1208,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
+                part_number(1),
                 body(b"hello"),
                 None,
             )
@@ -1290,7 +1285,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
+                part_number(1),
                 body(b"second"),
                 None,
             )
@@ -1508,7 +1503,7 @@ mod tests {
                 &b,
                 &dst,
                 &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
+                part_number(1),
                 Some(ByteRange::Inclusive(0, 4)),
             )
             .await
@@ -1518,15 +1513,7 @@ mod tests {
 
         // The whole source, as the completion's final part.
         let whole = storage
-            .copy_part(
-                &b,
-                &src,
-                &b,
-                &dst,
-                &upload.upload_id,
-                multipart::part_number(2).expect("a valid part number"),
-                None,
-            )
+            .copy_part(&b, &src, &b, &dst, &upload.upload_id, part_number(2), None)
             .await
             .unwrap();
         assert_eq!(whole.size, 11);
@@ -1544,7 +1531,7 @@ mod tests {
                 &b,
                 &reserved,
                 &upload.upload_id,
-                multipart::part_number(3).expect("a valid part number"),
+                part_number(3),
                 None,
             )
             .await
@@ -1569,7 +1556,7 @@ mod tests {
                 &b,
                 &reserved,
                 &upload.upload_id,
-                multipart::part_number(4).expect("a valid part number"),
+                part_number(4),
                 None,
             )
             .await

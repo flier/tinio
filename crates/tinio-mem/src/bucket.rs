@@ -14,6 +14,8 @@
 //! mem-local.
 
 use async_trait::async_trait;
+#[cfg(test)]
+use tinio_util::testing::part_number;
 
 #[cfg(test)]
 use crate::_core::bucket::name;
@@ -30,7 +32,6 @@ use crate::{
     Error,
     storage::MemoryStorage,
 };
-
 #[async_trait]
 impl BucketOps for MemoryStorage {
     async fn create_bucket(
@@ -203,9 +204,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        _core::{
-            CompletedPart, MultipartOps, ObjectOps, acl::Acl, multipart, object, storage::Error::*,
-        },
+        _core::{CompletedPart, MultipartOps, ObjectOps, acl::Acl, object, storage::Error::*},
         _store_redb::{bucket, bucket_lifecycle},
         _util::testing::{body, metadata::lifecycle_config},
         testutil::{other_owner_id, owner_id},
@@ -379,7 +378,7 @@ mod tests {
                     &doomed,
                     &pending,
                     &upload.upload_id,
-                    multipart::part_number(1).expect("a valid part number"),
+                    part_number(1),
                     body(b"orphan!".to_vec()),
                     None,
                 )
@@ -576,7 +575,7 @@ mod tests {
                 &bucket,
                 &key,
                 &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
+                part_number(1),
                 body(b"part".to_vec()),
                 None,
             )

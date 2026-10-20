@@ -7,6 +7,8 @@ use std::{io::Error as IoError, thread, time::Duration};
 use bytes::Bytes;
 use futures::StreamExt;
 use md5::{Digest, Md5};
+#[cfg(test)]
+use tinio_util::testing::object_key;
 use tokio::{fs, time::timeout};
 
 use super::*;
@@ -42,7 +44,6 @@ use crate::{
         all_users_read_grant, bucket, checksum_tee, fs_options, md5_wire, owner_id, storage,
     },
 };
-
 #[tokio::test]
 async fn conformance_green() {
     let (_root, storage) = storage();
@@ -239,11 +240,7 @@ async fn missing_bucket_is_no_such_bucket() {
     let (_root, storage) = storage();
     let ghost = bucket::name("ghost").unwrap();
     let err: StorageError = storage
-        .put_object(
-            &ghost,
-            &object::key("a").expect("a valid object key"),
-            body(b"x"),
-        )
+        .put_object(&ghost, &object_key("a"), body(b"x"))
         .await
         .unwrap_err()
         .into();
@@ -366,11 +363,7 @@ async fn delete_of_a_directory_without_slash_is_204() {
     let b = bucket(&storage).await;
     // 'dir' exists as a directory (a folder marker was PUT).
     storage
-        .put_object(
-            &b,
-            &object::key("dir/").expect("a valid object key"),
-            body(b""),
-        )
+        .put_object(&b, &object_key("dir/"), body(b""))
         .await
         .unwrap();
     // DELETE 'dir' (no trailing slash): idempotent 204, the
@@ -413,11 +406,7 @@ async fn folder_marker_semantics() {
     // A non-empty directory is left in place.
     storage.put_object(&b, &marker, body(b"")).await.unwrap();
     storage
-        .put_object(
-            &b,
-            &object::key("dir/file.txt").expect("a valid object key"),
-            body(b"x"),
-        )
+        .put_object(&b, &object_key("dir/file.txt"), body(b"x"))
         .await
         .unwrap();
     storage.delete_object(&b, &marker).await.unwrap();
@@ -512,11 +501,7 @@ async fn head_of_folder_marker_is_no_such_key() {
     let (_root, storage) = storage();
     let b = bucket(&storage).await;
     storage
-        .put_object(
-            &b,
-            &object::key("dir/").expect("a valid object key"),
-            body(b""),
-        )
+        .put_object(&b, &object_key("dir/"), body(b""))
         .await
         .unwrap();
     let err: StorageError = storage

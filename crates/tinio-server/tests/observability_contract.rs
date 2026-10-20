@@ -16,34 +16,16 @@
     reason = "test support: the plane, request and recording fixtures state their own invariants (docs/style.md §Panics)"
 )]
 
-use std::net::Ipv4Addr;
+mod common;
 
-use tinio_core::{BucketOps, acl::Acl, bucket};
-use tinio_mem::MemoryStorage;
-use tinio_server::{Capabilities, DataPlane};
 use tinio_util::testing::{http::exchange, spans};
-use tokio::{net::TcpListener, sync::watch};
 use tracing::Level;
 
 #[tokio::test]
 async fn the_request_spine_nests_request_operation_and_storage_spans() {
     spans::install();
-    let storage = MemoryStorage::new().expect("mem storage");
-    let name = bucket::name("data").expect("bucket name");
-    storage
-        .create_bucket(&name, None, &Acl::default_private(None))
-        .await
-        .expect("bucket");
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let (shutdown, rx) = watch::channel(false);
-    let plane = tokio::spawn(async move {
-        DataPlane::new(storage, Capabilities::default())
-            .serve(listener, rx)
-            .await
-    });
+    let plane = common::spawn_plane().await;
+    let addr = plane.addr;
 
     let put = exchange("localhost", addr, "PUT", "/data/key", &[], b"hello", 0)
         .await
@@ -53,11 +35,7 @@ async fn the_request_spine_nests_request_operation_and_storage_spans() {
         .await
         .status;
     assert_eq!(get, 200, "the GET reads it back");
-    let _ = shutdown.send(true);
-    plane
-        .await
-        .expect("the accept loop ends on the stop")
-        .expect("the plane serves");
+    plane.stop().await;
 
     // The recorder is global; the spans of any other thread are not this request's.
     // `#[tokio::test]` runs a current-thread runtime, so the plane's spawned connection task
@@ -147,17 +125,8 @@ async fn the_request_spine_nests_request_operation_and_storage_spans() {
 #[tokio::test]
 async fn an_unknown_access_key_opens_the_auth_lookup_span() {
     spans::install();
-    let storage = MemoryStorage::new().expect("mem storage");
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let (shutdown, rx) = watch::channel(false);
-    let plane = tokio::spawn(async move {
-        DataPlane::new_with_auth(storage, Capabilities::default(), "AKID", "SECRET")
-            .serve(listener, rx)
-            .await
-    });
+    let plane = common::spawn_plane_with_auth("AKID", "SECRET").await;
+    let addr = plane.addr;
 
     // A well-formed SigV4 header naming an unknown key reaches the credential
     // lookup before signature verification, which is the security decision the
@@ -198,11 +167,7 @@ async fn an_unknown_access_key_opens_the_auth_lookup_span() {
     .await
     .status;
     assert_eq!(status, 403, "an unknown key is denied");
-    let _ = shutdown.send(true);
-    plane
-        .await
-        .expect("the accept loop ends on the stop")
-        .expect("the plane serves");
+    plane.stop().await;
 
     let recorded: Vec<spans::RecordedSpan> = spans::spans_on_this_thread();
     let lookups: Vec<&spans::RecordedSpan> = recorded

@@ -30,6 +30,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream;
 use tinio_util::testing::blocks::MemBlocks;
+#[cfg(test)]
+use tinio_util::testing::{bucket_name, object_key};
 use tokio::fs;
 
 use crate::{
@@ -82,12 +84,12 @@ pub(crate) fn fixture() -> Fixture {
 
 /// A bucket name for the tests.
 pub(crate) fn bucket() -> Name {
-    bucket::name("demo").expect("a valid bucket name")
+    bucket_name("demo")
 }
 
 /// A key for the tests.
 pub(crate) fn key() -> object::Key {
-    object::key("notes.txt").expect("a valid object key")
+    object_key("notes.txt")
 }
 
 /// The contract double: every call the engine makes, over maps and one tempdir.

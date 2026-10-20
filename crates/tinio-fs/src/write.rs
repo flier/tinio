@@ -49,10 +49,7 @@ use uuid::Uuid;
 pub(crate) use crate::_util::fsutil::CHUNK_SIZE;
 use crate::{
     _core::{BodyStream, ETag, checksum},
-    _util::metrics::WriteOp,
-    Error,
-    error::record_failed_write,
-    fsutil,
+    Error, fsutil,
     fsutil::DirOwnerUid,
     path::TMP_DIR_NAME,
 };
@@ -287,7 +284,6 @@ impl AtomicWriter {
             Ok((etag, size)) => Ok((temp, etag, size)),
             Err(err) => {
                 let _ = fs::remove_file(&temp).await;
-                record_failed_write(WriteOp::Put, &err);
                 Err(err)
             }
         }

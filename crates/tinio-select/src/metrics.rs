@@ -5,15 +5,11 @@
 //! engine's own signal. The registry is process-global; the crate rendering
 //! `/metrics` gathers these families without this crate knowing it.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every error these registrations can answer is about each family's own name — prometheus 0.14's default registry refuses a name it already holds (`AlreadyReg`) or holds with a different label set or help (`Msg`). Each name has one registration site in the repo (its own `LazyLock` here, whose closure runs once per process) against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)`; a collision is a source-level mistake, not a runtime condition, and `LazyLock::new` has no `Result` to return it through. The module's test reads both names back out of the gathered exposition."
-)]
-
 use std::sync::LazyLock;
 
 use parse_display::Display;
 use prometheus::{IntCounterVec, register_int_counter_vec};
+use tinio_util::metrics::RegisteredExt;
 
 /// Input framing — the closed `format` label domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
@@ -42,7 +38,7 @@ static SCANNED_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Uncompressed input bytes scanned by S3 Select, by input framing",
         &["format"]
     )
-    .expect("register tinio_s3_select_scanned_bytes_total")
+    .registered("tinio_s3_select_scanned_bytes_total")
 });
 
 /// Output rows serialized for the client, cumulative.
@@ -52,7 +48,7 @@ static ROWS_RETURNED: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Rows returned by S3 Select, by input framing",
         &["format"]
     )
-    .expect("register tinio_s3_select_rows_returned_total")
+    .registered("tinio_s3_select_rows_returned_total")
 });
 
 /// Record one stream's cost: the uncompressed bytes it scanned and the rows it

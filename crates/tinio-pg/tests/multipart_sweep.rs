@@ -29,7 +29,7 @@ use tinio_core::{
     cleanup::CleanupOptions,
     lifecycle,
     meta::BucketMeta,
-    multipart, object,
+    object,
     storage::{BucketOps, ListUploadsParams, MultipartOps},
 };
 use tinio_pg::{
@@ -41,7 +41,7 @@ use tinio_pg::{
     Access, PgStorage,
     cleanup::PgCleanup,
 };
-use tinio_util::testing::body;
+use tinio_util::testing::{body, bucket_name, part_number};
 
 /// One hour: the legs' own timeout, so an upload two hours old is past it and a
 /// freshly created one is not.
@@ -164,7 +164,7 @@ async fn an_upload_past_the_timeout_is_aborted_and_a_young_one_survives() {
         return;
     }
     let db = TestDb::create().await.expect("a scratch database");
-    let data = bucket::name("sweep-leg").expect("a valid bucket name");
+    let data = bucket_name("sweep-leg");
     let storage = store(&db, &data).await;
     let stale = upload(&storage, &data, "stale.bin").await;
     let young = upload(&storage, &data, "young.bin").await;
@@ -193,7 +193,7 @@ async fn a_bucket_with_an_abort_rule_is_left_alone() {
         return;
     }
     let db = TestDb::create().await.expect("a scratch database");
-    let data = bucket::name("governed-leg").expect("a valid bucket name");
+    let data = bucket_name("governed-leg");
     let storage = store(&db, &data).await;
     let stale = upload(&storage, &data, "stale.bin").await;
     backdate(&db, &data, &stale, Duration::from_secs(2 * 3600)).await;
@@ -223,7 +223,7 @@ async fn a_bucket_with_an_abort_rule_is_swept_when_the_pass_is_off() {
         return;
     }
     let db = TestDb::create().await.expect("a scratch database");
-    let data = bucket::name("ungoverned-leg").expect("a valid bucket name");
+    let data = bucket_name("ungoverned-leg");
     let storage = store(&db, &data).await;
     let stale = upload(&storage, &data, "stale.bin").await;
     backdate(&db, &data, &stale, Duration::from_secs(2 * 3600)).await;
@@ -259,7 +259,7 @@ async fn an_upload_still_receiving_parts_survives_a_long_ago_initiation() {
         return;
     }
     let db = TestDb::create().await.expect("a scratch database");
-    let data = bucket::name("live-leg").expect("a valid bucket name");
+    let data = bucket_name("live-leg");
     let storage = store(&db, &data).await;
     let live_key = object::key("live.bin").expect("a valid key");
     let live = upload(&storage, &data, "live.bin").await;
@@ -267,14 +267,7 @@ async fn an_upload_still_receiving_parts_survives_a_long_ago_initiation() {
     let idle = upload(&storage, &data, "idle.bin").await;
     for (key, upload_id) in [(&live_key, &live), (&idle_key, &idle)] {
         storage
-            .upload_part(
-                &data,
-                key,
-                upload_id,
-                multipart::part_number(1).expect("a valid part number"),
-                body("part"),
-                None,
-            )
+            .upload_part(&data, key, upload_id, part_number(1), body("part"), None)
             .await
             .expect("the part is written just now");
         backdate(&db, &data, upload_id, Duration::from_secs(2 * 3600)).await;

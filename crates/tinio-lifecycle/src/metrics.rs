@@ -9,19 +9,13 @@
 //! these families without this crate knowing it. `Summary::errors` is what a
 //! pass prints; the counter is what an operator pages on.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every error a registration can answer is about this family's own name — the process-global default registry refuses a name it already holds, or holds with a different label set or help. Each name has one registration site in the repo (a `LazyLock` here, whose closure runs once per process) against the family list in `specs/001-s3-local-server/data-model.md` §Metrics; a collision is a source-level mistake, not a runtime condition, and `LazyLock::new` has no `Result` to return it through. The module's test reads both names back out of the gathered exposition."
-)]
-
 use std::{
     sync::LazyLock,
     time::{Duration, Instant},
 };
 
-use parse_display::Display;
 use prometheus::{Histogram, IntCounterVec, register_histogram, register_int_counter_vec};
-use tinio_util::metrics::PASS_DURATION_BUCKETS;
+use tinio_util::metrics::{PASS_DURATION_BUCKETS, RegisteredExt};
 #[cfg(test)]
 use tinio_util::testing::metrics::{counter, test_lock};
 
@@ -32,7 +26,7 @@ static PASS_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
         "Lifecycle pass durations",
         PASS_DURATION_BUCKETS.to_vec()
     )
-    .expect("register tinio_lifecycle_pass_duration_seconds")
+    .registered("tinio_lifecycle_pass_duration_seconds")
 });
 
 /// One action's outcome, by action kind.
@@ -42,12 +36,11 @@ static ACTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Lifecycle actions by kind and outcome",
         &["kind", "outcome"]
     )
-    .expect("register tinio_lifecycle_actions_total")
+    .registered("tinio_lifecycle_actions_total")
 });
 
 /// The action a sample belongs to — a closed label domain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
-#[display(style = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     /// A current version expired: an unlink, or a delete marker in a
     /// versioned bucket.

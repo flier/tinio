@@ -2,13 +2,15 @@ use std::{io, iter, time::Duration};
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
+#[cfg(test)]
+use tinio_util::testing::{bucket_name, object_key, part_number};
 
 use super::{PUBLISH_BATCH_CHUNKS, publish_plan};
 use crate::{
     _core::{
         bucket,
         content::{ContentKey, ObjectContent, StagedObject, stage_body},
-        multipart, object,
+        object,
         storage::{BodyStream, ByteRange},
     },
     _sqlx::query,
@@ -16,7 +18,6 @@ use crate::{
     cleanup::OrphanChunk,
     tests::fixtures::{bucket_row, scratch},
 };
-
 const MIB: usize = 1024 * 1024;
 
 /// Read a key through `open`, expecting bytes at every step.
@@ -52,7 +53,7 @@ async fn put(store: &PgStore, bucket: &bucket::Name, key: &ContentKey, bytes: &[
 
 /// A bucket name whose row exists. [`ObjectContent::stage`] locks that row.
 async fn named(store: &PgStore, raw: &str) -> bucket::Name {
-    let name = bucket::name(raw).expect("a valid bucket name");
+    let name = bucket_name(raw);
     bucket_row(store, &name).await;
     name
 }
@@ -90,7 +91,7 @@ async fn a_staged_write_is_invisible_until_publish_and_residue_is_never_content(
         return;
     };
     let bucket = named(&store, "conf-content-visibility").await;
-    let key = object::key("live.bin").expect("a valid object key");
+    let key = object_key("live.bin");
     let content = ContentKey::Object(key.clone());
 
     let mut staged = store
@@ -140,7 +141,7 @@ async fn a_staged_write_is_invisible_until_publish_and_residue_is_never_content(
     );
 
     // An abandoned stage is residue: invisible, never listed, never content.
-    let residue = object::key("residue.bin").expect("a valid object key");
+    let residue = object_key("residue.bin");
     let residue_content = ContentKey::Object(residue.clone());
     let mut abandoned = store
         .stage(&bucket, &residue_content)
@@ -201,7 +202,7 @@ async fn a_hundred_megabyte_stream_publishes_in_bounded_batches_and_round_trips(
     const SIZE: usize = CHUNKS * CHUNK + TAIL;
 
     let bucket = named(&store, "conf-content-big").await;
-    let key = object::key("big/stream.bin").expect("a valid object key");
+    let key = object_key("big/stream.bin");
     let content = ContentKey::Object(key.clone());
 
     let chunks = (0..CHUNKS)
@@ -296,7 +297,7 @@ async fn a_ranged_read_serves_only_the_live_generation() {
         return;
     };
     let bucket = named(&store, "conf-content-range").await;
-    let key = object::key("shrink.bin").expect("a valid object key");
+    let key = object_key("shrink.bin");
     let content = ContentKey::Object(key.clone());
 
     put(&store, &bucket, &content, &vec![b'a'; 3 * MIB]).await;
@@ -368,7 +369,7 @@ async fn a_zero_length_object_is_live_and_refuses_a_range() {
         return;
     };
     let bucket = named(&store, "conf-content-empty").await;
-    let key = object::key("empty.bin").expect("a valid object key");
+    let key = object_key("empty.bin");
     let content = ContentKey::Object(key.clone());
 
     put(&store, &bucket, &content, b"").await;
@@ -431,7 +432,7 @@ async fn a_superseded_publish_re_homes_and_flips_instead_of_erroring() {
         return;
     };
     let bucket = named(&store, "conf-content-race").await;
-    let key = object::key("raced.bin").expect("a valid object key");
+    let key = object_key("raced.bin");
     let content = ContentKey::Object(key.clone());
 
     let mut first = store
@@ -496,7 +497,7 @@ async fn a_same_key_race_never_tears_the_object() {
         return;
     };
     let bucket = named(&store, "conf-content-no-tear").await;
-    let key = object::key("raced.bin").expect("a valid object key");
+    let key = object_key("raced.bin");
     let content = ContentKey::Object(key.clone());
 
     let a = vec![b'a'; 3 * MIB + 17];
@@ -564,7 +565,7 @@ async fn a_superseded_generation_survives_a_sweep_in_its_window() {
         return;
     };
     let bucket = named(&store, "conf-content-race-sweep").await;
-    let key = object::key("raced.bin").expect("a valid object key");
+    let key = object_key("raced.bin");
     let content = ContentKey::Object(key.clone());
 
     // Five 1 MiB chunks: `write` flushes the first batch of four, so four rows
@@ -635,7 +636,7 @@ async fn an_in_flight_generation_survives_while_a_chunk_is_fresh() {
         return;
     };
     let bucket = named(&store, "conf-content-inflight").await;
-    let key = object::key("inflight.bin").expect("a valid object key");
+    let key = object_key("inflight.bin");
     let content = ContentKey::Object(key);
 
     let body = vec![b'a'; 5 * MIB];
@@ -742,7 +743,7 @@ async fn a_key_with_no_live_generation_is_missing_content() {
         return;
     };
     let bucket = named(&store, "conf-content-missing").await;
-    let key = object::key("absent.bin").expect("a valid object key");
+    let key = object_key("absent.bin");
     let content = ContentKey::Object(key.clone());
 
     let Err(err) = store.open(&bucket, &content, None).await else {
@@ -756,7 +757,7 @@ async fn a_key_with_no_live_generation_is_missing_content() {
 
     let part = ContentKey::Part {
         upload_id: "3b8a2f10-4d7c-4e21-9a6b-2f5c8e0d7b91".to_owned(),
-        number: multipart::part_number(1).expect("a valid part number"),
+        number: part_number(1),
     };
     let Err(err) = store.open(&bucket, &part, None).await else {
         panic!("a part key with no bytes is an error, not an empty body");
@@ -789,9 +790,9 @@ async fn a_generation_that_is_not_a_contiguous_run_is_corrupt() {
     };
     let bucket = named(&store, "conf-content-corrupt").await;
     let body: Vec<u8> = (0..MIB + 10).map(|offset| (offset % 251) as u8).collect();
-    let head = object::key("gap/head.bin").expect("a valid object key");
-    let tail = object::key("gap/tail.bin").expect("a valid object key");
-    let late = object::key("gap/late.bin").expect("a valid object key");
+    let head = object_key("gap/head.bin");
+    let tail = object_key("gap/tail.bin");
+    let late = object_key("gap/late.bin");
     put(&store, &bucket, &ContentKey::Object(head.clone()), &body).await;
     put(&store, &bucket, &ContentKey::Object(tail.clone()), &body).await;
     let long = vec![b'x'; (super::READ_WINDOW_CHUNKS + 2) * MIB];
@@ -859,7 +860,7 @@ async fn a_read_is_served_in_bounded_windows_and_a_range_crosses_them() {
         return;
     };
     let bucket = named(&store, "conf-content-window").await;
-    let key = object::key("windowed.bin").expect("a valid object key");
+    let key = object_key("windowed.bin");
     let content = ContentKey::Object(key.clone());
 
     // Three windows and a tail: the read is four statements, not one.
@@ -936,7 +937,7 @@ async fn a_removal_racing_a_read_is_missing_content_never_corruption() {
         return;
     };
     let bucket = named(&store, "conf-content-race-remove").await;
-    let key = object::key("raced-read.bin").expect("a valid object key");
+    let key = object_key("raced-read.bin");
     let content = ContentKey::Object(key.clone());
 
     // One window's worth: the bytes are resolved with the head, so the delete
@@ -1011,9 +1012,9 @@ async fn rename_and_copy_move_the_bytes_and_the_head() {
         return;
     };
     let bucket = named(&store, "conf-content-move").await;
-    let a = object::key("a.bin").expect("a valid object key");
-    let b = object::key("b.bin").expect("a valid object key");
-    let c = object::key("c.bin").expect("a valid object key");
+    let a = object_key("a.bin");
+    let b = object_key("b.bin");
+    let c = object_key("c.bin");
     let a_content = ContentKey::Object(a.clone());
     let b_content = ContentKey::Object(b.clone());
     let c_content = ContentKey::Object(c.clone());
@@ -1050,7 +1051,7 @@ async fn rename_and_copy_move_the_bytes_and_the_head() {
         "a self-move leaves the bytes where they are (R14)"
     );
 
-    let missing = object::key("missing.bin").expect("a valid object key");
+    let missing = object_key("missing.bin");
     assert!(
         store.rename(&bucket, &missing, &a).await.is_err(),
         "a rename with no source bytes fails"
@@ -1101,8 +1102,8 @@ async fn a_copy_of_a_multi_batch_object_round_trips_in_bounded_windows() {
         return;
     };
     let bucket = named(&store, "conf-content-copy-batches").await;
-    let from = object::key("copy-src/big.bin").expect("a valid object key");
-    let to = object::key("copy-dst/big.bin").expect("a valid object key");
+    let from = object_key("copy-src/big.bin");
+    let to = object_key("copy-dst/big.bin");
 
     // Three copy windows' worth of chunks: a boundary falls inside the body.
     let chunks = super::MOVE_BATCH_CHUNKS as usize * 2 + 1;
@@ -1136,7 +1137,7 @@ async fn a_copy_of_a_multi_batch_object_round_trips_in_bounded_windows() {
     );
 
     // Rename is the same bounded copy followed by a source drain: the bytes move.
-    let moved = object::key("copy-moved/big.bin").expect("a valid object key");
+    let moved = object_key("copy-moved/big.bin");
     store
         .rename(&bucket, &to, &moved)
         .await
@@ -1178,14 +1179,14 @@ async fn scan_is_byte_ordered_over_live_object_keys_only() {
     let bucket = named(&store, "conf-content-scan").await;
     let names = ["alpha", "alpha-1", "alpine", "beta"];
     for name in names {
-        let key = object::key(name).expect("a valid object key");
+        let key = object_key(name);
         put(&store, &bucket, &ContentKey::Object(key), b"x").await;
     }
 
     // A part inside the walked prefix proves the `kind = 'object'` exclusion is real.
     let part = ContentKey::Part {
         upload_id: "7a2e1c3d-8b4f-4a6e-b0c1-3e5d9f2a7c48".to_owned(),
-        number: multipart::part_number(1).expect("a valid part number"),
+        number: part_number(1),
     };
     put(&store, &bucket, &part, b"part").await;
     assert_eq!(read(&store, &bucket, &part, None).await, b"part");
@@ -1193,25 +1194,22 @@ async fn scan_is_byte_ordered_over_live_object_keys_only() {
     assert_eq!(
         walked(&store, &bucket, "", None, 100).await,
         vec![
-            object::key("alpha").expect("a valid object key"),
-            object::key("alpha-1").expect("a valid object key"),
-            object::key("alpine").expect("a valid object key"),
-            object::key("beta").expect("a valid object key"),
+            object_key("alpha"),
+            object_key("alpha-1"),
+            object_key("alpine"),
+            object_key("beta"),
         ],
         "scan is ascending by the key's UTF-8 bytes"
     );
     assert_eq!(
         walked(&store, &bucket, "alpha", None, 100).await,
-        vec![
-            object::key("alpha").expect("a valid object key"),
-            object::key("alpha-1").expect("a valid object key"),
-        ],
+        vec![object_key("alpha"), object_key("alpha-1"),],
         "prefix is a bound the walk must not scan past"
     );
-    let after = object::key("alpha").expect("a valid object key");
+    let after = object_key("alpha");
     assert_eq!(
         walked(&store, &bucket, "alpha", Some(&after), 100).await,
-        vec![object::key("alpha-1").expect("a valid object key")],
+        vec![object_key("alpha-1")],
         "after is exclusive"
     );
     assert_eq!(
@@ -1240,13 +1238,10 @@ async fn scan_is_byte_ordered_over_live_object_keys_only() {
         4,
         "an unrepresentable limit is never a negative count"
     );
-    let below = object::key("a").expect("a valid object key");
+    let below = object_key("a");
     assert_eq!(
         walked(&store, &bucket, "alpha", Some(&below), 100).await,
-        vec![
-            object::key("alpha").expect("a valid object key"),
-            object::key("alpha-1").expect("a valid object key"),
-        ],
+        vec![object_key("alpha"), object_key("alpha-1"),],
         "an after below the prefix cannot hide the prefix's page"
     );
 
@@ -1256,7 +1251,7 @@ async fn scan_is_byte_ordered_over_live_object_keys_only() {
         .await
         .expect("the walk runs");
     let stat = store
-        .stat(&bucket, &object::key("alpha").expect("a valid object key"))
+        .stat(&bucket, &object_key("alpha"))
         .await
         .expect("the probe runs")
         .expect("the published entry");
@@ -1269,7 +1264,7 @@ async fn scan_is_byte_ordered_over_live_object_keys_only() {
     assert_eq!(entry.mtime, stat.mtime);
 
     for name in names {
-        let key = object::key(name).expect("a valid object key");
+        let key = object_key(name);
         store
             .remove(&bucket, &ContentKey::Object(key))
             .await
@@ -1295,7 +1290,7 @@ async fn reclaim_leaves_a_live_generation_named_in_the_list() {
         return;
     };
     let bucket = named(&store, "conf-content-reclaim-live").await;
-    let object_key = object::key("live.bin").expect("a valid object key");
+    let object_key = object_key("live.bin");
     let content = ContentKey::Object(object_key);
     let body = b"live-body";
     put(&store, &bucket, &content, body).await;
@@ -1334,7 +1329,7 @@ async fn a_drain_keeps_the_generation_id_out_of_reach() {
         return;
     };
     let bucket = named(&store, "conf-content-drained-stage").await;
-    let object_key = object::key("drained.bin").expect("a valid object key");
+    let object_key = object_key("drained.bin");
     let content = ContentKey::Object(object_key.clone());
 
     // A body past one publish batch, so the stage has already committed rows of
@@ -1410,7 +1405,7 @@ async fn a_superseded_publish_re_homes_in_bounded_batches() {
         return;
     };
     let bucket = named(&store, "conf-content-rehome-batches").await;
-    let key = object::key("raced/big.bin").expect("a valid object key");
+    let key = object_key("raced/big.bin");
     let content = ContentKey::Object(key.clone());
 
     // Three move windows' worth of chunks.
@@ -1488,7 +1483,7 @@ async fn a_guarded_removal_compares_a_multi_window_generation() {
         return;
     };
     let bucket = named(&store, "conf-content-guard-window").await;
-    let key = object::key("guarded.bin").expect("a valid object key");
+    let key = object_key("guarded.bin");
     let content = ContentKey::Object(key.clone());
 
     let windows = super::READ_WINDOW_CHUNKS + 1;
@@ -1587,18 +1582,18 @@ async fn scan_lists_every_key_the_prefix_definer_selects() {
         "y",
     ];
     for name in names {
-        let key = object::key(name).expect("a valid object key");
+        let key = object_key(name);
         put(&store, &bucket, &ContentKey::Object(key), b"x").await;
     }
     // A part inside the walked key space, so the kind discriminator is real here
     // too: it is never listed, and the definer query agrees.
     let part = ContentKey::Part {
         upload_id: "5c1f2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f".to_owned(),
-        number: multipart::part_number(1).expect("a valid part number"),
+        number: part_number(1),
     };
     put(&store, &bucket, &part, b"part").await;
 
-    let last = object::key("x\u{10FFFF}").expect("a valid object key");
+    let last = object_key("x\u{10FFFF}");
     for (prefix, after) in [
         ("", None),
         ("x", None),
@@ -1638,7 +1633,7 @@ async fn scan_lists_every_key_the_prefix_definer_selects() {
     );
 
     for name in names {
-        let key = object::key(name).expect("a valid object key");
+        let key = object_key(name);
         store
             .remove(&bucket, &ContentKey::Object(key))
             .await
@@ -1687,7 +1682,7 @@ async fn remove_keeps_the_head_sequence() {
         return;
     };
     let bucket = named(&store, "conf-content-seq").await;
-    let object_key = object::key("seq.bin").expect("a valid object key");
+    let object_key = object_key("seq.bin");
     let content = ContentKey::Object(object_key);
     put(&store, &bucket, &content, b"one").await;
     let first = store

@@ -604,7 +604,7 @@ cargo test -p tinio-server --lib registers_all_families --all-features
 1 passed: the exact family set.
 
 cargo test --workspace --no-fail-fast
-3583 passed; 0 failed.
+3586 passed; 0 failed.
 
 cargo clippy --workspace --all-targets -- -D warnings
 No warning.

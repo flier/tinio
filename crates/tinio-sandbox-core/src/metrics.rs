@@ -12,20 +12,14 @@
 //! The registry is process-global, so the management plane renders these without this crate
 //! knowing it; the record calls are the only write paths.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every error a registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md` owns; a collision is a source-level mistake the registry refuses here, not a runtime condition, and `LazyLock::new` has no `Result` to return it through (design 2026-10-09 D2d). The module's tests read both names back out of the gathered exposition, so a registration that did not land fails a test."
-)]
-
 use std::{process::ExitStatus, sync::LazyLock};
 
-use parse_display::Display;
 use prometheus::{IntCounterVec, register_int_counter_vec};
+use tinio_util::metrics::RegisteredExt;
 
 /// What a readiness wait answered — the `result` label's whole domain, one variant per
 /// [`Readiness`](crate::Readiness) answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
-#[display(style = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ready {
     /// The child reported a terminal fact before the bound elapsed.
     Reported,
@@ -61,8 +55,7 @@ impl From<&crate::Readiness> for Ready {
 /// **The export code is not a label** (it is unbounded), so a non-zero exit is one value: a
 /// child that refuses after readiness and one that fails for any other reason are the same fact
 /// at this boundary — the core's `Attribution::Ran` states why.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
-#[display(style = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Exit {
     /// The child exited zero.
     Success,
@@ -105,7 +98,7 @@ static READINESS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Readiness waits by the answer they ended on",
         &["result"]
     )
-    .expect("register tinio_sandbox_readiness_total")
+    .registered("tinio_sandbox_readiness_total")
 });
 
 /// Child exits by how the wait ended.
@@ -115,7 +108,7 @@ static CHILD_EXIT: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Confined child exits by how the wait ended",
         &["outcome"]
     )
-    .expect("register tinio_sandbox_child_exit_total")
+    .registered("tinio_sandbox_child_exit_total")
 });
 
 /// Record one readiness wait's answer — exactly one sample per `wait_for_ready` call.

@@ -726,9 +726,7 @@ mod tests {
     };
 
     use redb::WriteTransaction;
-    use tinio_util::testing::{
-        metadata::assert_version_conformance, spans::one_named,
-    };
+    use tinio_util::testing::{metadata::assert_version_conformance, spans::one_named};
     use tracing::Level;
 
     use crate::{

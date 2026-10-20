@@ -28,12 +28,13 @@ use tinio_core::{
         self, AbortIncompleteMultipartUpload, Expiration, Filter, NoncurrentVersionExpiration,
         Rule, Status,
     },
-    multipart, object,
+    object,
     storage::{BucketOps, MultipartOps, ObjectOps, VersionOps},
     version::{self, CurrentVersion, ListParams, State},
 };
 use tinio_lifecycle::{FixedClock, Options, Runner, Seed};
 use tinio_mem::MemoryStorage;
+use tinio_util::testing::part_number;
 use tokio::sync::watch;
 
 /// An empty body: these tests are about which rows the pass touches, never
@@ -686,7 +687,7 @@ async fn an_upload_larger_than_the_size_bound_is_kept() {
             &name,
             &key,
             &upload.upload_id,
-            multipart::part_number(1).expect("a valid part number"),
+            part_number(1),
             Box::pin(stream::once(async { Ok(Bytes::from_static(b"abc")) })),
             None,
         )

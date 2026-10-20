@@ -32,6 +32,8 @@ use std::{collections::HashMap, sync::Mutex};
 use async_trait::async_trait;
 use redb::ReadableTable;
 use tinio_util::metrics::{Backend, record_read_only};
+#[cfg(test)]
+use tinio_util::testing::part_number;
 
 #[cfg(test)]
 use crate::_core::bucket::name;
@@ -619,7 +621,7 @@ mod tests {
                 &bucket,
                 &key,
                 &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
+                part_number(1),
                 body(vec![b'a'; min]),
                 None,
             )
@@ -630,7 +632,7 @@ mod tests {
                 &bucket,
                 &key,
                 &upload.upload_id,
-                multipart::part_number(2).expect("a valid part number"),
+                part_number(2),
                 body(b"def".to_vec()),
                 None,
             )

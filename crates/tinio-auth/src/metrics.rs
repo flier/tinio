@@ -6,14 +6,10 @@
 //! grow a series. The registry is process-global, so the management plane
 //! renders these families without this crate knowing it.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every registration in this module answers a duplicate or mismatched family at source level, not a runtime condition — one `LazyLock` site per family runs once per process, the registry refuses `AlreadyReg`/`Msg`, and `LazyLock::new` has no `Result` to return it through (design 2026-10-09 D2d); one exception for the module, not one per family"
-)]
-
 use std::sync::LazyLock;
 
 use prometheus::{IntCounterVec, register_int_counter_vec};
+use tinio_util::metrics::RegisteredExt;
 
 /// Credential lookups by result: `found` for a configured access key,
 /// `unknown` for one the identity map does not hold.
@@ -23,7 +19,7 @@ static CREDENTIAL_LOOKUPS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Credential lookups by result",
         &["result"]
     )
-    .expect("register tinio_auth_credential_lookups_total")
+    .registered("tinio_auth_credential_lookups_total")
 });
 
 /// Authorization decisions by outcome.
@@ -33,7 +29,7 @@ static AUTHORIZATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Authorization decisions by outcome",
         &["decision"]
     )
-    .expect("register tinio_auth_authorizations_total")
+    .registered("tinio_auth_authorizations_total")
 });
 
 /// Record one credential lookup; `found` is whether the access key resolved.

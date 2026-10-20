@@ -8,19 +8,6 @@
 //!
 //! `specs/001-s3-local-server/data-model.md` §Metrics owns the name and labels.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every error these registrations can answer is about the family's own name \
-              — the process-global default registry refuses a name it already holds or holds with \
-              a different label set or help. The name has one registration site in the repo (this \
-              module's `LazyLock`, whose closure runs once per process), against the family list \
-              `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not \
-              persisted)` owns; a collision is a source-level mistake, not a runtime condition, \
-              and `LazyLock::new` has no `Result` to return it through. The module's tests read \
-              the three states back out of the gathered exposition, so a registration that did \
-              not land fails a test."
-)]
-
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use prometheus::{
@@ -30,6 +17,7 @@ use prometheus::{
     register,
 };
 use sqlx::PgPool;
+use tinio_util::metrics::RegisteredExt;
 
 /// The family's name (`data-model.md` §Metrics).
 const NAME: &str = "tinio_storage_pool_connections";
@@ -47,7 +35,7 @@ static POOLS: LazyLock<Mutex<Vec<Weak<PoolHandle>>>> = LazyLock::new(|| Mutex::n
 /// The family is registered on the first pool and never again; a build with no
 /// pg pool exposes none of it.
 static REGISTERED: LazyLock<()> = LazyLock::new(|| {
-    register(Box::new(PoolCollector::new())).expect("register tinio_storage_pool_connections");
+    register(Box::new(PoolCollector::new())).registered("tinio_storage_pool_connections");
 });
 
 /// One live pool the collector reads. The [`Pool`](crate::pool::Pool) holds the
@@ -83,7 +71,7 @@ impl PoolCollector {
     fn new() -> Self {
         Self {
             connections: IntGaugeVec::new(Opts::new(NAME, HELP), &["state"])
-                .expect("build tinio_storage_pool_connections"),
+                .registered("tinio_storage_pool_connections"),
         }
     }
 

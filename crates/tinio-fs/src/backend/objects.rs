@@ -60,10 +60,8 @@ use crate::{
         version,
     },
     _ops::StagedBody as EngineStagedBody,
-    _util::metrics::WriteOp,
     backend::version::{Publication, Published},
     content::FsStaged,
-    error::record_failed_write,
     fsutil,
     meta::{Content, Verdict, gate},
     write::AtomicWriter,
@@ -712,7 +710,6 @@ impl FsStorage {
             Ok(published) => published,
             Err(err) => {
                 let _ = fs::remove_file(&temp).await;
-                record_failed_write(WriteOp::Put, &err);
                 return Err(err);
             }
         };

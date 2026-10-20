@@ -63,6 +63,18 @@ pub fn run() -> ExitCode {
     // The log exists before the parser does, which is what makes a refusal readable and lets the
     // confinement's own events reach stderr; the run swaps the full stack after it confines.
     bootstrap_logging();
+    let code = dispatch();
+    // **The export is the process's last teardown step, on every arm.** `start::serve` drains the
+    // planes and the background passes before it returns, but a refusal on the way there — the
+    // data plane's bind, the pg startup, `start::run`'s own arm — would otherwise drop the
+    // provider with its batch queue unflushed. This is the one site both outcomes share, and a
+    // build with no exporter pays one `OnceLock` read.
+    log::shutdown_otel();
+    code
+}
+
+/// The dispatcher [`run`] wraps: the SCM's arm, then the CLI's.
+fn dispatch() -> ExitCode {
     // The SCM's dispatcher, before any parser sees argv (decision 22): a process the SCM
     // started is a service rather than a command line, and the dispatcher answers `Err`
     // immediately for every other process — so an ordinary `tinio doctor` pays nothing for

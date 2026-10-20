@@ -7,12 +7,12 @@
     reason = "test support: a test proves the public paths"
 )]
 
+use tinio_util::testing::bucket_name;
 mod support;
 
 use support::{require_dsn, scratch_config};
 use tinio_core::{
     acl::Acl,
-    bucket,
     meta::VersionMeta,
     object,
     storage::{self, BucketOps, ObjectOps, VersionOps},
@@ -36,7 +36,7 @@ async fn delete_bucket_with_only_delete_markers_keeps_the_version_history() {
         .await
         .expect("a writable store over the scratch database");
 
-    let bucket = bucket::name("marker-bucket").expect("a valid bucket name");
+    let bucket = bucket_name("marker-bucket");
     let key = object::key("marked.txt").expect("a valid key");
     let acl = Acl::default_private(None);
     storage
@@ -113,7 +113,7 @@ async fn a_recreated_bucket_is_unversioned() {
         .await
         .expect("a writable store over the scratch database");
 
-    let bucket = bucket::name("recreated-bucket").expect("a valid bucket name");
+    let bucket = bucket_name("recreated-bucket");
     let acl = Acl::default_private(None);
     storage
         .create_bucket(&bucket, None, &acl)

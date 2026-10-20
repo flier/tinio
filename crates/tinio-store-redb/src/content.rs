@@ -235,7 +235,7 @@ impl ObjectContent for RedbContent {
         skip(self, staged),
         fields(
             bucket = %bucket,
-            kind = if key.is_part() { "part" } else { "object" },
+            kind = key.kind_label(),
             bytes = staged.bytes.len(),
             key = field::Empty,
         )
@@ -278,7 +278,7 @@ impl ObjectContent for RedbContent {
         skip(self),
         fields(
             bucket = %bucket,
-            kind = if key.is_part() { "part" } else { "object" },
+            kind = key.kind_label(),
             key = field::Empty,
         )
     )]
@@ -585,9 +585,7 @@ impl ObjectContent for RedbContent {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use tinio_util::testing::{
-        metadata::assert_content_conformance, spans::one_named,
-    };
+    use tinio_util::testing::{metadata::assert_content_conformance, spans::one_named};
     use tracing::Level;
 
     use crate::{

@@ -77,6 +77,17 @@ impl Mechanism {
     /// default mechanism would be a confinement nobody chose.
     pub const ENV: &'static str = "TINIO_SANDBOX_MACOS_MECHANISM";
 
+    /// The wire name — the same kebab-case spelling `Display` writes.
+    ///
+    /// The facade reports it as [`Applied`](crate::apply::Applied)'s `mechanism` string, so one
+    /// definer serves the render, the parser (through the derived `FromStr`) and that field.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SandboxExec => "sandbox-exec",
+            Self::SandboxInit => "sandbox-init",
+        }
+    }
+
     /// Read [`Self::ENV`]. Absent or empty means [`Mechanism::SandboxExec`].
     ///
     /// **The accepted values are `Display`'s, through the derived `FromStr`**: a spelling the

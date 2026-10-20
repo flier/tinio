@@ -459,7 +459,7 @@ where
         // One sample per call: the first-attempt success, the retry-healed
         // success, and the race that wrote no row are the family's whole set.
         let finish = |outcome: Outcome| {
-            span.record("result", field::display(outcome));
+            span.record("result", outcome.as_str());
             metrics::record_supersede(outcome);
         };
         // The design's retry: one re-resolve and read-and-publish after a

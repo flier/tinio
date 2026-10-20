@@ -35,7 +35,6 @@ use crate::{
     _server::{
         Capabilities, DataPlane, Identity, PlaneConfig,
         identity::{self, IdentityFromConfig},
-        log,
     },
     Error,
     commands::EnvArgs,
@@ -390,7 +389,11 @@ where
     // The data plane carries no metrics hook: the interim `/metrics` route on its listener is
     // retired, so there would be no reader for one. The management plane's `/metrics` gathers the
     // same process registry the reader below fills, so nothing about the data plane is unobserved.
-    let data = plane_for(storage.clone(), PlaneConfig { caps, access }, &resolution);
+    let data = plane_for(
+        storage.metrics_storage(),
+        PlaneConfig { caps, access },
+        &resolution,
+    );
 
     // `STOPPING=1` belongs to the **moment the shutdown begins**, not to the moment it ends:
     // watching the channel is what catches every entry point (a signal, `POST /stop`) at the
@@ -616,9 +619,8 @@ where
         outcome
     })
     .await;
-    // The export is the last teardown step: the planes, the background passes and the pipelines
-    // above are the final span producers, and a stopped provider drops what is still queued.
-    log::shutdown_otel();
+    // The export is not this function's last step: `run` flushes the provider once its dispatch
+    // returns, which is the one site every arm — this drain and the refusals above — shares.
     outcome?; // the graceful path: every arm returned cleanly, and this is `Ok(())`
     Ok(ExitCode::SUCCESS)
 }

@@ -38,6 +38,7 @@ use crate::{
 ///
 /// `file_identity` is the platform file identity at record time (`0` marks an
 /// unavailable identity), never a version identifier.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// The content ETag.

@@ -51,7 +51,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use futures::stream;
 
-use super::{read_body, unique_bucket};
+use super::{part_number, read_body, unique_bucket};
 use crate::_core::{
     ETag,
     acl::{Acl, AclGrants, OwnerId},
@@ -65,7 +65,7 @@ use crate::_core::{
         upload,
         version::{Current, Kind, Stored, VersionMeta},
     },
-    multipart::{self, PartNumber},
+    multipart::PartNumber,
     object,
     storage::{self, BodyStream, ByteRange},
     version,
@@ -98,7 +98,7 @@ fn bucket_name(prefix: &str) -> bucket::Name {
 }
 
 fn part(number: u32) -> PartNumber {
-    multipart::part_number(number).expect("a valid part number")
+    part_number(number)
 }
 
 fn owner() -> OwnerId {

@@ -26,11 +26,10 @@
 use futures::{StreamExt, stream};
 use tinio_core::{
     acl::Acl,
-    bucket, object,
     storage::{BodyStream, BucketOps, ObjectOps},
 };
 use tinio_pg::{_store_pg::test_support::TestDb, Access, PgStorage};
-use tinio_util::testing::body;
+use tinio_util::testing::{body, bucket_name, object_key};
 
 /// The body's chunk size: the store's content row is 1 MiB (PG2), so the stream arrives in the
 /// row-sized pieces a real client would send.
@@ -86,8 +85,8 @@ async fn a_body_over_a_hundred_mib_streams_through_the_backend_and_round_trips()
         .await
         .expect("a writable store over the scratch database");
 
-    let bucket = bucket::name("conform-large-body").expect("a valid bucket name");
-    let key = object::key("large/stream.bin").expect("a valid object key");
+    let bucket = bucket_name("conform-large-body");
+    let key = object_key("large/stream.bin");
     storage
         .create_bucket(&bucket, None, &Acl::default_private(None))
         .await

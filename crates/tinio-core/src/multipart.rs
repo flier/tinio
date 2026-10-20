@@ -80,7 +80,7 @@ pub fn part_number(n: u32) -> Result<PartNumber, storage::Error> {
 /// use tinio_core::{CompletedPart, ETag, multipart};
 ///
 /// let part = CompletedPart {
-///     part_number: multipart::part_number(1).expect("a valid part number"),
+///     part_number: tinio_util::testing::part_number(1),
 ///     etag: ETag::from_content(b"abc"),
 /// };
 /// assert_eq!(u32::from(part.part_number), 1);
@@ -104,8 +104,8 @@ pub struct CompletedPart {
 ///
 /// let upload = MultipartUpload {
 ///     upload_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479".into(),
-///     bucket: bucket::name("data").expect("a valid bucket name"),
-///     key: object::key("big.bin").expect("a valid object key"),
+///     bucket: tinio_util::testing::bucket_name("data"),
+///     key: tinio_util::testing::object_key("big.bin"),
 ///     initiated_at: SystemTime::UNIX_EPOCH,
 ///     checksum: None,
 ///     tags: object::Tags::empty(),
@@ -148,7 +148,7 @@ pub struct MultipartUpload {
 /// use tinio_core::{PartInfo, multipart};
 ///
 /// let part = PartInfo {
-///     part_number: multipart::part_number(1).expect("a valid part number"),
+///     part_number: tinio_util::testing::part_number(1),
 ///     size: 5_242_880,
 ///     etag: "d41d8cd98f00b204e9800998ecf8427e"
 ///         .parse()
@@ -183,7 +183,7 @@ pub struct PartInfo {
 /// use tinio_core::multipart::{self, ObjectPart};
 ///
 /// let part = ObjectPart {
-///     part_number: multipart::part_number(1).expect("a valid part number"),
+///     part_number: tinio_util::testing::part_number(1),
 ///     size: 5_242_880,
 ///     checksum: None,
 /// };

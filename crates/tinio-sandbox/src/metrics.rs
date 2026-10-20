@@ -15,14 +15,10 @@
 //! The registry is process-global, so the management plane renders these without this crate
 //! knowing it; the record call is the only write path.
 
-#![expect(
-    clippy::expect_used,
-    reason = "argued: every error a registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md` owns; a collision is a source-level mistake the registry refuses here, not a runtime condition, and `LazyLock::new` has no `Result` to return it through (design 2026-10-09 D2d). The module's tests read both names back out of the gathered exposition, so a registration that did not land fails a test."
-)]
-
 use std::{sync::LazyLock, time::Duration};
 
 use prometheus::{HistogramVec, IntCounterVec, register_histogram_vec, register_int_counter_vec};
+use tinio_util::metrics::RegisteredExt;
 
 #[cfg(target_os = "linux")]
 use crate::_linux::Mechanism as LinuxMechanism;
@@ -135,7 +131,7 @@ static CONFINEMENTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
         "Confinements by mechanism and outcome",
         &["mechanism", "outcome"]
     )
-    .expect("register tinio_sandbox_confinement_total")
+    .registered("tinio_sandbox_confinement_total")
 });
 
 /// The confinement's own duration bounds: a millisecond-scale in-place jail at one end and the
@@ -151,7 +147,7 @@ static CONFINEMENT_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
         &["mechanism"],
         CONFINEMENT_BUCKETS.to_vec(),
     )
-    .expect("register tinio_sandbox_confinement_seconds")
+    .registered("tinio_sandbox_confinement_seconds")
 });
 
 /// Record one confinement: the mechanism attempted (or applied), how it ended, and how long the

@@ -21,6 +21,8 @@ use http::{HeaderMap, HeaderValue, Uri, header::LAST_MODIFIED};
 use s3s::{S3Error, S3Result, s3_error};
 #[cfg(feature = "versioning")]
 use s3s::{S3Request, S3Response, dto};
+#[cfg(test)]
+use tinio_util::testing::object_key;
 
 use super::{S3Backend, map_backend_error, set_version_headers, version_id_header};
 #[cfg(feature = "versioning")]
@@ -922,7 +924,7 @@ mod tests {
             .storage()
             .put_object(
                 &bucket::name(&b).unwrap(),
-                &object::key("notes.txt").expect("a valid object key"),
+                &object_key("notes.txt"),
                 body(b"before"),
             )
             .await
@@ -1407,11 +1409,7 @@ mod tests {
         let first_id = version::id(&first).unwrap();
         let addressed = match backend
             .storage()
-            .head_object_version(
-                &bn,
-                &object::key("notes.txt").expect("a valid object key"),
-                Some(&first_id),
-            )
+            .head_object_version(&bn, &object_key("notes.txt"), Some(&first_id))
             .await
             .unwrap()
         {
@@ -1420,7 +1418,7 @@ mod tests {
         };
         let current = backend
             .storage()
-            .head_object(&bn, &object::key("notes.txt").expect("a valid object key"))
+            .head_object(&bn, &object_key("notes.txt"))
             .await
             .unwrap();
         assert_ne!(
@@ -1663,11 +1661,7 @@ mod tests {
 
         let got = backend
             .storage()
-            .get_object(
-                &bucket::name(&b).unwrap(),
-                &object::key("dst.txt").expect("a valid object key"),
-                None,
-            )
+            .get_object(&bucket::name(&b).unwrap(), &object_key("dst.txt"), None)
             .await
             .expect("the destination reads");
         assert_eq!(
@@ -1855,18 +1849,12 @@ mod tests {
         let b_name = bucket::name(&b).unwrap();
         let plain = backend
             .storage()
-            .head_object(
-                &b_name,
-                &object::key("plain.txt").expect("a valid object key"),
-            )
+            .head_object(&b_name, &object_key("plain.txt"))
             .await
             .expect("the plain destination heads");
         let versioned = backend
             .storage()
-            .head_object(
-                &b_name,
-                &object::key("versioned.txt").expect("a valid object key"),
-            )
+            .head_object(&b_name, &object_key("versioned.txt"))
             .await
             .expect("the versioned destination heads");
         assert_eq!(
@@ -1963,11 +1951,7 @@ mod tests {
 
         let got = backend
             .storage()
-            .get_object(
-                &bucket::name(&b).unwrap(),
-                &object::key("big.bin").expect("a valid object key"),
-                None,
-            )
+            .get_object(&bucket::name(&b).unwrap(), &object_key("big.bin"), None)
             .await
             .expect("the composed object reads");
         assert_eq!(
@@ -3746,11 +3730,7 @@ mod tests {
         let (backend, b) = setup_with_caps(caps).await;
         backend
             .storage()
-            .put_object(
-                &bucket::name(&b).unwrap(),
-                &object::key("t.txt").expect("a valid object key"),
-                body(b"x"),
-            )
+            .put_object(&bucket::name(&b).unwrap(), &object_key("t.txt"), body(b"x"))
             .await
             .unwrap();
 

@@ -6,6 +6,8 @@
 use std::io;
 
 use handlebars::RenderError;
+#[cfg(test)]
+use tinio_util::testing::{bucket_name, object_key};
 
 #[cfg(feature = "api")]
 use crate::_api;
@@ -142,7 +144,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        _core::{bucket, object, storage::Error::*},
+        _core::storage::Error::*,
         _util::{state::Error as StateError, testing::assert_send_sync},
         config::Error as ConfigError,
     };
@@ -161,10 +163,7 @@ mod tests {
             1
         );
         assert_eq!(
-            Error::Storage(NoSuchBucket(
-                bucket::name("data").expect("a valid bucket name")
-            ))
-            .exit_code(),
+            Error::Storage(NoSuchBucket(bucket_name("data"))).exit_code(),
             1
         );
     }
@@ -180,7 +179,7 @@ mod tests {
                 "state error: missing required value: home directory",
             ),
             (
-                Error::Storage(NoSuchKey(object::key("k").expect("a valid object key"))),
+                Error::Storage(NoSuchKey(object_key("k"))),
                 "storage error: no such object: `k`",
             ),
             // The two confinement classifications, and the difference between them is the

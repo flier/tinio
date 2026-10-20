@@ -33,6 +33,8 @@ use std::{
 };
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+#[cfg(test)]
+use tinio_util::testing::object_key;
 use tokio::{sync::watch, task::yield_now, time::sleep};
 use tracing::instrument;
 
@@ -132,8 +134,8 @@ pub struct ScannerOptions {
 ///     scanner.scan_once().await.unwrap();
 ///     let head = storage
 ///         .head_object(
-///             &bucket::name("data").expect("a valid bucket name"),
-///             &object::key("dropped.txt").expect("a valid object key"),
+///             &tinio_util::testing::bucket_name("data"),
+///             &tinio_util::testing::object_key("dropped.txt"),
 ///         )
 ///         .await
 ///         .unwrap();
@@ -832,11 +834,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .put_object(
-                &b,
-                &object::key("a.txt").expect("a valid object key"),
-                body(b"first"),
-            )
+            .put_object(&b, &object_key("a.txt"), body(b"first"))
             .await
             .unwrap();
         // Out-of-band edit: new content, new size.
@@ -846,10 +844,7 @@ mod tests {
         let scanner = Scanner::new(storage.clone(), options());
         let summary = scanner.scan_once().await.unwrap();
         assert_eq!(summary.recomputed, 1);
-        let head = storage
-            .head_object(&b, &object::key("a.txt").expect("a valid object key"))
-            .await
-            .unwrap();
+        let head = storage.head_object(&b, &object_key("a.txt")).await.unwrap();
         assert_eq!(head.size, 6);
         assert_eq!(head.etag, ETag::from_content(b"second"));
     }
@@ -865,16 +860,12 @@ mod tests {
             .unwrap();
         let file = root.path().join("data/a.txt");
         storage
-            .put_object(
-                &b,
-                &object::key("a.txt").expect("a valid object key"),
-                body(b"first!"),
-            )
+            .put_object(&b, &object_key("a.txt"), body(b"first!"))
             .await
             .unwrap();
         assert_eq!(
             storage
-                .head_object(&b, &object::key("a.txt").expect("a valid object key"))
+                .head_object(&b, &object_key("a.txt"))
                 .await
                 .unwrap()
                 .etag,
@@ -891,10 +882,7 @@ mod tests {
         let scanner = Scanner::new(storage.clone(), options());
         let summary = scanner.scan_once().await.unwrap();
         assert_eq!(summary.recomputed, 1, "the replacement must be recomputed");
-        let head = storage
-            .head_object(&b, &object::key("a.txt").expect("a valid object key"))
-            .await
-            .unwrap();
+        let head = storage.head_object(&b, &object_key("a.txt")).await.unwrap();
         assert_eq!(head.etag, ETag::from_content(b"second"));
     }
 
@@ -1397,7 +1385,7 @@ mod tests {
             "the good bucket reconciles despite the bad one (F12)"
         );
         let head = storage
-            .head_object(&good, &object::key("a.txt").expect("a valid object key"))
+            .head_object(&good, &object_key("a.txt"))
             .await
             .unwrap();
         assert_eq!(head.etag, ETag::from_content(b"x"));

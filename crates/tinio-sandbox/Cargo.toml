@@ -8,8 +8,10 @@ publish = false
 [dependencies]
 prometheus.workspace = true
 secrecy.workspace = true
-tinio-sandbox-core.workspace = true
 tracing.workspace = true
+
+tinio-sandbox-core.workspace = true
+tinio-util.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tinio-sandbox-linux.workspace = true

@@ -5,6 +5,8 @@
 //! legs start from the same handful, so they live here rather than in either
 //! module's copy.
 
+use tinio_util::testing::{bucket_name, object_key};
+
 use crate::{
     _core::{
         acl::OwnerId,
@@ -34,12 +36,12 @@ pub async fn scratch() -> Option<(TestDb, PgStore)> {
 
 /// A validated bucket name.
 pub fn name(value: &str) -> bucket::Name {
-    bucket::name(value).expect("a valid bucket name")
+    bucket_name(value)
 }
 
 /// A validated object key.
 pub fn key(value: &str) -> object::Key {
-    object::key(value).expect("a valid object key")
+    object_key(value)
 }
 
 /// A bucket row for `bucket`: the row every guarded writer asserts before it

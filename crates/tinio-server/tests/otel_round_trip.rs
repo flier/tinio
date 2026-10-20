@@ -11,15 +11,11 @@
 
 #![cfg(feature = "otel")]
 
-use std::net::Ipv4Addr;
+mod common;
 
 use opentelemetry::trace::{SpanId, TracerProvider as _};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
-use tinio_core::{BucketOps, acl::Acl, bucket};
-use tinio_mem::MemoryStorage;
-use tinio_server::{Capabilities, DataPlane};
 use tinio_util::testing::http::exchange;
-use tokio::{net::TcpListener, sync::watch};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::prelude::*;
 
@@ -34,32 +30,14 @@ async fn a_request_span_and_its_operation_export_with_the_parent_chain() {
     ));
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let storage = MemoryStorage::new().expect("mem storage");
-    let name = bucket::name("data").expect("bucket name");
-    storage
-        .create_bucket(&name, None, &Acl::default_private(None))
-        .await
-        .expect("bucket");
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let (shutdown, rx) = watch::channel(false);
-    let plane = tokio::spawn(async move {
-        DataPlane::new(storage, Capabilities::default())
-            .serve(listener, rx)
-            .await
-    });
+    let plane = common::spawn_plane().await;
+    let addr = plane.addr;
 
     let put = exchange("localhost", addr, "PUT", "/data/key", &[], b"hello", 0)
         .await
         .status;
     assert_eq!(put, 200, "the PUT stores the object");
-    let _ = shutdown.send(true);
-    plane
-        .await
-        .expect("the accept loop ends on the stop")
-        .expect("the plane serves");
+    plane.stop().await;
 
     provider.force_flush().expect("the exporter flushes");
     let spans = exporter

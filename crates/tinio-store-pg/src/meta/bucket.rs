@@ -376,6 +376,7 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
+    use tinio_util::testing::object_key;
     use tokio::time::sleep;
 
     use crate::{
@@ -735,7 +736,7 @@ mod tests {
             sleep(Duration::from_millis(20)).await;
         }
         assert!(saw_waiter, "the delete never waited on the bucket lock");
-        let key = object::key("kept").expect("a valid object key");
+        let key = object_key("kept");
         upsert_object(
             &mut tx,
             bucket,

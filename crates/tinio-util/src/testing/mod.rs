@@ -153,6 +153,37 @@ pub fn unique_bucket(prefix: &str) -> String {
     format!("{prefix}-{n}-{}", id())
 }
 
+/// A literal object key a test knows is valid — the one constructor the fixture call sites share,
+/// so a change to validation or its panic wording lands here.
+///
+/// # Panics
+///
+/// The literal is the test's own input, so an invalid one is a typo rather than a runtime
+/// condition.
+pub fn object_key(key: &str) -> object::Key {
+    object::key(key).expect("a literal test key is valid")
+}
+
+/// A literal bucket name a test knows is valid.
+///
+/// # Panics
+///
+/// The literal is the test's own input, so an invalid one is a typo rather than a runtime
+/// condition.
+pub fn bucket_name(name: &str) -> bucket::Name {
+    bucket::name(name).expect("a literal test bucket name is valid")
+}
+
+/// A literal multipart part number a test knows is valid.
+///
+/// # Panics
+///
+/// The number is the test's own input, so an out-of-range one is a typo rather than a runtime
+/// condition.
+pub fn part_number(number: u32) -> multipart::PartNumber {
+    multipart::part_number(number).expect("a literal test part number is valid")
+}
+
 /// Wrap bytes into a one-chunk body stream.
 pub fn body<C: Into<Vec<u8>>>(bytes: C) -> BodyStream {
     let data: Vec<u8> = bytes.into();

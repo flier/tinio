@@ -104,7 +104,7 @@ use crate::{
         blocks::PgBlocks,
         cleanup::{HistoryRow, OrphanPart},
     },
-    _util::metrics::{Pass, PassTimer, Section, record_pass_failure},
+    _util::metrics::{Pass, PassTimer, PgSection, record_pg_pass_failure},
     Error,
 };
 
@@ -373,12 +373,12 @@ impl PgCleanup {
         let owners = match self.lifecycle_configs().await {
             Ok(configs) => lifecycle::ActionOwners::from_configs(&configs, self.lifecycle_pass),
             Err(err) if !self.lifecycle_pass => {
-                record_pass_failure(Pass::PgCleanup, Section::Rules);
+                record_pg_pass_failure(PgSection::Rules);
                 actions.push(Err(err));
                 lifecycle::ActionOwners::unread(false)
             }
             Err(err) => {
-                record_pass_failure(Pass::PgCleanup, Section::Rules);
+                record_pg_pass_failure(PgSection::Rules);
                 return Err(err);
             }
         };
@@ -393,7 +393,7 @@ impl PgCleanup {
         let aborted = match aborted {
             Ok(aborted) => aborted,
             Err(err) => {
-                record_pass_failure(Pass::PgCleanup, Section::Uploads);
+                record_pg_pass_failure(PgSection::Uploads);
                 actions.push(Err(err));
                 0
             }
@@ -431,7 +431,7 @@ impl PgCleanup {
             let rows = match page {
                 Ok(rows) => rows,
                 Err(err) => {
-                    record_pass_failure(Pass::PgCleanup, Section::Chunks);
+                    record_pg_pass_failure(PgSection::Chunks);
                     actions.push(Err(Error::from(err)));
                     return;
                 }
@@ -451,7 +451,7 @@ impl PgCleanup {
             match self.store.reclaim_orphan_chunks(&rows, self.grace).await {
                 Ok(gone) => reclaimed = reclaimed.saturating_add(gone),
                 Err(err) => {
-                    record_pass_failure(Pass::PgCleanup, Section::Chunks);
+                    record_pg_pass_failure(PgSection::Chunks);
                     actions.push(Err(Error::from(err)));
                     return;
                 }
@@ -483,13 +483,13 @@ impl PgCleanup {
             let rows: Vec<OrphanPart> = match page {
                 Ok(rows) => rows,
                 Err(err) => {
-                    record_pass_failure(Pass::PgCleanup, Section::Parts);
+                    record_pg_pass_failure(PgSection::Parts);
                     actions.push(Err(Error::from(err)));
                     return;
                 }
             };
             if remove && let Err(err) = self.store.reclaim_orphan_parts(&rows).await {
-                record_pass_failure(Pass::PgCleanup, Section::Parts);
+                record_pg_pass_failure(PgSection::Parts);
                 actions.push(Err(Error::from(err)));
                 return;
             }
@@ -542,7 +542,7 @@ impl PgCleanup {
             let page = match page {
                 Ok(page) => page,
                 Err(err) => {
-                    record_pass_failure(Pass::PgCleanup, Section::Versions);
+                    record_pg_pass_failure(PgSection::Versions);
                     actions.push(Err(Error::from(err)));
                     return;
                 }
@@ -619,7 +619,7 @@ impl PgCleanup {
                         ),
                     })),
                     Err(err) => {
-                        record_pass_failure(Pass::PgCleanup, Section::Versions);
+                        record_pg_pass_failure(PgSection::Versions);
                         actions.push(Err(Error::from(err)));
                     }
                 }
@@ -647,7 +647,7 @@ impl PgCleanup {
         let live = match self.live_set().await {
             Ok(live) => live,
             Err(err) => {
-                record_pass_failure(Pass::PgCleanup, Section::Blocks);
+                record_pg_pass_failure(PgSection::Blocks);
                 actions.push(Err(err));
                 return;
             }
@@ -659,7 +659,7 @@ impl PgCleanup {
         {
             Ok(candidates) => candidates,
             Err(err) => {
-                record_pass_failure(Pass::PgCleanup, Section::Blocks);
+                record_pg_pass_failure(PgSection::Blocks);
                 actions.push(Err(Error::from(storage::Error::from(err))));
                 return;
             }
@@ -687,7 +687,7 @@ impl PgCleanup {
                 ),
             })),
             Err(err) => {
-                record_pass_failure(Pass::PgCleanup, Section::Blocks);
+                record_pg_pass_failure(PgSection::Blocks);
                 actions.push(Err(Error::from(storage::Error::from(err))));
             }
         }

@@ -36,9 +36,9 @@ use secrecy::ExposeSecret;
 use tinio_core::{
     ETag,
     acl::{Acl, AclGrants},
-    bucket, cors,
+    cors,
     meta::{ObjectMeta, object::Row},
-    multipart, object,
+    object,
     storage::{
         self, BucketOps, ListBucketsParams, ListObjectsParams, ListPartsParams, ListUploadsParams,
         MultipartOps, ObjectOps, VersionOps,
@@ -54,7 +54,9 @@ use tinio_pg::{
     },
     Access, Error, PgStorage,
 };
-use tinio_util::testing::{assert_conformance, body, conformance_versioning};
+use tinio_util::testing::{
+    assert_conformance, body, bucket_name, conformance_versioning, part_number,
+};
 
 /// The `TINIO_PG_DSN` gate and the scratch configuration both `tinio-pg` test targets share.
 mod support;
@@ -80,7 +82,7 @@ async fn the_shared_conformance_suite_holds_over_postgres() {
 
     // The versioning leg runs on a bucket of its own (the suite's rule): it enables
     // versioning on the bucket it is handed and leaves it suspended.
-    let versioned = bucket::name("conform-versioned-pg").expect("a valid bucket name");
+    let versioned = bucket_name("conform-versioned-pg");
     storage
         .create_bucket(&versioned, None, &Acl::default_private(None))
         .await
@@ -216,7 +218,7 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
         .await
         .expect("a read-only instance starts beside the writer");
 
-    let bucket = bucket::name("readonly-bucket").expect("a valid bucket name");
+    let bucket = bucket_name("readonly-bucket");
     let key = object::key("ro/object.txt").expect("a valid key");
     let part_key = object::key("ro/part.bin").expect("a valid key");
     let acl = Acl::default_private(None);
@@ -251,7 +253,7 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
             &bucket,
             &part_key,
             &upload.upload_id,
-            multipart::part_number(1).expect("a valid part number"),
+            part_number(1),
             body("part"),
             None,
         )
@@ -463,7 +465,7 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
                 &bucket,
                 &part_key,
                 &upload.upload_id,
-                multipart::part_number(1).expect("a valid part number"),
+                part_number(1),
                 body("part"),
                 None,
             )
@@ -482,7 +484,7 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
                 &bucket,
                 &part_key,
                 &upload.upload_id,
-                multipart::part_number(2).expect("a valid part number"),
+                part_number(2),
                 None,
             )
             .await
@@ -538,7 +540,7 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
     // The refusal is the guard's and not an argument that failed later: a bucket that does not
     // exist still answers the read-only class, never `NoSuchBucket` — the guard precedes every
     // probe, which is the "before any SQL" half of PG6 layer 1.
-    let absent = bucket::name("readonly-absent").expect("a valid bucket name");
+    let absent = bucket_name("readonly-absent");
     assert_denied(reader.delete_bucket(&absent).await.err());
     // The read twin of that same call answers the contract's **own** class, not the read-only
     // one: the guard sits on the writes alone and never leaked onto the reads.
@@ -651,7 +653,7 @@ async fn a_write_that_bypasses_the_entry_guard_is_refused_by_the_role() {
         .await
         .expect("the writable instance migrates the schema");
 
-    let bucket = bucket::name("ro-role").expect("a valid bucket name");
+    let bucket = bucket_name("ro-role");
     let key = object::key("probe.txt").expect("a valid key");
     let acl = Acl::default_private(None);
     writer

@@ -37,6 +37,8 @@ use s3s::{
     dto::{self, DeleteObjectOutput},
     s3_error,
 };
+#[cfg(test)]
+use tinio_util::testing::object_key;
 
 #[cfg(feature = "copy")]
 use crate::_auth::source::rename_source;
@@ -2002,11 +2004,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("digits").expect("a valid object key"),
-                body(b"0123456789"),
-            )
+            .put_object(&b, &object_key("digits"), body(b"0123456789"))
             .await
             .unwrap();
         let get = backend
@@ -2052,11 +2050,7 @@ mod tests {
         let etag = "5d41402abc4b2a76b9719d911017c592";
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("hello.txt").expect("a valid object key"),
-                body(b"hello"),
-            )
+            .put_object(&b, &object_key("hello.txt"), body(b"hello"))
             .await
             .unwrap();
 
@@ -2147,11 +2141,7 @@ mod tests {
         };
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("hello.txt").expect("a valid object key"),
-                body(b"hello"),
-            )
+            .put_object(&b, &object_key("hello.txt"), body(b"hello"))
             .await
             .unwrap();
 
@@ -2221,11 +2211,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("hello.txt").expect("a valid object key"),
-                body(b"hello"),
-            )
+            .put_object(&b, &object_key("hello.txt"), body(b"hello"))
             .await
             .unwrap();
         // AWS conditional writes reject If-Match + If-None-Match together.
@@ -2251,11 +2237,7 @@ mod tests {
         let etag = "5d41402abc4b2a76b9719d911017c592";
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("hello.txt").expect("a valid object key"),
-                body(b"hello"),
-            )
+            .put_object(&b, &object_key("hello.txt"), body(b"hello"))
             .await
             .unwrap();
 
@@ -2314,11 +2296,7 @@ mod tests {
         // A mismatching size on an existing object → 412.
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("hello.txt").expect("a valid object key"),
-                body(b"hello"),
-            )
+            .put_object(&b, &object_key("hello.txt"), body(b"hello"))
             .await
             .unwrap();
         let err = backend
@@ -2353,11 +2331,7 @@ mod tests {
         let etag = "5d41402abc4b2a76b9719d911017c592";
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("hello.txt").expect("a valid object key"),
-                body(b"hello"),
-            )
+            .put_object(&b, &object_key("hello.txt"), body(b"hello"))
             .await
             .unwrap();
         // Matching validator → the Range is honored (206).
@@ -2412,11 +2386,7 @@ mod tests {
         let etag = "5d41402abc4b2a76b9719d911017c592";
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("hello.txt").expect("a valid object key"),
-                body(b"hello"),
-            )
+            .put_object(&b, &object_key("hello.txt"), body(b"hello"))
             .await
             .unwrap();
         // A failing If-None-Match still answers 304 (no body)…
@@ -2454,19 +2424,11 @@ mod tests {
         let (backend, b) = setup_name().await;
         let storage = backend.storage();
         storage
-            .put_object(
-                &b,
-                &object::key("a.txt").expect("a valid object key"),
-                body(b"a"),
-            )
+            .put_object(&b, &object_key("a.txt"), body(b"a"))
             .await
             .unwrap();
         storage
-            .put_object(
-                &b,
-                &object::key("b.txt").expect("a valid object key"),
-                body(b"b"),
-            )
+            .put_object(&b, &object_key("b.txt"), body(b"b"))
             .await
             .unwrap();
         let out = backend
@@ -2506,7 +2468,7 @@ mod tests {
         assert_eq!(
             read_body(
                 storage
-                    .get_object(&b, &object::key("b.txt").expect("a valid object key"), None)
+                    .get_object(&b, &object_key("b.txt"), None)
                     .await
                     .unwrap()
                     .body
@@ -2716,11 +2678,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         let storage = backend.storage();
         storage
-            .put_object(
-                &b,
-                &object::key("src.txt").expect("a valid object key"),
-                body(b"source data"),
-            )
+            .put_object(&b, &object_key("src.txt"), body(b"source data"))
             .await
             .unwrap();
         let out = backend
@@ -2741,11 +2699,7 @@ mod tests {
         );
         let got = read_body(
             storage
-                .get_object(
-                    &b,
-                    &object::key("dst.txt").expect("a valid object key"),
-                    None,
-                )
+                .get_object(&b, &object_key("dst.txt"), None)
                 .await
                 .unwrap()
                 .body,
@@ -2762,11 +2716,7 @@ mod tests {
         let etag = "d22c0597587f7fd97ac77ee2fdba689d";
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("src.txt").expect("a valid object key"),
-                body(b"source data"),
-            )
+            .put_object(&b, &object_key("src.txt"), body(b"source data"))
             .await
             .unwrap();
 
@@ -2813,23 +2763,15 @@ mod tests {
         let (backend, b) = setup_name().await;
         let storage = backend.storage();
         storage
-            .put_object(
-                &b,
-                &object::key("src.txt").expect("a valid object key"),
-                body(b"source data"),
-            )
+            .put_object(&b, &object_key("src.txt"), body(b"source data"))
             .await
             .unwrap();
         storage
-            .put_object(
-                &b,
-                &object::key("dst.txt").expect("a valid object key"),
-                body(b"existing"),
-            )
+            .put_object(&b, &object_key("dst.txt"), body(b"existing"))
             .await
             .unwrap();
         let dst_etag = storage
-            .head_object(&b, &object::key("dst.txt").expect("a valid object key"))
+            .head_object(&b, &object_key("dst.txt"))
             .await
             .unwrap()
             .etag
@@ -2851,11 +2793,7 @@ mod tests {
         assert_eq!(err.code().as_str(), "PreconditionFailed");
         let got = read_body(
             storage
-                .get_object(
-                    &b,
-                    &object::key("dst.txt").expect("a valid object key"),
-                    None,
-                )
+                .get_object(&b, &object_key("dst.txt"), None)
                 .await
                 .unwrap()
                 .body,
@@ -2920,11 +2858,7 @@ mod tests {
         assert!(out.output.copy_object_result.is_some());
         let got = read_body(
             storage
-                .get_object(
-                    &b,
-                    &object::key("dst.txt").expect("a valid object key"),
-                    None,
-                )
+                .get_object(&b, &object_key("dst.txt"), None)
                 .await
                 .unwrap()
                 .body,
@@ -2975,11 +2909,7 @@ mod tests {
         let etag = "5d41402abc4b2a76b9719d911017c592";
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("src.txt").expect("a valid object key"),
-                body(b"hello"),
-            )
+            .put_object(&b, &object_key("src.txt"), body(b"hello"))
             .await
             .unwrap();
 
@@ -3073,11 +3003,7 @@ mod tests {
         // destination.
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("other.txt").expect("a valid object key"),
-                body(b"x"),
-            )
+            .put_object(&b, &object_key("other.txt"), body(b"x"))
             .await
             .unwrap();
         let err = backend
@@ -3095,11 +3021,7 @@ mod tests {
             read_body(
                 backend
                     .storage()
-                    .get_object(
-                        &b,
-                        &object::key("other.txt").expect("a valid object key"),
-                        None
-                    )
+                    .get_object(&b, &object_key("other.txt"), None)
                     .await
                     .unwrap()
                     .body,
@@ -3160,11 +3082,7 @@ mod tests {
             read_body(
                 backend
                     .storage()
-                    .get_object(
-                        &b,
-                        &object::key("other.txt").expect("a valid object key"),
-                        None
-                    )
+                    .get_object(&b, &object_key("other.txt"), None)
                     .await
                     .unwrap()
                     .body,
@@ -3206,11 +3124,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("t.txt").expect("a valid object key"),
-                body(b"x"),
-            )
+            .put_object(&b, &object_key("t.txt"), body(b"x"))
             .await
             .unwrap();
 
@@ -3317,11 +3231,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("t.txt").expect("a valid object key"),
-                body(b"x"),
-            )
+            .put_object(&b, &object_key("t.txt"), body(b"x"))
             .await
             .unwrap();
         // Duplicate keys → InvalidTag.
@@ -3438,11 +3348,7 @@ mod tests {
         // A tag-less object omits the count on both surfaces (AWS).
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("plain.txt").expect("a valid object key"),
-                body(b"x"),
-            )
+            .put_object(&b, &object_key("plain.txt"), body(b"x"))
             .await
             .unwrap();
         let got = backend
@@ -3650,11 +3556,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("plain.txt").expect("a valid object key"),
-                body(b"hello"),
-            )
+            .put_object(&b, &object_key("plain.txt"), body(b"hello"))
             .await
             .unwrap();
         // The plain object: every requested attribute answers, and
@@ -3944,11 +3846,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("t.txt").expect("a valid object key"),
-                body(b"x"),
-            )
+            .put_object(&b, &object_key("t.txt"), body(b"x"))
             .await
             .unwrap();
         // A policy body: the lazy default owner as the policy Owner (the
@@ -4019,11 +3917,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("t.txt").expect("a valid object key"),
-                body(b"x"),
-            )
+            .put_object(&b, &object_key("t.txt"), body(b"x"))
             .await
             .unwrap();
         let policy = acl_policy(None, vec![]);
@@ -4057,11 +3951,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("t.txt").expect("a valid object key"),
-                body(b"x"),
-            )
+            .put_object(&b, &object_key("t.txt"), body(b"x"))
             .await
             .unwrap();
         let other = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
@@ -4084,11 +3974,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("t.txt").expect("a valid object key"),
-                body(b"x"),
-            )
+            .put_object(&b, &object_key("t.txt"), body(b"x"))
             .await
             .unwrap();
         let default_id = acl::default_owner_id();
@@ -4163,11 +4049,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("t.txt").expect("a valid object key"),
-                body(b"x"),
-            )
+            .put_object(&b, &object_key("t.txt"), body(b"x"))
             .await
             .unwrap();
         let default_id = acl::default_owner_id();
@@ -4215,11 +4097,7 @@ mod tests {
         let (backend, b) = setup_name().await;
         backend
             .storage()
-            .put_object(
-                &b,
-                &object::key("t.txt").expect("a valid object key"),
-                body(b"x"),
-            )
+            .put_object(&b, &object_key("t.txt"), body(b"x"))
             .await
             .unwrap();
         // The canned surface: `public-read` expands to the owner's
