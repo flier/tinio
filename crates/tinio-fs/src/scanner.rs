@@ -34,6 +34,7 @@ use std::{
 
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::{sync::watch, task::yield_now, time::sleep};
+use tracing::instrument;
 
 use crate::{
     _core::{bucket, cleanup::CleanupOptions, mode::AccessMode, object, pipeline::Completion},
@@ -89,7 +90,9 @@ pub struct ScannerOptions {
 /// use std::{fs, sync::Arc, time::Duration};
 ///
 /// use tinio_core::{
+///     bucket,
 ///     mode::AccessMode,
+///     object,
 ///     pipeline::InlineRunner,
 ///     storage::{
 ///         BucketOps, DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES,
@@ -128,7 +131,10 @@ pub struct ScannerOptions {
 /// Runtime::new().unwrap().block_on(async {
 ///     scanner.scan_once().await.unwrap();
 ///     let head = storage
-///         .head_object(&"data".into(), &"dropped.txt".into())
+///         .head_object(
+///             &bucket::name("data").expect("a valid bucket name"),
+///             &object::key("dropped.txt").expect("a valid object key"),
+///         )
 ///         .await
 ///         .unwrap();
 ///     assert_eq!(head.size, 11);
@@ -229,6 +235,12 @@ impl Scanner {
     /// cannot starve the rest of the pass (or leave ghost bucket records)
     /// forever. Only a root-level failure (the `bucket_names` walk)
     /// aborts the pass.
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(pass = "fs_scanner")
+    )]
     pub async fn scan_once(&self) -> Result<ScanSummary, Error> {
         let mut summary = ScanSummary::default();
         for name in self.storage.bucket_names("").await? {
@@ -820,7 +832,11 @@ mod tests {
             .await
             .unwrap();
         storage
-            .put_object(&b, &"a.txt".into(), body(b"first"))
+            .put_object(
+                &b,
+                &object::key("a.txt").expect("a valid object key"),
+                body(b"first"),
+            )
             .await
             .unwrap();
         // Out-of-band edit: new content, new size.
@@ -830,7 +846,10 @@ mod tests {
         let scanner = Scanner::new(storage.clone(), options());
         let summary = scanner.scan_once().await.unwrap();
         assert_eq!(summary.recomputed, 1);
-        let head = storage.head_object(&b, &"a.txt".into()).await.unwrap();
+        let head = storage
+            .head_object(&b, &object::key("a.txt").expect("a valid object key"))
+            .await
+            .unwrap();
         assert_eq!(head.size, 6);
         assert_eq!(head.etag, ETag::from_content(b"second"));
     }
@@ -846,11 +865,19 @@ mod tests {
             .unwrap();
         let file = root.path().join("data/a.txt");
         storage
-            .put_object(&b, &"a.txt".into(), body(b"first!"))
+            .put_object(
+                &b,
+                &object::key("a.txt").expect("a valid object key"),
+                body(b"first!"),
+            )
             .await
             .unwrap();
         assert_eq!(
-            storage.head_object(&b, &"a.txt".into()).await.unwrap().etag,
+            storage
+                .head_object(&b, &object::key("a.txt").expect("a valid object key"))
+                .await
+                .unwrap()
+                .etag,
             ETag::from_content(b"first!")
         );
         // Replace with a NEW file, same size, mtime restored.
@@ -864,7 +891,10 @@ mod tests {
         let scanner = Scanner::new(storage.clone(), options());
         let summary = scanner.scan_once().await.unwrap();
         assert_eq!(summary.recomputed, 1, "the replacement must be recomputed");
-        let head = storage.head_object(&b, &"a.txt".into()).await.unwrap();
+        let head = storage
+            .head_object(&b, &object::key("a.txt").expect("a valid object key"))
+            .await
+            .unwrap();
         assert_eq!(head.etag, ETag::from_content(b"second"));
     }
 
@@ -1366,7 +1396,10 @@ mod tests {
             summary.reconciled, 1,
             "the good bucket reconciles despite the bad one (F12)"
         );
-        let head = storage.head_object(&good, &"a.txt".into()).await.unwrap();
+        let head = storage
+            .head_object(&good, &object::key("a.txt").expect("a valid object key"))
+            .await
+            .unwrap();
         assert_eq!(head.etag, ETag::from_content(b"x"));
     }
 

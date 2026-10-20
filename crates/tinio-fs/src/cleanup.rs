@@ -51,9 +51,10 @@ use crate::{
         },
         mode::AccessMode,
     },
+    _util::metrics::WriteOp,
     backend::FsStorage,
     bucket,
-    error::Error,
+    error::{Error, record_failed_write},
     fsutil,
     fsutil::{entries_of, ok_if_missing, remove_tree},
     path::{MULTIPART_DIR_NAME, STATE_DIR_NAME, TMP_DIR_NAME},
@@ -93,7 +94,10 @@ async fn record_repair(
             level: RepairActionLevel::Warn,
             description: did,
         })),
-        Err(err) => actions.push(Err(err)),
+        Err(err) => {
+            record_failed_write(WriteOp::Cleanup, &err);
+            actions.push(Err(err));
+        }
     }
 }
 
@@ -1109,7 +1113,7 @@ mod tests {
             acl::Acl,
             bucket,
             meta::version::Stored,
-            object,
+            multipart, object,
             pipeline::InlineRunner,
             storage::{BucketOps, ObjectOps},
         },
@@ -1450,7 +1454,14 @@ mod tests {
             .unwrap();
         storage
             .multipart_store()
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"x"),
+                None,
+            )
             .await
             .unwrap();
         // Corrupt the stored key out-of-band: the validated view no
@@ -1550,7 +1561,14 @@ mod tests {
         // without any idle grace.
         storage
             .multipart_store()
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"x"),
+                None,
+            )
             .await
             .unwrap();
         let live_dir = state.path().join("multipart/live").join(&upload.upload_id);

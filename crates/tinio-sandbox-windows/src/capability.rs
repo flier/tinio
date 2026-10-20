@@ -208,6 +208,7 @@ pub(crate) struct Admission(());
 /// early gate and the call that actually ran say the same thing. The probe's own events stay
 /// silenced (`probe_once`); this call is outside that guard, because by the time it runs the
 /// dispatcher is the caller's again.
+#[tracing::instrument(target = "tinio::sandbox", level = "info", skip_all)]
 pub(crate) fn admit() -> Result<Admission, Error> {
     match get_or_probe(&VERDICT, probe_once) {
         Ok(()) => Ok(Admission(())),

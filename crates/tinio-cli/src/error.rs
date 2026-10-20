@@ -142,7 +142,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        _core::storage::Error::*,
+        _core::{bucket, object, storage::Error::*},
         _util::{state::Error as StateError, testing::assert_send_sync},
         config::Error as ConfigError,
     };
@@ -160,7 +160,13 @@ mod tests {
             Error::State(StateError::Missing("home directory".into())).exit_code(),
             1
         );
-        assert_eq!(Error::Storage(NoSuchBucket("data".into())).exit_code(), 1);
+        assert_eq!(
+            Error::Storage(NoSuchBucket(
+                bucket::name("data").expect("a valid bucket name")
+            ))
+            .exit_code(),
+            1
+        );
     }
 
     #[test]
@@ -174,7 +180,7 @@ mod tests {
                 "state error: missing required value: home directory",
             ),
             (
-                Error::Storage(NoSuchKey("k".into())),
+                Error::Storage(NoSuchKey(object::key("k").expect("a valid object key"))),
                 "storage error: no such object: `k`",
             ),
             // The two confinement classifications, and the difference between them is the

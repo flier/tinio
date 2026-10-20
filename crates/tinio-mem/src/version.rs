@@ -2080,7 +2080,7 @@ mod tests {
                 acl::Acl,
                 bucket, from_nanos,
                 meta::object as object_row,
-                now_nanos, object,
+                multipart, now_nanos, object,
                 storage::{self, VersionOps},
                 version::{self, HeadResult, ListParams, ReadResult, State},
             },
@@ -2454,7 +2454,7 @@ mod tests {
                     &b,
                     &key,
                     &upload.upload_id,
-                    1.into(),
+                    multipart::part_number(1).expect("a valid part number"),
                     body(b"first".to_vec()),
                     None,
                 )

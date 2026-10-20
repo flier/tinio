@@ -27,6 +27,7 @@ hex.workspace = true
 http.workspace = true
 humantime-serde.workspace = true
 parse-display.workspace = true
+prometheus.workspace = true
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_ignored.workspace = true
@@ -59,6 +60,7 @@ tinio-util = { workspace = true, features = ["render", "state"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+tinio-mem.workspace = true
 tinio-store-pg = { workspace = true, features = ["testing"] }
 tinio-util = { workspace = true, features = ["testing"] }
 
@@ -79,9 +81,10 @@ windows-sys = { workspace = true, features = [
 
 [features]
 default = ["api", "mem", "sandbox", "versioning"]
-api = ["dep:tinio-api"]
-lifecycle = ["api", "dep:tinio-lifecycle", "tinio-api/lifecycle"]
+api = ["dep:tinio-api", "tinio-api/lifecycle"]
+lifecycle = ["api", "dep:tinio-lifecycle"]
 mem = ["dep:tinio-mem"]
+otel = ["tinio-server/otel"]
 pg = ["dep:tinio-pg"]
 sandbox = ["api"]
 tls = ["api", "tinio-api/tls"]

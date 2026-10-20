@@ -32,9 +32,8 @@ use crate::_core::{Error, MACOS_MECHANISM_USAGE, Result};
 ///
 /// **`Display` is the wire spelling, and it is the parser's spelling too**: the
 /// `kebab-case` render is derived from the variant names, so what this crate prints
-/// and what [`Self::from_env`] accepts cannot drift apart. [`Self::as_str`], the
-/// `&'static str` projection the launch payload and the facade's `Applied` take, is
-/// pinned to both by the test at the foot of this file.
+/// and what [`Self::from_env`] accepts cannot drift apart — pinned by the test at
+/// the foot of this file.
 ///
 /// # Examples
 ///
@@ -77,35 +76,6 @@ impl Mechanism {
     /// variable and its two values**, because a typo that silently ran the
     /// default mechanism would be a confinement nobody chose.
     pub const ENV: &'static str = "TINIO_SANDBOX_MACOS_MECHANISM";
-
-    /// The wire spelling as a `&'static str`.
-    ///
-    /// **`Display` is the home of the spelling and this is its projection**, not a second list:
-    /// the derive renders each variant's name in `kebab-case`, and the two literals below are held
-    /// to it by the round-trip test at the foot of this file, so a rename that reached one side
-    /// fails there rather than in an operator's event.
-    ///
-    /// **The `'static` borrow is what this is for**: `tinio-sandbox`'s `Applied.mechanism` is a
-    /// `&'static str` — its `apply_self_confinement` reads this — and a rendered `String` cannot
-    /// serve that field. The launcher takes it the same way for the payload's mechanism marker.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tinio_sandbox_macos::Mechanism;
-    ///
-    /// assert_eq!(Mechanism::SandboxExec.as_str(), "sandbox-exec");
-    /// assert_eq!(
-    ///     Mechanism::from_env(Some(Mechanism::SandboxInit.as_str())).unwrap(),
-    ///     Mechanism::SandboxInit
-    /// );
-    /// ```
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SandboxExec => "sandbox-exec",
-            Self::SandboxInit => "sandbox-init",
-        }
-    }
 
     /// Read [`Self::ENV`]. Absent or empty means [`Mechanism::SandboxExec`].
     ///
@@ -411,20 +381,14 @@ mod tests {
 
     #[test]
     fn the_display_spelling_is_the_parsed_spelling() {
-        // **The pin between the two spellings that remain, and the reason `as_str` may keep its
-        // literals**: `Display`/`FromStr` are one derivation, and `as_str` is the `&'static str`
-        // projection the facade's `Applied` and this crate's payload need. The first two
-        // assertions name the wire bytes every reader takes — those two, the environment variable
-        // and the e2e legs — and the loop then holds the projection, the render and the parser to
-        // each other, so a launch cannot report a mechanism the parser does not accept.
+        // **`Display`/`FromStr` are one derivation**: the assertions name the wire bytes every
+        // reader takes, and the loop holds the render and the parser to each other so a launch
+        // cannot report a mechanism the parser does not accept.
         assert_eq!(Mechanism::SandboxExec.to_string(), "sandbox-exec");
         assert_eq!(Mechanism::SandboxInit.to_string(), "sandbox-init");
         for mechanism in [Mechanism::SandboxExec, Mechanism::SandboxInit] {
-            assert_eq!(mechanism.to_string(), mechanism.as_str());
-            assert_eq!(
-                Mechanism::from_env(Some(mechanism.as_str())).unwrap(),
-                mechanism
-            );
+            let wire = mechanism.to_string();
+            assert_eq!(Mechanism::from_env(Some(&wire)).unwrap(), mechanism);
         }
     }
 

@@ -49,6 +49,16 @@ impl From<Error> for storage::Error {
     }
 }
 
+impl Error {
+    /// Whether this is the read-only refusal: the store's `25006` projection, which the
+    /// contract's own `is_read_only` already recognises.
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Self::Storage(inner) => inner.is_read_only(),
+        }
+    }
+}
+
 impl From<tinio_store_pg::Error> for Error {
     /// The store's own error, projected the way the store projects it: its
     /// `From<Error> for storage::Error` is the one mapping (host and database named, the dsn

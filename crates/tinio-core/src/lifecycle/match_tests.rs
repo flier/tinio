@@ -19,7 +19,7 @@
     impl Object {
         fn new(key: &str, tags: &[(&str, &str)]) -> Self {
             Self {
-                key: key.into(),
+                key: object::key(key).expect("a valid object key"),
                 tags: object::Tags::from_pairs(
                     tags.iter()
                         .map(|&(key, value)| (key.to_owned(), value.to_owned())),

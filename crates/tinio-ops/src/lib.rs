@@ -74,6 +74,7 @@ pub extern crate tinio_version as _version;
 pub mod bucket;
 pub mod hooks;
 pub mod listing;
+pub(crate) mod metrics;
 pub mod multipart;
 pub mod object;
 pub mod ops;

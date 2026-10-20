@@ -546,7 +546,7 @@ mod tests {
         _core::{
             CompletedPart,
             acl::Acl,
-            multipart::MIN_PART_BYTES,
+            multipart::{self, MIN_PART_BYTES},
             object,
             storage::{BucketOps, Error as StorageError, ObjectOps},
         },
@@ -579,7 +579,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 Box::pin(stream::iter(vec![
                     Ok::<_, io::Error>(Bytes::from_static(b"x")),
                     Err(io::Error::other("boom")),
@@ -643,7 +643,7 @@ mod tests {
                     &b,
                     &k,
                     &upload.upload_id,
-                    ((i + 1) as u32).into(),
+                    multipart::part_number((i + 1) as u32).expect("a valid part number"),
                     body(data.clone()),
                     None,
                 )
@@ -721,7 +721,14 @@ mod tests {
             .unwrap();
         for i in 1..=5u32 {
             storage
-                .upload_part(&b, &k, &upload.upload_id, i.into(), body(b"x"), None)
+                .upload_part(
+                    &b,
+                    &k,
+                    &upload.upload_id,
+                    multipart::part_number(i).expect("a valid part number"),
+                    body(b"x"),
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -997,7 +1004,14 @@ mod tests {
             .await
             .unwrap();
         let part = storage
-            .upload_part(&b, &k, &upload.upload_id, 1.into(), body(b"hello"), None)
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"hello"),
+                None,
+            )
             .await
             .unwrap();
         let completed = vec![CompletedPart {
@@ -1066,7 +1080,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(first.clone()),
                 Some(checksum_tee(checksum::Algorithm::Md5, &md5_wire(&first))),
             )
@@ -1077,7 +1091,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                2.into(),
+                multipart::part_number(2).expect("a valid part number"),
                 body(b"world"),
                 Some(checksum_tee(checksum::Algorithm::Md5, &md5_wire(b"world"))),
             )
@@ -1140,7 +1154,14 @@ mod tests {
             .await
             .unwrap();
         let p = storage
-            .upload_part(&b, &k, &upload2.upload_id, 3.into(), body(b"tail"), None)
+            .upload_part(
+                &b,
+                &k,
+                &upload2.upload_id,
+                multipart::part_number(3).expect("a valid part number"),
+                body(b"tail"),
+                None,
+            )
             .await
             .unwrap();
         storage
@@ -1188,7 +1209,14 @@ mod tests {
         assert_eq!(upload.owner.as_ref(), Some(&owner));
         assert_eq!(upload.acl.grants, grants);
         let part = storage
-            .upload_part(&b, &k, &upload.upload_id, 1.into(), body(b"hello"), None)
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"hello"),
+                None,
+            )
             .await
             .unwrap();
         let info = storage
@@ -1258,7 +1286,14 @@ mod tests {
             .await
             .unwrap();
         let part = storage
-            .upload_part(&b, &k, &upload.upload_id, 1.into(), body(b"second"), None)
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"second"),
+                None,
+            )
             .await
             .unwrap();
         let info = storage
@@ -1473,7 +1508,7 @@ mod tests {
                 &b,
                 &dst,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 Some(ByteRange::Inclusive(0, 4)),
             )
             .await
@@ -1483,7 +1518,15 @@ mod tests {
 
         // The whole source, as the completion's final part.
         let whole = storage
-            .copy_part(&b, &src, &b, &dst, &upload.upload_id, 2.into(), None)
+            .copy_part(
+                &b,
+                &src,
+                &b,
+                &dst,
+                &upload.upload_id,
+                multipart::part_number(2).expect("a valid part number"),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(whole.size, 11);
@@ -1495,7 +1538,15 @@ mod tests {
         // destination's refusal.
         let reserved = object::key(".tinio/part.bin").unwrap();
         let err = storage
-            .copy_part(&b, &src, &b, &reserved, &upload.upload_id, 3.into(), None)
+            .copy_part(
+                &b,
+                &src,
+                &b,
+                &reserved,
+                &upload.upload_id,
+                multipart::part_number(3).expect("a valid part number"),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -1518,7 +1569,7 @@ mod tests {
                 &b,
                 &reserved,
                 &upload.upload_id,
-                4.into(),
+                multipart::part_number(4).expect("a valid part number"),
                 None,
             )
             .await

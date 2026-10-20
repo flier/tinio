@@ -17,6 +17,7 @@ parse-display.workspace = true
 parquet = { workspace = true, optional = true }
 pest.workspace = true
 pest_derive.workspace = true
+prometheus.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = [
@@ -28,10 +29,12 @@ sqlparser = { workspace = true, features = ["visitor"] }
 struson.workspace = true
 thiserror.workspace = true
 time = { workspace = true, features = ["formatting"], optional = true }
+tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 criterion.workspace = true
+tinio-util = { workspace = true, features = ["testing"] }
 
 [[bench]]
 name = "select_scan"

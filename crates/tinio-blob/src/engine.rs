@@ -9,6 +9,7 @@ use std::io;
 
 use futures::{StreamExt, stream};
 use sha2::{Digest, Sha256};
+use tracing::{Span, field, instrument};
 
 use crate::{
     _core::{
@@ -135,6 +136,12 @@ impl<S: BlockStore> Store<S> {
     ///     "version 1 stores one block per blob"
     /// );
     /// ```
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bytes = field::Empty)
+    )]
     pub async fn put(&self, mut body: BodyStream) -> Result<BlobRef, Error> {
         let mut staged = self
             .blocks
@@ -149,6 +156,9 @@ impl<S: BlockStore> Store<S> {
             len += chunk.len() as u64;
             staged.write(chunk).await.map_err(Error::Io)?;
         }
+        // The staged length is known here and not earlier: the field reports
+        // it even when the publish below fails.
+        Span::current().record("bytes", len);
         let hash = BlockHash::from_digest(hasher.finalize().into());
         self.blocks
             .publish(staged, &hash)

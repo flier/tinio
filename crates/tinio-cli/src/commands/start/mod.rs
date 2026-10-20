@@ -13,7 +13,7 @@ pub(crate) mod api;
 mod args;
 mod chown;
 #[cfg(feature = "api")]
-mod metrics;
+mod reader;
 mod run;
 mod serve;
 mod serving;
@@ -124,22 +124,21 @@ pub enum Server {
 /// The serving half's state, built by [`run()`] and read by nothing but [`serve()`].
 ///
 /// `backend` and `pipelines` are here rather than in [`serve()`] for one reason: the management
-/// plane's bind is the plane's single-instance gate and belongs **before** the repair, and the
-/// plane's `/metrics` route is fed by a `Gauges` built from this task's `ServerMetrics` — which
-/// reads the storage. For the filesystem backend (`Served::Fs`) those are built in `run` and
-/// carried here, so the bind precedes the runtime as it always has; for pg (`Served::Pg`) the
-/// storage is constructed inside the runtime and its plane is bound there, before the repair.
-/// `Plane::bind` and `select` are synchronous by design, so none of this needs a runtime, which
-/// is exactly why the filesystem arm can precede one.
+/// plane's bind is the plane's single-instance gate and belongs **before** the repair. For the
+/// filesystem backend (`Served::Fs`) those are built in `run` and carried here, so the bind
+/// precedes the runtime as it always has; for pg (`Served::Pg`) the storage is constructed
+/// inside the runtime and its plane is bound there, before the repair. `Plane::bind` and
+/// `select` are synchronous by design, so none of this needs a runtime, which is exactly why the
+/// filesystem arm can precede one.
 ///
 /// **The backend is the one generic seam** (`Served`): the serving half is written once over
 /// `S: ServingBackend` and hands `serve` whichever storage this run resolved, so no serving code
-/// is duplicated per backend. `Served::Fs`'s `plane` is the one `api`-gated field (and
-/// `ServerMetrics`, `refresh_handle` and the adapter's `MetricsSource` impl are gated with it),
-/// because `tinio-api` is an optional dependency of this crate: in a `--no-default-features`
-/// build there is no plane, no state file and no single-instance gate, which is the api-off build
-/// the design's Risk table describes. The serving half still serves, and nothing else in this
-/// struct mentions the plane's crate.
+/// is duplicated per backend. `Served::Fs`'s `plane` is the one `api`-gated field, because
+/// `tinio-api` is an optional dependency of this crate: in a `--no-default-features` build there
+/// is no plane, no state file and no single-instance gate, which is the api-off build the
+/// design's Risk table describes. The serving half still serves, and nothing else in this struct
+/// mentions the plane's crate. The metrics reader is started by the serving half through
+/// `ServingBackend::metrics_reader`, so no plane carries it.
 pub struct Ready {
     /// The resolution steps a–e produced: root, config, mode, state dir.
     resolution: Resolution,

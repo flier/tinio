@@ -23,7 +23,7 @@ use crate::{bucket, object};
 ///
 /// use tinio_core::{lifecycle::Facts, object};
 ///
-/// let key: object::Key = "logs/a.txt".into();
+/// let key = object::key("logs/a.txt").expect("a valid object key");
 /// let tags = object::Tags::empty();
 /// let facts = Facts {
 ///     key: &key,
@@ -51,7 +51,7 @@ impl<'a> Facts<'a> {
     ///
     /// use tinio_core::{lifecycle::Facts, object};
     ///
-    /// let key: object::Key = "logs/a.txt".into();
+    /// let key = object::key("logs/a.txt").expect("a valid object key");
     /// let tags = object::Tags::empty();
     /// let facts = Facts::new(&key, 10, SystemTime::UNIX_EPOCH, &tags);
     /// assert_eq!(facts.size, 10);
@@ -127,7 +127,7 @@ impl Config {
     ///         abort_incomplete_multipart_upload: None,
     ///     }],
     /// };
-    /// let key: object::Key = "logs/a.txt".into();
+    /// let key = object::key("logs/a.txt").expect("a valid object key");
     /// let tags = object::Tags::empty();
     /// let facts = Facts {
     ///     key: &key,
@@ -176,7 +176,7 @@ impl Config {
     ///         abort_incomplete_multipart_upload: None,
     ///     }],
     /// };
-    /// let key: object::Key = "a.txt".into();
+    /// let key = object::key("a.txt").expect("a valid object key");
     /// let tags = object::Tags::empty();
     /// let facts = Facts {
     ///     key: &key,
@@ -231,7 +231,7 @@ impl Config {
     ///         abort_incomplete_multipart_upload: None,
     ///     }],
     /// };
-    /// let key: object::Key = "a.txt".into();
+    /// let key = object::key("a.txt").expect("a valid object key");
     /// let tags = object::Tags::empty();
     /// let facts = Facts {
     ///     key: &key,
@@ -278,7 +278,7 @@ impl Config {
     ///         }),
     ///     }],
     /// };
-    /// let key: object::Key = "a.txt".into();
+    /// let key = object::key("a.txt").expect("a valid object key");
     /// let tags = object::Tags::empty();
     /// let facts = Facts {
     ///     key: &key,

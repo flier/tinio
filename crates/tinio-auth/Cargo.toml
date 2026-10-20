@@ -7,9 +7,12 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+parse-display.workspace = true
+prometheus.workspace = true
 s3s.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 tinio-core.workspace = true
 
@@ -19,6 +22,7 @@ futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 tinio-mem.workspace = true
+tinio-util = { workspace = true, features = ["testing"] }
 
 [lints.clippy]
 absolute_paths = "warn"

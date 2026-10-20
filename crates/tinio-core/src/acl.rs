@@ -26,7 +26,9 @@
 //! stored element outside the domain — the same discipline this module's own
 //! `from_grants_wire` applies.
 
+use derive_more::Deref;
 use sha2::{Digest, Sha256};
+use tracing::instrument;
 
 use crate::percent;
 
@@ -41,7 +43,7 @@ pub const ANONYMOUS_CANONICAL_ID: &str = "65a011a29cdf8ec533ec3d1ccaae921c";
 /// ([`ANONYMOUS_CANONICAL_ID`] — the one exception to the shape).
 #[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[cfg_attr(feature = "sqlx", sqlx(transparent))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deref)]
 pub struct OwnerId(String);
 
 const CANONICAL_ID_LEN: usize = 64;
@@ -61,11 +63,6 @@ impl OwnerId {
         } else {
             Err(AclError::InvalidOwnerId(s))
         }
-    }
-
-    /// The canonical ID as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 
     /// Wrap a raw SHA-256 digest: hex-encoding 32 bytes emits exactly the
@@ -123,6 +120,7 @@ pub fn derive_canonical_id(access_key: &str) -> OwnerId {
 /// `object_owner` is the RAW row element — `None` (the empty wire,
 /// review B4) resolves to `lazy_default`, NOT to the bucket owner: an
 /// empty-wire object is owned by the configured lazy default.
+#[instrument(target = "tinio::auth", level = "debug", skip_all, ret)]
 pub fn can_delete(
     principal: &OwnerId,
     bucket_owner: &OwnerId,

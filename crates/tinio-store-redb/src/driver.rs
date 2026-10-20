@@ -6,7 +6,7 @@
 //! `read`/`write` pattern are the shared store handle's
 //! ([`crate::store::Handle`]); this type adds the tokio blocking-pool hop
 //! every transaction takes and the write-lock histograms the server's
-//! `tinio_write_lock_*` metrics are scraped from.
+//! `tinio_storage_write_lock_*` metrics are scraped from.
 //!
 //! **The closure error is generic** (`E: From<Error>`), exactly as the
 //! wrapped store handle's is: a backend accumulates its own error through a
@@ -29,7 +29,9 @@ use redb::{Database, ReadTransaction, WriteTransaction};
 use tokio::task::{JoinError, spawn_blocking};
 
 use crate::{
-    _core::storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS},
+    _core::storage::{
+        WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS, WriteLockSnapshot,
+    },
     compact::{needs_compact, snapshot},
     error::Error,
     open::{open, open_read_only},
@@ -48,32 +50,6 @@ pub(crate) fn write_lock_bucket(duration_us: u64) -> usize {
 /// panic payload, so the detail rides the error's chain to the log.
 fn blocking_task_failed(what: &str, join: JoinError) -> Error {
     Error::Io(io::Error::other(format!("the {what} task failed: {join}")))
-}
-
-/// A read-only snapshot of the write-lock histograms (pipeline-spec.md
-/// §4). Two distributions are recorded per write transaction — the
-/// **wait** (the `begin_write` return ≈ the lock wait, incl. a little
-/// transaction initialization) and the **total** (the commit/abort return
-/// — the whole transaction incl. fsync). Per-distribution `count`,
-/// `sum`, and `max` let the metrics layer derive p50/p90/p99
-/// approximations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct WriteLockSnapshot {
-    /// Wait-duration counts per bucket (index per
-    /// [`WRITE_LOCK_BUCKET_BOUNDS_US`]).
-    pub wait_buckets: [u64; WRITE_LOCK_BUCKETS],
-    /// Total-duration counts per bucket.
-    pub total_buckets: [u64; WRITE_LOCK_BUCKETS],
-    /// Write transactions recorded.
-    pub count: u64,
-    /// Sum of wait durations, microseconds.
-    pub wait_sum_us: u64,
-    /// Maximum wait duration, microseconds.
-    pub wait_max_us: u64,
-    /// Sum of total durations, microseconds.
-    pub total_sum_us: u64,
-    /// Maximum total duration, microseconds.
-    pub total_max_us: u64,
 }
 
 /// The fixed-bucket write-lock histogram behind [`Driver`] — plain
@@ -200,6 +176,12 @@ impl Driver {
     /// let driver = Driver::empty().unwrap();
     /// assert!(!driver.compact_needed().unwrap());
     /// ```
+    #[tracing::instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(kind = "degraded", reason = "state database unavailable")
+    )]
     pub fn empty() -> Result<Arc<Self>, Error> {
         Ok(Self::wrap(store::Handle::empty()?))
     }
@@ -296,6 +278,12 @@ impl Driver {
     /// collect the keys in an inner scope so the iterator is dropped
     /// first (the `drain_impl` macro in `crate::scan`). `put_with_parts`,
     /// `move_` and the drains are the worked examples.
+    #[tracing::instrument(
+        target = "tinio::storage",
+        level = "trace",
+        skip_all,
+        fields(kind = "write")
+    )]
     pub async fn write<T, E>(
         self: &Arc<Self>,
         f: impl FnOnce(&mut WriteTransaction) -> Result<T, E> + Send + 'static,
@@ -328,6 +316,12 @@ impl Driver {
     /// the same redb page-manager ordering rule applies (see
     /// [`Self::write`]: removals before inserts within one table, and no
     /// live range iterator across the removals).
+    #[tracing::instrument(
+        target = "tinio::storage",
+        level = "trace",
+        skip_all,
+        fields(kind = "write_if")
+    )]
     pub async fn write_if<T, E>(
         self: &Arc<Self>,
         f: impl FnOnce(&mut WriteTransaction) -> Result<Option<T>, E> + Send + 'static,
@@ -462,6 +456,12 @@ impl Driver {
     /// transaction goes through the same timing wrapper as [`Self::write`]
     /// (P5 — all write transactions are covered) and runs on the blocking
     /// pool like it (G3 revision — the stats call is a write transaction).
+    #[tracing::instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(threshold_percent = threshold_percent)
+    )]
     pub async fn evaluate_compact(self: &Arc<Self>, threshold_percent: u8) -> Result<bool, Error> {
         self.timed_write::<bool, Error>(move |mut txn| {
             let stats = txn.stats()?;
@@ -519,11 +519,14 @@ mod tests {
     use io::Error as IoError;
     use redb::Database;
     use tokio::{runtime::Builder, sync::oneshot, time::timeout};
+    use tracing::Level;
 
     use super::*;
+    use tinio_util::testing::spans::one_named;
     use crate::{
         _core::{bucket::name, object},
         bucket, object_meta, open, state,
+        testutil::capture_spans,
     };
 
     fn open_db() -> (tempfile::TempDir, Database) {
@@ -947,6 +950,66 @@ mod tests {
             .unwrap_err();
         assert!(err.is_read_only(), "{err:?}");
         drop(dir);
+    }
+
+    /// The transaction choke points open one span at their tier on the
+    /// storage target: trace for the unlabelled write pair, info for the
+    /// once-per-cycle compaction evaluation. The driver cannot know the
+    /// caller's op, so the span carries the transaction kind only.
+    #[tokio::test]
+    async fn transaction_spans_carry_their_tier_and_kind() {
+        let capture = capture_spans();
+        let watermark = capture.watermark();
+        let (dir, db) = open_db();
+        let driver = Driver::new(db);
+        let name = name("traced").unwrap();
+        driver
+            .write(move |txn| -> Result<(), Error> {
+                bucket::Table::open(txn)?.put(&name, UNIX_EPOCH)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        driver
+            .write_if(|_txn| -> Result<Option<()>, Error> { Ok(None) })
+            .await
+            .unwrap();
+        driver.evaluate_compact(20).await.unwrap();
+
+        let spans = capture.spans_since(watermark);
+        let one = |name: &str| one_named(&spans, name);
+        let write = one("write");
+        assert_eq!(write.target, "tinio::storage");
+        assert_eq!(write.level, Level::TRACE);
+        assert_eq!(write.field("kind"), Some("write"));
+        let write_if = one("write_if");
+        assert_eq!(write_if.target, "tinio::storage");
+        assert_eq!(write_if.level, Level::TRACE);
+        assert_eq!(write_if.field("kind"), Some("write_if"));
+        let compact = one("evaluate_compact");
+        assert_eq!(compact.target, "tinio::storage");
+        assert_eq!(compact.level, Level::INFO);
+        assert_eq!(compact.field("threshold_percent"), Some("20"));
+        drop(dir);
+    }
+
+    /// The degraded empty view opens one info span and names the reason: a
+    /// read-only run that falls back to it must not look like an empty store.
+    #[test]
+    fn the_degraded_empty_view_records_the_reason() {
+        let capture = capture_spans();
+        let watermark = capture.watermark();
+        let _driver = Driver::empty().unwrap();
+
+        let spans = capture.spans_since(watermark);
+        let empty = spans
+            .iter()
+            .find(|span| span.name == "empty")
+            .unwrap_or_else(|| panic!("no empty span in {spans:?}"));
+        assert_eq!(empty.target, "tinio::storage");
+        assert_eq!(empty.level, Level::INFO);
+        assert_eq!(empty.field("kind"), Some("degraded"));
+        assert_eq!(empty.field("reason"), Some("state database unavailable"));
     }
 
     /// A driver whose database was written out-of-band reports the stored

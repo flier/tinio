@@ -45,7 +45,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -54,6 +54,7 @@ use futures::FutureExt;
 #[cfg(feature = "config")]
 use garde::Validate;
 use parse_display::{Display, FromStr};
+use prometheus::{Histogram, IntCounter};
 #[cfg(feature = "config")]
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
@@ -64,6 +65,7 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+use tracing::instrument;
 
 #[cfg(feature = "config")]
 use crate::_core::pipeline::{CAPACITY_MAX, CAPACITY_MIN};
@@ -73,7 +75,7 @@ use crate::{
         DEFAULT_IO_WORKERS, DEFAULT_REMOVE_WORKERS, Error::ShutDown, IO_WORKERS_MAX,
         IO_WORKERS_MIN, Outcome, Reply, RunOutput, Runner, Stats, Task,
     },
-    Error,
+    Error, metrics,
 };
 
 /// Worker-thread priority of a pipeline (`priority` in `[pipeline.*]`;
@@ -200,7 +202,7 @@ fn default_capacity() -> u32 {
 
 /// One queued job: the task plus the reply the worker sends after `run()`
 /// (the other end is [`Completion`]).
-type Job<O> = (Box<dyn Task<Output = O>>, Reply<O>);
+type Job<O> = (Instant, Box<dyn Task<Output = O>>, Reply<O>);
 
 /// The consecutive `run()` failure count at which the DB write pipeline
 /// escalates its warning (R7, pipeline-spec.md §7).
@@ -439,11 +441,19 @@ impl<O> Runner<O> for Pipeline<O>
 where
     O: Outcome,
 {
+    #[instrument(
+        level = "debug",
+        target = "tinio::pipeline",
+        name = "pipeline.enqueue",
+        skip(self, task),
+        fields(pipeline = self.inner.kind)
+    )]
     async fn enqueue(
         &self,
         task: Box<dyn Task<Output = O>>,
     ) -> Result<Completion<O>, pipeline::Error> {
         if self.inner.shut_down.load(Ordering::Relaxed) {
+            record_refused(self.inner.kind);
             return Err(ShutDown);
         }
         let (reply, done) = Completion::pair();
@@ -451,7 +461,10 @@ where
         // clone is taken whole (`queue_guard` carries the D3 recovery), and a
         // poisoned lock's slot is still the enqueue answer the shutdown arm
         // reads.
-        let sender = self.inner.queue_guard().clone().ok_or(ShutDown)?;
+        let Some(sender) = self.inner.queue_guard().clone() else {
+            record_refused(self.inner.kind);
+            return Err(ShutDown);
+        };
         // No depth counting here — `stats()` reads the depth from the
         // channel itself (`max_capacity() - capacity()`, item 4,
         // data-path review 2026-08-29): a task still blocked in `send`
@@ -460,8 +473,10 @@ where
         // counted increment/decrement race (a decrement consumed before
         // the producer's increment landed, drifting the gauge upward
         // permanently) cannot exist.
-        if sender.send((task, reply)).await.is_err() {
+        let queued = Instant::now();
+        if sender.send((queued, task, reply)).await.is_err() {
             // The channel closed under us (shutdown race) — not accepted.
+            record_refused(self.inner.kind);
             return Err(ShutDown);
         }
         // F08: a shutdown that fired while the send was in flight would
@@ -472,6 +487,7 @@ where
         // the task is either run (harmless — the completion dies with
         // this Err) or dropped unrun (Q3 semantics).
         if self.inner.shut_down.load(Ordering::Relaxed) {
+            record_refused(self.inner.kind);
             return Err(ShutDown);
         }
         Ok(done)
@@ -603,6 +619,50 @@ impl<IoResult, RemoveResult, DbResult> Drop for Pipelines<IoResult, RemoveResult
     }
 }
 
+/// One task's outcome, the closed `outcome` label set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskOutcome {
+    /// `run()` answered `Ok`.
+    Ok,
+    /// `run()` answered `Err` (or panicked in `kind()`).
+    Error,
+    /// `run()` panicked.
+    Panic,
+}
+
+/// One worker's metric handles, resolved once: `kind` is fixed for the worker's lifetime, so
+/// the label-map lookup belongs here rather than in every task.
+struct TaskMetrics {
+    enqueue_wait: Histogram,
+    ok: IntCounter,
+    error: IntCounter,
+    panic: IntCounter,
+    duration: Histogram,
+}
+
+impl TaskMetrics {
+    /// Resolve every per-worker handle.
+    fn new(kind: &'static str) -> Self {
+        let task = |outcome: &str| metrics::PIPELINE_TASKS.with_label_values(&[kind, outcome]);
+        Self {
+            enqueue_wait: metrics::PIPELINE_ENQUEUE_WAIT.with_label_values(&[kind]),
+            ok: task("ok"),
+            error: task("error"),
+            panic: task("panic"),
+            duration: metrics::PIPELINE_TASK_DURATION.with_label_values(&[kind]),
+        }
+    }
+
+    /// The counter for one outcome.
+    fn task(&self, outcome: TaskOutcome) -> &IntCounter {
+        match outcome {
+            TaskOutcome::Ok => &self.ok,
+            TaskOutcome::Error => &self.error,
+            TaskOutcome::Panic => &self.panic,
+        }
+    }
+}
+
 /// One worker loop: receives tasks off the bounded queue and runs them.
 ///
 /// Shutdown (the watch signal, or a closed channel) exits the loop and
@@ -623,6 +683,7 @@ async fn worker_loop<O>(
     O: Outcome,
 {
     let mut consecutive_failures: u32 = 0;
+    let task_metrics = TaskMetrics::new(kind);
     loop {
         tokio::select! {
             biased;
@@ -630,12 +691,15 @@ async fn worker_loop<O>(
             // are dropped at shutdown (Q3).
             _ = shutdown_rx.changed() => break,
             job = receive(&rx) => {
-                let Some((mut task, reply)) = job else { break }; // channel closed
+                let Some((queued, mut task, reply)) = job else { break }; // channel closed
                 // A shutdown that fired while this worker was parked in
                 // receive() drops the task instead of running it (Q3).
                 if *shutdown_rx.borrow() {
                     break;
                 }
+                task_metrics
+                    .enqueue_wait
+                    .observe(queued.elapsed().as_secs_f64());
                 run_one(
                     kind,
                     track_consecutive_failures,
@@ -643,6 +707,7 @@ async fn worker_loop<O>(
                     &mut consecutive_failures,
                     &mut task,
                     reply,
+                    &task_metrics,
                 )
                 .await;
             }
@@ -670,6 +735,7 @@ async fn receive<O>(rx: &TokioMutex<mpsc::Receiver<Job<O>>>) -> Option<Job<O>> {
 /// [`Reply::send`] of `run()`'s value to [`Completion`], run() failure
 /// and consecutive-failure handling (R7/R8), counters down (a guard —
 /// every exit path, panic included, decrements them, F09).
+#[tracing::instrument(target = "tinio::pipeline", level = "debug", skip_all, fields(pipeline = kind))]
 async fn run_one<O>(
     kind: &'static str,
     track_consecutive_failures: bool,
@@ -677,9 +743,12 @@ async fn run_one<O>(
     consecutive_failures: &mut u32,
     task: &mut Box<dyn Task<Output = O>>,
     reply: Reply<O>,
+    task_metrics: &TaskMetrics,
 ) where
     O: Outcome,
 {
+    let started = Instant::now();
+    let mut task_outcome = TaskOutcome::Ok;
     counters.in_flight.fetch_add(1, Ordering::Relaxed);
     // F09: the counters are decremented on EVERY exit path — a panic in
     // any step of the task must never leave in_flight stuck at its
@@ -714,6 +783,7 @@ async fn run_one<O>(
         let output = task.run().await;
         match output.failure() {
             Some(err) => {
+                task_outcome = TaskOutcome::Error;
                 *consecutive_failures += 1;
                 let escalated = escalation_due(track_consecutive_failures, *consecutive_failures);
                 // F48: one warn per failure arm — the escalation rides as
@@ -741,6 +811,7 @@ async fn run_one<O>(
     .catch_unwind()
     .await;
     if let Err(payload) = outcome {
+        task_outcome = TaskOutcome::Panic;
         // A panic is a failure (R6): it increments the
         // consecutive-failure streak (R7), never resets it. Dropping
         // `reply` cancels [`Completion`] (`Error::Dropped`). One warn per
@@ -760,6 +831,19 @@ async fn run_one<O>(
             }
         );
     }
+    task_metrics.task(task_outcome).inc();
+    task_metrics
+        .duration
+        .observe(started.elapsed().as_secs_f64());
+}
+
+/// Count one refused enqueue — a task the pipeline did not accept because it
+/// was shut down or its queue closed. The caller still gets `Err(ShutDown)`;
+/// the counter is what makes refusal visible in aggregate.
+fn record_refused(kind: &str) {
+    metrics::PIPELINE_TASKS
+        .with_label_values(&[kind, "refused"])
+        .inc();
 }
 
 /// Render a panic payload for the logs (R6). The hand-rolled helper
@@ -839,11 +923,13 @@ mod tests {
     use std::{
         collections::HashMap,
         error::Error as StdError,
+        future::Future,
         mem,
         sync::{
             Arc, Mutex, OnceLock,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        task::{Context, Waker},
         time::{Duration, SystemTime},
     };
 
@@ -1164,9 +1250,19 @@ mod tests {
         }
 
         // enqueue after shutdown errors (Q3); shutdown is idempotent.
+        let refused = || {
+            metrics::PIPELINE_TASKS
+                .with_label_values(&["io", "refused"])
+                .get()
+        };
+        let before = refused();
         let (_, _, task) = FlagTask::new();
         let err = pipelines.io().enqueue(Box::new(task)).await.unwrap_err();
         assert_eq!(err, ShutDown, "{err}");
+        assert!(
+            refused() > before,
+            "a refused enqueue is counted under outcome=refused"
+        );
         pipelines.io().shutdown();
     }
 
@@ -1360,6 +1456,140 @@ mod tests {
         let (ran, _dropped, task) = FlagTask::new();
         pipelines.io().enqueue(Box::new(task)).await.unwrap();
         wait_for(|| ran.load(Ordering::Relaxed)).await;
+    }
+
+    /// `run_one` books one sample under the pipeline's outcome label for each
+    /// arm: `ok`, `error` (a `run()` failure), and `panic` (the caught panic).
+    /// Unique kind labels keep the exact deltas deterministic in the
+    /// process-global registry; the counter guard must balance on every arm,
+    /// and the completion must carry the arm's own shape.
+    #[tokio::test]
+    async fn run_one_books_each_outcome_under_its_label() {
+        for (kind, expected) in [
+            ("outcome-ok-probe", "ok"),
+            ("outcome-error-probe", "error"),
+            ("outcome-panic-probe", "panic"),
+        ] {
+            let mut task: Box<dyn Task<Output = RunOutput>> = match expected {
+                "ok" => Box::new(FlagTask::new().2),
+                "error" => Box::new(FailingTask {
+                    runs: Arc::new(AtomicUsize::new(0)),
+                }),
+                _ => Box::new(PanicTask::new().1),
+            };
+            let counters = Counters::default();
+            let mut streak = 0;
+            let (reply, done) = Completion::pair();
+            let task_metrics = TaskMetrics::new(kind);
+            run_one(
+                kind,
+                false,
+                &counters,
+                &mut streak,
+                &mut task,
+                reply,
+                &task_metrics,
+            )
+            .await;
+            assert_eq!(
+                counters.in_flight.load(Ordering::Relaxed),
+                0,
+                "{kind}: the guard balances every exit path"
+            );
+            assert_eq!(
+                metrics::PIPELINE_TASKS
+                    .with_label_values(&[kind, expected])
+                    .get(),
+                1,
+                "{kind}: one sample under outcome={expected}"
+            );
+            let completion = done.await;
+            match expected {
+                "ok" => assert!(
+                    completion.unwrap().is_ok(),
+                    "{kind}: the reply carries the success"
+                ),
+                "error" => assert!(
+                    completion.unwrap().is_err(),
+                    "{kind}: the reply carries the failure"
+                ),
+                _ => assert!(
+                    matches!(completion, Err(Dropped)),
+                    "{kind}: a panic cancels the reply"
+                ),
+            }
+        }
+    }
+
+    /// The closed-sender refused arm: the enqueue slot is empty while the
+    /// shutdown flag is still clear. `shutdown_inner` sets the flag before it
+    /// takes the sender, so this ordering is only reachable through the race
+    /// — the test plants the state directly, as the race's deterministic
+    /// spelling.
+    #[tokio::test]
+    async fn enqueue_refuses_when_the_queue_slot_is_taken() {
+        let pipelines = pipelines(1, 1, 8);
+        let pipeline = pipelines.io();
+        *pipeline.inner.queue_guard() = None;
+        let (_, _, task) = FlagTask::new();
+        let err = pipeline.enqueue(Box::new(task)).await.unwrap_err();
+        assert_eq!(err, ShutDown);
+    }
+
+    /// The send-failure refused arm: the workers are gone (their receiver
+    /// dropped) while the shutdown flag is still clear, so the pre-check
+    /// passes and the send itself refuses. The watch signal alone stops the
+    /// workers — the API's `shutdown` would set the flag and take the sender,
+    /// hiding the arm behind the pre-check.
+    #[tokio::test]
+    async fn enqueue_refuses_when_the_channel_closed_under_it() {
+        let pipelines = pipelines(1, 1, 8);
+        let pipeline = pipelines.io();
+        pipeline.inner.shutdown_tx.send(true).unwrap();
+        pipeline.drain().await;
+        let (ran, dropped, task) = FlagTask::new();
+        let err = pipeline.enqueue(Box::new(task)).await.unwrap_err();
+        assert_eq!(err, ShutDown);
+        assert!(!ran.load(Ordering::Relaxed), "the refused task never ran");
+        assert!(
+            dropped.load(Ordering::Relaxed),
+            "the refused task is dropped with the refused send"
+        );
+    }
+
+    /// The post-send refused arm (F08): a shutdown that lands while the send
+    /// is in flight hands back `Err(ShutDown)`, not `Ok(done)` for a task the
+    /// workers may drop unrun. Polling the enqueue once parks it in `send` on
+    /// a full queue, so the flag flips at exactly the post-send window; the
+    /// task's own run proves the send completed before the recheck refused.
+    #[tokio::test]
+    async fn enqueue_refuses_a_shutdown_that_lands_after_the_send() {
+        let pipelines = pipelines(1, 1, 1);
+        let (started, release, _gate_ran, gate) = GateTask::new();
+        pipelines.io().enqueue(Box::new(gate)).await.unwrap();
+        started.await.unwrap(); // the worker is inside run()
+
+        // Fill the single queue slot behind the in-flight gate.
+        let (_, _, fill) = FlagTask::new();
+        pipelines.io().enqueue(Box::new(fill)).await.unwrap();
+
+        let pipeline = pipelines.io();
+        let (ran, _dropped, task) = FlagTask::new();
+        let mut enqueue = Box::pin(pipeline.enqueue(Box::new(task)));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(
+            enqueue.as_mut().poll(&mut cx).is_pending(),
+            "the full queue parks the enqueue in send, past the pre-check"
+        );
+        pipeline.inner.shut_down.store(true, Ordering::Relaxed);
+        release.send(()).unwrap();
+        assert_eq!(enqueue.await.unwrap_err(), ShutDown);
+        wait_for(|| ran.load(Ordering::Relaxed)).await;
+
+        // The flag was set without the watch signal; stop the workers now.
+        let _ = pipeline.inner.shutdown_tx.send(true);
+        pipeline.drain().await;
     }
 
     #[tokio::test]

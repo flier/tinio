@@ -1260,16 +1260,13 @@ fn field_of(line: &str, name: &str) -> Option<String> {
 /// in this file that names a platform's events rather than a platform's mechanism.
 #[cfg(target_os = "linux")]
 const CONFINED_STEPS: &[(&str, &[&str])] = &[
-    // The §7 events `crate::sandbox::confine`'s `announce_in_place` writes after the in-place
-    // confinement, every value taken from the answer the confinement itself returned
-    // (`serve::Confined`): the *resolved* model (`model`), the exposure event's whole field set —
-    // the set's size (`count`), the mounts the jail applied (`mounts`) and the rendered path list
-    // (`exposures`) — and the network filter's outcome (`installed` — `true` on an architecture
-    // with a syscall table, `false` where the filter was skipped and the network guarantee is not
-    // delivered). The step and field names are the shared §7 vocabulary and not this table's
-    // choice: the re-emit replaces the backend's own events, which the in-place ordering drops
-    // (the subscriber is installed after the confinement, design decision 26), rather than
-    // inventing a vocabulary of its own.
+    // The §7 events the Linux backend emits while it confines in place: the *resolved* model
+    // (`model`), the exposure event's whole field set — the set's size (`count`), the mounts the
+    // jail applied (`mounts`) and the rendered path list (`exposures`) — and the network filter's
+    // outcome (`installed` — `true` on an architecture with a syscall table, `false` where the
+    // filter was skipped and the network guarantee is not delivered). They are live because the
+    // CLI installs a fmt-only bootstrap before parsing, so the in-place ordering no longer drops
+    // them (design decision 26); the step and field names are the backend's own.
     ("model", &["model"]),
     ("exposures", &["count", "mounts", "exposures"]),
     ("seccomp", &["installed"]),
@@ -2776,8 +2773,8 @@ async fn systemd_received_within(world: &mut World, tag: String, count: usize, w
 /// **The first carrier is the product's own record** ([`CONFINED_STEPS`]): the events the
 /// confinement emits about itself, one per platform, with the fields that make each one that event
 /// rather than a sentence that mentions it. On the launcher arms this is the only record of the
-/// launch; on the in-place arm it is the re-emit the CLI owes because its subscriber is installed
-/// *after* the confinement (design decision 26).
+/// launch; on the in-place arm the fmt-only bootstrap the CLI installs before parsing is what
+/// makes the backend's own events reach stderr (design decision 26).
 ///
 /// **The second carrier is independent of that record, one per platform, and it is the half that
 /// keeps this step from being a self-report.** A run that served without confining anything would

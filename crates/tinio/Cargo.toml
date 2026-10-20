@@ -2,6 +2,7 @@
 name = "tinio"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Tinio: an S3-compatible local storage server (facade crate with the tinio binary and public re-export library)"
 
 [dependencies]

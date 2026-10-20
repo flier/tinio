@@ -28,7 +28,7 @@ use tinio_core::{
         self, AbortIncompleteMultipartUpload, Expiration, Filter, NoncurrentVersionExpiration,
         Rule, Status,
     },
-    object,
+    multipart, object,
     storage::{BucketOps, MultipartOps, ObjectOps, VersionOps},
     version::{self, CurrentVersion, ListParams, State},
 };
@@ -686,7 +686,7 @@ async fn an_upload_larger_than_the_size_bound_is_kept() {
             &name,
             &key,
             &upload.upload_id,
-            1.into(),
+            multipart::part_number(1).expect("a valid part number"),
             Box::pin(stream::once(async { Ok(Bytes::from_static(b"abc")) })),
             None,
         )

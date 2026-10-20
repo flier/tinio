@@ -2741,6 +2741,7 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.5",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -3548,9 +3549,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -3571,15 +3572,6 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
 ]
 
 [[package]]
@@ -4542,7 +4534,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -4699,8 +4691,8 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "itoa",
  "prometheus",
- "rustls-pemfile",
  "secrecy",
  "serde",
  "serde_json",
@@ -4725,12 +4717,16 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "parse-display",
+ "prometheus",
  "s3s",
  "sha2 0.11.0",
  "thiserror 2.0.20",
  "tinio-core",
  "tinio-mem",
+ "tinio-util",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4756,6 +4752,7 @@ dependencies = [
  "tinio-util",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -4777,6 +4774,7 @@ dependencies = [
  "http",
  "humantime-serde",
  "parse-display",
+ "prometheus",
  "rustix 1.1.4",
  "sd-notify",
  "secrecy",
@@ -4911,12 +4909,15 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "parse-display",
+ "prometheus",
  "smart-default",
  "tinio-core",
  "tinio-mem",
  "tinio-util",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4936,6 +4937,7 @@ dependencies = [
  "tinio-version",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -4948,6 +4950,7 @@ dependencies = [
  "criterion",
  "futures",
  "md-5",
+ "prometheus",
  "tempfile",
  "tinio-blob",
  "tinio-core",
@@ -4983,13 +4986,16 @@ dependencies = [
 name = "tinio-sandbox"
 version = "0.1.0"
 dependencies = [
+ "prometheus",
  "rustix 1.1.4",
  "secrecy",
  "tinio-sandbox-core",
  "tinio-sandbox-linux",
  "tinio-sandbox-macos",
  "tinio-sandbox-windows",
+ "tinio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4998,6 +5004,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "derive_more",
+ "parse-display",
+ "prometheus",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -5049,6 +5057,7 @@ dependencies = [
 name = "tinio-sandbox-windows"
 version = "0.1.0"
 dependencies = [
+ "derive_more",
  "getrandom 0.4.3",
  "hex",
  "sha2 0.11.0",
@@ -5077,6 +5086,7 @@ dependencies = [
  "parse-display",
  "pest",
  "pest_derive",
+ "prometheus",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -5085,6 +5095,8 @@ dependencies = [
  "struson",
  "thiserror 2.0.20",
  "time",
+ "tinio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -5106,6 +5118,7 @@ dependencies = [
  "http-body",
  "hyper",
  "hyper-util",
+ "itoa",
  "md-5",
  "mime_guess",
  "opentelemetry",
@@ -5151,6 +5164,7 @@ dependencies = [
  "futures",
  "hex",
  "parse-display",
+ "prometheus",
  "sha2 0.11.0",
  "sqlx",
  "tempfile",
@@ -5179,6 +5193,7 @@ dependencies = [
  "tinio-util",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5194,6 +5209,7 @@ dependencies = [
  "hex",
  "hmac",
  "papaya",
+ "prometheus",
  "rustix 1.1.4",
  "secrecy",
  "serde",
@@ -5216,12 +5232,16 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "parse-display",
+ "prometheus",
  "tempfile",
  "thiserror 2.0.20",
  "tinio-blob",
  "tinio-core",
  "tinio-util",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5393,11 +5413,13 @@ dependencies = [
  "pin-project",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5884,6 +5906,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

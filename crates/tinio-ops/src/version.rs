@@ -92,6 +92,8 @@
 
 use std::time::SystemTime;
 
+use tracing::instrument;
+
 use crate::{
     _core::{
         ByteRange, ETag, GetObjectResult,
@@ -176,6 +178,12 @@ where
     /// recorded identity its content no longer matches is **not** the current
     /// version, so a request that names it resolves nothing (`NoSuchVersion`)
     /// instead of serving the drift under a stale identifier.
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     async fn resolve<R, B, G>(
         &self,
         plane: &Plane<R, C, B, G>,
@@ -810,6 +818,12 @@ where
     ///
     /// The version engine's failures (a supersede race included), the row
     /// plane's, the content plane's and the marker port's.
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub async fn create_delete_marker<R, B, G, W>(
         &self,
         plane: &Plane<R, C, B, G>,
@@ -1132,6 +1146,12 @@ where
         clippy::too_many_arguments,
         reason = "the versioned undo's field set — plane, marker port, bucket, key, the row it replaces, the history sequence, the retained parts and the publish — is the operation's own"
     )]
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub async fn undo_versioned_put<R, B, G, W>(
         &self,
         plane: &Plane<R, C, B, G>,
@@ -1327,6 +1347,12 @@ where
     #[expect(
         clippy::too_many_arguments,
         reason = "the versioned put's field set — plane, bucket, key, staged body, tags, owner, ACL and the marker port — is the operation's own, forwarded once into the version engine"
+    )]
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
     )]
     pub async fn put_object_versioned<R, B, G, W>(
         &self,

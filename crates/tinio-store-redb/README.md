@@ -22,7 +22,7 @@ Offline only, and never from the runtime: compaction runs on a **not-yet-shared*
 | `src/lib.rs` | `RedbMetadata` — the metadata contracts over one driver — and `ensure_all`, the shared schema's creation helper |
 | `src/table.rs` | the parameterized table handle over a per-table definition marker |
 | `src/store.rs` | the store handle: its three arms (writable, read-only, the degraded empty view) and the transaction entry |
-| `src/driver.rs` | the async transaction handle: the blocking-pool hop and the write-lock histograms the server's `tinio_write_lock_*` metrics are scraped from |
+| `src/driver.rs` | the async transaction handle: the blocking-pool hop and the write-lock histograms the server's `tinio_storage_write_lock_*` metrics are scraped from |
 | `src/open.rs` | the state-database open, the format gate, and the integrity check |
 | `src/compact.rs` | offline compaction: the fragmentation snapshot, the decision, the execution |
 | `src/error.rs` | the redb error core the backends nest or alias |

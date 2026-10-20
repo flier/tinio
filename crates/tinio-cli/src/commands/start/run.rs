@@ -4,7 +4,7 @@
 use std::os::unix::net::UnixListener;
 #[cfg(feature = "api")]
 use std::process;
-#[cfg(feature = "api")]
+#[cfg(feature = "lifecycle")]
 use std::sync::Arc;
 use std::{
     fs,
@@ -13,16 +13,11 @@ use std::{
 
 use tracing::subscriber::set_global_default;
 
-#[cfg(feature = "api")]
-use super::metrics::{ServerMetrics, WriteLockStatsSource};
 use super::{Args, Ready, Served, Server};
 #[cfg(feature = "api")]
 use crate::_api::state::State;
 #[cfg(feature = "api")]
-use crate::_api::{
-    Error as ApiError, Options as ApiOptions, Plane,
-    metrics::{DEFAULT_TTL, Gauges, MetricsSource},
-};
+use crate::_api::{Error as ApiError, Options as ApiOptions, Plane};
 #[cfg(feature = "api")]
 use crate::_core::storage::Storage;
 #[cfg(feature = "api")]
@@ -42,7 +37,9 @@ use crate::{
     commands::is_pg_root,
     config::{self, Config, storage::Backend},
     events,
+    metrics::{Phase, Timer},
     resolve::{self, Located, Pipelines, Resolution},
+    run::reload_handle,
     sandbox, signal,
 };
 #[cfg(feature = "pg")]
@@ -116,6 +113,7 @@ use crate::{_pg, _util::secret::Secret, config::storage::pg::DEFAULT_POOL_SIZE};
 /// `<state dir>/.env` was loaded — and `located` is what the first one answered. Passing the
 /// discovery parse's flags here would silently ignore `.env`, which is why the process entry
 /// hands this function the pair it re-parsed rather than the one it dispatched on.
+#[tracing::instrument(target = "tinio::cli", level = "info", skip_all, name = "start.run")]
 pub fn run(
     args: Args,
     located: Located,
@@ -146,10 +144,17 @@ pub fn run(
     // **A confined child takes the document from its launch payload** (decision 18): the text
     // travelled with the launch because the file it came from can sit outside every exposure,
     // so a child that read the path again would be denied by its own confinement.
-    let resolution = match adopted.as_ref() {
-        Some(adopted) => resolve::server_confined(located, &args, provenance, adopted.config())?,
-        None => resolve::server(located, &args, provenance)?,
+    let resolve_timer = Timer::new(Phase::Resolve);
+    let resolved = match adopted.as_ref() {
+        Some(adopted) => resolve::server_confined(located, &args, provenance, adopted.config()),
+        None => resolve::server(located, &args, provenance),
     };
+    drop(resolve_timer);
+    let resolution = resolved?;
+    // **The configuration-derived determinations are their own phase**, measured even when one
+    // of them refuses: a start that died on a plan or on the credential policy has paid exactly
+    // this cost, and that is the number an operator comparing a refusal with a success wants.
+    let config_timer = Timer::new(Phase::Config);
 
     // **The pg backend is served now** (PG5): `[storage] type = "pg"` reaches `Served::Pg` and the
     // storage is constructed inside the runtime (its `connect` is async and this half is the
@@ -223,6 +228,7 @@ pub fn run(
     if let Some(detail) = resolution.credential_policy()?.refusal() {
         return Err(Error::Config(config::Error::invalid_value("auth", detail)));
     }
+    drop(config_timer);
 
     // h: the bind sources must exist before anything binds — the data plane and the plane's
     // control channel both bind below — and the storage opens under the root, so a missing state
@@ -355,7 +361,7 @@ pub fn run(
     {
         tracing::warn!(
             channel = %channel,
-            endpoint = %endpoint,
+            endpoint = %redact_endpoint(endpoint),
             "the confinement cuts the outbound path only the OTLP exporter uses (the pg store's \
              database connection is this product's other outbound path, and a pg run under a \
              confinement is refused before it is served), so this run's export is lost: the \
@@ -486,14 +492,8 @@ pub fn run(
                 storage.set_max_concurrent_uploads(s3.max_concurrent_uploads);
             }
             #[cfg(feature = "api")]
-            let plane = open_management_plane(
-                &storage,
-                &resolution,
-                &args,
-                adopted.as_ref(),
-                &handles,
-                &pipelines,
-            )?;
+            let plane =
+                open_management_plane(&storage, &resolution, &args, adopted.as_ref(), &handles)?;
             Served::Fs(Box::new(super::Prepared {
                 storage,
                 #[cfg(feature = "api")]
@@ -580,11 +580,8 @@ fn lifecycle_admin<S: Storage + Clone + Send + Sync + 'static>(
 /// **One implementation, two call sites** (the backend-generic serving seam): a filesystem run
 /// binds it here, in the pre-runtime half, so the gate still precedes the runtime; a pg run binds
 /// it inside [`serve`](super::serve::serve), after its storage is constructed and before the
-/// repair. Nothing about the bind is backend-specific — the storage is read only by the metrics
-/// adapter's `/metrics` gauges — so it is written once and generic over the served backend.
-///
-/// The gauges' source is `ServerMetrics`, which reads the storage through the contract's generic
-/// walk and takes the write-lock family through [`WriteLockStatsSource`] (fs only).
+/// repair. Nothing about the bind is backend-specific, so it is written once and generic over the
+/// served backend.
 #[cfg(feature = "api")]
 pub(super) fn open_management_plane<S>(
     storage: &S,
@@ -592,18 +589,24 @@ pub(super) fn open_management_plane<S>(
     args: &Args,
     adopted: Option<&Adopted>,
     handles: &signal::Handles,
-    pipelines: &Pipelines,
 ) -> Result<Plane, Error>
 where
-    S: Storage + WriteLockStatsSource + Clone + 'static,
+    S: Storage + Clone + 'static,
 {
+    // The control channel's bind is the single-instance gate, and the phase the histogram
+    // labels `bind` is that claim's cost — a failed bind records the wait it spent failing.
+    let _bind_timer = Timer::new(Phase::Bind);
     let confined = adopted.is_some();
-    let metrics = Arc::new(ServerMetrics::new(pipelines, storage));
-    // Plan A's `Options::gauges` is what feeds the plane's `/metrics`. The field is not optional in
-    // the literal, and omitting it would answer 404 on every scrape: the source is this task's
-    // adapter, and the plane's `serve` is what drives it.
-    let source: Arc<dyn MetricsSource> = metrics.clone();
-    let gauges = Arc::new(Gauges::new(source, DEFAULT_TTL));
+    // The storage is read only by the lifecycle admin; an api-only build injects none.
+    #[cfg(not(feature = "lifecycle"))]
+    let _ = storage;
+    // The api plane always carries the three lifecycle routes (`api` turns that feature on);
+    // this run's own `lifecycle` feature decides whether one is injected, and a plane carrying
+    // no admin answers the contract's `404` (LC15, LC23).
+    #[cfg(feature = "lifecycle")]
+    let lifecycle = lifecycle_admin(storage, resolution);
+    #[cfg(not(feature = "lifecycle"))]
+    let lifecycle = None;
     // `[server] host`/`port`, the flags folded in — what `/status` reports as the host.
     let bind = resolution.address()?;
     let options = ApiOptions {
@@ -611,8 +614,12 @@ where
         state_dir: resolution.state_dir.clone(),          // the plane's only filesystem anchor
         root: resolution.root.clone(),                    // canonical: `state.root` too
         host: bind.ip().to_string(),
+        metrics_requires_token: resolution
+            .config
+            .api
+            .as_ref()
+            .is_some_and(|api| api.metrics_requires_token),
         stop: handles.stopper.clone(), // `/stop` sends on the one shutdown channel
-        gauges: Some(gauges),          // 404 on `/metrics` without it
         // **The launcher's token, when this process was launched by one** (design decision 17's
         // private channel, extended to the one secret the two processes share). The launcher
         // generated it *and* published `state` with it, and **the reason is ownership on every
@@ -627,8 +634,7 @@ where
         // running and discoverable. `None` is every run that owns its own `state`: the unconfined
         // ones, and the in-place platforms.
         token: adopted.and_then(|adopted| adopted.token().map(str::to_owned)),
-        #[cfg(feature = "lifecycle")]
-        lifecycle: lifecycle_admin(storage, resolution),
+        lifecycle,
     };
     // **A launcher already bound the control channel, and this process serves on what it
     // inherited** (`Adopted::controls`). Windows' reason is identity: the launcher's pipes carry
@@ -890,29 +896,51 @@ fn remove_launcher_state(resolution: &Resolution) {
     }
 }
 
-/// Build this process's subscriber and install it as the global default — **the one construction
-/// site, handed to `sandbox::confine` as the action it calls at the one position this target's
-/// shape requires** (that function's doc is the ordering's home, and its `FnOnce` is what makes
-/// the install exactly one).
+/// Reload this process's full subscriber — **the one construction site, handed to
+/// `sandbox::confine` as the action it calls at the one position this target's shape requires**
+/// (that function's doc is the ordering's home, and its `FnOnce` is what makes the reload exactly
+/// one).
 ///
-/// **A subscriber that cannot be built is fatal; one that cannot be installed is not.** The build
-/// reads the access log and, in an `otel` build with `[telemetry] otlp_endpoint` configured, starts
-/// the exporter's thread — a failure there is a startup failure (`Error::Log`, exit 1), and the
-/// error is named rather than propagated with a bare `?` because
-/// `Box<dyn Error + Send + Sync>` is no variant of this crate's [`Error`]. `set_global_default`'s
-/// own failure is ignored: a server with no subscriber serves, it only logs nothing, and a process
-/// that got this far has installed none — `confine`'s `FnOnce` is what keeps it to one install
-/// rather than a flag.
+/// **The bootstrap is the global default; this call swaps its operational layers and its
+/// filter.** The process entry installs the fmt-only bootstrap before anything is parsed, with
+/// `set_global_default` called once there; here the two reload handles replace those layers and
+/// that filter with the full stack — the access log, the close-only layer and, in an `otel` build
+/// with `[telemetry] otlp_endpoint` configured, the exporter's thread. That thread therefore
+/// starts at this position, after an in-place confinement and before a launch, never before the
+/// fork.
+///
+/// **A subscriber that cannot be built is fatal; one that cannot be reloaded is not.** The build
+/// reads the access log and starts the exporter — a failure there is a startup failure
+/// (`Error::Log`, exit 1), named rather than propagated with a bare `?` because
+/// `Box<dyn Error + Send + Sync>` is no variant of this crate's [`Error`]. A failed reload leaves
+/// the bootstrap in place: the run serves and logs, it only lacks the access log.
+///
+/// **A process with no bootstrap installs the full stack here**, which is the one remaining path
+/// that calls `set_global_default` — a test binary or a caller that already owns the default.
 fn install_subscriber(resolution: &Resolution) -> Result<(), Error> {
-    let subscriber = log::build_subscriber(
-        verbosity(resolution),
-        format(resolution),
-        &access_format(resolution),
-        &resolution.state_dir.join("access.log"),
-        otlp_endpoint(&resolution.config),
-    )
-    .map_err(|err| Error::Log(err.to_string()))?;
-    set_global_default(subscriber).ok();
+    let level = verbosity(resolution);
+    let log_format = format(resolution);
+    let access_format = access_format(resolution);
+    let access_path = resolution.state_dir.join("access.log");
+    let otlp = otlp_endpoint(&resolution.config);
+    if let Some(handles) = reload_handle() {
+        // **Two reloads, and the order is the stack's**: the operational layers are what the
+        // access log and the exporter live in, so they go in first; the filter then admits the
+        // configured verbosity. Each is a separate handle because the filter is the
+        // subscriber's per-layer filter and cannot be part of the layer the handle wraps (a
+        // `Filtered` inside a `reload` never receives its `FilterId`).
+        let (layer, otel) = log::build_layer(log_format, &access_format, Some(&access_path), otlp)
+            .map_err(|err| Error::Log(err.to_string()))?;
+        log::install_otel(otel); // retained for the process; dropped here, it exports nothing
+        handles.layer.reload(layer).ok();
+        handles.filter.reload(log::build_filter(level)).ok();
+    } else {
+        let logging =
+            log::build_subscriber(level, log_format, &access_format, Some(&access_path), otlp)
+                .map_err(|err| Error::Log(err.to_string()))?;
+        log::install_otel(logging.otel);
+        set_global_default(logging.subscriber).ok();
+    }
     Ok(())
 }
 
@@ -965,6 +993,22 @@ fn otlp_endpoint(config: &Config) -> Option<&str> {
         .telemetry
         .as_ref()
         .map(|telemetry| telemetry.otlp_endpoint.as_str())
+}
+
+/// Strip URL userinfo before an endpoint reaches a log line.
+///
+/// The userinfo ends at the **last** `@` of the authority, so a password carrying an unencoded
+/// `@` cannot survive into the line — the rule the pg dsn identity states.
+fn redact_endpoint(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_string();
+    };
+    let boundary = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(boundary);
+    match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => format!("{scheme}://{host}{tail}"),
+        None => endpoint.to_string(),
+    }
 }
 
 #[cfg(test)]

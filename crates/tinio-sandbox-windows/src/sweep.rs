@@ -247,6 +247,7 @@ type ProcessCheck = fn() -> io::Result<usize>;
 /// Nothing here can fail a launch: an unresolvable `%LOCALAPPDATA%` and every
 /// error the sweep itself meets are warnings, and the caller has no `Result` to
 /// check.
+#[tracing::instrument(target = "tinio::sandbox", level = "info", skip_all)]
 pub(crate) fn stale_profiles() {
     static SWEPT: Once = Once::new();
     SWEPT.call_once(|| {

@@ -22,6 +22,7 @@ use std::{
 
 use smart_default::SmartDefault;
 use tokio::sync::watch;
+use tracing::{field, instrument};
 
 use crate::{
     _core::{
@@ -33,6 +34,7 @@ use crate::{
     },
     _util::pacing,
     clock::Clock,
+    metrics::{self, Kind},
 };
 
 /// One page of any listing. The pass walks every page: a bucket larger than
@@ -273,6 +275,7 @@ impl<S: Storage> Runner<S> {
     /// assert_eq!(summary.buckets_with_rules, 1, "one bucket took the rule");
     /// # }
     /// ```
+    #[instrument(target = "tinio::lifecycle", level = "debug", skip_all)]
     pub async fn seed(&self, seeds: &[Seed]) -> Summary {
         let mut summary = Summary::default();
         // One write per bucket: the rules of a bucket land together. The index
@@ -300,7 +303,7 @@ impl<S: Storage> Runner<S> {
             // not replaced by this snapshot (LC13).
             match self.storage.merge_bucket_lifecycle(bucket, &rules).await {
                 Ok(lifecycle::Merged::Stored) => summary.buckets_with_rules += 1,
-                Ok(lifecycle::Merged::Absent) => failed(
+                Ok(lifecycle::Merged::Absent) => pass_failed(
                     storage::no_such_bucket(bucket),
                     &mut summary,
                     "seed a bucket's configuration",
@@ -309,7 +312,7 @@ impl<S: Storage> Runner<S> {
                     tracing::warn!(%invalid, "a lifecycle seed was refused");
                     summary.errors += 1;
                 }
-                Err(error) => failed(error, &mut summary, "seed a bucket's configuration"),
+                Err(error) => pass_failed(error, &mut summary, "seed a bucket's configuration"),
             }
         }
         summary
@@ -344,7 +347,21 @@ impl<S: Storage> Runner<S> {
     /// assert_eq!(summary.errors, 0);
     /// # }
     /// ```
+    #[instrument(
+        target = "tinio::lifecycle",
+        level = "info",
+        name = "tinio.lifecycle.pass",
+        skip_all,
+        fields(
+            buckets_with_rules = field::Empty,
+            expired_objects = field::Empty,
+            expired_versions = field::Empty,
+            aborted_uploads = field::Empty,
+            errors = field::Empty
+        )
+    )]
     pub async fn pass(&self) -> Summary {
+        let _pass = metrics::PassTimer::new();
         let mut summary = Summary::default();
         let now = self.clock.now();
         // One scan for every stored configuration, then the bucket walk reads
@@ -354,7 +371,7 @@ impl<S: Storage> Runner<S> {
         let mut configs: HashMap<_, _> = match self.storage.lifecycles().await {
             Ok(configs) => configs.into_iter().collect(),
             Err(error) => {
-                failed(error, &mut summary, "read the lifecycle rules");
+                pass_failed(error, &mut summary, "read the lifecycle rules");
                 HashMap::new()
             }
         };
@@ -376,7 +393,7 @@ impl<S: Storage> Runner<S> {
                 {
                     Ok(page) => page,
                     Err(error) => {
-                        failed(error, &mut summary, "list buckets");
+                        pass_failed(error, &mut summary, "list buckets");
                         break;
                     }
                 };
@@ -413,14 +430,13 @@ impl<S: Storage> Runner<S> {
                 }
             }
         }
-        tracing::info!(
-            buckets_with_rules = summary.buckets_with_rules,
-            expired_objects = summary.expired_objects,
-            expired_versions = summary.expired_versions,
-            aborted_uploads = summary.aborted_uploads,
-            errors = summary.errors,
-            "lifecycle pass"
-        );
+        // The summary rides on the span, so the close line prints it once instead
+        // of a second event beside the line.
+        tracing::Span::current().record("buckets_with_rules", summary.buckets_with_rules);
+        tracing::Span::current().record("expired_objects", summary.expired_objects);
+        tracing::Span::current().record("expired_versions", summary.expired_versions);
+        tracing::Span::current().record("aborted_uploads", summary.aborted_uploads);
+        tracing::Span::current().record("errors", summary.errors);
         summary
     }
 
@@ -449,13 +465,26 @@ impl<S: Storage> Runner<S> {
     /// run.await.expect("the pass ends cleanly");
     /// # }
     /// ```
+    #[instrument(
+        level = "info",
+        target = "tinio::lifecycle",
+        name = "tinio.lifecycle.run",
+        skip(self)
+    )]
+    async fn cycle(&self) -> bool {
+        self.pass().await;
+        self.wait(self.options.cycle).await
+    }
+
     pub async fn run(&self) {
         loop {
             if self.stopping() {
                 return;
             }
-            self.pass().await;
-            if !self.wait(self.options.cycle).await {
+            // The loop body is the unit: one `run` span per cycle, so a
+            // process-length future never carries one process-length span.
+            let keep_going = self.cycle().await;
+            if !keep_going {
                 return;
             }
         }
@@ -497,6 +526,7 @@ impl<S: Storage> Runner<S> {
     }
 
     /// Expire current versions, page by page.
+    #[instrument(target = "tinio::lifecycle", level = "debug", skip_all)]
     async fn expire_objects(&self, sweep: &mut Sweep<'_>) -> bool {
         let mut start_after: Option<String> = None;
         loop {
@@ -518,6 +548,7 @@ impl<S: Storage> Runner<S> {
                         sweep.bucket,
                         sweep.summary,
                         "list a bucket's objects",
+                        Kind::Object,
                     );
                     return true;
                 }
@@ -546,6 +577,7 @@ impl<S: Storage> Runner<S> {
                             sweep.bucket,
                             sweep.summary,
                             "read a due key's current version",
+                            Kind::Object,
                         );
                         continue;
                     }
@@ -553,6 +585,7 @@ impl<S: Storage> Runner<S> {
                 if counted(
                     self.storage.delete_object(sweep.bucket, &info.key).await,
                     sweep.summary,
+                    Kind::Object,
                 ) {
                     sweep.summary.expired_objects += 1;
                 }
@@ -583,6 +616,7 @@ impl<S: Storage> Runner<S> {
 
     /// Expire noncurrent versions and expired delete markers, per key over the
     /// whole version chain.
+    #[instrument(target = "tinio::lifecycle", level = "debug", skip_all)]
     async fn expire_versions(&self, sweep: &mut Sweep<'_>) -> bool {
         // A bucket that records no versions has no noncurrent version and no
         // marker, so its chain listing has nothing for either action.
@@ -595,6 +629,7 @@ impl<S: Storage> Runner<S> {
                     sweep.bucket,
                     sweep.summary,
                     "read a bucket's versioning state",
+                    Kind::Version,
                 );
                 return true;
             }
@@ -623,6 +658,7 @@ impl<S: Storage> Runner<S> {
                         sweep.bucket,
                         sweep.summary,
                         "list a bucket's versions",
+                        Kind::Version,
                     );
                     return true;
                 }
@@ -657,6 +693,7 @@ impl<S: Storage> Runner<S> {
     }
 
     /// One key's chain, newest first.
+    #[instrument(target = "tinio::lifecycle", level = "debug", skip_all)]
     async fn expire_chain(&self, sweep: &mut Sweep<'_>, chain: &[version::Entry]) -> bool {
         // The stop is checked here, not only per listed entry: the chain left
         // after the listing loop reaches this call with no check of its own, and
@@ -688,6 +725,7 @@ impl<S: Storage> Runner<S> {
                     .delete_object_version(sweep.bucket, &newest.key, newest.id.as_ref())
                     .await,
                 sweep.summary,
+                Kind::Marker,
             ) {
                 sweep.summary.expired_versions += 1;
             }
@@ -723,7 +761,13 @@ impl<S: Storage> Runner<S> {
                     // An unreadable version is retained, never over-deleted,
                     // and the next pass retries it.
                     Err(error) => {
-                        read_failed(error, sweep.bucket, sweep.summary, "read a version's tags");
+                        read_failed(
+                            error,
+                            sweep.bucket,
+                            sweep.summary,
+                            "read a version's tags",
+                            Kind::Version,
+                        );
                         continue;
                     }
                 }
@@ -747,6 +791,7 @@ impl<S: Storage> Runner<S> {
                     .delete_object_version(sweep.bucket, &entry.key, entry.id.as_ref())
                     .await,
                 sweep.summary,
+                Kind::Version,
             ) {
                 sweep.summary.expired_versions += 1;
             }
@@ -758,6 +803,7 @@ impl<S: Storage> Runner<S> {
     }
 
     /// Abort incomplete uploads past their rule's clock, page by page.
+    #[instrument(target = "tinio::lifecycle", level = "debug", skip_all)]
     async fn abort_uploads(&self, sweep: &mut Sweep<'_>) -> bool {
         // A size predicate matches the bytes already uploaded. The listing
         // carries none, so a rule that bounds size pays one part walk; a rule
@@ -788,6 +834,7 @@ impl<S: Storage> Runner<S> {
                         sweep.bucket,
                         sweep.summary,
                         "list a bucket's incomplete uploads",
+                        Kind::Upload,
                     );
                     return true;
                 }
@@ -805,6 +852,7 @@ impl<S: Storage> Runner<S> {
                                 sweep.bucket,
                                 sweep.summary,
                                 "read an upload's parts",
+                                Kind::Upload,
                             );
                             continue;
                         }
@@ -825,6 +873,7 @@ impl<S: Storage> Runner<S> {
                         .abort_multipart_upload(sweep.bucket, &upload.key, &upload.upload_id)
                         .await,
                     sweep.summary,
+                    Kind::Upload,
                 ) {
                     sweep.summary.aborted_uploads += 1;
                 }
@@ -899,10 +948,18 @@ async fn upload_bytes<S: Storage>(
 ///
 /// A deleted item is the outcome the action wanted, so an item that vanished
 /// first is counted, not failed — otherwise the pass's accounting would depend
-/// on whether a backend's delete happens to be idempotent (S3's are).
-fn counted<M, E: Into<storage::Error>>(outcome: Result<M, E>, summary: &mut Summary) -> bool {
+/// on whether a backend's delete happens to be idempotent (S3's are). Either
+/// way the action family records one sample under `kind`.
+fn counted<M, E: Into<storage::Error>>(
+    outcome: Result<M, E>,
+    summary: &mut Summary,
+    kind: Kind,
+) -> bool {
     match outcome.map_err(Into::into) {
-        Ok(_) => true,
+        Ok(_) => {
+            metrics::record_action(kind, true);
+            true
+        }
         Err(error) => {
             if matches!(
                 error,
@@ -912,9 +969,10 @@ fn counted<M, E: Into<storage::Error>>(outcome: Result<M, E>, summary: &mut Summ
                     | storage::Error::NoSuchBucket(_)
             ) {
                 tracing::debug!(%error, "a lifecycle action found its item already gone");
+                metrics::record_action(kind, true);
                 true
             } else {
-                failed(error, summary, "act on an item");
+                action_failed(error, summary, "act on an item", kind);
                 false
             }
         }
@@ -923,23 +981,40 @@ fn counted<M, E: Into<storage::Error>>(outcome: Result<M, E>, summary: &mut Summ
 
 /// One read's failure: a bucket that vanished mid-pass is gone, not broken
 /// (R41) — logged and skipped at every read site, never counted as an error.
-/// Everything else is [`failed`]'s one warning and one counter.
+/// Everything else is [`action_failed`]'s one warning and one error sample.
 fn read_failed<E: Into<storage::Error>>(
     error: E,
     bucket: &bucket::Name,
     summary: &mut Summary,
     action: &str,
+    kind: Kind,
 ) {
     let error: storage::Error = error.into();
     if matches!(error, storage::Error::NoSuchBucket(_)) {
         tracing::debug!(%bucket, %error, "a bucket vanished during the lifecycle pass");
     } else {
-        failed(error, summary, action);
+        action_failed(error, summary, action, kind);
     }
 }
 
-/// A failed read or write: one warning, one counter.
-fn failed<E: Into<storage::Error>>(error: E, summary: &mut Summary, action: &str) {
+/// A failed action: one warning, one summary error, one `outcome="error"`
+/// sample under the action's own `kind`. The pass carries on; the next item
+/// or the next cycle retries.
+fn action_failed<E: Into<storage::Error>>(
+    error: E,
+    summary: &mut Summary,
+    action: &str,
+    kind: Kind,
+) {
+    let error: storage::Error = error.into();
+    tracing::warn!(%error, action, "the lifecycle pass could not continue");
+    summary.errors += 1;
+    metrics::record_action(kind, false);
+}
+
+/// A failure outside one action — a pass-level read, or a seed write. The
+/// actions family has no kind to file it under, so only the summary counts it.
+fn pass_failed<E: Into<storage::Error>>(error: E, summary: &mut Summary, action: &str) {
     let error: storage::Error = error.into();
     tracing::warn!(%error, action, "the lifecycle pass could not continue");
     summary.errors += 1;

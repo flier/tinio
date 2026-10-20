@@ -1,8 +1,9 @@
 //! Business-agnostic confine entry: paths, bound sockets, token — no product types.
 
-use std::{net::TcpListener, path::PathBuf};
+use std::{net::TcpListener, path::PathBuf, time::Instant};
 
 use secrecy::ExposeSecret;
+use tracing::{Span, field};
 
 // **The platform vocabulary `Confined` carries on Linux** — the resolved mechanism and the
 // network filter's outcome, the two facts the in-place re-emit states after the confinement.
@@ -15,6 +16,7 @@ use crate::Error;
 use crate::{
     _core::{Secret, SecretKey},
     AccessMode, Child, Confinement, ControlHandle, LaunchPlan, Result, Sandbox, describe_exposures,
+    metrics,
 };
 
 /// How a caller asks this process (or a child) to be confined — builder in, [`Confined`] out.
@@ -326,8 +328,26 @@ impl Spec {
     ///     .expose("/srv/data", AccessMode::ReadWrite)
     ///     .apply();
     /// ```
+    #[tracing::instrument(
+        name = "tinio.sandbox.apply",
+        target = "tinio::sandbox",
+        level = "info",
+        skip_all,
+        fields(
+            count = self.sandbox.exposures().len(),
+            mechanism = field::Empty,
+            outcome = field::Empty
+        )
+    )]
     pub fn apply(self) -> Result<Confined> {
-        apply_platform(self)
+        let result = apply_platform(self);
+        // **One close line at default verbosity, and the outcome on it**: the plan's T0 rule
+        // asks a refused launch to be visible as a refusal, and the error is the caller's to
+        // print. The fields are a closed pair — an exposure count and `refused` — never a path.
+        if result.is_err() {
+            Span::current().record("outcome", "refused");
+        }
+        result
     }
 
     /// [`LaunchPlan`] from the optional facts this spec carries.
@@ -453,6 +473,23 @@ pub(crate) fn map_confinement(confinement: Confinement) -> Result<Option<Child>>
     }
 }
 
+/// The `outcome` label for a backend's `confine` answer, read before the caller's `?` consumes
+/// it so the family is recorded on both paths.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn outcome<T>(result: &Result<T>) -> metrics::Outcome {
+    match result {
+        Ok(_) => metrics::Outcome::Applied,
+        Err(_) => metrics::Outcome::Refused,
+    }
+}
+
+/// Record a `confine` call's outcome metric and the span's mechanism field together, so a
+/// platform arm cannot write one and forget the other.
+fn record_confinement(mechanism: metrics::Mechanism, outcome: metrics::Outcome, started: Instant) {
+    metrics::record(mechanism, outcome, started.elapsed());
+    Span::current().record("mechanism", mechanism.label());
+}
+
 /// Static detail for the launcher `InPlace` refusal — `Error::Unsupported` needs `'static`.
 ///
 /// **One sentence, and the platform is not in it**: which platforms answer this is the `cfg` on
@@ -484,9 +521,19 @@ fn apply_platform(spec: Spec) -> Result<Confined> {
     let options = Options::from_env()?
         .with_device_files(true)
         .with_local_uid(local_uid);
+    // **The request, kept for the refusal taken before a model is resolved.** `Auto` becomes one
+    // of the two models inside `enter`, so the mechanism a refusal names is the resolved one when
+    // the resolution happened and the request when validation refused first.
+    let requested = options.model();
     let mut backend = LinuxBackend::with_options(options);
-    let confinement = backend.confine(&sandbox, &plan)?;
-    let child = map_confinement(confinement)?;
+    // **The one call families 19-20 time, and the one place this span learns its mechanism**: the
+    // answer is read after the call because `Auto` resolves inside it, and the record cannot
+    // depend on a subscriber — the confinement is the first thing a run does.
+    let started = Instant::now();
+    let confinement = backend.confine(&sandbox, &plan);
+    let mechanism = metrics::Mechanism::from(backend.resolved().unwrap_or(requested));
+    record_confinement(mechanism, outcome(&confinement), started);
+    let child = map_confinement(confinement?)?;
     // **The facts are the backend's, read after the confinement — never re-derived here.** The
     // resolved mechanism is `Some` by construction after a successful confine (`enter` records it
     // the moment the resolution answers, and an unavailable one is refused before that), so a
@@ -533,10 +580,18 @@ fn apply_platform(spec: Spec) -> Result<Confined> {
         mechanism = %options.mechanism(),
         "the macOS confinement mechanism is resolved"
     );
+    // The mechanism this launch applies is the one `from_env` resolved: this platform has no
+    // `Auto`, so the request and the answer are one value.
+    let requested = options.mechanism();
     let mut backend = MacosBackend::with_options(options);
-    let confinement = backend.confine(&sandbox, &plan)?;
+    // Families 19-20, timed around the one call that confines — the Linux arm's comment states
+    // why the mechanism is known on both paths.
+    let started = Instant::now();
+    let confinement = backend.confine(&sandbox, &plan);
+    let mechanism = metrics::Mechanism::from(requested);
+    record_confinement(mechanism, outcome(&confinement), started);
     Ok(Confined {
-        child: map_confinement(confinement)?,
+        child: map_confinement(confinement?)?,
         exposures: sandbox.exposures().len(),
         // **No mounts on this arm**: the profile grants the set rather than binding it, so the
         // count is the jail's own zero while the rendered list is the value the confinement was
@@ -563,9 +618,14 @@ fn apply_platform(spec: Spec) -> Result<Confined> {
         ..Default::default()
     };
     let mut backend = WindowsBackend::with_options(options);
-    let confinement = backend.confine(&sandbox, &plan)?;
+    // Families 19-20, timed around the one call that launches — the AppContainer is this
+    // platform's only mechanism, so both paths name it.
+    let started = Instant::now();
+    let confinement = backend.confine(&sandbox, &plan);
+    let mechanism = metrics::Mechanism::AppContainer;
+    record_confinement(mechanism, outcome(&confinement), started);
     Ok(Confined {
-        child: map_confinement(confinement)?,
+        child: map_confinement(confinement?)?,
         exposures: sandbox.exposures().len(),
         // The same two facts as the macOS arm's, for the same reason: the capability set's ACL
         // grants are not mounts, and the rendered list is the set this launch was handed.
@@ -579,6 +639,11 @@ fn apply_platform(spec: Spec) -> Result<Confined> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn apply_platform(spec: Spec) -> Result<Confined> {
     let _ = spec;
+    // The refusal is still an attempt, so the families and the span say so: a target with no
+    // backend has no mechanism to name, which is the `none` label.
+    let started = Instant::now();
+    let mechanism = metrics::Mechanism::None;
+    record_confinement(mechanism, metrics::Outcome::Refused, started);
     Err(Error::Unsupported {
         detail: "no confinement backend is wired for this target",
     })

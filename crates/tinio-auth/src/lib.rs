@@ -6,8 +6,9 @@
 //! the authorization pipeline consumes; [`matrix`] is the
 //! operation→requirement truth table, [`canned`] the canned-ACL
 //! expansion and request-level grant parsing, [`access`] the
-//! pre-route `S3Access` authorization pipeline (spec §4), and [`source`]
-//! the one parse authority for the copy/rename source headers.
+//! pre-route `S3Access` authorization pipeline (spec §4), [`source`]
+//! the one parse authority for the copy/rename source headers, and
+//! [`metrics`] the two decision families.
 
 #[doc(hidden)]
 pub extern crate tinio_core as _core;
@@ -18,6 +19,7 @@ pub mod canned;
 pub mod error;
 pub mod identity;
 pub mod matrix;
+pub mod metrics;
 pub mod source;
 
 pub use self::{

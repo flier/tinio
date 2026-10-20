@@ -6,6 +6,7 @@ description = "Windows AppContainer confinement for tinio: DACL whitelist, conta
 publish = false
 
 [dependencies]
+derive_more = { workspace = true, features = ["deref"] }
 getrandom.workspace = true
 hex.workspace = true
 sha2.workspace = true

@@ -60,6 +60,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[garde(dive)]
     pub https: Option<Https>,
+    /// Require the control token for `/metrics` too (default `false`: a
+    /// scraper cannot send a custom header on the local channel).
+    #[serde(default)]
+    #[garde(skip)]
+    pub metrics_requires_token: bool,
 }
 
 /// The local management channel, unix form (`[api.unix]`, Linux/macOS):

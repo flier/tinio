@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream;
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
+use tracing::{Span, field, instrument};
 
 use crate::{
     _core::{
@@ -228,12 +229,28 @@ impl ObjectContent for RedbContent {
         Ok(RedbStaged::default())
     }
 
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip(self, staged),
+        fields(
+            bucket = %bucket,
+            kind = if key.is_part() { "part" } else { "object" },
+            bytes = staged.bytes.len(),
+            key = field::Empty,
+        )
+    )]
     async fn publish(
         &self,
         bucket: &bucket::Name,
         staged: RedbStaged,
         key: &ContentKey,
     ) -> Result<(), Error> {
+        // The visibility point of a staged write: one info span per publish,
+        // with the kind and the byte count the commit carries.
+        if let Some(object) = key.object() {
+            Span::current().record("key", field::display(object));
+        }
         let bucket = bucket.to_string();
         let bytes = staged.bytes;
         match key {
@@ -255,12 +272,27 @@ impl ObjectContent for RedbContent {
         }
     }
 
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip(self),
+        fields(
+            bucket = %bucket,
+            kind = if key.is_part() { "part" } else { "object" },
+            key = field::Empty,
+        )
+    )]
     async fn open(
         &self,
         bucket: &bucket::Name,
         key: &ContentKey,
         range: Option<ByteRange>,
     ) -> Result<BodyStream, Error> {
+        // A read is a T1 unit inside the request's T0 span: it never commits,
+        // so it stays out of the default info filter.
+        if let Some(object) = key.object() {
+            Span::current().record("key", field::display(object));
+        }
         let bucket = bucket.to_string();
         let bytes = match key {
             ContentKey::Object(key) => {
@@ -553,7 +585,10 @@ impl ObjectContent for RedbContent {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use tinio_util::testing::metadata::assert_content_conformance;
+    use tinio_util::testing::{
+        metadata::assert_content_conformance, spans::one_named,
+    };
+    use tracing::Level;
 
     use crate::{
         _core::{
@@ -562,6 +597,7 @@ mod tests {
             object, storage,
         },
         RedbContent,
+        testutil::capture_spans,
     };
 
     /// The suite's content leg — the staged write and its visibility point,
@@ -636,5 +672,40 @@ mod tests {
 
         store.remove(&bucket, &content_key).await.unwrap();
         store.remove_bucket(&bucket).await.unwrap();
+    }
+
+    /// The publish commit is one info span and the read one debug span; both
+    /// carry the object key recorded after creation, so a dynamic field lands
+    /// on the span the caller sees.
+    #[tokio::test]
+    async fn publish_and_open_open_one_span_at_their_tier() {
+        let capture = capture_spans();
+        let store = RedbContent::in_memory().unwrap();
+        let bucket = bucket::name("content-spans").unwrap();
+        let key = object::key("traced.txt").unwrap();
+        let content_key = ContentKey::Object(key.clone());
+        let mut staged = store.stage(&bucket, &content_key).await.unwrap();
+        staged.write(Bytes::from_static(b"traced!")).await.unwrap();
+
+        let watermark = capture.watermark();
+        store.publish(&bucket, staged, &content_key).await.unwrap();
+        drop(store.open(&bucket, &content_key, None).await.unwrap());
+
+        let spans = capture.spans_since(watermark);
+        let one = |name: &str| one_named(&spans, name);
+
+        let publish = one("publish");
+        assert_eq!(publish.target, "tinio::storage");
+        assert_eq!(publish.level, Level::INFO);
+        assert_eq!(publish.field("bucket"), Some("content-spans"));
+        assert_eq!(publish.field("key"), Some("traced.txt"));
+        assert_eq!(publish.field("kind"), Some("object"));
+        assert_eq!(publish.field("bytes"), Some("7"));
+
+        let open = one("open");
+        assert_eq!(open.target, "tinio::storage");
+        assert_eq!(open.level, Level::DEBUG);
+        assert_eq!(open.field("key"), Some("traced.txt"));
+        assert_eq!(open.field("kind"), Some("object"));
     }
 }

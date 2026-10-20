@@ -13,6 +13,7 @@ getrandom.workspace = true
 hex.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+itoa.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = [
     "server",
@@ -21,7 +22,6 @@ hyper-util = { workspace = true, features = [
     "http1",
 ] }
 prometheus.workspace = true
-rustls-pemfile = { workspace = true, optional = true }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -47,7 +47,7 @@ tinio-util.workspace = true
 default = ["lifecycle", "openapi", "tls"]
 lifecycle = []
 openapi = ["dep:utoipa"]
-tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+tls = ["dep:tokio-rustls"]
 
 [dev-dependencies]
 tempfile.workspace = true

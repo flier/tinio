@@ -510,7 +510,9 @@ async fn the_staleness_gate_and_the_composed_keep_rule_are_read_off_the_contract
     // The composed keep rule: a `-N` form on the same size, confirmed by
     // the identity and the unchanged mtime — or by the jitter window when
     // no identity exists.
-    let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
+    let composed = "5d41402abc4b2a76b9719d911017c592-2"
+        .parse::<ETag>()
+        .unwrap();
     assert!(composed_keep(&row(composed.clone(), 10, 1_000, 7), &entry));
     assert!(
         !composed_keep(&row(composed.clone(), 10, 1_000, 9), &entry),

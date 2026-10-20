@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn a_storage_error_passes_through_the_projection_unchanged() {
-        let contract = storage::no_such_key(&object::Key::from("missing"));
+        let contract = storage::no_such_key(&object::key("missing").expect("a valid object key"));
         let expected = contract.to_string();
         let err: StorageError = Error::Storage(contract).into();
         assert_eq!(err.to_string(), expected);
@@ -64,7 +64,7 @@ mod tests {
 
     #[test]
     fn the_remaining_variants_project_through_io_other() {
-        let malformed = blob::BlockHash::new("not hex").unwrap_err();
+        let malformed = "not hex".parse::<blob::BlockHash>().unwrap_err();
         let projected: StorageError = Error::Blob(malformed).into();
         let StorageError::Io(io) = projected else {
             panic!("expected an I/O projection, got {projected:?}");

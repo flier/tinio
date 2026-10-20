@@ -49,6 +49,7 @@ use tokio::{
     fs::{self, File},
     io::{AsyncWriteExt, BufWriter},
 };
+use tracing::{Span, field, instrument};
 use uuid::Uuid;
 
 use crate::{
@@ -183,11 +184,20 @@ impl BlockStore for LocalBlocks {
         })
     }
 
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        name = "tinio.storage.block_publish",
+        skip(self, staged, hash),
+        fields(result = field::Empty)
+    )]
     async fn publish(
         &self,
         mut staged: Self::Staged,
         hash: &BlockHash,
     ) -> Result<Published, Self::Error> {
+        // `async_trait` boxes the method, so the span rides the future; the
+        // field names which half of the dedup the publish landed on.
         // The handle leaves the stage first, so the finish sequence below names
         // it explicitly; the stage's `Drop` then has nothing left to close.
         let mut file = staged.file.take().ok_or_else(|| {
@@ -216,6 +226,7 @@ impl BlockStore for LocalBlocks {
             {
                 tracing::warn!(error = %err, "a dedup publish left its staged temp behind");
             }
+            Span::current().record("result", "existing");
             return Ok(Published::Existing);
         }
         file.flush().await?;
@@ -240,12 +251,16 @@ impl BlockStore for LocalBlocks {
         // root.
         let temp = staged.take_path()?;
         match commit(&temp, &target, Some(&self.root), DirOwnerUid::new(None)).await {
-            Ok(()) => Ok(Published::Stored),
+            Ok(()) => {
+                Span::current().record("result", "stored");
+                Ok(Published::Stored)
+            }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 // The temp vanished (a crashed stage's residue was reaped, or a
                 // concurrent publish won): a concurrent publish under the same
                 // hash stores identical bytes, so a present target is a hit.
                 if fs::try_exists(&target).await? {
+                    Span::current().record("result", "existing");
                     Ok(Published::Existing)
                 } else {
                     Err(Error::Io(err))
@@ -259,11 +274,19 @@ impl BlockStore for LocalBlocks {
         Ok(fs::try_exists(self.block_path(hash)).await?)
     }
 
+    #[instrument(
+        level = "trace",
+        target = "tinio::storage",
+        name = "tinio.storage.block_open",
+        skip(self, hash, range)
+    )]
     async fn open(
         &self,
         hash: &BlockHash,
         range: Option<ByteRange>,
     ) -> Result<BodyStream, Self::Error> {
+        // `async_trait` boxes the method, so the span rides the future; the
+        // name carries the `block` prefix four contract impls' `open` lacks.
         let path = self.block_path(hash);
         // A block that is not there is `NotFound` I/O: the contract pins that
         // shape, so a caller — and a sweep racing a read — tells "not there"
@@ -277,7 +300,10 @@ impl BlockStore for LocalBlocks {
             Some(range) => range.resolve(len).map_err(Error::from)?,
             // No bytes exist to stream — not a 1-byte read, which could
             // overshoot if the block grew after the stat.
-            None if len == 0 => return Ok(Box::pin(stream::empty())),
+            None if len == 0 => {
+                let empty: BodyStream = Box::pin(stream::empty());
+                return Ok(empty);
+            }
             None => (0, len - 1),
         };
         // Served as a stream, never materialized whole (constitution V): the
@@ -416,7 +442,7 @@ async fn fan_out_entries(
         if cursor.is_some_and(|cursor| name <= cursor) {
             continue;
         }
-        let Ok(hash) = BlockHash::new(name) else {
+        let Ok(hash) = name.parse::<BlockHash>() else {
             continue;
         };
         // The invariant, not the spelling: an entry is a block only if it sits

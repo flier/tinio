@@ -26,11 +26,16 @@
 //! `specs/001-s3-local-server/data-model.md`'s `## Metrics` owns the name list, and
 //! `contracts/management-api.md` owns the exposition.
 
+#![expect(
+    clippy::expect_used,
+    reason = "argued: every error a registration can answer is about these families' own names — prometheus 0.14's `RegistryCore::register` refuses a name the process-global default registry already holds (`AlreadyReg`) or holds with a different label set or help string (`Msg`) — from one `LazyLock` site each a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics` owns; a collision is a source-level mistake the registry refuses here, not a runtime condition, and `LazyLock::new` has no `Result` to return it through (design 2026-10-09 D2d). The module's tests read the three names back out of the gathered exposition, so a registration that did not land fails a test."
+)]
+
 use std::sync::LazyLock;
 
 use prometheus::{IntGauge, IntGaugeVec, register_int_gauge, register_int_gauge_vec};
 
-use crate::Seccomp;
+use crate::{Resolved, Seccomp};
 
 /// The read-only arm an exposure actually took (design §4's two implementations).
 ///
@@ -64,10 +69,6 @@ impl ReadOnlyArm {
 /// A gauge rather than a counter: the fact is *which* arm this run used, not how many times an
 /// exposure used it, and two exposures that took different arms set two labels rather than
 /// summing into one unreadable number.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: every error this registration can answer is about this family's own name — prometheus 0.14's `RegistryCore::register` refuses a name the process-global default registry already holds (`AlreadyReg`) or holds with a different label set or help string (`Msg`) — and the name has exactly one registration site in the repo (this `LazyLock`, whose closure runs once per process), with the family list owned by `specs/001-s3-local-server/data-model.md`'s `## Metrics`; a collision is a source-level mistake the registry refuses here, not a runtime condition, and `LazyLock::new` has no `Result` to return it through. No dedicated name-uniqueness test exists (checked 2026-10-09): the registry's refusal, which this `expect` renders, is the mechanism (design 2026-10-09 D2d)"
-)]
 static READ_ONLY_ARM: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "tinio_sandbox_read_only_arm",
@@ -82,10 +83,6 @@ static READ_ONLY_ARM: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 ///
 /// **Both answers are recorded, so the family is not merely present but readable in either
 /// state**: a `0` is the assertion that the network cut landed, which an absence could not make.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `READ_ONLY_ARM` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against a family list owned by `specs/001-s3-local-server/data-model.md`'s `## Metrics`; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 static SECCOMP_SKIPPED: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "tinio_sandbox_seccomp_skipped",
@@ -93,6 +90,35 @@ static SECCOMP_SKIPPED: LazyLock<IntGauge> = LazyLock::new(|| {
     )
     .expect("register tinio_sandbox_seccomp_skipped")
 });
+
+/// The confinement model this process resolved and applied — `1` for the model in use, by
+/// model.
+///
+/// **A gauge rather than a counter, and one sample per run**: a process confines itself once, so
+/// the fact is *which* mechanism confined this server — the value the CLI states after the
+/// confinement, and the one thing an operator reading a degraded run asks first. `auto` is not
+/// a value: the resolution turns the request into one of the two before this is recorded.
+static MODEL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "tinio_sandbox_model",
+        "The confinement model this run resolved and applied (1 for the model in use, by model)",
+        &["model"]
+    )
+    .expect("register tinio_sandbox_model")
+});
+
+/// Record the model the resolution chose, where it chooses it.
+///
+/// **`Unavailable` records nothing**: no model ran, the run is refused, and the refusal is the
+/// caller's answer — a sample for a mechanism that confined nothing would be the wrong fact.
+pub(crate) fn record_model(resolved: Resolved) {
+    let model = match resolved {
+        Resolved::UserNamespace => "user-namespace",
+        Resolved::Root => "root",
+        Resolved::Unavailable(_) => return,
+    };
+    MODEL.with_label_values(&[model]).set(1);
+}
 
 /// Record the read-only arm `arm` landed, for the exposure the caller just enforced.
 ///
@@ -120,7 +146,6 @@ pub(crate) fn record_seccomp(state: Seccomp) {
 mod tests {
     use std::{fs, sync::Mutex};
 
-    use prometheus::{Encoder, TextEncoder, default_registry};
     use tempfile::tempdir;
 
     use super::*;
@@ -134,13 +159,7 @@ mod tests {
 
     /// The exposition the management plane serves, as the CLI's adapter produces it: the default
     /// registry, text-encoded.
-    fn exposition() -> String {
-        let mut buf = Vec::new();
-        TextEncoder::new()
-            .encode(&default_registry().gather(), &mut buf)
-            .expect("encode the default registry");
-        String::from_utf8(buf).expect("the text exposition is UTF-8")
-    }
+    use tinio_util::testing::metrics::{assert_registered, exposition};
 
     /// Both families render their values, and **neither carries a value the run holds as a
     /// secret** (the sandbox review's STD-01: a control token reaching CI logs).
@@ -166,6 +185,11 @@ mod tests {
 
         record_read_only_arm(ReadOnlyArm::Remount);
         record_seccomp(Seccomp::SkippedUnsupportedArch);
+        assert_registered(&[
+            "tinio_sandbox_model",
+            "tinio_sandbox_read_only_arm",
+            "tinio_sandbox_seccomp_skipped",
+        ]);
         let text = exposition();
 
         // The sample lines are asserted whole, which is the label half of the same rule: a
@@ -200,6 +224,19 @@ mod tests {
         );
         assert!(
             text.contains("tinio_sandbox_read_only_arm{arm=\"overlay\"} 1"),
+            "{text}"
+        );
+    }
+
+    /// The model gauge names the resolved mechanism, and `auto` never appears: the resolution
+    /// turns the request into one of the two before this is recorded.
+    #[test]
+    fn the_model_gauge_names_the_resolved_mechanism() {
+        let _guard = FAMILIES.lock().expect("the family lock");
+        record_model(Resolved::Root);
+        let text = exposition();
+        assert!(
+            text.contains("tinio_sandbox_model{model=\"root\"} 1"),
             "{text}"
         );
     }

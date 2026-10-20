@@ -1,32 +1,37 @@
 //! Prometheus registry and metric families (task T023).
 //!
-//! The metric layers of the data model (data-model.md Metrics): HTTP
-//! (`tinio_http_*`), S3 operations (`tinio_s3_*`), storage
-//! (`tinio_storage_*`), the pipeline gauges (`tinio_pipeline_*`), and the
-//! write-lock duration histograms (`tinio_write_lock_*`, pipeline-spec.md
-//! §4). Families are process-wide globals, registered once on the default
-//! registry via `register_*!`. The storage-layer full-scan gauges are
-//! computed by the management plane's reader task (T075 — one scan per
-//! ttl, no cache; the cadence lives in `tinio-api`'s `Gauges`);
-//! the pipeline gauges are refreshed from the runtimes' [`Stats`]
-//! snapshots on scrape, and the write-lock histograms are converted from
-//! a plain-data [`WriteLockStats`] (the backend snapshot conversion lives
-//! at the wiring point — `tinio-server` never imports a backend crate) —
-//! cheap atomic snapshots, no TTL cache (that pattern belongs to the
-//! storage full-scan gauges only).
+//! The metric layers of the data model (data-model.md Metrics): S3 operations
+//! (`tinio_s3_*`), storage (`tinio_storage_*`), the pipeline gauges
+//! (`tinio_pipeline_*`), and the write-lock duration histograms
+//! (`tinio_storage_write_lock_*`, pipeline-spec.md §4). The HTTP families
+//! (`tinio_http_*`) are declared and emitted in `tinio-api`, the crate that
+//! renders `/metrics` and serves the management plane they observe. Families
+//! are process-wide globals, registered once on the default registry via
+//! `register_*!`. The storage-layer full-scan gauges are computed by the
+//! CLI-owned reader task (T075 — one scan per ttl, no cache; the cadence is
+//! `tinio_api::DEFAULT_TTL`); the pipeline gauges are refreshed from the
+//! runtimes' [`Stats`] snapshots on that same tick, and the write-lock
+//! histograms are filled from the shared plain-data [`WriteLockSnapshot`]
+//! (`tinio-core` owns the type, so `tinio-server` never imports a backend
+//! crate) — cheap atomic snapshots, no TTL cache (that pattern belongs to
+//! the storage full-scan gauges only).
 //!
 //! # Examples
 //!
 //! ```rust
 //! use std::time::Duration;
 //!
-//! use tinio_server::metrics::{STORAGE_BUCKETS, record_http_request, record_s3_operation};
+//! use tinio_server::metrics::{STORAGE_BUCKETS, record_s3_operation};
 //!
-//! record_http_request("GET", 200, Duration::from_millis(3));
 //! record_s3_operation("GetObject", 200, Duration::from_millis(5));
 //! STORAGE_BUCKETS.set(2);
 //! assert!(!prometheus::default_registry().gather().is_empty());
 //! ```
+
+#![expect(
+    clippy::expect_used,
+    reason = "argued: every error these registrations can answer is about a family's own name — the process-global default registry refuses a name it already holds, or holds with a different label set or help. Each name has one registration site here, a `LazyLock` whose closure runs once per process, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns (the write-lock descriptors are built from two fixed literals before registering); a collision is a source-level mistake, not a runtime condition, so the refusal is the collision detection — `LazyLock::new` has no `Result` to return it through (design 2026-10-09 D2d); the `registers_all_families` test reads the names back out of the gathered exposition, so a registration that did not land fails a test."
+)]
 
 use std::{
     collections::HashMap,
@@ -43,85 +48,21 @@ use prometheus::{
     register, register_histogram_vec, register_int_counter, register_int_counter_vec,
     register_int_gauge, register_int_gauge_vec,
 };
-use s3s::{S3, S3Request, S3Response, S3Result, dto};
+use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, dto};
+use tinio_util::status_label;
+use tracing::{field, instrument};
 
 use crate::{
     _core::{
         pipeline::Stats,
-        storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS},
+        storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS, WriteLockSnapshot},
     },
     backend::ops::tinio_s3_ops,
 };
 
-/// The write-lock distribution snapshot as **plain data** — the metric
-/// layer is decoupled from any backend's snapshot type: the caller
-/// converts the tinio-fs `WriteLockSnapshot` into this value
-/// (`tinio-cli`'s `commands/start.rs`), so `tinio-server` never imports a
-/// backend crate. The bucket
-/// bounds are the shared tinio-core constants (positional with the
-/// fs backend's bucketing).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct WriteLockStats {
-    /// Wait-duration counts per bucket (index per
-    /// [`WRITE_LOCK_BUCKET_BOUNDS_US`]).
-    pub wait_buckets: [u64; WRITE_LOCK_BUCKETS],
-    /// Total-duration counts per bucket.
-    pub total_buckets: [u64; WRITE_LOCK_BUCKETS],
-    /// Write transactions recorded.
-    pub count: u64,
-    /// Sum of wait durations, microseconds.
-    pub wait_sum_us: u64,
-    /// Maximum wait duration, microseconds.
-    pub wait_max_us: u64,
-    /// Sum of total durations, microseconds.
-    pub total_sum_us: u64,
-    /// Maximum total duration, microseconds.
-    pub total_max_us: u64,
-}
 
-/// HTTP requests served by the management plane, by method and status.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: every error this registration can answer is about this family's own name — prometheus 0.14's `RegistryCore::register` refuses a name the process-global default registry already holds (`AlreadyReg`) or holds with a different label set or help string (`Msg`) — and each of this module's eighteen names has one registration site in the repo (its own `LazyLock` here, whose closure runs once per process), against a family list owned by `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)`; a collision is a source-level mistake the registry refuses here, not a runtime condition, and `LazyLock::new` has no `Result` to return it through. The module's `registers_all_families` test reads the `tinio_*` names back out of the gathered exposition and pins the exact set, so a registration that did not land fails a test (design 2026-10-09 D2d)"
-)]
-pub static HTTP_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    register_int_counter_vec!(
-        "tinio_http_requests_total",
-        "HTTP requests served by the management plane, by method and status",
-        &["method", "status"]
-    )
-    .expect("register tinio_http_requests_total")
-});
-/// HTTP request durations, by method.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
-pub static HTTP_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
-    register_histogram_vec!(
-        "tinio_http_request_duration_seconds",
-        "HTTP request durations, by method",
-        &["method"]
-    )
-    .expect("register tinio_http_request_duration_seconds")
-});
-/// HTTP requests currently being served.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
-pub static HTTP_IN_FLIGHT: LazyLock<IntGauge> = LazyLock::new(|| {
-    register_int_gauge!(
-        "tinio_http_in_flight",
-        "HTTP requests currently being served"
-    )
-    .expect("register tinio_http_in_flight")
-});
+
 /// S3 data-plane operations, by operation and status.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static S3_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "tinio_s3_operations_total",
@@ -131,10 +72,6 @@ pub static S3_OPERATIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register tinio_s3_operations_total")
 });
 /// S3 operation durations, by operation.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static S3_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "tinio_s3_operation_duration_seconds",
@@ -143,47 +80,40 @@ pub static S3_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     )
     .expect("register tinio_s3_operation_duration_seconds")
 });
+/// S3 wire errors, by operation and error code.
+pub static S3_ERRORS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "tinio_s3_errors_total",
+        "S3 wire errors, by operation and error code",
+        &["op", "code"]
+    )
+    .expect("register tinio_s3_errors_total")
+});
 /// Bucket count (full-scan, TTL-cached 30 s; management plane, T075).
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static STORAGE_BUCKETS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
-        "tinio_storage_buckets_total",
+        "tinio_storage_buckets",
         "Number of buckets (full-scan, TTL-cached 30 s)"
     )
-    .expect("register tinio_storage_buckets_total")
+    .expect("register tinio_storage_buckets")
 });
 /// Object count (full-scan, TTL-cached 30 s; management plane, T075).
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static STORAGE_OBJECTS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
-        "tinio_storage_objects_total",
+        "tinio_storage_objects",
         "Number of objects (full-scan, TTL-cached 30 s)"
     )
-    .expect("register tinio_storage_objects_total")
+    .expect("register tinio_storage_objects")
 });
 /// Total object bytes (full-scan, TTL-cached 30 s; management plane, T075).
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static STORAGE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
-        "tinio_storage_bytes_total",
+        "tinio_storage_bytes",
         "Total object bytes (full-scan, TTL-cached 30 s)"
     )
-    .expect("register tinio_storage_bytes_total")
+    .expect("register tinio_storage_bytes")
 });
 /// Bytes streamed into storage.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static STORAGE_UPLOAD_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "tinio_storage_upload_bytes_total",
@@ -192,10 +122,6 @@ pub static STORAGE_UPLOAD_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("register tinio_storage_upload_bytes_total")
 });
 /// Bytes streamed out of storage.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static STORAGE_DOWNLOAD_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "tinio_storage_download_bytes_total",
@@ -204,10 +130,6 @@ pub static STORAGE_DOWNLOAD_BYTES: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("register tinio_storage_download_bytes_total")
 });
 /// Objects written, by operation (put, copy, multipart-complete).
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static STORAGE_OBJECTS_UPLOADED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "tinio_storage_objects_uploaded_total",
@@ -217,10 +139,6 @@ pub static STORAGE_OBJECTS_UPLOADED: LazyLock<IntCounterVec> = LazyLock::new(|| 
     .expect("register tinio_storage_objects_uploaded_total")
 });
 /// Objects deleted from storage.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static STORAGE_OBJECTS_DELETED: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "tinio_storage_objects_deleted_total",
@@ -229,10 +147,6 @@ pub static STORAGE_OBJECTS_DELETED: LazyLock<IntCounter> = LazyLock::new(|| {
     .expect("register tinio_storage_objects_deleted_total")
 });
 /// Multipart uploads currently in progress.
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static STORAGE_MULTIPART_IN_PROGRESS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "tinio_storage_multipart_in_progress",
@@ -241,10 +155,6 @@ pub static STORAGE_MULTIPART_IN_PROGRESS: LazyLock<IntGauge> = LazyLock::new(|| 
     .expect("register tinio_storage_multipart_in_progress")
 });
 /// Tasks currently queued in a pipeline, by pipeline (io/db).
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static PIPELINE_QUEUE_DEPTH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "tinio_pipeline_queue_depth",
@@ -254,10 +164,6 @@ pub static PIPELINE_QUEUE_DEPTH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .expect("register tinio_pipeline_queue_depth")
 });
 /// Tasks currently executing in a pipeline, by pipeline (io/db).
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static PIPELINE_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "tinio_pipeline_in_flight",
@@ -266,28 +172,43 @@ pub static PIPELINE_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     )
     .expect("register tinio_pipeline_in_flight")
 });
-/// Workers currently busy in a pipeline, by pipeline (io/db).
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above — every error this registration can answer is about this family's own name (already registered, or registered with a different label set or help), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
-pub static PIPELINE_BUSY_WORKERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    register_int_gauge_vec!(
-        "tinio_pipeline_busy_workers",
-        "Workers currently busy in a pipeline, by pipeline",
-        &["pipeline"]
+/// The pipeline families' bucket bounds: one scale for task duration and enqueue wait.
+const TASK_DURATION_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0];
+
+/// Pipeline task durations, by pipeline.
+pub static PIPELINE_TASK_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "tinio_pipeline_task_duration_seconds",
+        "Pipeline task durations, by pipeline",
+        &["pipeline"],
+        TASK_DURATION_BUCKETS.to_vec(),
     )
-    .expect("register tinio_pipeline_busy_workers")
+    .expect("register tinio_pipeline_task_duration_seconds")
+});
+/// Pipeline task outcomes, by pipeline and outcome (`ok` | `error` | `panic`).
+pub static PIPELINE_TASKS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "tinio_pipeline_tasks_total",
+        "Pipeline task outcomes, by pipeline and outcome",
+        &["pipeline", "outcome"]
+    )
+    .expect("register tinio_pipeline_tasks_total")
+});
+/// Time a task waited between enqueue and the worker picking it up, by pipeline.
+pub static PIPELINE_ENQUEUE_WAIT: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "tinio_pipeline_enqueue_wait_seconds",
+        "Time a task waited before a worker picked it up, by pipeline",
+        &["pipeline"],
+        TASK_DURATION_BUCKETS.to_vec(),
+    )
+    .expect("register tinio_pipeline_enqueue_wait_seconds")
 });
 /// The write-lock duration histograms (pipeline-spec.md §4): the
 /// `wait` and `total` distributions of every write transaction,
 /// converted from the tinio-fs snapshot at scrape time (registered
 /// with the default registry — the registry holds its own copy of
 /// the descriptors).
-#[expect(
-    clippy::expect_used,
-    reason = "argued: the same argument as `HTTP_REQUESTS` above for both of this item's registrations — the two histogram families' names (already registered, or registered with a different label set or help; the descriptors are built from two fixed literals before that), from one `LazyLock` site a process runs once, against the family list `specs/001-s3-local-server/data-model.md`'s `## Metrics (read-only views, not persisted)` owns, with `registers_all_families` pinning the gathered set; the refusal is the collision detection, and it has nowhere to return a `Result` to (design 2026-10-09 D2d)"
-)]
 pub static WRITE_LOCK_HISTOGRAMS: LazyLock<WriteLockHistograms> = LazyLock::new(|| {
     let histograms =
         WriteLockHistograms::new().expect("build the write-lock histogram descriptors");
@@ -300,7 +221,7 @@ pub static WRITE_LOCK_HISTOGRAMS: LazyLock<WriteLockHistograms> = LazyLock::new(
 /// every one of which records into the same statics through the data
 /// plane, so an exact-value/family assertion races the other tests'
 /// writes (observed flakes: the write-lock snapshot, the family set,
-/// `STORAGE_DOWNLOAD_BYTES`, `HTTP_IN_FLIGHT`). The serialization is a
+/// `STORAGE_DOWNLOAD_BYTES`). The serialization is a
 /// cfg(test)-only writer lock: every metric WRITE takes it, and the
 /// exact-assert tests take it for their whole assert window. Production
 /// call sites compile the lock away. Reentrant: an exact test holds the
@@ -309,66 +230,7 @@ pub static WRITE_LOCK_HISTOGRAMS: LazyLock<WriteLockHistograms> = LazyLock::new(
 /// on its own lock — the window marks the thread and writers skip
 /// acquisition while it is held.
 #[cfg(test)]
-pub(crate) mod test_lock {
-    use std::{
-        cell::Cell,
-        sync::{Mutex, MutexGuard},
-    };
-
-    static LOCK: Mutex<()> = Mutex::new(());
-
-    thread_local! {
-        static HELD: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Writer-side guard: `Some` blocks while an exact-assert test on
-    /// another thread holds the window; `None` on the window's own
-    /// thread (reentrant setup).
-    pub(crate) fn writer() -> Option<MutexGuard<'static, ()>> {
-        if HELD.with(Cell::get) {
-            None
-        } else {
-            Some(LOCK.lock().unwrap())
-        }
-    }
-
-    /// The exact-assert window: exclusive against every other-thread
-    /// writer; reentrant on this thread. The thread mark is cleared on
-    /// drop — the harness reuses test threads, so a stale mark would
-    /// silently disable the lock for a later test.
-    pub(crate) struct Window {
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl Drop for Window {
-        fn drop(&mut self) {
-            HELD.with(|held| held.set(false));
-        }
-    }
-
-    /// Open the window (the assert-exclusive region of an exact test).
-    pub(crate) fn window() -> Window {
-        HELD.with(|held| held.set(true));
-        Window {
-            _lock: LOCK.lock().unwrap(),
-        }
-    }
-}
-
-/// Take the in-flight gauge for a request (the data plane's per-request
-/// inc/dec pair).
-pub(crate) fn http_in_flight_inc() {
-    #[cfg(test)]
-    let _g = test_lock::writer();
-    HTTP_IN_FLIGHT.inc();
-}
-
-/// Release the in-flight gauge (request completion or cancellation).
-pub(crate) fn http_in_flight_dec() {
-    #[cfg(test)]
-    let _g = test_lock::writer();
-    HTTP_IN_FLIGHT.dec();
-}
+pub(crate) use tinio_util::testing::metrics::test_lock;
 
 /// Record the uploaded bytes of a completed request.
 pub(crate) fn record_upload_bytes(n: u64) {
@@ -404,6 +266,19 @@ pub(crate) fn multipart_in_progress_dec() {
     }
 }
 
+/// Count one successful upload-shaped operation under its wire name.
+///
+/// The shared operation table carries the call beside the row, so a new upload-shaped operation
+/// declares its count where the operation itself is declared.
+pub(crate) fn object_uploaded(op: &'static str) {
+    STORAGE_OBJECTS_UPLOADED.with_label_values(&[op]).inc();
+}
+
+/// Count one successful object deletion.
+pub(crate) fn object_deleted() {
+    STORAGE_OBJECTS_DELETED.inc();
+}
+
 /// Record a completed operation against a counter/histogram family pair.
 fn record(
     counter: &IntCounterVec,
@@ -418,81 +293,54 @@ fn record(
         .observe(duration.as_secs_f64());
 }
 
-/// The six verbs the data plane serves; any other HTTP token collapses to
-/// one label so a client cannot grow the metric families.
-fn method_label(method: &str) -> &'static str {
-    match method {
-        "GET" => "GET",
-        "PUT" => "PUT",
-        "POST" => "POST",
-        "DELETE" => "DELETE",
-        "HEAD" => "HEAD",
-        "OPTIONS" => "OPTIONS",
-        _ => "OTHER",
-    }
-}
-
-/// Record a completed HTTP request (management plane). The method is
-/// collapsed by `method_label` before it becomes a label, so an
-/// arbitrary request token books `OTHER` rather than a new family.
-pub fn record_http_request(method: &str, status: u16, duration: Duration) {
-    #[cfg(test)]
-    let _g = test_lock::writer();
-    let method = method_label(method);
-    record(
-        &HTTP_REQUESTS,
-        &[method, &status.to_string()],
-        &HTTP_DURATION,
-        method,
-        duration,
-    );
-}
-
 /// Record a completed S3 data-plane operation.
 pub fn record_s3_operation(op: &str, status: u16, duration: Duration) {
     #[cfg(test)]
     let _g = test_lock::writer();
+    let mut label = itoa::Buffer::new();
     record(
         &S3_OPERATIONS,
-        &[op, &status.to_string()],
+        &[op, status_label!(status, label)],
         &S3_DURATION,
         op,
         duration,
     );
 }
 
+/// Record one S3 wire error: the operation and the S3 error code the client receives.
+pub fn record_s3_error(op: &'static str, code: &S3ErrorCode) {
+    #[cfg(test)]
+    let _g = test_lock::writer();
+    S3_ERRORS.with_label_values(&[op, code.as_str()]).inc();
+}
+
 /// Refresh every scrape-computed family from one call (F49 — the single
 /// refresh entry point behind the management plane's `/metrics`,
 /// pipeline-spec.md §4): the pipeline gauges from two [`Stats`]
-/// snapshots and the write-lock histograms from a plain-data
-/// [`WriteLockStats`] (the conversion happens at gather, never on the
-/// write path; the backend snapshot → [`WriteLockStats`] conversion
-/// lives at the wiring point). Touching the statics registers the
-/// families with the default registry (F10 — the management plane calls
-/// this on every scrape, through the CLI's `MetricsSource` adapter, so a
-/// running server's registry always contains them; the data-plane
-/// listener serves no `/metrics`).
-pub fn refresh(io: Stats, db: Stats, write_lock: WriteLockStats) {
+/// snapshots and the write-lock histograms from the shared plain-data
+/// [`WriteLockSnapshot`] (the snapshot is taken at gather, never on the
+/// write path). Touching the statics registers the
+/// families with the default registry (F10 — the CLI's reader tick calls
+/// this every ttl, so a running server's registry always contains them; the
+/// data-plane listener serves no `/metrics`).
+pub fn refresh(io: Stats, remove: Stats, db: Stats, write_lock: WriteLockSnapshot) {
     #[cfg(test)]
     let _g = test_lock::writer();
-    for (label, stats) in [("io", io), ("db", db)] {
+    for (label, stats) in [("io", io), ("remove", remove), ("db", db)] {
         PIPELINE_QUEUE_DEPTH
             .with_label_values(&[label])
             .set(i64::try_from(stats.queue_depth).unwrap_or(i64::MAX));
         PIPELINE_IN_FLIGHT
             .with_label_values(&[label])
             .set(i64::try_from(stats.in_flight).unwrap_or(i64::MAX));
-        PIPELINE_BUSY_WORKERS
-            .with_label_values(&[label])
-            .set(i64::try_from(stats.busy_workers).unwrap_or(i64::MAX));
     }
     WRITE_LOCK_HISTOGRAMS.refresh(write_lock);
 }
 
 /// The scrape-time conversion of the write-lock histograms
 /// (pipeline-spec.md §4): two cumulative histogram families — the `wait`
-/// and `total` distributions of every write transaction — filled from
-/// the latest [`WriteLockStats`] on gather. Prometheus histograms
+/// and `hold` distributions of every write transaction — filled from
+/// the latest [`WriteLockSnapshot`] on gather. Prometheus histograms
 /// cannot be set from external counts, so the families are a small
 /// custom [`Collector`] over the [`prometheus::proto`] message types: the shared
 /// tinio-core bucket bounds become cumulative `le=` buckets (µs →
@@ -507,7 +355,7 @@ pub struct WriteLockHistograms {
     /// per-copy state). A cheap atomic read on the write path — no 30 s
     /// TTL cache; that pattern belongs to the storage full-scan gauges
     /// only.
-    snapshot: Arc<Mutex<WriteLockStats>>,
+    snapshot: Arc<Mutex<WriteLockSnapshot>>,
 }
 
 impl WriteLockHistograms {
@@ -516,15 +364,15 @@ impl WriteLockHistograms {
     /// index (the metrics layer reads the buckets by index, not name).
     fn new() -> PromResult<Self> {
         let wait_desc = Desc::new(
-            "tinio_write_lock_wait_duration_seconds".to_string(),
+            "tinio_storage_write_lock_wait_seconds".to_string(),
             "Write-lock wait duration of write transactions (the entry-to-begin_write interval, approximating the single-writer lock wait), cumulative histogram"
                 .to_string(),
             Vec::new(),
             HashMap::new(),
         )?;
         let total_desc = Desc::new(
-            "tinio_write_lock_total_duration_seconds".to_string(),
-            "Total duration of write transactions (entry to commit/abort return, incl. fsync), cumulative histogram"
+            "tinio_storage_write_lock_hold_seconds".to_string(),
+            "Write-lock hold duration of write transactions (entry to commit/abort return, incl. fsync), cumulative histogram"
                 .to_string(),
             Vec::new(),
             HashMap::new(),
@@ -532,7 +380,7 @@ impl WriteLockHistograms {
         Ok(Self {
             wait_desc,
             total_desc,
-            snapshot: Arc::new(Mutex::new(WriteLockStats::default())),
+            snapshot: Arc::new(Mutex::new(WriteLockSnapshot::default())),
         })
     }
 
@@ -540,12 +388,12 @@ impl WriteLockHistograms {
     /// never a panic: both critical sections are one whole-struct write or
     /// read, invariant-preserving, so a poisoned lock still holds a complete
     /// snapshot.
-    fn snapshot_guard(&self) -> MutexGuard<'_, WriteLockStats> {
+    fn snapshot_guard(&self) -> MutexGuard<'_, WriteLockSnapshot> {
         self.snapshot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Store the latest snapshot for the scrape-time conversion.
-    fn refresh(&self, snapshot: WriteLockStats) {
+    fn refresh(&self, snapshot: WriteLockSnapshot) {
         *self.snapshot_guard() = snapshot;
     }
 }
@@ -620,7 +468,7 @@ mod tests {
     use std::{collections::HashSet, sync::Mutex};
 
     use http::{Extensions, HeaderMap, Method, Uri};
-    use prometheus::{Encoder, TextEncoder, default_registry};
+    use prometheus::default_registry;
     #[cfg(feature = "copy")]
     use s3s::dto::CopySource;
     #[cfg(feature = "multipart")]
@@ -634,9 +482,50 @@ mod tests {
         },
         s3_error,
     };
+    use tinio_util::testing::{metrics::exposition, spans};
     use tokio::runtime::Runtime;
+    use tracing::{Level, callsite::rebuild_interest_cache, subscriber::with_default};
+    use tracing_subscriber::{prelude::*, registry};
 
     use super::*;
+    #[cfg(any(feature = "acl", feature = "copy"))]
+    use crate::_auth::metrics as auth_metrics;
+    #[cfg(feature = "select")]
+    use crate::_select::metrics as select_metrics;
+    use crate::{_mem::MemoryStorage, _util::metrics as util_metrics, backend::S3Backend};
+
+    /// The `tinio_*` names the process registers today, grouped by the crate
+    /// that declares them. A task that adds a family appends it here in the
+    /// same change: the gate is exact, so an unlisted family fails this test.
+    const SPEC_FAMILIES: &[&str] = &[
+        // `tinio-server`
+        "tinio_s3_operations_total",
+        "tinio_s3_operation_duration_seconds",
+        "tinio_s3_errors_total",
+        "tinio_storage_buckets",
+        "tinio_storage_objects",
+        "tinio_storage_bytes",
+        "tinio_storage_upload_bytes_total",
+        "tinio_storage_download_bytes_total",
+        "tinio_storage_objects_uploaded_total",
+        "tinio_storage_objects_deleted_total",
+        "tinio_storage_multipart_in_progress",
+        "tinio_pipeline_queue_depth",
+        "tinio_pipeline_in_flight",
+        "tinio_pipeline_task_duration_seconds",
+        "tinio_pipeline_tasks_total",
+        "tinio_pipeline_enqueue_wait_seconds",
+        "tinio_storage_write_lock_wait_seconds",
+        "tinio_storage_write_lock_hold_seconds",
+        // `tinio-util` — the cross-backend families.
+        "tinio_storage_write_failures_total",
+        "tinio_storage_pass_duration_seconds",
+        "tinio_storage_pass_failures_total",
+        "tinio_storage_read_only",
+        "tinio_storage_corrupt_rows_total",
+        // `tinio-auth` — a data test's ACL path registers the decision counter.
+        "tinio_auth_authorizations_total",
+    ];
 
     /// Serializes the tests that mutate the shared, label-less
     /// `STORAGE_MULTIPART_IN_PROGRESS` gauge — parallel interleaving would
@@ -653,9 +542,8 @@ mod tests {
         let _guard = MULTIPART_GAUGE.lock().unwrap();
         // gather() only emits families with samples — record one of each
         // label-bearing family first.
-        record_http_request("GET", 200, Duration::from_millis(1));
         record_s3_operation("FamGetObject", 200, Duration::from_millis(1));
-        HTTP_IN_FLIGHT.set(0);
+        record_s3_error("FamGetObject", &S3ErrorCode::NoSuchKey);
         STORAGE_BUCKETS.set(0);
         STORAGE_OBJECTS.set(0);
         STORAGE_BYTES.set(0);
@@ -664,6 +552,37 @@ mod tests {
         STORAGE_OBJECTS_UPLOADED.with_label_values(&["put"]).inc();
         STORAGE_OBJECTS_DELETED.inc_by(0);
         STORAGE_MULTIPART_IN_PROGRESS.set(0);
+        // The five cross-backend families are declared in `tinio-util`; touch
+        // each so this gate also sees them in the shared registry.
+        util_metrics::record_write_failure(
+            util_metrics::Backend::Fs,
+            util_metrics::WriteOp::Put,
+            util_metrics::WriteFailureKind::Io,
+        );
+        util_metrics::record_pass_duration(util_metrics::Pass::FsSweep, Duration::ZERO);
+        util_metrics::record_pass_failure(util_metrics::Pass::FsSweep, util_metrics::Section::Tmp);
+        util_metrics::record_read_only(util_metrics::Backend::Fs, false);
+        util_metrics::record_corrupt_rows(util_metrics::Backend::Fs, 0);
+        // The pipeline families: the histograms need one sample each to be gathered.
+        PIPELINE_TASK_DURATION
+            .with_label_values(&["gate"])
+            .observe(0.0);
+        PIPELINE_ENQUEUE_WAIT
+            .with_label_values(&["gate"])
+            .observe(0.0);
+        PIPELINE_TASKS.with_label_values(&["gate", "ok"]).inc();
+        // The decision counter is declared in `tinio-auth`, which this binary
+        // links for the ACL tests; touch it so the gate sees it in isolation
+        // and in a full run alike.
+        #[cfg(any(feature = "acl", feature = "copy"))]
+        {
+            auth_metrics::record_authorization(false);
+            auth_metrics::record_credential_lookup(false);
+        }
+        // The Select families are declared in `tinio-select`; touch them so the
+        // gate sees them in isolation and in a full run alike.
+        #[cfg(feature = "select")]
+        select_metrics::record_stream(select_metrics::Format::Csv, 0, 0);
         // The write-lock histograms are always emitted (zero counts
         // before any write transaction); the refresh is also the
         // registration path (the management plane's `/metrics` calls it on
@@ -672,49 +591,119 @@ mod tests {
         // other snapshot test's refresh+encode (a clobbered snapshot
         // fails its exact-value asserts and poisons the guard).
         let _snapshot_guard = WRITE_LOCK_SNAPSHOT_TEST.lock().unwrap();
-        // The pipeline gauges (io/db labels) sample the inline runners —
-        // stats are all zeros, the family set is what matters here.
+        // The pipeline gauges (io/remove/db labels) sample the inline
+        // runners — stats are all zeros, the family set is what matters.
         refresh(
             Stats::default(),
             Stats::default(),
-            WriteLockStats::default(),
+            Stats::default(),
+            WriteLockSnapshot::default(),
         );
         let names: Vec<String> = default_registry()
             .gather()
             .iter()
             .map(|f| f.name().to_string())
             .collect();
-        // The tinio_* family set must be exactly the 18 spec'd names
-        // (data-model.md Metrics + the pipeline gauges + the write-lock
-        // histograms) — a 19th family would fail this equality.
-        let expected: HashSet<&str> = [
-            "tinio_http_requests_total",
-            "tinio_http_request_duration_seconds",
-            "tinio_http_in_flight",
-            "tinio_s3_operations_total",
-            "tinio_s3_operation_duration_seconds",
-            "tinio_storage_buckets_total",
-            "tinio_storage_objects_total",
-            "tinio_storage_bytes_total",
-            "tinio_storage_upload_bytes_total",
-            "tinio_storage_download_bytes_total",
-            "tinio_storage_objects_uploaded_total",
-            "tinio_storage_objects_deleted_total",
-            "tinio_storage_multipart_in_progress",
-            "tinio_pipeline_queue_depth",
-            "tinio_pipeline_in_flight",
-            "tinio_pipeline_busy_workers",
-            "tinio_write_lock_wait_duration_seconds",
-            "tinio_write_lock_total_duration_seconds",
-        ]
-        .into_iter()
-        .collect();
+        // The HTTP families belong to `tinio-api` (its middleware records
+        // them; a process that runs that plane carries them in the same
+        // registry), so this crate's set is the gate below.
+        let mut expected: HashSet<&str> = SPEC_FAMILIES.iter().copied().collect();
+        // Families another crate declares on this binary's path; the spec table
+        // is their home, and this gate sees them only when the feature is on.
+        #[cfg(any(feature = "acl", feature = "copy"))]
+        expected.insert("tinio_auth_credential_lookups_total");
+        #[cfg(feature = "select")]
+        {
+            expected.insert("tinio_s3_select_scanned_bytes_total");
+            expected.insert("tinio_s3_select_rows_returned_total");
+        }
         let actual: HashSet<&str> = names
             .iter()
             .filter(|n| n.starts_with("tinio_"))
             .map(|n| n.as_str())
             .collect();
-        assert_eq!(actual, expected, "tinio_* family set");
+        // Exact in both directions: a declared family that never registered, and a
+        // registered family the spec does not list, both fail. The spec table in
+        // `data-model.md` §Metrics is the one enumeration; this list is its code-side
+        // projection for this binary's feature set.
+        let mut missing: Vec<&str> = expected.difference(&actual).copied().collect();
+        missing.sort_unstable();
+        let mut unexpected: Vec<&str> = actual.difference(&expected).copied().collect();
+        unexpected.sort_unstable();
+        assert!(
+            missing.is_empty() && unexpected.is_empty(),
+            "family gate mismatch — unregistered: {missing:?}; undeclared: {unexpected:?}"
+        );
+    }
+
+    #[test]
+    fn s3_errors_total_records_the_wire_code() {
+        let _window = test_lock::window();
+        record_s3_error("ErrGetObject", &S3ErrorCode::NoSuchKey);
+        let text = exposition();
+        assert!(
+            text.lines().any(|line| {
+                line.starts_with("tinio_s3_errors_total{")
+                    && line.contains(r#"op="ErrGetObject""#)
+                    && line.contains(r#"code="NoSuchKey""#)
+            }),
+            "{text}"
+        );
+    }
+
+    /// The decorator's `Err` arm is `record_s3_error`'s only production
+    /// caller: the wire code the client receives is booked under the
+    /// operation. The delta is exact under the window (every other writer is
+    /// locked out), and the labels are this test's own — the status-class
+    /// test records the status family, never the error family.
+    #[test]
+    fn metric_s3_records_the_wire_code_on_a_failed_operation() {
+        let _window = test_lock::window();
+        let counter = || {
+            S3_ERRORS
+                .with_label_values(&["CreateBucket", "NoSuchBucket"])
+                .get()
+        };
+        let before = counter();
+        let backend = MetricS3::new(FakeS3 {
+            mode: FakeMode::NoSuchBucket,
+        });
+        let rt = Runtime::new().unwrap();
+        let result = rt.block_on(backend.create_bucket(request(CreateBucketInput::default())));
+        let err = result.expect_err("the fake refuses the operation");
+        assert_eq!(err.code().as_str(), "NoSuchBucket");
+        assert_eq!(
+            counter() - before,
+            1,
+            "the Err arm books one error under its op and code"
+        );
+    }
+
+    /// `refresh` publishes both pipeline gauges for all three lanes (`io`,
+    /// `remove`, `db`) — the three-lane loop is the branch, not a single
+    /// `io` sample. Distinct values per lane make a swapped or missing lane
+    /// observable; the window keeps parallel writers out of the window.
+    #[test]
+    fn refresh_publishes_every_pipeline_lane() {
+        let _window = test_lock::window();
+        let stats = |queue_depth, in_flight| Stats {
+            queue_depth,
+            in_flight,
+            busy_workers: in_flight,
+        };
+        refresh(
+            stats(11, 12),
+            stats(21, 22),
+            stats(31, 32),
+            WriteLockSnapshot::default(),
+        );
+        let text = exposition();
+        for (lane, depth, flight) in [("io", 11, 12), ("remove", 21, 22), ("db", 31, 32)] {
+            let queue = format!(r#"tinio_pipeline_queue_depth{{pipeline="{lane}"}} {depth}"#);
+            let in_flight = format!(r#"tinio_pipeline_in_flight{{pipeline="{lane}"}} {flight}"#);
+            assert!(text.contains(&queue), "missing {queue}: {text}");
+            assert!(text.contains(&in_flight), "missing {in_flight}: {text}");
+        }
     }
 
     #[test]
@@ -726,107 +715,87 @@ mod tests {
         // the `le="+Inf"` bucket from `_count` (the open >100k µs
         // bucket's counts are implicit there).
         let _snapshot_guard = WRITE_LOCK_SNAPSHOT_TEST.lock().unwrap();
-        let snapshot = WriteLockStats {
+        let snapshot = WriteLockSnapshot {
             wait_buckets: [10, 5, 3, 2, 1, 0, 0],
             total_buckets: [0, 1, 2, 3, 4, 5, 6],
             count: 21,
             wait_sum_us: 21_000,
-            wait_max_us: 9_999,
             total_sum_us: 210_000,
-            total_max_us: 99_999,
+            ..WriteLockSnapshot::default()
         };
-        refresh(Stats::default(), Stats::default(), snapshot);
+        refresh(
+            Stats::default(),
+            Stats::default(),
+            Stats::default(),
+            snapshot,
+        );
 
-        let mut buf = Vec::new();
-        TextEncoder::new()
-            .encode(&default_registry().gather(), &mut buf)
-            .unwrap();
-        let text = String::from_utf8(buf).unwrap();
+        let text = exposition();
         // Wait distribution: cumulative 10/15/18/20/21/21, sum 0.021 s.
         assert!(
-            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.00001"} 10"#),
+            text.contains(r#"tinio_storage_write_lock_wait_seconds_bucket{le="0.00001"} 10"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.0001"} 15"#),
+            text.contains(r#"tinio_storage_write_lock_wait_seconds_bucket{le="0.0001"} 15"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.001"} 18"#),
+            text.contains(r#"tinio_storage_write_lock_wait_seconds_bucket{le="0.001"} 18"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.005"} 20"#),
+            text.contains(r#"tinio_storage_write_lock_wait_seconds_bucket{le="0.005"} 20"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.02"} 21"#),
+            text.contains(r#"tinio_storage_write_lock_wait_seconds_bucket{le="0.02"} 21"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="0.1"} 21"#),
+            text.contains(r#"tinio_storage_write_lock_wait_seconds_bucket{le="0.1"} 21"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"tinio_write_lock_wait_duration_seconds_bucket{le="+Inf"} 21"#),
+            text.contains(r#"tinio_storage_write_lock_wait_seconds_bucket{le="+Inf"} 21"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"tinio_write_lock_wait_duration_seconds_sum 0.021"#),
+            text.contains(r#"tinio_storage_write_lock_wait_seconds_sum 0.021"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"tinio_write_lock_wait_duration_seconds_count 21"#),
+            text.contains(r#"tinio_storage_write_lock_wait_seconds_count 21"#),
             "{text}"
         );
         // Total distribution: cumulative 0/1/3/6/10/15, +Inf 21, sum 0.21 s.
         assert!(
-            text.contains(r#"tinio_write_lock_total_duration_seconds_bucket{le="0.005"} 6"#),
+            text.contains(r#"tinio_storage_write_lock_hold_seconds_bucket{le="0.005"} 6"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"tinio_write_lock_total_duration_seconds_bucket{le="+Inf"} 21"#),
+            text.contains(r#"tinio_storage_write_lock_hold_seconds_bucket{le="+Inf"} 21"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"tinio_write_lock_total_duration_seconds_sum 0.21"#),
+            text.contains(r#"tinio_storage_write_lock_hold_seconds_sum 0.21"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"tinio_write_lock_total_duration_seconds_count 21"#),
+            text.contains(r#"tinio_storage_write_lock_hold_seconds_count 21"#),
             "{text}"
         );
-    }
-
-    #[test]
-    fn unknown_methods_share_one_label() {
-        assert_eq!(method_label("FAM"), "OTHER");
-        assert_eq!(method_label("PATCH"), "OTHER");
-        assert_eq!(method_label("GET"), "GET");
-        assert_eq!(method_label("OPTIONS"), "OPTIONS");
     }
 
     #[test]
     fn recording_increments_counters() {
         let _window = test_lock::window();
-        record_http_request("INC", 200, Duration::from_millis(2));
-        record_http_request("INC", 200, Duration::from_millis(1));
         record_s3_operation("IncGetObject", 200, Duration::from_millis(3));
 
-        let mut buf = Vec::new();
-        TextEncoder::new()
-            .encode(&default_registry().gather(), &mut buf)
-            .unwrap();
-        let text = String::from_utf8(buf).unwrap();
+        let text = exposition();
         // Label-bearing counters are asserted with unique labels so parallel
         // tests cannot clobber each other (the shared default registry);
         // label-less gauges are covered by registers_all_families instead.
-        // The fabricated `INC` is not a served verb, so it proves the
-        // collapse: it books under `OTHER`, this test's label alone.
-        assert!(
-            text.contains(r#"tinio_http_requests_total{method="OTHER",status="200"} 2"#),
-            "{text}"
-        );
         assert!(
             text.contains(r#"tinio_s3_operations_total{op="IncGetObject",status="200"} 1"#),
             "{text}"
@@ -914,14 +883,20 @@ mod tests {
     }
 
     fn s3_counter(op: &str, status: u16) -> u64 {
-        S3_OPERATIONS
-            .with_label_values(&[op, &status.to_string()])
-            .get()
+        let mut buffer = itoa::Buffer::new();
+        let status = status_label!(status, buffer);
+        S3_OPERATIONS.with_label_values(&[op, status]).get()
     }
 
     #[test]
     fn metric_s3_records_status_classes() {
         let _window = test_lock::window();
+        // The registry is process-global and a parallel probe may already have
+        // recorded CreateBucket, so the assertions are deltas.
+        let before_200 = s3_counter("CreateBucket", 200);
+        let before_404 = s3_counter("CreateBucket", 404);
+        let before_500 = s3_counter("CreateBucket", 500);
+        let before_501 = s3_counter("CreateBucket", 501);
         // Ok → 200; a client error → its own status (NoSuchBucket → 404);
         // InternalError → 500; the trait default (NotImplemented) → 501.
         for (mode, _status) in [
@@ -934,10 +909,10 @@ mod tests {
             let rt = Runtime::new().unwrap();
             let _ = rt.block_on(backend.create_bucket(request(CreateBucketInput::default())));
         }
-        assert_eq!(s3_counter("CreateBucket", 200), 1);
-        assert_eq!(s3_counter("CreateBucket", 404), 1);
-        assert_eq!(s3_counter("CreateBucket", 500), 1);
-        assert_eq!(s3_counter("CreateBucket", 501), 1);
+        assert_eq!(s3_counter("CreateBucket", 200) - before_200, 1);
+        assert_eq!(s3_counter("CreateBucket", 404) - before_404, 1);
+        assert_eq!(s3_counter("CreateBucket", 500) - before_500, 1);
+        assert_eq!(s3_counter("CreateBucket", 501) - before_501, 1);
     }
 
     #[test]
@@ -1263,6 +1238,214 @@ mod tests {
         #[cfg(feature = "select")]
         assert_eq!(s3_counter("SelectObjectContent", 501), 1);
     }
+
+    /// A probe input for one table row.
+    ///
+    /// Most inputs derive `Default`; the ones that do not — their required
+    /// fields are non-optional — are built through s3s's own builders with
+    /// empty required values. Any other input without `Default` fails to
+    /// compile here instead of going quietly undriven.
+    macro_rules! probe_input {
+        (CopyObjectInput) => {
+            dto::CopyObjectInput::builder()
+                .bucket(String::new())
+                .key(String::new())
+                .copy_source(dto::CopySource::parse("src/key").expect("a copy source"))
+                .build()
+                .expect("a probe input")
+        };
+        (UploadPartCopyInput) => {
+            dto::UploadPartCopyInput::builder()
+                .bucket(String::new())
+                .key(String::new())
+                .copy_source(dto::CopySource::parse("src/key").expect("a copy source"))
+                .part_number(1)
+                .upload_id(String::new())
+                .build()
+                .expect("a probe input")
+        };
+        (SelectObjectContentInput) => {
+            dto::SelectObjectContentInput::builder()
+                .bucket(String::new())
+                .key(String::new())
+                .request(dto::SelectObjectContentRequest {
+                    expression: String::new(),
+                    expression_type: dto::ExpressionType::from(String::new()),
+                    input_serialization: Default::default(),
+                    output_serialization: Default::default(),
+                    request_progress: None,
+                    scan_range: None,
+                })
+                .build()
+                .expect("a probe input")
+        };
+        (PutBucketTaggingInput) => {
+            dto::PutBucketTaggingInput::builder()
+                .bucket(String::new())
+                .tagging(Default::default())
+                .build()
+                .expect("a probe input")
+        };
+        (PutBucketCorsInput) => {
+            dto::PutBucketCorsInput::builder()
+                .bucket(String::new())
+                .cors_configuration(Default::default())
+                .build()
+                .expect("a probe input")
+        };
+        (DeleteObjectsInput) => {
+            dto::DeleteObjectsInput::builder()
+                .bucket(String::new())
+                .delete(Default::default())
+                .build()
+                .expect("a probe input")
+        };
+        (PutObjectTaggingInput) => {
+            dto::PutObjectTaggingInput::builder()
+                .bucket(String::new())
+                .key(String::new())
+                .tagging(Default::default())
+                .build()
+                .expect("a probe input")
+        };
+        (PutBucketVersioningInput) => {
+            dto::PutBucketVersioningInput::builder()
+                .bucket(String::new())
+                .versioning_configuration(Default::default())
+                .build()
+                .expect("a probe input")
+        };
+        ($other:ident) => {
+            dto::$other::default()
+        };
+    }
+
+    /// The probe inner backend: every row answers the same 400, so the span
+    /// is the subject and the status label stays off the families the
+    /// exact-value tests pin.
+    #[derive(Debug, Clone, Copy)]
+    struct ProbeFake;
+
+    macro_rules! probe_fake {
+        (
+            read { $( $(#[handler($rop:ident)])? $(#[gated($($rg:ident $(: $rf:literal)?),+)])? $(#[on_ok($rh:expr)])? fn $r:ident ( $ri:ident ) -> $ro:ident; )* }
+            write { $( $(#[handler($wop:ident)])? $(#[gated($($wg:ident $(: $wf:literal)?),+)])? $(#[on_ok($wh:expr)])? fn $w:ident ( $wi:ident ) -> $wo:ident; )* }
+        ) => {
+            #[async_trait]
+            impl S3 for ProbeFake {
+                $(
+                    $( $( $(#[cfg(feature = $rf)])? )+ )?
+                    async fn $r(
+                        &self,
+                        _req: S3Request<dto::$ri>,
+                    ) -> S3Result<S3Response<dto::$ro>> {
+                        Err(s3_error!(InvalidArgument, "span probe"))
+                    }
+                )*
+                $(
+                    $( $( $(#[cfg(feature = $wf)])? )+ )?
+                    async fn $w(
+                        &self,
+                        _req: S3Request<dto::$wi>,
+                    ) -> S3Result<S3Response<dto::$wo>> {
+                        Err(s3_error!(InvalidArgument, "span probe"))
+                    }
+                )*
+            }
+        };
+    }
+    tinio_s3_ops!(probe_fake);
+
+    macro_rules! span_probe {
+        (
+            read { $( $(#[handler($rop:ident)])? $(#[gated($($rg:ident $(: $rf:literal)?),+)])? $(#[on_ok($rh:expr)])? fn $r:ident ( $ri:ident ) -> $ro:ident; )* }
+            write { $( $(#[handler($wop:ident)])? $(#[gated($($wg:ident $(: $wf:literal)?),+)])? $(#[on_ok($wh:expr)])? fn $w:ident ( $wi:ident ) -> $wo:ident; )* }
+        ) => {
+            /// Every row this build compiles, as (table name, wire name).
+            fn probe_rows() -> Vec<(&'static str, &'static str)> {
+                vec![
+                    $(
+                        $( $( $(#[cfg(feature = $rf)])? )+ )?
+                        (stringify!($r), wire_name!($ri)),
+                    )*
+                    $(
+                        $( $( $(#[cfg(feature = $wf)])? )+ )?
+                        (stringify!($w), wire_name!($wi)),
+                    )*
+                ]
+            }
+
+            /// Drive one row through `backend`, by its table name.
+            async fn call_probe<T: S3>(backend: &T, op: &str) -> S3Result<()> {
+                match op {
+                    $(
+                        $( $( $(#[cfg(feature = $rf)])? )+ )?
+                        stringify!($r) => {
+                            backend.$r(request(probe_input!($ri))).await.map(|_| ())
+                        }
+                    )*
+                    $(
+                        $( $( $(#[cfg(feature = $wf)])? )+ )?
+                        stringify!($w) => {
+                            backend.$w(request(probe_input!($wi))).await.map(|_| ())
+                        }
+                    )*
+                    other => panic!("no table row named {other}"),
+                }
+            }
+        };
+    }
+    tinio_s3_ops!(span_probe);
+
+    /// The dispatch opens one span per operation, named and targeted before
+    /// the handler runs; the table is the operation list, so a row added
+    /// without its span fails here.
+    #[test]
+    fn every_operation_opens_exactly_one_s3_span() {
+        let capture = spans::Capture::new();
+        with_default(registry().with(capture.clone()), || {
+            // Interest is process-wide: another test may have cached it with
+            // no recorder installed, so rebuild it under this thread's.
+            rebuild_interest_cache();
+            let runtime = Runtime::new().unwrap();
+            let backend = MetricS3::new(ProbeFake);
+            for (row, wire) in probe_rows() {
+                capture.clear();
+                let result = runtime.block_on(call_probe(&backend, row));
+                assert!(result.is_err(), "{row} is a probe, not an answer");
+                let spans = capture.named("tinio.s3.operation");
+                assert_eq!(spans.len(), 1, "{row}: {spans:?}");
+                assert_eq!(spans[0].target, "tinio::s3", "{row}");
+                assert_eq!(spans[0].level, Level::INFO, "{row}");
+                assert_eq!(spans[0].field("op"), Some(wire), "{row}");
+            }
+        });
+    }
+
+    /// A T0 handler fills the identity the decorator left empty: one span,
+    /// carrying the bucket and key the request named.
+    #[test]
+    fn put_object_records_its_identity_on_the_operation_span() {
+        let capture = spans::Capture::new();
+        with_default(registry().with(capture.clone()), || {
+            rebuild_interest_cache();
+            let runtime = Runtime::new().unwrap();
+            let backend = MetricS3::new(S3Backend::new(
+                MemoryStorage::new().unwrap(),
+                Default::default(),
+            ));
+            let _ = runtime.block_on(backend.put_object(request(dto::PutObjectInput {
+                bucket: "probe-bucket".into(),
+                key: "probe/key.txt".into(),
+                ..Default::default()
+            })));
+            let spans = capture.named("tinio.s3.operation");
+            assert_eq!(spans.len(), 1, "{spans:?}");
+            assert_eq!(spans[0].field("op"), Some("PutObject"));
+            assert_eq!(spans[0].field("bucket"), Some("probe-bucket"));
+            assert_eq!(spans[0].field("key"), Some("probe/key.txt"));
+        });
+    }
 }
 
 /// A delegation wrapper recording `tinio_s3_operations_total{op,status}`
@@ -1322,21 +1505,43 @@ impl<T> MetricS3<T> {
         &self.inner
     }
 
-    /// Record one operation: `op` label, HTTP status, duration.
+    /// Record one operation: `op` label, HTTP status, duration — and the one span every
+    /// operation shares, because this is the only place all 42 of them pass through.
+    ///
+    /// `bucket` and `key` are declared empty here and filled by the handler that knows them:
+    /// a T0 operation records its object identity without a second span per handler.
     async fn record<R>(
         &self,
         op: &'static str,
         fut: impl Future<Output = S3Result<R>> + Send,
     ) -> S3Result<R> {
         let start = Instant::now();
-        let result = fut.await;
+        let result = s3_operation(op, fut).await;
         let status = match &result {
             Ok(_) => 200u16,
-            Err(err) => err.status_code().map_or(500, |code| code.as_u16()),
+            Err(err) => {
+                record_s3_error(op, err.code());
+                err.status_code().map_or(500, |code| code.as_u16())
+            }
         };
         record_s3_operation(op, status, start.elapsed());
         result
     }
+}
+
+#[instrument(
+    level = "info",
+    target = "tinio::s3",
+    name = "tinio.s3.operation",
+    skip(work),
+    fields(op, bucket = field::Empty, key = field::Empty)
+)]
+async fn s3_operation<R>(
+    op: &'static str,
+    work: impl Future<Output = S3Result<R>> + Send,
+) -> S3Result<R> {
+    tracing::Span::current().record("op", op);
+    work.await
 }
 
 /// The input dto's name minus `Input` — the AWS operation name s3s's

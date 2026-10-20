@@ -18,9 +18,12 @@ use crate::{bucket, etag, object};
 /// ```rust
 /// use std::io;
 ///
-/// use tinio_core::storage::{self, Error::*};
+/// use tinio_core::{
+///     bucket,
+///     storage::{self, Error::*},
+/// };
 ///
-/// let err = NoSuchBucket("data".into());
+/// let err = NoSuchBucket(bucket::name("data").expect("a valid bucket name"));
 /// assert_eq!(err.to_string(), "no such bucket: `data`");
 ///
 /// // I/O errors convert into the domain error transparently.
@@ -180,7 +183,7 @@ impl Error {
 /// let refused = storage::access_denied_bucket(&bucket);
 /// assert_eq!(refused.to_string(), "access denied: `data`");
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, derive_more::Display)]
+#[derive(Debug, Clone, PartialEq, Eq, derive_more::Display, derive_more::From)]
 pub enum Denied {
     /// A key-scoped refusal, naming the object key.
     #[display("{_0}")]
@@ -188,18 +191,6 @@ pub enum Denied {
     /// A bucket-scoped refusal, naming the bucket.
     #[display("{_0}")]
     Bucket(bucket::Name),
-}
-
-impl From<object::Key> for Denied {
-    fn from(key: object::Key) -> Self {
-        Self::Key(key)
-    }
-}
-
-impl From<bucket::Name> for Denied {
-    fn from(name: bucket::Name) -> Self {
-        Self::Bucket(name)
-    }
 }
 
 /// The referenced bucket does not exist.
@@ -355,11 +346,11 @@ mod tests {
     fn displays_variants() {
         let cases = [
             (
-                Error::NoSuchBucket("my-bucket".into()),
+                Error::NoSuchBucket(bucket::name("my-bucket").expect("a valid bucket name")),
                 "no such bucket: `my-bucket`",
             ),
             (
-                Error::NoSuchKey("dir/file.txt".into()),
+                Error::NoSuchKey(object::key("dir/file.txt").expect("a valid object key")),
                 "no such object: `dir/file.txt`",
             ),
             (
@@ -375,11 +366,11 @@ mod tests {
                 "invalid version: `bad id`",
             ),
             (
-                Error::AlreadyExists("my-bucket".into()),
+                Error::AlreadyExists(bucket::name("my-bucket").expect("a valid bucket name")),
                 "already exists: `my-bucket`",
             ),
             (
-                Error::NotEmpty("my-bucket".into()),
+                Error::NotEmpty(bucket::name("my-bucket").expect("a valid bucket name")),
                 "bucket is not empty: `my-bucket`",
             ),
             (
@@ -409,7 +400,9 @@ mod tests {
                 "invalid byte range: requested From(10) on object of 5 bytes",
             ),
             (
-                Error::AccessDenied(Denied::Key("a/.tinio/b".into())),
+                Error::AccessDenied(Denied::Key(
+                    object::key("a/.tinio/b").expect("a valid object key"),
+                )),
                 "access denied: `a/.tinio/b`",
             ),
             (

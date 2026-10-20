@@ -8,7 +8,7 @@ use crate::{
     _core::{
         bucket,
         content::{ContentKey, ObjectContent, StagedObject, stage_body},
-        object,
+        multipart, object,
         storage::{BodyStream, ByteRange},
     },
     _sqlx::query,
@@ -756,7 +756,7 @@ async fn a_key_with_no_live_generation_is_missing_content() {
 
     let part = ContentKey::Part {
         upload_id: "3b8a2f10-4d7c-4e21-9a6b-2f5c8e0d7b91".to_owned(),
-        number: 1.into(),
+        number: multipart::part_number(1).expect("a valid part number"),
     };
     let Err(err) = store.open(&bucket, &part, None).await else {
         panic!("a part key with no bytes is an error, not an empty body");
@@ -1185,7 +1185,7 @@ async fn scan_is_byte_ordered_over_live_object_keys_only() {
     // A part inside the walked prefix proves the `kind = 'object'` exclusion is real.
     let part = ContentKey::Part {
         upload_id: "7a2e1c3d-8b4f-4a6e-b0c1-3e5d9f2a7c48".to_owned(),
-        number: 1.into(),
+        number: multipart::part_number(1).expect("a valid part number"),
     };
     put(&store, &bucket, &part, b"part").await;
     assert_eq!(read(&store, &bucket, &part, None).await, b"part");
@@ -1594,7 +1594,7 @@ async fn scan_lists_every_key_the_prefix_definer_selects() {
     // too: it is never listed, and the definer query agrees.
     let part = ContentKey::Part {
         upload_id: "5c1f2d3e-4a5b-4c6d-8e9f-0a1b2c3d4e5f".to_owned(),
-        number: 1.into(),
+        number: multipart::part_number(1).expect("a valid part number"),
     };
     put(&store, &bucket, &part, b"part").await;
 

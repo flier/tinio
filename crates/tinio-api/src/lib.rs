@@ -34,7 +34,7 @@ pub mod transport;
 pub use self::openapi::document;
 pub use self::{
     error::{Error, ErrorBody},
-    metrics::{DEFAULT_TTL, Gauges, MetricsSource},
+    metrics::DEFAULT_TTL,
     state::State,
     transport::{Options, Plane},
 };

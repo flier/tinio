@@ -26,6 +26,7 @@ testing = []
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
 
 tinio-blob = { path = ".", features = ["testing"] }
 tinio-util = { workspace = true, features = ["testing"] }

@@ -36,6 +36,7 @@ use std::ops::Deref;
 
 use async_trait::async_trait;
 use redb::{ReadableTable, WriteTransaction};
+use tracing::instrument;
 
 use crate::{
     _core::{
@@ -150,9 +151,9 @@ fn part_row(part: &PartRow) -> object_part::Stored {
 /// [`storage::Error`] variant the failing arm carries) rather than panicking on
 /// a row that cannot be served either way (style.md §Panics).
 fn invalid_etag(etag: &str) -> storage::Error {
-    match ETag::new(etag) {
+    match etag.parse::<ETag>() {
         Ok(_) => etag::Error::InvalidFormat.into(),
-        Err(rejected) => rejected,
+        Err(rejected) => rejected.into(),
     }
 }
 
@@ -281,6 +282,17 @@ impl ObjectMeta for RedbMetadata {
             .await
     }
 
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip(self, row, parts),
+        fields(
+            bucket = %bucket,
+            key = %key,
+            bytes = row.size,
+            count = parts.len(),
+        )
+    )]
     async fn put_with_parts(
         &self,
         bucket: &bucket::Name,
@@ -288,6 +300,8 @@ impl ObjectMeta for RedbMetadata {
         row: &Row,
         parts: &[PartRow],
     ) -> Result<(), <Self as Metadata>::Error> {
+        // The commit is the contract's unit, not the row's: one info span per
+        // object write, carrying the key, size and part count.
         let refusal = storage::no_such_bucket(bucket);
         let bucket = bucket.to_string();
         let key = key.to_string();
@@ -697,11 +711,15 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use tinio_util::testing::metadata::assert_object_meta_conformance;
+    use tracing::Level;
 
     use super::*;
-    use crate::_core::{
-        meta::{BucketMeta, bucket as bucket_row},
-        multipart::ObjectPart,
+    use crate::{
+        _core::{
+            meta::{BucketMeta, bucket as bucket_row},
+            multipart::ObjectPart,
+        },
+        testutil::capture_spans,
     };
 
     const ETAG: &str = "d41d8cd98f00b204e9800998ecf8427e";
@@ -717,7 +735,7 @@ mod tests {
 
     fn row(size: u64) -> Row {
         Row {
-            etag: ETag::new(ETAG).unwrap(),
+            etag: ETAG.parse::<ETag>().unwrap(),
             size,
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(3),
             identity: 7,
@@ -730,7 +748,7 @@ mod tests {
 
     fn identity(size: u64) -> Identity {
         Identity {
-            etag: ETag::new(ETAG).unwrap(),
+            etag: ETAG.parse::<ETag>().unwrap(),
             size,
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(11),
             file_identity: 9,
@@ -1128,5 +1146,32 @@ mod tests {
             ObjectPart::try_from(row).is_err(),
             "the projection into the S3 shape refuses the out-of-range number"
         );
+    }
+
+    /// The object commit opens one info span per contract call, not per row:
+    /// the key, byte size and part count are the recorded fields.
+    #[tokio::test]
+    async fn put_with_parts_opens_one_info_commit_span() {
+        let capture = capture_spans();
+        let store = RedbMetadata::in_memory().unwrap();
+        let bucket = bucket_with(&store, "span-parts").await;
+        let key = key("parts.txt");
+        let watermark = capture.watermark();
+        store
+            .put_with_parts(&bucket, &key, &row(5), &[part(1), part(2)])
+            .await
+            .unwrap();
+
+        let spans = capture.spans_since(watermark);
+        let commit = spans
+            .iter()
+            .find(|span| span.name == "put_with_parts")
+            .unwrap_or_else(|| panic!("no put_with_parts span in {spans:?}"));
+        assert_eq!(commit.target, "tinio::storage");
+        assert_eq!(commit.level, Level::INFO);
+        assert_eq!(commit.field("bucket"), Some("span-parts"));
+        assert_eq!(commit.field("key"), Some("parts.txt"));
+        assert_eq!(commit.field("bytes"), Some("5"));
+        assert_eq!(commit.field("count"), Some("2"));
     }
 }

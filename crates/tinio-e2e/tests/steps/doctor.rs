@@ -252,7 +252,9 @@ async fn doctor_orphaned_meta(world: &mut World, key: String, bucket: String) {
         .set(
             &bucket_name(bucket).expect("a bucket name"),
             &object_key(key).expect("an object key"),
-            &ETag::new("d41d8cd98f00b204e9800998ecf8427e").expect("an etag"),
+            &"d41d8cd98f00b204e9800998ecf8427e"
+                .parse::<ETag>()
+                .expect("an etag"),
             4,
             SystemTime::UNIX_EPOCH,
             0,

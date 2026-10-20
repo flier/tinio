@@ -6,7 +6,7 @@ use bytes::Bytes;
 use derive_more::{Deref, Display};
 use md5::{Digest, Md5};
 
-use crate::{multipart::PartInfo, storage};
+use crate::multipart::PartInfo;
 
 /// A validated ETag.
 ///
@@ -15,7 +15,7 @@ use crate::{multipart::PartInfo, storage};
 /// Wire-format hex encoding is a protocol-layer concern — use [`ETag::as_str`] or
 /// [`std::fmt::Display`] when emitting S3 headers.
 ///
-/// Construct from untrusted wire input via [`ETag::new`]; from content via
+/// Parse untrusted wire input with [`FromStr`]; build from content via
 /// [`ETag::from_content`]; from assembled parts via
 /// [`ETag::composed_from_parts`].
 ///
@@ -24,17 +24,19 @@ use crate::{multipart::PartInfo, storage};
 /// ```rust
 /// use tinio_core::ETag;
 ///
-/// let single = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+/// let single = "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap();
 /// assert_eq!(single.as_str(), "d41d8cd98f00b204e9800998ecf8427e");
 ///
 /// let from_content = ETag::from_content(b"");
 /// assert_eq!(from_content, ETag::EMPTY);
 /// assert_eq!(from_content, single);
 ///
-/// let multipart = ETag::new("d41d8cd98f00b204e9800998ecf8427e-3").unwrap();
+/// let multipart = "d41d8cd98f00b204e9800998ecf8427e-3"
+///     .parse::<ETag>()
+///     .unwrap();
 /// assert_eq!(multipart.as_str(), "d41d8cd98f00b204e9800998ecf8427e-3");
 ///
-/// assert!(ETag::new("not-a-hex-etag").is_err());
+/// assert!("not-a-hex-etag".parse::<ETag>().is_err());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Display, Deref)]
 #[display("{}", self.as_str())]
@@ -109,12 +111,6 @@ impl ETag {
         hasher.finalize().into()
     }
 
-    /// Validate wire-format input and store the raw digest (plus multipart
-    /// suffix when present).
-    pub fn new(etag: &str) -> Result<Self, storage::Error> {
-        Ok(etag.parse()?)
-    }
-
     /// Content MD5 for a single upload (16 raw bytes).
     pub fn from_content(data: &[u8]) -> Self {
         Self::Single(Self::md5(data))
@@ -154,46 +150,34 @@ impl From<ETag> for Bytes {
     }
 }
 
-impl From<&str> for ETag {
-    /// Trusted-input convenience (panics on invalid ETags — use
-    /// [`ETag::new`] for untrusted input).
-    #[expect(
-        clippy::expect_used,
-        reason = "literal: the documented literal API — a `From<&str>` call site is a compile-time ETag fixture, wire input goes through `ETag::new`"
-    )]
-    fn from(etag: &str) -> Self {
-        etag.parse().expect("valid etag")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{error::Error as StdError, time::SystemTime};
 
     use super::*;
-    use crate::_util::testing::assert_send_sync;
+    use crate::{_util::testing::assert_send_sync, multipart};
 
     #[test]
     fn etag_validates_formats() {
         let hex = "d41d8cd98f00b204e9800998ecf8427e";
-        assert_eq!(ETag::new(hex).unwrap().as_str(), hex);
+        assert_eq!(hex.parse::<ETag>().unwrap().as_str(), hex);
         assert_eq!(
-            ETag::new(&format!("{hex}-3")).unwrap().as_str(),
+            format!("{hex}-3").parse::<ETag>().unwrap().as_str(),
             format!("{hex}-3")
         );
-        assert_eq!(ETag::new(&hex.to_uppercase()).unwrap().as_str(), hex);
-        let from_literal: ETag = hex.into();
+        assert_eq!(hex.to_uppercase().parse::<ETag>().unwrap().as_str(), hex);
+        let from_literal = hex.parse::<ETag>().expect("a valid etag");
         assert_eq!(from_literal.as_str(), hex);
         assert_eq!(from_literal.len(), 16);
         let bytes: Bytes = from_literal.clone().into();
         assert_eq!(bytes.len(), 16);
         assert_eq!(ETag::from_content(b""), ETag::EMPTY);
-        assert_eq!(ETag::EMPTY, ETag::new(hex).unwrap());
-        assert!(ETag::new("").is_err());
-        assert!(ETag::new("short").is_err());
-        assert!(ETag::new(&format!("{hex}-")).is_err());
-        assert!(ETag::new(&format!("{hex}-x")).is_err());
-        assert!(ETag::new(&format!("zzzz{hex}")).is_err());
+        assert_eq!(ETag::EMPTY, hex.parse::<ETag>().unwrap());
+        assert!("".parse::<ETag>().is_err());
+        assert!("short".parse::<ETag>().is_err());
+        assert!(format!("{hex}-").parse::<ETag>().is_err());
+        assert!(format!("{hex}-x").parse::<ETag>().is_err());
+        assert!(format!("zzzz{hex}").parse::<ETag>().is_err());
     }
 
     #[test]
@@ -204,13 +188,13 @@ mod tests {
     #[test]
     fn etag_composed_deref_and_edge_cases() {
         let hex = "d41d8cd98f00b204e9800998ecf8427e";
-        let single = ETag::new(hex).unwrap();
-        let composed = ETag::new(&format!("{hex}-3")).unwrap();
+        let single = hex.parse::<ETag>().unwrap();
+        let composed = format!("{hex}-3").parse::<ETag>().unwrap();
         // Deref/AsRef on the composed variant yields the same raw digest.
         assert_eq!(single.as_ref(), composed.as_ref());
         assert_eq!(composed.len(), 16);
         // `-0` part count is not a valid multipart ETag.
-        assert!(ETag::new(&format!("{hex}-0")).is_err());
+        assert!(format!("{hex}-0").parse::<ETag>().is_err());
         // An empty part list cannot compose an ETag.
         assert!(ETag::composed_from_parts(&[]).is_none());
     }
@@ -224,14 +208,14 @@ mod tests {
         // re-verifies the multipart etag.
         let parts = [
             PartInfo {
-                part_number: 1.into(),
+                part_number: multipart::part_number(1).expect("a valid part number"),
                 size: 5,
                 etag: ETag::from_content(b"hello"),
                 last_modified: SystemTime::UNIX_EPOCH,
                 checksum: None,
             },
             PartInfo {
-                part_number: 2.into(),
+                part_number: multipart::part_number(2).expect("a valid part number"),
                 size: 5,
                 etag: ETag::from_content(b"world"),
                 last_modified: SystemTime::UNIX_EPOCH,
@@ -245,7 +229,9 @@ mod tests {
         // — it must re-parse to the same value.
         assert_eq!(
             composed,
-            ETag::new("065947336a2f2a95ba8899f3675c3be6-2").unwrap()
+            "065947336a2f2a95ba8899f3675c3be6-2"
+                .parse::<ETag>()
+                .unwrap()
         );
 
         // A suffix that overflows `u32` is the only failing parse: the
@@ -255,11 +241,8 @@ mod tests {
         // layer answers a different code for each).
         let hex = "d41d8cd98f00b204e9800998ecf8427e";
         let overflowing = format!("{hex}-{}", u64::from(u32::MAX) + 1);
-        let err = ETag::new(&overflowing).unwrap_err();
-        assert_eq!(err.to_string(), "invalid etag: invalid ETag part count");
-        // Both hops stay in the chain (the mapping layer logs them).
-        let etag_err = err.source().expect("the etag error is the source");
-        assert_eq!(etag_err.to_string(), "invalid ETag part count");
-        assert!(etag_err.source().is_some(), "the parse error is its source");
+        let err = overflowing.parse::<ETag>().unwrap_err();
+        assert_eq!(err.to_string(), "invalid ETag part count");
+        assert!(err.source().is_some(), "the parse error is its source");
     }
 }

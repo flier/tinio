@@ -449,7 +449,10 @@ fn composed(parts: &[(u32, String)]) -> String {
         .map(|(n, wire)| PartInfo {
             part_number: part_number(*n).expect("a composed part number is in 1..=10000"),
             size: 0,
-            etag: ETag::new(wire.trim_matches('"')).expect("recorded part etag"),
+            etag: wire
+                .trim_matches('"')
+                .parse::<ETag>()
+                .expect("recorded part etag"),
             last_modified: SystemTime::UNIX_EPOCH,
             checksum: None,
         })

@@ -56,6 +56,7 @@ pub mod store;
 pub mod teardown;
 
 mod error;
+mod metrics;
 mod timestamp;
 mod window;
 
@@ -73,6 +74,7 @@ mod tests;
 pub(crate) type PgTx = _sqlx::Transaction<'static, _sqlx::Postgres>;
 
 /// Acquire one connection and begin a transaction on it.
+#[tracing::instrument(target = "tinio::storage", level = "trace", skip_all)]
 pub(crate) async fn begin(pool: &_sqlx::PgPool) -> Result<PgTx, Error> {
     Ok(pool.begin().await?)
 }

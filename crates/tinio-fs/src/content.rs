@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use tokio::{fs, runtime::Handle, task};
+use tracing::instrument;
 
 use crate::{
     _core::{
@@ -36,10 +37,12 @@ use crate::{
         object,
         storage::{self, BodyStream, BucketOps, ByteRange, access_denied},
     },
+    _util::metrics::WriteOp,
     Error,
     backend::{
         FsStorage, Publication, StagedBytes, bucket_is_empty, prune_parents, remove_object_file,
     },
+    error::record_failed_write,
     fsutil,
     listing::WalkedFile,
     write::StagedFile,
@@ -273,6 +276,16 @@ impl ObjectContent for FsContent {
         })
     }
 
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        name = "fs.publish",
+        skip(self, staged),
+        fields(
+            bucket = %bucket,
+            op = if key.is_part() { "part" } else { "object" },
+        )
+    )]
     async fn publish(
         &self,
         bucket: &bucket::Name,
@@ -391,8 +404,17 @@ impl ObjectContent for FsContent {
         Ok(FsStorage::object_body(file, size, range).await?.0)
     }
 
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        skip(self),
+        fields(
+            bucket = %bucket,
+            op = if key.is_part() { "part" } else { "object" },
+        )
+    )]
     async fn remove(&self, bucket: &bucket::Name, key: &ContentKey) -> Result<(), Error> {
-        match key {
+        let result = match key {
             ContentKey::Object(key) => {
                 // Idempotent: an absent bucket or object is a no-op, like
                 // the row-backed plane's removal of an absent row.
@@ -414,9 +436,19 @@ impl ObjectContent for FsContent {
                     Err(err) => Err(err.into()),
                 }
             }
+        };
+        if let Err(err) = &result {
+            record_failed_write(WriteOp::Delete, err);
         }
+        result
     }
 
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        skip(self, from),
+        fields(bucket = %bucket, key = %to)
+    )]
     async fn rename(
         &self,
         bucket: &bucket::Name,
@@ -922,7 +954,7 @@ mod tests {
     /// One object row with nothing behind it — a **delete marker's** shape.
     fn detached_row() -> meta_object::Row {
         meta_object::Row {
-            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
             size: 0,
             mtime: SystemTime::now(),
             identity: 0,
@@ -966,7 +998,7 @@ mod tests {
                 &bucket,
                 &key,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(b"assembled"),
                 None,
             )

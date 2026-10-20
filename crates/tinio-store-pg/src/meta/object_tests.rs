@@ -21,7 +21,7 @@ use crate::{
 const ETAG_B: &str = "0cc175b9c0f1b6a831c399e269772661";
 
 fn etag(value: &str) -> ETag {
-    ETag::new(value).expect("a valid etag literal")
+    value.parse::<ETag>().expect("a valid etag literal")
 }
 
 fn row(size: u64, etag_wire: &str) -> ObjectRow {

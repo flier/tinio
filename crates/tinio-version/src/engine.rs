@@ -52,6 +52,8 @@
 
 use std::time::SystemTime;
 
+use tracing::{Span, debug, field, instrument};
+
 use crate::{
     _blob::{LiveSet, Store},
     _core::{
@@ -68,6 +70,7 @@ use crate::{
         version::State,
     },
     error::Error,
+    metrics::{self, Outcome},
     ports::{Current, CurrentRows, PublishedBody},
 };
 
@@ -246,6 +249,12 @@ where
     /// # });
     /// # }
     /// ```
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket)
+    )]
     pub async fn set_state(&self, bucket: &Name, state: State) -> Result<(), Error> {
         self.rows
             .set_bucket_state(bucket, state)
@@ -279,6 +288,12 @@ where
     /// # });
     /// # }
     /// ```
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub async fn current(&self, bucket: &Name, key: &object::Key) -> Result<Current, Error> {
         Ok(self.gate.current(bucket, key).await?)
     }
@@ -428,20 +443,37 @@ where
     /// moved slot re-resolves and retries the read-and-publish once against
     /// the moved slot; only a second disagreement answers
     /// [`Error::SupersedeRace`] with no row written.
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %bucket, key = %key, result = field::Empty)
+    )]
     pub async fn supersede_with(
         &self,
         bucket: &Name,
         key: &object::Key,
         before: &Current,
     ) -> Result<(), Error> {
+        let span = Span::current();
+        // One sample per call: the first-attempt success, the retry-healed
+        // success, and the race that wrote no row are the family's whole set.
+        let finish = |outcome: Outcome| {
+            span.record("result", field::display(outcome));
+            metrics::record_supersede(outcome);
+        };
         // The design's retry: one re-resolve and read-and-publish after a
         // race, against the slot the fresh resolve named; only a second
         // disagreement is the error.
         let mut before = before.clone();
         for attempt in 0..SUPERSEDE_ATTEMPTS {
             if !before.exists {
-                return Ok(()); // nothing is current: nothing to move into history
+                finish(Outcome::Ok); // nothing is current: nothing to move into history
+                return Ok(());
             }
+            // One event per resolve-read-verify attempt: the contention signal
+            // the counter aggregates.
+            debug!(target: "tinio::storage", attempt, "supersede attempt");
             // What the read found: `Some` is a version to move, `None` a
             // disagreement the retry may heal — except for the null version
             // with no content, which has nothing to preserve at all.
@@ -498,15 +530,24 @@ where
             // changed under the read.
             let after = self.gate.current(bucket, key).await?;
             if after == before {
-                if let Some(superseded) = superseded {
-                    self.rows
-                        .put_version(bucket, key, &superseded)
-                        .await
-                        .map_err(projected)?;
+                let committed = match superseded {
+                    Some(superseded) => {
+                        self.rows
+                            .put_version(bucket, key, &superseded)
+                            .await
+                            .map_err(projected)?;
+                        true
+                    }
+                    // An empty null version has nothing to preserve either.
+                    None => empty_null,
+                };
+                if committed {
+                    finish(if attempt == 0 {
+                        Outcome::Ok
+                    } else {
+                        Outcome::Retried
+                    });
                     return Ok(());
-                }
-                if empty_null {
-                    return Ok(()); // an empty null version: nothing to preserve
                 }
             }
             if attempt + 1 == SUPERSEDE_ATTEMPTS {
@@ -516,6 +557,7 @@ where
             }
             before = after;
         }
+        finish(Outcome::Race);
         Err(Error::SupersedeRace { key: key.clone() })
     }
 
@@ -556,6 +598,12 @@ where
     /// # });
     /// # }
     /// ```
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub async fn materialize(
         &self,
         bucket: &Name,

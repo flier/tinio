@@ -1,10 +1,8 @@
 //! §1's serving half — the steps after the runtime exists.
 
-#[cfg(feature = "versioning")]
-use std::future::Future;
 #[cfg(feature = "api")]
 use std::sync::Arc;
-use std::{fmt::Display, net::SocketAddr, process::ExitCode, time::Duration};
+use std::{fmt::Display, future::Future, net::SocketAddr, process::ExitCode, time::Duration};
 
 use futures::future::{Either, select};
 use tokio::{
@@ -13,6 +11,7 @@ use tokio::{
     task::JoinError,
     time::{error::Elapsed, timeout},
 };
+use tracing::instrument;
 
 #[cfg(all(test, feature = "pg"))]
 use super::serving::pg_pass;
@@ -36,10 +35,12 @@ use crate::{
     _server::{
         Capabilities, DataPlane, Identity, PlaneConfig,
         identity::{self, IdentityFromConfig},
+        log,
     },
     Error,
     commands::EnvArgs,
     events,
+    metrics::{Phase, Timer},
     resolve::{Pipelines, Resolution},
     sandbox, signal,
 };
@@ -144,6 +145,7 @@ impl Ready {
     }
 }
 
+#[tracing::instrument(target = "tinio::cli", level = "info", skip_all, name = "start.serve")]
 pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
     let (backend, serving) = ready.split();
     match backend {
@@ -187,6 +189,9 @@ async fn bind_served_listener(
     resolution: &Resolution,
     adopted: Option<&Adopted>,
 ) -> Result<(TcpListener, SocketAddr), Error> {
+    // The data-plane listener's bind: the second `bind` sample a serving run records, beside
+    // the control channel's (`run::open_management_plane`).
+    let _bind_timer = Timer::new(Phase::Bind);
     let bind = resolution.address()?;
     let listener = match adopted {
         // The listener a launcher handed this child over the inherited descriptor (Task 9).
@@ -224,7 +229,6 @@ async fn prepare_pg(
         &serving.args,
         serving.adopted.as_ref(),
         &serving.handles,
-        &serving.pipelines,
     )?;
     #[cfg(feature = "api")]
     let prepared = Prepared { storage, plane };
@@ -276,10 +280,12 @@ where
     //
     // **The repair runs in every build; only the `versioning` feature reads its answer** (it arms
     // the optional post-repair block verify below), so the *binding* — not the call — is gated.
+    let repair_timer = Timer::new(Phase::Repair);
     #[cfg(feature = "versioning")]
     let repaired = storage.repair(&resolution).await;
     #[cfg(not(feature = "versioning"))]
     let _ = storage.repair(&resolution).await;
+    drop(repair_timer);
     // **The run's access mode, bound once** and read by the `versioning` block below and by the
     // data plane and the background pass further down — so it is unconditional (a `versioning`-off
     // or `api`-off build still reads it), and the earlier placement is what lets those readers
@@ -348,6 +354,10 @@ where
         .await
         .inspect_err(frame_startup)?;
     warn_if_non_loopback(address);
+    // The readiness window: from the bound listener to READY=1. Everything inside it is what a
+    // client is waiting on before `tinio status` can see the server, so the phase is the number
+    // the contract's startup window is spent in.
+    let ready_timer = Timer::new(Phase::Ready);
     let caps = capabilities_for(&resolution);
     // The fail-open defense's startup half (spec 2026-10-03): the feature is compiled in but
     // `[s3] versioning` is off, so a root that still holds version data keeps serving its current
@@ -378,8 +388,8 @@ where
         }
     });
     // The data plane carries no metrics hook: the interim `/metrics` route on its listener is
-    // retired, so there would be no reader for one. The cheap families are still published — the
-    // adapter above calls them on the management plane's reader, which is the same registry.
+    // retired, so there would be no reader for one. The management plane's `/metrics` gathers the
+    // same process registry the reader below fills, so nothing about the data plane is unobserved.
     let data = plane_for(storage.clone(), PlaneConfig { caps, access }, &resolution);
 
     // `STOPPING=1` belongs to the **moment the shutdown begins**, not to the moment it ends:
@@ -394,6 +404,15 @@ where
             notify::stopping();
         }
     });
+
+    // **The metrics reader starts before the planes serve, and it is the CLI's, not the
+    // plane's.** One task over this run's storage refreshes the pipeline gauges, the write-lock
+    // histograms and the storage scan on one `ttl`; a `/metrics` scrape only gathers what its
+    // last tick published, so no request ever scans and a stalled scan cannot fail one. The
+    // handle is joined on the shutdown path below, under the same bound as the background
+    // passes, and the channel is what ends the loop.
+    #[cfg(feature = "api")]
+    let metrics_reader = storage.metrics_reader(&pipelines, stop.clone());
 
     // Both planes are up before `state` exists (decision 12), which is why the api plane is
     // spawned: its `serve` borrows the plane, and `state` is published after it. One `Arc`,
@@ -444,6 +463,7 @@ where
     notify::ready(); // READY=1, inert off systemd
     #[cfg(unix)]
     notify::watchdog();
+    drop(ready_timer);
 
     // **The background passes start here, after readiness, and the lifecycle seed is why**
     // (LC13): the seed writes a stored configuration at the first pass, and `contracts/config.md`
@@ -463,13 +483,6 @@ where
         lifecycle,
     ));
 
-    // **No metrics ticker here**, and that is deliberate rather than an omission. The scrape's
-    // cadence and the storage scan's schedule belong to the plane: its `serve` spawns the
-    // reader (`gauges.spawn_reader(stop)`), `Gauges::refresh` is the only method a scrape calls
-    // and it never scans, and `counts()` — this adapter's expensive half — is called by that
-    // reader alone. A second ticker in this module would be a cache beside a reader, and the
-    // two would have to agree on a period neither of them owns.
-
     // **The order of these three awaits is the contract's, not a preference.** The api and data
     // planes are joined first and `Plane::shutdown` — the only ordinary site that removes `state`
     // and the socket — runs before the background arm is awaited, because
@@ -479,12 +492,12 @@ where
     // measured at ~15 s after an accepted `stop`, outside the promise. Do not simplify this back
     // into one `join!`; the removal window is the whole reason the three are apart.
     #[cfg(feature = "api")]
-    let drain = async { tokio::join!(api, data) };
+    let planes = async { tokio::join!(api, data) };
     // Not an `async { data.await }`: the single handle is already a future, and clippy's
     // `redundant_async_block` is a `-D warnings` error in the api-less graphs.
     #[cfg(not(feature = "api"))]
-    let drain = data;
-    tokio::pin!(drain);
+    let planes = data;
+    tokio::pin!(planes);
     let stopped = stopping(&mut stop);
     tokio::pin!(stopped);
     // **The bound is armed by a stop — or by a plane that ended on its own — never by the mere
@@ -502,82 +515,110 @@ where
     // `select!` that took the stop arm with an already-complete drain arm would re-poll it in the
     // timeout below. `select` returns the arm that did *not* finish, so the timeout only ever
     // wraps a drain that is still pending.
-    let drained = match select(drain, stopped).await {
-        Either::Left((outcome, _)) => Ok::<_, Elapsed>(outcome),
-        Either::Right(((), drain)) => timeout(DRAIN_BOUND, drain).await,
-    };
-    // **The bound is the promise's, and this is where it is enforced.** A download in flight
-    // would otherwise hold `state` and the socket past the window — and past `stop`'s own 15 s
-    // refusal bound, which is how the operator meets it. An arm still draining at the bound is
-    // *abandoned*, not failed: what is left is a client's connection, no state of ours is
-    // inconsistent, and `plane.shutdown()` below still removes what this process owns. So the
-    // bound costs a warning and never an exit code — a "drain ≤ 10 s, exit 0" that turned into
-    // exit 1 would be the contract read backwards.
-    if drained.is_err() {
-        tracing::warn!(
-            "the planes were still draining at the {DRAIN_BOUND:?} bound; abandoning them so `state` and the socket come out inside the contract's window"
-        );
-    }
-
-    #[cfg(feature = "api")]
-    plane.shutdown().await?; // drain, remove the socket and `state` — inside the drain window
-
-    // Then the background passes, **bounded** so the process's exit is too: a scanner mid-chunk
-    // is abandoned at the bound rather than holding the exit open for up to its full pacing
-    // chunk. Abandonment is not a failure — the passes' work is idempotent and resumes on the
-    // next start — so it leaves the exit code alone; a pass that panicked *inside* the bound
-    // still reaches `background_arm` below.
-    let background = match timeout(BACKGROUND_BOUND, background).await {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            tracing::warn!("the background passes were abandoned at the shutdown bound");
-            Ok(())
+    // **The drain is its own T0 span.** It opens where a stop can first arrive and closes before
+    // the export is torn down: everything between — the planes' drain, the removal of `state`
+    // and the socket, the background passes' bounded join, the pipelines' own drain — is what an
+    // operator reads a stop's duration from, and its close line is the contract's "cease
+    // accepting, drain ≤ 10 s" in the trace. The unit is a region of one function rather than
+    // the outer `serve_backend` frame (Conventions §2's region shape), so it lives in
+    // [`drain`]; it is a child of `start.serve` so the run's own span still closes last.
+    let outcome = drain(async {
+        let drained = match select(planes, stopped).await {
+            Either::Left((outcome, _)) => Ok::<_, Elapsed>(outcome),
+            Either::Right(((), planes)) => timeout(DRAIN_BOUND, planes).await,
+        };
+        // **The bound is the promise's, and this is where it is enforced.** A download in flight
+        // would otherwise hold `state` and the socket past the window — and past `stop`'s own 15 s
+        // refusal bound, which is how the operator meets it. An arm still draining at the bound is
+        // *abandoned*, not failed: what is left is a client's connection, no state of ours is
+        // inconsistent, and `plane.shutdown()` below still removes what this process owns. So the
+        // bound costs a warning and never an exit code — a "drain ≤ 10 s, exit 0" that turned into
+        // exit 1 would be the contract read backwards.
+        if drained.is_err() {
+            tracing::warn!(
+                "the planes were still draining at the {DRAIN_BOUND:?} bound; abandoning them so `state` and the socket come out inside the contract's window"
+            );
         }
-    };
 
-    // **Held, not returned yet**, and inspected rather than discarded: every arm ends on the
-    // same `stop` channel, so a clean return from all of them *is* the graceful path — while a
-    // plane that returned an error (a data listener that stopped accepting, a control channel
-    // that could not serve) or a task that did not finish is an operational failure. A run
-    // that discarded these would exit 0 with a silent S3 outage on the arms still alive, and
-    // the shutdown below still has to run either way: a failed plane must not leave its socket
-    // and `state` behind.
-    #[cfg(feature = "api")]
-    let planes = match drained {
-        Ok((api, data)) => {
-            plane_arm("the management plane", api).and(plane_arm("the data plane", data))
-        }
-        // Abandoned at the bound, which is what the bound is *for*: a plane that did not finish
-        // is the accepted outcome there, not the operational failure `plane_arm` reports for a
-        // task that panicked. The warning above is that arm's whole report.
-        Err(_) => Ok(()),
-    };
-    #[cfg(not(feature = "api"))]
-    let planes = match drained {
-        Ok(data) => plane_arm("the data plane", data),
-        Err(_) => Ok(()),
-    };
-    let outcome = planes.and(background_arm("the background passes", background));
+        #[cfg(feature = "api")]
+        plane.shutdown().await?; // drain, remove the socket and `state` — inside the drain window
 
-    // **The toggle-off warning's task is joined here unbounded, and the task's own work is what
-    // makes that safe.** Its scan carries `WARNING_BOUND` (`bounded_versioning_warning` below), so
-    // a wedged read cannot hold this join: by this line the task has either answered — by an
-    // ordinary stop it has long answered, started as it is alongside the planes — or degraded to
-    // the count-free message at its own bound. Bounding this *join* instead would re-create the
-    // defect one step later: the warning is the task's whole purpose, and an abandoned task
-    // prints nothing, while a bounded scan still warns. The two bounds above protect the drain
-    // window, and this join sits *after* that window's removal (`plane.shutdown()` and the
-    // background await), so waiting here cannot push `state` or the socket past the promise
-    // either. Its join error is the other tasks' rule too: a task that did not finish is an
-    // operational failure, whatever it was for.
-    #[cfg(feature = "versioning")]
-    let outcome = outcome.and(background_arm(
-        "the toggle-off warning",
-        versioning_warning.await,
-    ));
+        // Then the background passes, **bounded** so the process's exit is too: a scanner mid-chunk
+        // is abandoned at the bound rather than holding the exit open for up to its full pacing
+        // chunk. Abandonment is not a failure — the passes' work is idempotent and resumes on the
+        // next start — so it leaves the exit code alone; a pass that panicked *inside* the bound
+        // still reaches `background_arm` below.
+        let background = match timeout(BACKGROUND_BOUND, background).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::warn!("the background passes were abandoned at the shutdown bound");
+                Ok(())
+            }
+        };
 
-    pipelines.shutdown(); // IO first, the DB write pipeline last
-    pipelines.drain().await;
+        // The metrics reader on the same rule: it ends on the stop channel, but a scan already
+        // on the blocking pool may still be running, so its exit is bounded rather than awaited
+        // open-ended. Abandonment is not a failure — the next start rescans.
+        #[cfg(feature = "api")]
+        let metrics_reader = match timeout(BACKGROUND_BOUND, metrics_reader).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::warn!("the metrics reader was abandoned at the shutdown bound");
+                Ok(())
+            }
+        };
+
+        // **Held, not returned yet**, and inspected rather than discarded: every arm ends on the
+        // same `stop` channel, so a clean return from all of them *is* the graceful path — while a
+        // plane that returned an error (a data listener that stopped accepting, a control channel
+        // that could not serve) or a task that did not finish is an operational failure. A run
+        // that discarded these would exit 0 with a silent S3 outage on the arms still alive, and
+        // the shutdown below still has to run either way: a failed plane must not leave its socket
+        // and `state` behind.
+        #[cfg(feature = "api")]
+        let planes = match drained {
+            Ok((api, data)) => {
+                plane_arm("the management plane", api).and(plane_arm("the data plane", data))
+            }
+            // Abandoned at the bound, which is what the bound is *for*: a plane that did not finish
+            // is the accepted outcome there, not the operational failure `plane_arm` reports for a
+            // task that panicked. The warning above is that arm's whole report.
+            Err(_) => Ok(()),
+        };
+        #[cfg(not(feature = "api"))]
+        let planes = match drained {
+            Ok(data) => plane_arm("the data plane", data),
+            Err(_) => Ok(()),
+        };
+        let outcome = planes.and(background_arm("the background passes", background));
+        #[cfg(feature = "api")]
+        let outcome = outcome.and(background_arm("the metrics reader", metrics_reader));
+
+        // **The toggle-off warning's task is joined here unbounded, and the task's own work is what
+        // makes that safe.** Its scan carries `WARNING_BOUND` (`bounded_versioning_warning` below), so
+        // a wedged read cannot hold this join: by this line the task has either answered — by an
+        // ordinary stop it has long answered, started as it is alongside the planes — or degraded to
+        // the count-free message at its own bound. Bounding this *join* instead would re-create the
+        // defect one step later: the warning is the task's whole purpose, and an abandoned task
+        // prints nothing, while a bounded scan still warns. The two bounds above protect the drain
+        // window, and this join sits *after* that window's removal (`plane.shutdown()` and the
+        // background await), so waiting here cannot push `state` or the socket past the promise
+        // either. Its join error is the other tasks' rule too: a task that did not finish is an
+        // operational failure, whatever it was for.
+        #[cfg(feature = "versioning")]
+        let outcome = outcome.and(background_arm(
+            "the toggle-off warning",
+            versioning_warning.await,
+        ));
+
+        pipelines.shutdown(); // IO first, the DB write pipeline last
+        pipelines.drain().await;
+        outcome
+    })
+    .await;
+    // The export is the last teardown step: the planes, the background passes and the pipelines
+    // above are the final span producers, and a stopped provider drops what is still queued.
+    log::shutdown_otel();
     outcome?; // the graceful path: every arm returned cleanly, and this is `Ok(())`
     Ok(ExitCode::SUCCESS)
 }
@@ -676,6 +717,14 @@ fn warn_if_non_loopback(address: SocketAddr) {
     warn(&format!(
         "binding a non-loopback address ({address}); the data plane is reachable from other hosts"
     ));
+}
+
+#[instrument(level = "info", target = "tinio::cli", name = "start.drain", skip_all)]
+async fn drain<F, O>(body: F) -> O
+where
+    F: Future<Output = O>,
+{
+    body.await
 }
 
 /// One serving arm's outcome, as this process's.

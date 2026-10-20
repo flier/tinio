@@ -257,6 +257,7 @@ impl Store {
         self.meta
             .record_if_absent(name, now)
             .await
+            .map(|(created, _)| created)
             .map_err(database::map_contract_error)
             .or_else(|err| not_recorded(now, err))
     }
@@ -273,6 +274,7 @@ impl Store {
         self.meta
             .record_if_absent(name, now)
             .await
+            .map(|(created, _)| created)
             .map_err(database::map_contract_error)
             .or_else(|err| not_recorded(now, err))
     }

@@ -11,7 +11,7 @@
 //! and [`object::Info`], [`ETag`], [`MultipartUpload`] and [`PartInfo`],
 //! [`checksum::Algorithm`] and [`checksum::Type`].
 //! The newtypes carry validation in [`object::key`],
-//! [`bucket::name`], and [`ETag::new`]: untrusted input MUST go
+//! [`bucket::name`], and [`ETag`]'s [`FromStr`](std::str::FromStr): untrusted input MUST go
 //! through the checked constructors before any backend is called.
 
 #[cfg(test)]
@@ -53,7 +53,8 @@ pub use self::{
         BodyStream, BucketOps, BucketsListing, ByteRange, GetObjectResult, ListBucketsParams,
         ListObjectsParams, ListPartsParams, ListUploadsParams, MultipartOps, ObjectListing,
         ObjectOps, PartsListing, PutObjectResult, Storage, TagWriteResult, UnorderedPager,
-        UploadsListing, WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS, collect_body, from_nanos,
+        UploadsListing, WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS, WriteLockSnapshot,
+        collect_body, from_nanos,
         group_and_paginate, group_and_paginate_ordered, group_and_paginate_unordered,
         key_marker_order, now_nanos, paginate_ordered, split_uploads_order, to_nanos,
         uploads_order,

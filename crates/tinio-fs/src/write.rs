@@ -41,6 +41,7 @@ use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
 };
+use tracing::instrument;
 use uuid::Uuid;
 
 // One definer for the bounded-chunk constant (the ranged body stream serves in
@@ -48,7 +49,10 @@ use uuid::Uuid;
 pub(crate) use crate::_util::fsutil::CHUNK_SIZE;
 use crate::{
     _core::{BodyStream, ETag, checksum},
-    Error, fsutil,
+    _util::metrics::WriteOp,
+    Error,
+    error::record_failed_write,
+    fsutil,
     fsutil::DirOwnerUid,
     path::TMP_DIR_NAME,
 };
@@ -152,6 +156,12 @@ impl StagedFile {
     /// Flush and sync the bytes (D1) and answer the temp path, the content
     /// ETag and the byte count. `tee_etag` is the digest a tee promised when
     /// the write was not hashed.
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bytes = self.written)
+    )]
     pub(crate) async fn finish(
         mut self,
         tee_etag: Option<[u8; 16]>,
@@ -264,6 +274,7 @@ impl AtomicWriter {
     /// is the server's tee slot: with the `etag` cell the slot already
     /// holds the content MD5 (a part's ETag IS its content MD5), so the
     /// write is not hashed a second time.
+    #[instrument(target = "tinio::storage", level = "debug", skip_all)]
     pub(crate) async fn stage(
         &self,
         body: BodyStream,
@@ -276,6 +287,7 @@ impl AtomicWriter {
             Ok((etag, size)) => Ok((temp, etag, size)),
             Err(err) => {
                 let _ = fs::remove_file(&temp).await;
+                record_failed_write(WriteOp::Put, &err);
                 Err(err)
             }
         }

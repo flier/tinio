@@ -684,7 +684,7 @@ mod tests {
             acl::Acl,
             bucket,
             content::ContentKey,
-            multipart::{MIN_PART_BYTES, part_number},
+            multipart::{self, MIN_PART_BYTES, part_number},
             object,
             storage::Error::*,
         },
@@ -983,14 +983,21 @@ mod tests {
                 &b,
                 &key,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(vec![b'a'; min]),
                 None,
             )
             .await
             .unwrap();
         let second = storage
-            .upload_part(&b, &key, &upload.upload_id, 2.into(), body(b"b"), None)
+            .upload_part(
+                &b,
+                &key,
+                &upload.upload_id,
+                multipart::part_number(2).expect("a valid part number"),
+                body(b"b"),
+                None,
+            )
             .await
             .unwrap();
         let first_key = ContentKey::Part {
@@ -1174,7 +1181,7 @@ mod tests {
                 &b,
                 &key,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(b"assembled"),
                 None,
             )
@@ -1242,7 +1249,7 @@ mod tests {
                     &b,
                     &key,
                     &upload.upload_id,
-                    1.into(),
+                    multipart::part_number(1).expect("a valid part number"),
                     body(b"assembled"),
                     None,
                 )
@@ -1487,7 +1494,14 @@ mod tests {
         ] {
             uploaded.push(
                 storage
-                    .upload_part(&bucket, &key, &upload.upload_id, n.into(), body(data), None)
+                    .upload_part(
+                        &bucket,
+                        &key,
+                        &upload.upload_id,
+                        multipart::part_number(n).expect("a valid part number"),
+                        body(data),
+                        None,
+                    )
                     .await
                     .unwrap(),
             );
@@ -1535,7 +1549,7 @@ mod tests {
                 &bucket,
                 &key,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(vec![b'b'; min - 1]),
                 None,
             )
@@ -1546,7 +1560,7 @@ mod tests {
                 &bucket,
                 &key,
                 &upload.upload_id,
-                2.into(),
+                multipart::part_number(2).expect("a valid part number"),
                 body(b"x".to_vec()),
                 None,
             )
@@ -1634,7 +1648,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(first.clone()),
                 Some(checksum_tee(checksum::Algorithm::Crc32, "NhCmhg==")),
             )
@@ -1645,7 +1659,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                2.into(),
+                multipart::part_number(2).expect("a valid part number"),
                 body(b"world".to_vec()),
                 Some(checksum_tee(
                     checksum::Algorithm::Md5,
@@ -1717,7 +1731,14 @@ mod tests {
             .await
             .unwrap();
         let p = storage
-            .upload_part(&b, &k, &upload2.upload_id, 3.into(), body(b"tail"), None)
+            .upload_part(
+                &b,
+                &k,
+                &upload2.upload_id,
+                multipart::part_number(3).expect("a valid part number"),
+                body(b"tail"),
+                None,
+            )
             .await
             .unwrap();
         storage
@@ -1786,7 +1807,14 @@ mod tests {
             .await
             .unwrap();
         let part = storage
-            .upload_part(&b, &key, &upload.upload_id, 1.into(), body(b"mp"), None)
+            .upload_part(
+                &b,
+                &key,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"mp"),
+                None,
+            )
             .await
             .unwrap();
         let info = storage
@@ -1878,7 +1906,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(b"bytes".to_vec()),
                 None,
             )

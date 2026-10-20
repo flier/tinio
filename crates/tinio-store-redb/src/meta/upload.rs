@@ -113,7 +113,7 @@ fn join_parts(
 ) -> Result<Vec<PartRow>, Error> {
     let mut rows = Vec::with_capacity(recorded.len());
     for (number, hex) in recorded {
-        let Ok(etag) = ETag::new(&hex) else {
+        let Ok(etag) = hex.parse::<ETag>() else {
             continue;
         };
         rows.push(PartRow {
@@ -380,7 +380,7 @@ impl UploadMeta for RedbMetadata {
                     Some(hex) => {
                         let checksum = checksums.get(&bucket, &upload_id, number)?;
                         let written_at = stamps.get(&bucket, &upload_id, number)?;
-                        ETag::new(&hex).ok().map(|etag| PartRow {
+                        hex.parse::<ETag>().ok().map(|etag| PartRow {
                             number,
                             etag,
                             checksum,
@@ -555,7 +555,7 @@ mod tests {
                 UploadMeta,
                 upload::{PartRow, Row},
             },
-            object, storage,
+            multipart, object, storage,
         },
         Error, RedbMetadata,
         part::Table as PartTable,
@@ -587,11 +587,18 @@ mod tests {
         let bucket = bucket::name("data").unwrap();
         let key = object::key("big.bin").unwrap();
         let other = object::key("other.bin").unwrap();
-        let etag = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        let etag = "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap();
 
         // No upload row at all.
         let err = store
-            .put_part(&bucket, &key, "conf-refuse-1", 1u32.into(), &etag, None)
+            .put_part(
+                &bucket,
+                &key,
+                "conf-refuse-1",
+                multipart::part_number(1u32).expect("a valid part number"),
+                &etag,
+                None,
+            )
             .await
             .expect_err("put_part must refuse an upload with no row");
         assert!(
@@ -622,7 +629,14 @@ mod tests {
             .await
             .unwrap();
         let err = store
-            .put_part(&bucket, &other, "conf-refuse-1", 1u32.into(), &etag, None)
+            .put_part(
+                &bucket,
+                &other,
+                "conf-refuse-1",
+                multipart::part_number(1u32).expect("a valid part number"),
+                &etag,
+                None,
+            )
             .await
             .expect_err("put_part must refuse a key-mismatched upload");
         assert!(
@@ -633,7 +647,11 @@ mod tests {
         // Neither refusal wrote a part row.
         assert!(
             store
-                .list_parts(&bucket, "conf-refuse-1", 1u32.into())
+                .list_parts(
+                    &bucket,
+                    "conf-refuse-1",
+                    multipart::part_number(1u32).expect("a valid part number")
+                )
                 .await
                 .unwrap()
                 .is_empty(),
@@ -665,7 +683,7 @@ mod tests {
         let bucket = bucket::name("data").unwrap();
         let key = object::key("big.bin").unwrap();
         let upload_id = "conf-etag-page-1";
-        let etag = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        let etag = "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap();
         store
             .create(
                 &bucket,
@@ -684,7 +702,14 @@ mod tests {
             .unwrap();
         for number in [1u32, 2, 3] {
             store
-                .put_part(&bucket, &key, upload_id, number.into(), &etag, None)
+                .put_part(
+                    &bucket,
+                    &key,
+                    upload_id,
+                    multipart::part_number(number).expect("a valid part number"),
+                    &etag,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -776,7 +801,7 @@ mod tests {
         let bucket = bucket::name("data").unwrap();
         let key = object::key("big.bin").unwrap();
         let upload_id = "conf-stamp-1";
-        let etag = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        let etag = "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap();
         // Created two seconds before its parts were written, so the creation
         // instant a stamp-less part falls back to is unmistakably not a stamp.
         let initiated_at = SystemTime::now() - Duration::from_secs(2);
@@ -790,17 +815,35 @@ mod tests {
             .unwrap();
 
         store
-            .put_part(&bucket, &key, upload_id, 1u32.into(), &etag, None)
+            .put_part(
+                &bucket,
+                &key,
+                upload_id,
+                multipart::part_number(1u32).expect("a valid part number"),
+                &etag,
+                None,
+            )
             .await
             .unwrap();
         thread::sleep(Duration::from_millis(1_100));
         store
-            .put_part(&bucket, &key, upload_id, 2u32.into(), &etag, None)
+            .put_part(
+                &bucket,
+                &key,
+                upload_id,
+                multipart::part_number(2u32).expect("a valid part number"),
+                &etag,
+                None,
+            )
             .await
             .unwrap();
 
         let rows = store
-            .list_parts(&bucket, upload_id, 1u32.into())
+            .list_parts(
+                &bucket,
+                upload_id,
+                multipart::part_number(1u32).expect("a valid part number"),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -826,7 +869,15 @@ mod tests {
         // The completion-time join reads the same rows and the same stamps:
         // `part_records` answers the instants the listing just served.
         let records = store
-            .part_records(&bucket, &key, upload_id, &[1u32.into(), 2u32.into()])
+            .part_records(
+                &bucket,
+                &key,
+                upload_id,
+                &[
+                    multipart::part_number(1u32).expect("a valid part number"),
+                    multipart::part_number(2u32).expect("a valid part number"),
+                ],
+            )
             .await
             .unwrap()
             .expect("the upload matches the key");
@@ -849,7 +900,7 @@ mod tests {
         let bucket = bucket::name("data").unwrap();
         let key = object::key("big.bin").unwrap();
         let upload_id = "conf-stamp-2";
-        let etag = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        let etag = "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap();
         let initiated_at = SystemTime::now() - Duration::from_secs(2);
         store
             .create(
@@ -861,24 +912,46 @@ mod tests {
             .unwrap();
 
         store
-            .put_part(&bucket, &key, upload_id, 1u32.into(), &etag, None)
+            .put_part(
+                &bucket,
+                &key,
+                upload_id,
+                multipart::part_number(1u32).expect("a valid part number"),
+                &etag,
+                None,
+            )
             .await
             .unwrap();
         let first = served_stamps(
             &store
-                .list_parts(&bucket, upload_id, 1u32.into())
+                .list_parts(
+                    &bucket,
+                    upload_id,
+                    multipart::part_number(1u32).expect("a valid part number"),
+                )
                 .await
                 .unwrap(),
             initiated_at,
         );
         thread::sleep(Duration::from_millis(200));
         store
-            .put_part(&bucket, &key, upload_id, 1u32.into(), &etag, None)
+            .put_part(
+                &bucket,
+                &key,
+                upload_id,
+                multipart::part_number(1u32).expect("a valid part number"),
+                &etag,
+                None,
+            )
             .await
             .unwrap();
 
         let rows = store
-            .list_parts(&bucket, upload_id, 1u32.into())
+            .list_parts(
+                &bucket,
+                upload_id,
+                multipart::part_number(1u32).expect("a valid part number"),
+            )
             .await
             .unwrap();
         assert_eq!(rows.len(), 1, "a re-upload upserts the one part row");
@@ -1019,7 +1092,7 @@ mod tests {
         let key = object::key("big.bin").unwrap();
         let other = object::key("other.bin").unwrap();
         let upload_id = "conf-drain-1";
-        let etag = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+        let etag = "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap();
         let writes = || store.driver().write_lock_stats().count;
 
         // No row at all: the refusal names the upload, projects to
@@ -1047,7 +1120,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_part(&bucket, &key, upload_id, 1u32.into(), &etag, None)
+            .put_part(
+                &bucket,
+                &key,
+                upload_id,
+                multipart::part_number(1u32).expect("a valid part number"),
+                &etag,
+                None,
+            )
             .await
             .unwrap();
         let err = store
@@ -1060,7 +1140,11 @@ mod tests {
         );
         assert_eq!(
             store
-                .list_parts(&bucket, upload_id, 1u32.into())
+                .list_parts(
+                    &bucket,
+                    upload_id,
+                    multipart::part_number(1u32).expect("a valid part number")
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -1085,7 +1169,11 @@ mod tests {
         );
         assert!(
             store
-                .list_parts(&bucket, upload_id, 1u32.into())
+                .list_parts(
+                    &bucket,
+                    upload_id,
+                    multipart::part_number(1u32).expect("a valid part number")
+                )
                 .await
                 .unwrap()
                 .is_empty(),

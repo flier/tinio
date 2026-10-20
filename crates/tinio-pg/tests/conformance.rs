@@ -38,7 +38,7 @@ use tinio_core::{
     acl::{Acl, AclGrants},
     bucket, cors,
     meta::{ObjectMeta, object::Row},
-    object,
+    multipart, object,
     storage::{
         self, BucketOps, ListBucketsParams, ListObjectsParams, ListPartsParams, ListUploadsParams,
         MultipartOps, ObjectOps, VersionOps,
@@ -251,7 +251,7 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
             &bucket,
             &part_key,
             &upload.upload_id,
-            1.into(),
+            multipart::part_number(1).expect("a valid part number"),
             body("part"),
             None,
         )
@@ -463,7 +463,7 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
                 &bucket,
                 &part_key,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body("part"),
                 None,
             )
@@ -482,7 +482,7 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
                 &bucket,
                 &part_key,
                 &upload.upload_id,
-                2.into(),
+                multipart::part_number(2).expect("a valid part number"),
                 None,
             )
             .await

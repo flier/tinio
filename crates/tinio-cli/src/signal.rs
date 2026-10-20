@@ -102,6 +102,12 @@ pub struct Handles {
 /// refused `SetConsoleCtrlHandler` on Windows, or — Windows only — a **second** call in one
 /// process, because a console handler is a plain `fn` Windows hands no context to and the
 /// process has exactly one channel for it to flip.
+#[tracing::instrument(
+    target = "tinio::cli",
+    level = "debug",
+    skip_all,
+    name = "signal.install"
+)]
 pub fn install() -> Result<Handles, Error> {
     let (stopper, shutdown) = watch::channel(false);
 

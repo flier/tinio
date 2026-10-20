@@ -1,19 +1,23 @@
 # The PostgreSQL 18 the store's database-backed tests run against.
+# Run from the repository root:
+#   docker compose -f tools/pg/docker-compose.yml up -d
+#
 # The image postgres:18-alpine is expected in the local image store; the
 # default "missing" pull policy never fetches it again.
 #
-# Host port 55432 matches the dsn in README.md. An older spike container
-# (tinio-pg-meta-spike) may already bind that port; stop it before bringing
-# this one up.
+# Host port 55432 matches the dsn in crates/tinio-store-pg/README.md. An older
+# spike container (tinio-pg-meta-spike) may already bind that port; stop it
+# before bringing this one up.
 #
-# This fixture serves plaintext, which is why README.md's dsn carries
+# This fixture serves plaintext, which is why the README's dsn carries
 # sslmode=disable: the store's policy treats an omitted sslmode as require
 # (PG10), so the omission is an error here rather than a silent downgrade.
 # A TLS server is not needed to exercise the policy; the test that proves the
 # refusal names TLS without downgrading is store.rs::db_tests::a_require_dsn_never_downgrades.
 #
 # The data volume is only initialized on first creation; after changing
-# POSTGRES_INITDB_ARGS, recreate it with `docker compose down -v`.
+# POSTGRES_INITDB_ARGS, recreate it with
+#   docker compose -f tools/pg/docker-compose.yml down -v
 services:
   postgres:
     image: postgres:18-alpine

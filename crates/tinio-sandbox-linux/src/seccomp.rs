@@ -569,7 +569,7 @@ pub enum Seccomp {
 /// let installed = install().unwrap();
 /// # let _ = installed;
 /// ```
-#[instrument(skip_all, ret, fields(arch = field::Empty, instructions = field::Empty))]
+#[instrument(target = "tinio::sandbox", level = "debug", skip_all, fields(arch = field::Empty, instructions = field::Empty))]
 #[expect(
     unsafe_code,
     reason = "the `unsafe extern \"C\"` `prctl` declaration is deliberately local to this body — edition 2024 makes an `extern` block unsafe in its own right — so the attribute must sit on the function"
@@ -587,16 +587,17 @@ pub fn install() -> Result<Seccomp> {
         // `warn!`: the directory boundary still holds, the network guarantee
         // does not, and that is a sentence an operator has to be given rather
         // than left to infer from a filter that was never installed. **The text
-        // has one home** (`SECCOMP_SKIP_WARNING`): the CLI's in-place re-emit
-        // renders the same sentence from the same definition, so the two log
-        // lines an operator greps for cannot drift apart.
-        warn!(step = "seccomp", "{SECCOMP_SKIP_WARNING}");
-        // **The `warn!` above has no subscriber on the arm that needs it most**, which is why
-        // this state is a metric rather than only a line: the process that confines in place
-        // builds its subscriber *after* the confinement (`tinio-cli`'s in-place arm, decision
-        // 26), so this event is discarded where it was emitted. The scraped `1` is the record
-        // that survives — and the caller reading the returned variant is the other half of one
-        // answer, not a second one.
+        // has one home** (`SECCOMP_SKIP_WARNING`), so every line an operator
+        // greps for cannot drift from another.
+        warn!(
+            step = "seccomp",
+            installed = false,
+            "{SECCOMP_SKIP_WARNING}"
+        );
+        // **The line and the metric are two carriers of one answer, not two answers.** The CLI's
+        // fmt-only bootstrap is installed before this call, so the `warn!` reaches stderr on the
+        // in-place arm too; the scraped `1` is what a collector reads long after the run, and the
+        // returned variant is what the caller acts on.
         record_seccomp(Seccomp::SkippedUnsupportedArch);
         return Ok(Seccomp::SkippedUnsupportedArch);
     };
@@ -650,14 +651,14 @@ pub fn install() -> Result<Seccomp> {
 ///
 /// **The skip's `warn!` stays inline, and it is the one event here no test
 /// reads.** It records a state (`Seccomp::SkippedUnsupportedArch`) rather than an
-/// install, it is emitted on the path that returns before a program exists, and
-/// the process that reaches it is the confined child — which installs no
-/// subscriber — so §7's rule that a degradation be named where it is decided is
-/// what that line satisfies, and `Seccomp`'s returned variant is what the caller
-/// acts on.
+/// install, and it is emitted on the path that returns before a program exists —
+/// unreachable from a test on a host whose architecture has a table. §7's rule
+/// that a degradation be named where it is decided is what that line satisfies,
+/// and `Seccomp`'s returned variant is what the caller acts on.
 fn announce_installed(arch: Arch, instructions: usize) {
     info!(
         step = "seccomp",
+        installed = true,
         arch = ?arch,
         instructions,
         "the seccomp filter is installed"
@@ -1065,6 +1066,7 @@ mod tests {
         // and `announce_installed`'s doc says why.
         let (_, logged) = record_events(|| announce_installed(Arch::X86_64, 29));
         assert_step(&logged, "seccomp");
+        assert!(logged.contains("installed=true"), "{logged}");
         assert!(logged.contains("arch=X86_64"), "{logged}");
         assert!(logged.contains("instructions=29"), "{logged}");
     }

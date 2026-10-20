@@ -4,13 +4,19 @@ use std::{
 };
 
 use futures::stream;
-use tokio::sync::watch;
+use tinio_util::testing::{metrics::test_lock, spans};
+use tokio::{runtime, sync::watch, time::sleep};
+use tracing::{Level, subscriber::with_default};
+use tracing_subscriber::prelude::*;
 
 use super::*;
 use crate::{
-    _core::{BucketOps, ObjectOps, acl::Acl, object, storage::VersionOps, version::State},
+    _core::{
+        BucketOps, MultipartOps, ObjectOps, acl::Acl, object, storage::VersionOps, version::State,
+    },
     _mem::MemoryStorage,
     clock::FixedClock,
+    metrics::action_count,
 };
 
 /// A versioned bucket holding one key.
@@ -76,6 +82,8 @@ async fn a_marked_key_is_not_due() {
 /// which is exactly why the seam exists.
 #[test]
 fn a_key_that_vanished_is_counted_not_failed() {
+    let _guard = test_lock::window();
+    let before = action_count(Kind::Object, "error");
     let mut summary = Summary::default();
     for gone in [
         storage::Error::NoSuchKey(object::key("a.txt").unwrap()),
@@ -84,7 +92,7 @@ fn a_key_that_vanished_is_counted_not_failed() {
         storage::Error::NoSuchBucket(bucket::name("data").unwrap()),
     ] {
         assert!(
-            counted(Err::<(), _>(gone), &mut summary),
+            counted(Err::<(), _>(gone), &mut summary, Kind::Object),
             "an item already gone is the outcome the action wanted"
         );
     }
@@ -92,10 +100,15 @@ fn a_key_that_vanished_is_counted_not_failed() {
 
     let broken: storage::Error = storage::Error::Io(io::Error::other("boom"));
     assert!(
-        !counted(Err::<(), _>(broken), &mut summary),
+        !counted(Err::<(), _>(broken), &mut summary, Kind::Object),
         "a real failure is not the action's outcome"
     );
     assert_eq!(summary.errors, 1);
+    assert_eq!(
+        action_count(Kind::Object, "error") - before,
+        1.0,
+        "a failed action records one outcome=\"error\" sample"
+    );
 }
 
 /// The read seam's one classification (R41): a bucket that vanished
@@ -103,6 +116,8 @@ fn a_key_that_vanished_is_counted_not_failed() {
 /// failure does.
 #[test]
 fn a_vanished_bucket_is_gone_not_broken() {
+    let _guard = test_lock::window();
+    let before = action_count(Kind::Object, "error");
     let bucket = bucket::name("data").unwrap();
     let mut summary = Summary::default();
     read_failed(
@@ -110,6 +125,7 @@ fn a_vanished_bucket_is_gone_not_broken() {
         &bucket,
         &mut summary,
         "list a bucket's objects",
+        Kind::Object,
     );
     assert_eq!(summary.errors, 0);
     read_failed(
@@ -117,8 +133,14 @@ fn a_vanished_bucket_is_gone_not_broken() {
         &bucket,
         &mut summary,
         "list a bucket's objects",
+        Kind::Object,
     );
     assert_eq!(summary.errors, 1);
+    assert_eq!(
+        action_count(Kind::Object, "error") - before,
+        1.0,
+        "a failed action records one outcome=\"error\" sample"
+    );
 }
 
 /// A stop covers the chain the walk ends on as well as the entry the
@@ -231,5 +253,259 @@ fn a_day_count_rounds_forward_to_midnight() {
     assert!(
         !due_on_midnight(due, 1, noon),
         "a clock that stepped back expires nothing"
+    );
+}
+
+/// An enabled rule on every object.
+fn rule() -> lifecycle::Rule {
+    lifecycle::Rule {
+        id: None,
+        status: lifecycle::Status::Enabled,
+        filter: lifecycle::Filter::default(),
+        expiration: None,
+        noncurrent_version_expiration: None,
+        abort_incomplete_multipart_upload: None,
+    }
+}
+
+/// Expire the current version `days` after it was created.
+fn expires(days: i32) -> lifecycle::Rule {
+    lifecycle::Rule {
+        expiration: Some(lifecycle::Expiration {
+            days: Some(days),
+            date: None,
+            expired_object_delete_marker: None,
+        }),
+        ..rule()
+    }
+}
+
+/// Expire a noncurrent version `days` after it became noncurrent.
+fn noncurrent(days: i32) -> lifecycle::Rule {
+    lifecycle::Rule {
+        noncurrent_version_expiration: Some(lifecycle::NoncurrentVersionExpiration {
+            noncurrent_days: Some(days),
+            newer_noncurrent_versions: None,
+        }),
+        ..rule()
+    }
+}
+
+/// Abort an incomplete upload `days` after it was initiated.
+fn aborts(days: i32) -> lifecycle::Rule {
+    lifecycle::Rule {
+        abort_incomplete_multipart_upload: Some(lifecycle::AbortIncompleteMultipartUpload {
+            days_after_initiation: days,
+        }),
+        ..rule()
+    }
+}
+
+/// The pass is the T0 unit: one `info` span, one `debug` child per action,
+/// the chain walk under its version action, and the summary event inside it.
+#[test]
+fn a_pass_spans_its_cycle_and_its_actions() {
+    let runtime = runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let runner = runtime.block_on(async {
+        let storage = Arc::new(MemoryStorage::new().unwrap());
+        let data = bucket::name("data").unwrap();
+        let archive = bucket::name("archive").unwrap();
+        for name in [&data, &archive] {
+            storage
+                .create_bucket(name, None, &Acl::default_private(None))
+                .await
+                .unwrap();
+        }
+        storage
+            .set_bucket_versioning(&archive, State::Enabled)
+            .await
+            .unwrap();
+        storage
+            .put_object(
+                &data,
+                &object::key("a.txt").unwrap(),
+                Box::pin(stream::empty()),
+            )
+            .await
+            .unwrap();
+        let logs = object::key("logs/b.txt").unwrap();
+        for _ in 0..2 {
+            storage
+                .put_object(&archive, &logs, Box::pin(stream::empty()))
+                .await
+                .unwrap();
+        }
+        storage
+            .create_multipart_upload(
+                &archive,
+                &object::key("big.bin").unwrap(),
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        let (_stop, stopped) = watch::channel(false);
+        let runner = Runner::new(
+            Arc::clone(&storage),
+            Options {
+                delay: Duration::ZERO,
+                ..Options::default()
+            },
+            Arc::new(FixedClock(
+                SystemTime::now() + Duration::from_secs(100 * 86_400),
+            )),
+            stopped,
+        );
+        // The seed merges by rule id: two id-less rules would replace each
+        // other, so the archive's two actions need their own ids.
+        let mut versioned = noncurrent(1);
+        versioned.id = Some("noncurrent".into());
+        let mut uploads = aborts(1);
+        uploads.id = Some("abort".into());
+        runner
+            .seed(&[
+                Seed {
+                    bucket: data,
+                    rule: expires(1),
+                },
+                Seed {
+                    bucket: archive.clone(),
+                    rule: versioned,
+                },
+                Seed {
+                    bucket: archive,
+                    rule: uploads,
+                },
+            ])
+            .await;
+        runner
+    });
+
+    let capture = spans::Capture::new();
+    with_default(tracing_subscriber::registry().with(capture.clone()), || {
+        runtime.block_on(async {
+            let summary = runner.pass().await;
+            assert_eq!(summary.buckets_with_rules, 2, "both buckets were swept");
+        });
+    });
+
+    let recorded = capture.spans_on_this_thread();
+    let spans = &recorded;
+    let pass = spans
+        .iter()
+        .find(|span| span.name == "tinio.lifecycle.pass")
+        .expect("the pass opens its info span");
+    assert_eq!(pass.target, "tinio::lifecycle");
+    assert_eq!(pass.level, Level::INFO);
+    assert!(
+        pass.parent.is_none(),
+        "the pass is the root of its own tree"
+    );
+    let field = |name: &str| {
+        pass.fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    // The whole summary rides on the span — every field the close line prints.
+    for name in [
+        "buckets_with_rules",
+        "expired_objects",
+        "expired_versions",
+        "aborted_uploads",
+        "errors",
+    ] {
+        assert!(
+            field(name).is_some(),
+            "the summary's {name} is recorded: {:?}",
+            pass.fields
+        );
+    }
+    assert_eq!(
+        field("buckets_with_rules"),
+        Some("2"),
+        "the summary rides on the span, so the close line prints it: {:?}",
+        pass.fields
+    );
+    assert_eq!(
+        field("errors"),
+        Some("0"),
+        "no action failed in this pass: {:?}",
+        pass.fields
+    );
+
+    for action in ["expire_objects", "expire_versions", "abort_uploads"] {
+        let span = spans
+            .iter()
+            .find(|span| span.name == action)
+            .unwrap_or_else(|| panic!("the pass opened {action}: {spans:?}"));
+        assert_eq!(span.target, "tinio::lifecycle");
+        assert_eq!(span.level, Level::DEBUG);
+        assert_eq!(span.parent, Some(pass.id), "{action} is a pass child");
+    }
+    let versions = spans
+        .iter()
+        .find(|span| span.name == "expire_versions")
+        .expect("the version action ran");
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.name == "expire_chain" && span.parent == Some(versions.id)),
+        "the chain walk is a child of the version action: {spans:?}"
+    );
+}
+
+/// The run loop's body is the unit, so each cycle opens its own `info` span
+/// above that cycle's pass.
+#[test]
+fn a_run_cycle_owns_a_span_above_its_pass() {
+    let runtime = runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let capture = spans::Capture::new();
+    let (stop, stopped) = watch::channel(false);
+    let runner = Runner::new(
+        Arc::new(MemoryStorage::new().unwrap()),
+        Options {
+            delay: Duration::ZERO,
+            cycle: Duration::from_millis(10),
+        },
+        Arc::new(FixedClock(SystemTime::now())),
+        stopped,
+    );
+    with_default(tracing_subscriber::registry().with(capture.clone()), || {
+        runtime.block_on(async move {
+            let run = tokio::spawn(async move { runner.run().await });
+            sleep(Duration::from_millis(50)).await;
+            stop.send(true).unwrap();
+            run.await.unwrap();
+        });
+    });
+
+    let recorded = capture.spans_on_this_thread();
+    let spans = &recorded;
+    let runs: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "tinio.lifecycle.run")
+        .collect();
+    assert!(!runs.is_empty(), "the loop opens one span per cycle");
+    assert!(
+        runs.iter()
+            .all(|span| span.target == "tinio::lifecycle" && span.level == Level::INFO),
+        "the cycle span is the lifecycle layer's info span: {runs:?}"
+    );
+    let pass = spans
+        .iter()
+        .find(|span| span.name == "tinio.lifecycle.pass")
+        .expect("a cycle ran its pass");
+    assert!(
+        runs.iter().any(|run| pass.parent == Some(run.id)),
+        "the pass is a child of the cycle that drove it: {spans:?}"
     );
 }

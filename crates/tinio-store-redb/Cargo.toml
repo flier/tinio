@@ -20,6 +20,7 @@ tinio-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 tinio-util = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = [
     "macros",

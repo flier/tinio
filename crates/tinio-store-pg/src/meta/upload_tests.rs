@@ -133,7 +133,7 @@ async fn upload_rows_round_trip_and_the_key_check_binds() {
             &target,
             upload_id,
             part(number),
-            &ETag::new(ETAG_A).unwrap(),
+            &ETAG_A.parse::<ETag>().unwrap(),
             None,
         )
         .await
@@ -146,7 +146,7 @@ async fn upload_rows_round_trip_and_the_key_check_binds() {
             &absent,
             upload_id,
             part(4),
-            &ETag::new(ETAG_A).unwrap(),
+            &ETAG_A.parse::<ETag>().unwrap(),
             None,
         )
         .await,
@@ -250,7 +250,7 @@ async fn every_algorithm_round_trips_through_a_fresh_database() {
             &target,
             &upload_id,
             part(1),
-            &ETag::new(ETAG_A).unwrap(),
+            &ETAG_A.parse::<ETag>().unwrap(),
             Some(&tee),
         )
         .await
@@ -290,7 +290,7 @@ async fn list_parts_page_is_bounded_and_reports_its_raw_last() {
             &target,
             upload_id,
             part(number),
-            &ETag::new(ETAG_A).unwrap(),
+            &ETAG_A.parse::<ETag>().unwrap(),
             None,
         )
         .await
@@ -340,7 +340,7 @@ async fn drain_upload_checked_refuses_a_mismatched_key_and_drains_the_match() {
         &target,
         upload_id,
         part(1),
-        &ETag::new(ETAG_A).unwrap(),
+        &ETAG_A.parse::<ETag>().unwrap(),
         None,
     )
     .await
@@ -401,7 +401,7 @@ async fn create_guarded_refuses_an_absent_bucket_and_drain_bucket_clears_parts()
         &target,
         upload_id,
         part(1),
-        &ETag::new(ETAG_A).unwrap(),
+        &ETAG_A.parse::<ETag>().unwrap(),
         None,
     )
     .await
@@ -673,7 +673,7 @@ async fn a_corrupt_checksum_label_heals_every_read() {
         &target,
         upload_id,
         part(1),
-        &ETag::new(ETAG_A).unwrap(),
+        &ETAG_A.parse::<ETag>().unwrap(),
         Some(&tee),
     )
     .await
@@ -759,7 +759,7 @@ async fn a_stored_part_number_outside_the_contract_reads_as_absent() {
         &target,
         upload_id,
         part(1),
-        &ETag::new(ETAG_A).unwrap(),
+        &ETAG_A.parse::<ETag>().unwrap(),
         None,
     )
     .await
@@ -810,7 +810,7 @@ async fn a_part_write_stamps_the_parts_own_modification_time() {
         &target,
         upload_id,
         part(1),
-        &ETag::new(ETAG_A).unwrap(),
+        &ETAG_A.parse::<ETag>().unwrap(),
         None,
     )
     .await
@@ -830,7 +830,7 @@ async fn a_part_write_stamps_the_parts_own_modification_time() {
         &target,
         upload_id,
         part(1),
-        &ETag::new(ETAG_B).unwrap(),
+        &ETAG_B.parse::<ETag>().unwrap(),
         None,
     )
     .await
@@ -870,7 +870,7 @@ async fn two_parts_of_one_upload_report_their_own_write_stamps() {
         &target,
         upload_id,
         part(1),
-        &ETag::new(ETAG_A).unwrap(),
+        &ETAG_A.parse::<ETag>().unwrap(),
         None,
     )
     .await
@@ -882,7 +882,7 @@ async fn two_parts_of_one_upload_report_their_own_write_stamps() {
         &target,
         upload_id,
         part(2),
-        &ETag::new(ETAG_B).unwrap(),
+        &ETAG_B.parse::<ETag>().unwrap(),
         None,
     )
     .await

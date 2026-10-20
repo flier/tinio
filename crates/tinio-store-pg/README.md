@@ -24,15 +24,15 @@
 | `src/teardown.rs` | the bucket teardown and the per-upload part lock |
 | `src/error.rs` | the crate error and every redaction rule (PG5) |
 | `src/tests/db.rs` | the `testing` harness: one scratch database per leg, the dsn read, and the skip/required switch |
-| `docker-compose.yml` | the pinned PostgreSQL 18 the DB-backed tests run against |
+| `../../tools/pg/docker-compose.yml` | the pinned PostgreSQL 18 the DB-backed tests run against (repository root) |
 
 ## Bring up PostgreSQL 18
 
 ```console
-docker compose -f crates/tinio-store-pg/docker-compose.yml up -d
+docker compose -f tools/pg/docker-compose.yml up -d
 ```
 
-The compose file pins host port **55432**, the named volume, and a `pg_isready` healthcheck. An older spike container (`tinio-pg-meta-spike`) may still hold port 55432; stop it before bringing this one up.
+Run it from the repository root. The compose file pins host port **55432**, the named volume, and a `pg_isready` healthcheck. An older spike container (`tinio-pg-meta-spike`) may still hold port 55432; stop it before bringing this one up.
 
 ### Verify
 
@@ -45,7 +45,7 @@ The expected `server_encoding` is `UTF8`: the store refuses to start otherwise, 
 
 ## The dsn
 
-The crate compiles in **no** dsn: the DB-backed tests read `TINIO_PG_DSN`, and the value lives only in `docker-compose.yml` and here, so the credential scan (PG25) never meets a literal in the source. A connection error renders the dsn redacted — never the password (PG5).
+The crate compiles in **no** dsn: the DB-backed tests read `TINIO_PG_DSN`, and the value lives only in `tools/pg/docker-compose.yml` and here, so the credential scan (PG25) never meets a literal in the source. A connection error renders the dsn redacted — never the password (PG5).
 
 TLS follows PG10: a dsn with **no** `sslmode` is treated as `require` (rustls over the system trust store, chain and hostname verified), and plaintext is reached only through an explicit `sslmode=disable`. **Every other spelling — `prefer`, `allow`, `verify-ca`, `verify-full`, an unknown value, or the key written in a case the driver's own parse ignores — is refused at connect** with a message naming the two modes that are served: sqlx maps its `Prefer` onto a connection that accepts any certificate, so the mode could never mean what it said. `PGSSLMODE` can no longer weaken a dsn's mode, and the session is named by the dsn or by this crate, never by `PGAPPNAME`. The compose database above serves no TLS, so name it explicitly:
 

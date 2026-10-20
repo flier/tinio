@@ -360,6 +360,7 @@ impl<S: Storage> S3Backend<S> {
         // Cloned: the checksum-spec parse below borrows the whole input.
         let bucket = self.bucket(req.input.bucket.clone())?;
         let key = self.key(req.input.key.clone())?;
+        Self::record_operation_identity(&bucket, Some(&key));
         let upload_id = req.input.upload_id.clone();
         let part_number = part_number(req.input.part_number)?;
         // The checksum tee (spec 2026-08-31): parse the request spec and
@@ -594,6 +595,7 @@ impl<S: Storage> S3Backend<S> {
         // Cloned: the checksum validation below borrows the whole input.
         let bucket = self.bucket(req.input.bucket.clone())?;
         let key = self.key(req.input.key.clone())?;
+        Self::record_operation_identity(&bucket, Some(&key));
         let upload_id = req.input.upload_id.clone();
         // The request-shape rejections go up front (before the parts
         // parse and the lock — a rejected request must not pay for
@@ -627,7 +629,9 @@ impl<S: Storage> S3Backend<S> {
             let etag = etag
                 .into_strong()
                 .ok_or_else(|| s3_error!(InvalidPart, "weak part ETag"))?;
-            let etag = ETag::new(&etag).map_err(|_| s3_error!(InvalidPart, "invalid part ETag"))?;
+            let etag = etag
+                .parse::<ETag>()
+                .map_err(|_| s3_error!(InvalidPart, "invalid part ETag"))?;
             // The client's checksum entry of this part: exactly one of
             // the six value fields (a second → `InvalidRequest`,
             // mirroring UploadPart — F6). Gated: with the toggle off the
@@ -1153,7 +1157,7 @@ mod tests {
     use crate::{
         _core::{
             acl, bucket,
-            multipart::MIN_PART_BYTES,
+            multipart::{self, MIN_PART_BYTES},
             object,
             storage::{BucketOps, MultipartOps, ObjectOps},
         },
@@ -1826,7 +1830,7 @@ mod tests {
                 &bucket::name(&b).unwrap(),
                 &object::key("big.bin").unwrap(),
                 &upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(b"data"),
                 None,
             )

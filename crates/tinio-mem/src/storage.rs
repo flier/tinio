@@ -31,6 +31,7 @@ use std::{collections::HashMap, sync::Mutex};
 
 use async_trait::async_trait;
 use redb::ReadableTable;
+use tinio_util::metrics::{Backend, record_read_only};
 
 #[cfg(test)]
 use crate::_core::bucket::name;
@@ -182,13 +183,17 @@ impl MemoryStorage {
             crate::version::blobs::Table::ensure(txn)?;
             Ok(())
         })?;
-        Ok(Self {
+        let storage = Self {
             #[cfg(feature = "testing")]
             object_listings: Mutex::new(HashMap::new()),
             db: handle,
             metadata,
             content: Arc::new(content),
-        })
+        };
+        // mem has no read-only mode, so the flag is always 0; it is recorded
+        // anyway so a mem build exposes its own `backend` label.
+        record_read_only(Backend::Mem, false);
+        Ok(storage)
     }
 
     /// The bucket-group receiver over this backend's handles.
@@ -614,7 +619,7 @@ mod tests {
                 &bucket,
                 &key,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(vec![b'a'; min]),
                 None,
             )
@@ -625,7 +630,7 @@ mod tests {
                 &bucket,
                 &key,
                 &upload.upload_id,
-                2.into(),
+                multipart::part_number(2).expect("a valid part number"),
                 body(b"def".to_vec()),
                 None,
             )

@@ -7,12 +7,14 @@
 
 use std::sync::Arc;
 
+use parse_display::Display;
 use s3s::{
     S3Error, S3Result,
     access::{S3Access, S3AccessContext},
     path::S3Path,
     s3_error,
 };
+use tracing::{Span, field, instrument};
 
 use crate::{
     _core::{
@@ -26,7 +28,7 @@ use crate::{
     error::{AccessDecision, classify},
     identity::Identity,
     matrix::{OpRule, Requirement, rule_for},
-    source,
+    metrics, source,
 };
 
 /// The s3s `S3Access` authorization pipeline over a [`Storage`] backend
@@ -67,6 +69,50 @@ struct Request<'a> {
     rename_source: Option<&'a str>,
 }
 
+/// The bounded reason a decision span records — an enum, not a free string, so
+/// a new reason is a code change and never a new metric series.
+#[derive(Clone, Copy, Display)]
+#[display(style = "kebab-case")]
+enum Reason {
+    Owner,
+    Grant,
+    Authenticated,
+    Missing,
+    UploadCreator,
+    OwnerMismatch,
+    MalformedHeader,
+    MalformedSource,
+    NoResource,
+    NoGrant,
+    StorageError,
+}
+
+impl Reason {
+    fn record(self) {
+        // `Display` renders the kebab-case label, so the span field and the
+        // decision vocabulary cannot drift from the enum. `display` defers the
+        // formatting to the subscriber, so a disabled span allocates nothing.
+        Span::current().record("reason", field::display(self));
+    }
+}
+
+/// Allow with a reason on the active decision span.
+fn allow(reason: Reason) -> S3Result<()> {
+    reason.record();
+    Ok(())
+}
+
+/// Deny with a reason on the active decision span.
+fn deny(reason: Reason) -> S3Result<()> {
+    Err(deny_with(reason))
+}
+
+/// The error form of [`deny`], for the `?` and `map_err` sites.
+fn deny_with(reason: Reason) -> S3Error {
+    reason.record();
+    denied()
+}
+
 #[async_trait::async_trait]
 impl<S: Storage> S3Access for AclAccess<S> {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
@@ -77,6 +123,8 @@ impl<S: Storage> S3Access for AclAccess<S> {
         // still reads the same refusal it verifies with, never a panic.
         let principal = self.identity.principal(cx.credentials())?;
         let headers = cx.headers();
+        // The decision span lives on `evaluate`: this async_trait trampoline
+        // must not open a second span for the same decision.
         self.evaluate(&Request {
             principal,
             authenticated: cx.credentials().is_some(),
@@ -87,7 +135,11 @@ impl<S: Storage> S3Access for AclAccess<S> {
             // header fails closed (403) — never a silent skip; the source
             // headers fail closed the same way (None → deny downstream).
             expected_bucket_owner: match headers.get("x-amz-expected-bucket-owner") {
-                Some(value) => Some(value.to_str().map_err(|_| denied())?),
+                Some(value) => Some(
+                    value
+                        .to_str()
+                        .map_err(|_| deny_with(Reason::MalformedHeader))?,
+                ),
                 None => None,
             },
             copy_source: headers
@@ -102,29 +154,45 @@ impl<S: Storage> S3Access for AclAccess<S> {
 }
 
 impl<S: Storage> AclAccess<S> {
+    /// The authorization decision: one `info` span and one family sample around
+    /// the gate pipeline.
+    #[instrument(
+        level = "info",
+        target = "tinio::auth",
+        skip_all,
+        fields(op = request.op, decision = field::Empty, reason = field::Empty)
+    )]
+    async fn evaluate(&self, request: &Request<'_>) -> S3Result<()> {
+        let result = self.authorize(request).await;
+        let decision = if result.is_ok() { "allowed" } else { "denied" };
+        Span::current().record("decision", decision);
+        metrics::record_authorization(result.is_ok());
+        result
+    }
+
     /// The authorization pipeline (spec §4 order): the
     /// expected-bucket-owner header, the DeleteObjects coarse gate
     /// BEFORE `rule_for` (review B2), the operation mapping, the
     /// resource gates (owner bypass → grants), the B1 existence head,
     /// and the fail-closed / three-tier storage-error posture (B3).
-    async fn evaluate(&self, request: &Request<'_>) -> S3Result<()> {
+    async fn authorize(&self, request: &Request<'_>) -> S3Result<()> {
         // (2) expected_bucket_owner: a mismatch on an existing bucket →
         // 403; a missing bucket skips (the handler answers NoSuchBucket).
         if let Some(expected) = request.expected_bucket_owner
             && let Some(bucket_name) = request.path.get_bucket_name()
         {
-            let name = bucket::name(bucket_name).map_err(|_| denied())?;
+            let name = bucket::name(bucket_name).map_err(|_| deny_with(Reason::NoResource))?;
             let bucket_acl = match self.storage.get_bucket_acl(&name).await {
                 Ok(acl) => Some(acl),
                 Err(err) => match err.into() {
                     storage::Error::NoSuchBucket(_) => None,
-                    _ => return Err(denied()),
+                    _ => return deny(Reason::StorageError),
                 },
             };
             if let Some(acl) = bucket_acl
                 && self.resolved_owner(&acl).as_str() != expected
             {
-                return Err(denied());
+                return deny(Reason::OwnerMismatch);
             }
         }
         // (3) DeleteObjects: the coarse gate special-cases BEFORE
@@ -148,24 +216,24 @@ impl<S: Storage> AclAccess<S> {
     /// checks are the handler's (Task 12).
     async fn delete_objects_gate(&self, request: &Request<'_>) -> S3Result<()> {
         let Some(bucket_name) = request.path.get_bucket_name() else {
-            return Err(denied());
+            return deny(Reason::NoResource);
         };
-        let name = bucket::name(bucket_name).map_err(|_| denied())?;
+        let name = bucket::name(bucket_name).map_err(|_| deny_with(Reason::NoResource))?;
         let bucket_acl = match self.storage.get_bucket_acl(&name).await {
             Ok(acl) => acl,
             Err(err) => return self.missing_tiers(&name, &err.into(), request).await,
         };
         if self.is_owner(&bucket_acl, &request.principal) {
-            return Ok(());
+            return allow(Reason::Owner);
         }
         if bucket_acl
             .grants
             .iter()
             .any(|g| grantee_matches(&g.grantee, &request.principal, request.authenticated))
         {
-            return Ok(());
+            return allow(Reason::Grant);
         }
-        Err(denied())
+        deny(Reason::NoGrant)
     }
 
     /// Upload-scoped ops (UploadPart, UploadPartCopy, Complete, Abort,
@@ -194,7 +262,9 @@ impl<S: Storage> AclAccess<S> {
             .owner
             .as_ref()
             .unwrap_or(&self.identity.default_owner);
-        if creator != &request.principal {
+        if creator == &request.principal {
+            Reason::UploadCreator.record();
+        } else {
             let bucket_acl = match self.storage.get_bucket_acl(&bucket_name).await {
                 Ok(acl) => acl,
                 Err(err) => return self.missing_tiers(&bucket_name, &err.into(), request).await,
@@ -205,14 +275,15 @@ impl<S: Storage> AclAccess<S> {
                 &self.identity.default_owner,
                 upload.owner.as_ref(),
             ) {
-                return Err(denied());
+                return deny(Reason::NoGrant);
             }
+            Reason::Owner.record();
         }
         if rule.reads_source {
             // UploadPartCopy: copy parity on the source (source READ).
             let (src_bucket, src_key) = match request.copy_source.and_then(source::copy_source) {
                 Some(pair) => pair,
-                None => return Err(denied()),
+                None => return deny(Reason::MalformedSource),
             };
             self.object_gate(&src_bucket, &src_key, Requirement::ObjectRead, request)
                 .await?;
@@ -243,7 +314,7 @@ impl<S: Storage> AclAccess<S> {
             Some(pair) => pair,
             // A missing/malformed source header fails closed — the check
             // runs before s3s deserializes the input.
-            None => return Err(denied()),
+            None => return deny(Reason::MalformedSource),
         };
         match rule.base {
             // CopyObject: source object READ (owner bypass + source ACL).
@@ -257,7 +328,7 @@ impl<S: Storage> AclAccess<S> {
                 self.object_or_bucket_owner(&src_bucket, &src_key, request)
                     .await?;
             }
-            _ => return Err(denied()), // unreachable per the matrix — fail closed
+            _ => return deny(Reason::NoGrant), // unreachable per the matrix — fail closed
         }
         if rule.writes_destination_bucket {
             self.bucket_gate(&dst_bucket, Requirement::BucketWrite, request)
@@ -280,22 +351,23 @@ impl<S: Storage> AclAccess<S> {
                 // ListBuckets: any signed principal.
                 Requirement::Authenticated => {
                     if request.authenticated {
-                        Ok(())
+                        allow(Reason::Authenticated)
                     } else {
-                        Err(denied())
+                        deny(Reason::NoGrant)
                     }
                 }
-                _ => Err(denied()), // no resource owner — fail closed
+                _ => deny(Reason::NoGrant), // no resource owner — fail closed
             },
             S3Path::Bucket { bucket } => {
-                let name = bucket::name(bucket.as_ref()).map_err(|_| denied())?;
+                let name =
+                    bucket::name(bucket.as_ref()).map_err(|_| deny_with(Reason::NoResource))?;
                 match rule.base {
                     // CreateBucket: an authenticated principal only.
                     Requirement::Authenticated => {
                         if request.authenticated {
-                            Ok(())
+                            allow(Reason::Authenticated)
                         } else {
-                            Err(denied())
+                            deny(Reason::NoGrant)
                         }
                     }
                     // Policy-only bucket ops and resolved-but-unmapped
@@ -314,12 +386,13 @@ impl<S: Storage> AclAccess<S> {
                         // recorded deviation per the B1 amendment.
                         self.bucket_gate(&name, rule.base, request).await
                     }
-                    _ => Err(denied()),
+                    _ => deny(Reason::NoGrant),
                 }
             }
             S3Path::Object { bucket, key } => {
-                let name = bucket::name(bucket.as_ref()).map_err(|_| denied())?;
-                let key = object::key(key.as_ref()).map_err(|_| denied())?;
+                let name =
+                    bucket::name(bucket.as_ref()).map_err(|_| deny_with(Reason::NoResource))?;
+                let key = object::key(key.as_ref()).map_err(|_| deny_with(Reason::NoResource))?;
                 match rule.base {
                     Requirement::ObjectRead
                     | Requirement::ObjectReadAcp
@@ -347,7 +420,7 @@ impl<S: Storage> AclAccess<S> {
                     // Resolved-but-unmapped object ops: the object owner
                     // only (default B).
                     Requirement::OwnerOnly => self.object_owner_only(&name, &key, request).await,
-                    _ => Err(denied()),
+                    _ => deny(Reason::NoGrant),
                 }
             }
         }
@@ -410,7 +483,7 @@ impl<S: Storage> AclAccess<S> {
         request: &Request<'_>,
     ) -> S3Result<()> {
         if self.is_owner(dst_acl, &request.principal) {
-            return Ok(());
+            return allow(Reason::Owner);
         }
         let bucket_acl = match self.storage.get_bucket_acl(bucket_name).await {
             Ok(acl) => acl,
@@ -422,9 +495,9 @@ impl<S: Storage> AclAccess<S> {
             &self.identity.default_owner,
             dst_acl.owner.as_ref(),
         ) {
-            Ok(())
+            allow(Reason::Owner)
         } else {
-            Err(denied())
+            deny(Reason::NoGrant)
         }
     }
 
@@ -441,12 +514,12 @@ impl<S: Storage> AclAccess<S> {
             Err(err) => return self.missing_tiers(bucket_name, &err.into(), request).await,
         };
         if self.is_owner(&bucket_acl, &request.principal) {
-            return Ok(());
+            return allow(Reason::Owner);
         }
         if grant_satisfies(&bucket_acl, requirement, request) {
-            return Ok(());
+            return allow(Reason::Grant);
         }
-        Err(denied())
+        deny(Reason::NoGrant)
     }
 
     /// An object-resource gate: owner bypass, then grant evaluation over
@@ -463,12 +536,12 @@ impl<S: Storage> AclAccess<S> {
             Err(err) => return self.missing_tiers(bucket_name, &err.into(), request).await,
         };
         if self.is_owner(&object_acl, &request.principal) {
-            return Ok(());
+            return allow(Reason::Owner);
         }
         if grant_satisfies(&object_acl, requirement, request) {
-            return Ok(());
+            return allow(Reason::Grant);
         }
-        Err(denied())
+        deny(Reason::NoGrant)
     }
 
     /// Object-owner-or-bucket-owner parity (delete/overwrite parity, the
@@ -495,9 +568,9 @@ impl<S: Storage> AclAccess<S> {
             &self.identity.default_owner,
             object_acl.owner.as_ref(),
         ) {
-            Ok(())
+            allow(Reason::Owner)
         } else {
-            Err(denied())
+            deny(Reason::NoGrant)
         }
     }
 
@@ -513,9 +586,9 @@ impl<S: Storage> AclAccess<S> {
             Err(err) => return self.missing_tiers(bucket_name, &err.into(), request).await,
         };
         if self.is_owner(&bucket_acl, &request.principal) {
-            Ok(())
+            allow(Reason::Owner)
         } else {
-            Err(denied())
+            deny(Reason::NoGrant)
         }
     }
 
@@ -531,9 +604,9 @@ impl<S: Storage> AclAccess<S> {
             Err(err) => return self.missing_tiers(bucket_name, &err.into(), request).await,
         };
         if self.is_owner(&object_acl, &request.principal) {
-            Ok(())
+            allow(Reason::Owner)
         } else {
-            Err(denied())
+            deny(Reason::NoGrant)
         }
     }
 
@@ -551,7 +624,7 @@ impl<S: Storage> AclAccess<S> {
         request: &Request<'_>,
     ) -> S3Result<()> {
         if !matches!(classify(err), AccessDecision::PassThroughMissing) {
-            return Err(denied());
+            return deny(Reason::StorageError);
         }
         let bucket_acl = match self.storage.get_bucket_acl(bucket_name).await {
             Ok(acl) => acl,
@@ -561,17 +634,17 @@ impl<S: Storage> AclAccess<S> {
             // the B3 never-reveal tiers closed). Any other storage
             // failure still fails closed.
             Err(probe) => match probe.into() {
-                storage::Error::NoSuchBucket(_) => return Ok(()),
-                _ => return Err(denied()),
+                storage::Error::NoSuchBucket(_) => return allow(Reason::Missing),
+                _ => return deny(Reason::StorageError),
             },
         };
         if self.is_owner(&bucket_acl, &request.principal) {
-            return Ok(());
+            return allow(Reason::Owner);
         }
         if grant_satisfies(&bucket_acl, Requirement::BucketRead, request) {
-            return Ok(());
+            return allow(Reason::Grant);
         }
-        Err(denied())
+        deny(Reason::NoGrant)
     }
 
     /// The resolved owner of a resource row: the stored owner element,
@@ -596,10 +669,13 @@ impl<S: Storage> AclAccess<S> {
 /// source-reading ops always resolve to S3Path::Object); anything else
 /// fails closed.
 fn object_resource(request: &Request<'_>) -> Result<(bucket::Name, object::Key), S3Error> {
-    let (b, k) = request.path.as_object().ok_or_else(denied)?;
+    let (b, k) = request
+        .path
+        .as_object()
+        .ok_or_else(|| deny_with(Reason::NoResource))?;
     Ok((
-        bucket::name(b).map_err(|_| denied())?,
-        object::key(k).map_err(|_| denied())?,
+        bucket::name(b).map_err(|_| deny_with(Reason::NoResource))?,
+        object::key(k).map_err(|_| deny_with(Reason::NoResource))?,
     ))
 }
 
@@ -693,8 +769,9 @@ mod tests {
     use futures::stream;
     use s3s::path::S3Path;
     use tinio_mem::MemoryStorage;
+    use tinio_util::testing::{metrics::counter, spans};
 
-    use super::{AclAccess, OpRule, Request, Requirement, rule_for};
+    use super::{AclAccess, OpRule, Reason, Request, Requirement, rule_for};
     use crate::{
         _core::{
             acl::{
@@ -1211,5 +1288,194 @@ mod tests {
                 existence_dispatch: false,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_denial_books_the_denied_decision() {
+        let owner = uid();
+        let storage = storage_with_bucket(&owner, vec![]).await;
+        let access = AclAccess::new(storage, identity());
+        let path = S3Path::object("data", "a.txt");
+        let before = counter("tinio_auth_authorizations_total", &[("decision", "denied")]);
+        assert_denied(&access, &req(bob(), true, "GetObject", &path)).await;
+        let after = counter("tinio_auth_authorizations_total", &[("decision", "denied")]);
+        assert!(
+            after > before,
+            "the denial must increment the family: {before} -> {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allowance_books_the_allowed_decision() {
+        let owner = uid();
+        let storage = storage_with_bucket(&owner, vec![]).await;
+        let access = AclAccess::new(storage, identity());
+        let path = S3Path::bucket("data");
+        let before = counter(
+            "tinio_auth_authorizations_total",
+            &[("decision", "allowed")],
+        );
+        assert_allowed(
+            &access,
+            &req(owner.clone(), true, "GetBucketLocation", &path),
+        )
+        .await;
+        let after = counter(
+            "tinio_auth_authorizations_total",
+            &[("decision", "allowed")],
+        );
+        assert!(
+            after > before,
+            "the allowance must increment the family: {before} -> {after}"
+        );
+    }
+
+    /// Evaluate one request under the process-wide span recorder and return
+    /// whether it was allowed plus the `reason` its decision span carried.
+    /// The recorder filters to this thread, so parallel tests cannot supply
+    /// the span; the `op` and `decision` fields are asserted with it.
+    async fn recorded_decision(
+        access: &AclAccess<MemoryStorage>,
+        request: &Request<'_>,
+    ) -> (bool, Option<String>) {
+        spans::install();
+        let capture = spans::capture();
+        let before = capture.spans_on_this_thread().len();
+        let allowed = access.evaluate(request).await.is_ok();
+        let recorded = capture.spans_on_this_thread();
+        let span = recorded[before..]
+            .iter()
+            .find(|span| span.name == "evaluate")
+            .unwrap_or_else(|| panic!("the decision span: {recorded:#?}"));
+        assert_eq!(span.field("op"), Some(request.op));
+        assert_eq!(
+            span.field("decision"),
+            Some(if allowed { "allowed" } else { "denied" })
+        );
+        (allowed, span.field("reason").map(str::to_string))
+    }
+
+    /// Every reachable decision branch records its bounded reason on the
+    /// decision span: owner bypass, a grant, the authenticated-only root and
+    /// bucket branches, the missing-resource tiers, the upload creator, the
+    /// expected-owner mismatch, a malformed source header, a missing grant,
+    /// and a missing resource path.
+    #[tokio::test]
+    async fn each_decision_records_its_bounded_reason() {
+        let owner = uid();
+        let storage = storage_with_bucket(
+            &owner,
+            vec![
+                canonical(&bob(), Permission::Read),
+                group(GROUP_ALL_USERS, Permission::Read),
+            ],
+        )
+        .await;
+        put_object(&storage, "a.txt", Some(&owner), &private(&owner)).await;
+        let access = AclAccess::new(Arc::clone(&storage), identity());
+
+        let (allowed, reason) = recorded_decision(
+            &access,
+            &req(
+                owner.clone(),
+                true,
+                "GetBucketLocation",
+                &S3Path::bucket("data"),
+            ),
+        )
+        .await;
+        assert!(allowed, "the owner bypasses the grant gate");
+        assert_eq!(reason.as_deref(), Some("owner"));
+
+        let (allowed, reason) = recorded_decision(
+            &access,
+            &req(anon(), false, "ListObjectsV2", &S3Path::bucket("data")),
+        )
+        .await;
+        assert!(allowed, "an AllUsers READ grant satisfies BucketRead");
+        assert_eq!(reason.as_deref(), Some("grant"));
+
+        let (allowed, reason) =
+            recorded_decision(&access, &req(alice(), true, "ListBuckets", &S3Path::root())).await;
+        assert!(allowed, "ListBuckets needs only a signed principal");
+        assert_eq!(reason.as_deref(), Some("authenticated"));
+
+        let (allowed, reason) = recorded_decision(
+            &access,
+            &req(bob(), true, "GetObject", &S3Path::object("data", "a.txt")),
+        )
+        .await;
+        assert!(!allowed, "a signed non-owner holds no object grant");
+        assert_eq!(reason.as_deref(), Some("no-grant"));
+
+        let bucket_path = S3Path::bucket("data");
+        let mut mismatch = req(owner.clone(), true, "GetBucketLocation", &bucket_path);
+        let stranger = other();
+        mismatch.expected_bucket_owner = Some(stranger.as_str());
+        let (allowed, reason) = recorded_decision(&access, &mismatch).await;
+        assert!(!allowed, "an expected-owner mismatch denies");
+        assert_eq!(reason.as_deref(), Some("owner-mismatch"));
+
+        let (allowed, reason) = recorded_decision(
+            &access,
+            &req(
+                anon(),
+                false,
+                "CopyObject",
+                &S3Path::object("data", "dst.txt"),
+            ),
+        )
+        .await;
+        assert!(!allowed, "a missing copy source fails closed");
+        assert_eq!(reason.as_deref(), Some("malformed-source"));
+
+        let (allowed, reason) = recorded_decision(
+            &access,
+            &req(owner.clone(), true, "DeleteObjects", &S3Path::root()),
+        )
+        .await;
+        assert!(!allowed, "the coarse gate needs a bucket path");
+        assert_eq!(reason.as_deref(), Some("no-resource"));
+
+        let upload_id = upload(&storage, "dst.txt", Some(&alice())).await;
+        let query = format!("uploadId={upload_id}");
+        let path = S3Path::object("data", "dst.txt");
+        let mut creator = req(alice(), true, "ListParts", &path);
+        creator.query = &query;
+        let (allowed, reason) = recorded_decision(&access, &creator).await;
+        assert!(allowed, "the upload's creator owns the upload row");
+        assert_eq!(reason.as_deref(), Some("upload-creator"));
+
+        let empty = Arc::new(MemoryStorage::new().unwrap());
+        let empty_access = AclAccess::new(empty, identity());
+        let (allowed, reason) = recorded_decision(
+            &empty_access,
+            &req(anon(), false, "ListObjectsV2", &S3Path::bucket("ghost")),
+        )
+        .await;
+        assert!(allowed, "a genuinely missing bucket passes through");
+        assert_eq!(reason.as_deref(), Some("missing"));
+    }
+
+    /// The reason vocabulary is closed and kebab-case: a new reason is a code
+    /// change, never a client-chosen series (`StorageError` is listed though
+    /// the mem backend cannot induce it, so the whole domain is pinned).
+    #[test]
+    fn every_reason_renders_its_bounded_label() {
+        for (reason, label) in [
+            (Reason::Owner, "owner"),
+            (Reason::Grant, "grant"),
+            (Reason::Authenticated, "authenticated"),
+            (Reason::Missing, "missing"),
+            (Reason::UploadCreator, "upload-creator"),
+            (Reason::OwnerMismatch, "owner-mismatch"),
+            (Reason::MalformedHeader, "malformed-header"),
+            (Reason::MalformedSource, "malformed-source"),
+            (Reason::NoResource, "no-resource"),
+            (Reason::NoGrant, "no-grant"),
+            (Reason::StorageError, "storage-error"),
+        ] {
+            assert_eq!(reason.to_string(), label);
+        }
     }
 }

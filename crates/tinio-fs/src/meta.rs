@@ -47,6 +47,7 @@ use std::{
 };
 
 pub use object::{Key, key};
+use tracing::instrument;
 
 pub use crate::bucket::{Name, name};
 use crate::{
@@ -269,11 +270,14 @@ pub(crate) fn gate(stored: &object_meta::Stored, content: Content) -> Verdict {
 /// ```rust
 /// use std::time::SystemTime;
 ///
+/// use tinio_core::object;
 /// use tinio_fs::meta::Record;
 ///
 /// let record = Record {
-///     key: "dir/file.txt".into(),
-///     etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+///     key: object::key("dir/file.txt").expect("a valid object key"),
+///     etag: "d41d8cd98f00b204e9800998ecf8427e"
+///         .parse()
+///         .expect("a valid etag"),
 ///     size: 4,
 ///     mtime: 0,
 /// };
@@ -356,7 +360,7 @@ fn corrupt_row(key: &str, source: storage::Error) -> DatabaseError {
 /// let store = meta::store(state.path()).unwrap();
 /// let bucket = bucket::name("data").unwrap();
 /// let key = object::key("dir/file.txt").unwrap();
-/// let etag = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+/// let etag = "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap();
 /// Runtime::new().unwrap().block_on(async {
 ///     store
 ///         .set(&bucket, &key, &etag, 4, SystemTime::UNIX_EPOCH, 0)
@@ -553,6 +557,12 @@ impl Store {
     #[expect(
         clippy::too_many_arguments,
         reason = "one argument per element the staleness gate judges — bucket, key, path, size, mtime, identity, the symlink policy and the gate's `stale` verdict"
+    )]
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
     )]
     pub(crate) async fn ensure_row(
         &self,
@@ -2357,7 +2367,9 @@ mod tests {
         let file = state.path().join("mp.bin");
         fs::write(&file, b"hello").await.unwrap();
         let metadata = fs::metadata(&file).await.unwrap();
-        let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
+        let composed = "5d41402abc4b2a76b9719d911017c592-2"
+            .parse::<ETag>()
+            .unwrap();
         store
             .set(
                 &b,
@@ -2400,7 +2412,9 @@ mod tests {
         let file = state.path().join("mp.bin");
         fs::write(&file, b"hello").await.unwrap();
         let metadata = fs::metadata(&file).await.unwrap();
-        let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
+        let composed = "5d41402abc4b2a76b9719d911017c592-2"
+            .parse::<ETag>()
+            .unwrap();
         store
             .set(
                 &b,
@@ -2443,7 +2457,9 @@ mod tests {
         let file = state.path().join("mp.bin");
         fs::write(&file, b"hello").await.unwrap();
         let metadata = fs::metadata(&file).await.unwrap();
-        let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
+        let composed = "5d41402abc4b2a76b9719d911017c592-2"
+            .parse::<ETag>()
+            .unwrap();
         store
             .set(
                 &b,
@@ -2495,7 +2511,9 @@ mod tests {
         let file = state.path().join("mp.bin");
         fs::write(&file, b"hello").await.unwrap();
         let metadata = fs::metadata(&file).await.unwrap();
-        let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
+        let composed = "5d41402abc4b2a76b9719d911017c592-2"
+            .parse::<ETag>()
+            .unwrap();
         store
             .set(
                 &b,
@@ -2545,7 +2563,9 @@ mod tests {
         let file = state.path().join("mp.bin");
         fs::write(&file, b"hello").await.unwrap();
         let metadata = fs::metadata(&file).await.unwrap();
-        let composed = ETag::new("5d41402abc4b2a76b9719d911017c592-2").unwrap();
+        let composed = "5d41402abc4b2a76b9719d911017c592-2"
+            .parse::<ETag>()
+            .unwrap();
         store
             .set(
                 &b,
@@ -2597,7 +2617,7 @@ mod tests {
             secs in 0u64..1_000_000_000,
         ) {
             let key = object::key(segs.join("/")).unwrap();
-            let etag = ETag::new(&etag_hex).unwrap();
+            let etag = etag_hex.parse::<ETag>().unwrap();
             let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
             let runtime = testutil::runtime();
             runtime.block_on(async {
@@ -2623,7 +2643,7 @@ mod tests {
         /// Composed multipart ETags round-trip through the stored wire form.
         #[test]
         fn composed_etags_round_trip(hex in "[0-9a-f]{32}", parts in 1u32..10_000) {
-            let etag = ETag::new(&format!("{hex}-{parts}")).unwrap();
+            let etag = format!("{hex}-{parts}").parse::<ETag>().unwrap();
             let runtime = testutil::runtime();
             runtime.block_on(async {
                 let state = tempfile::tempdir().unwrap();
@@ -2705,7 +2725,7 @@ mod tests {
                     let b = b.clone();
                     let key = object::key(format!("{key}.txt")).unwrap();
                     handles.push(tokio::spawn(async move {
-                        let etag = ETag::new(&format!("{i:032x}")).unwrap();
+                        let etag = format!("{i:032x}").parse::<ETag>().unwrap();
                         store
                             .set(&b, &key, &etag, i as u64, SystemTime::UNIX_EPOCH, 0)
                             .await

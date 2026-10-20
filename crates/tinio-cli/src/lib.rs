@@ -58,6 +58,8 @@ mod error;
 /// (design decision 19). Private: the frames are the protocol, not an API, and a caller inside
 /// this crate is the only thing that writes one.
 mod events;
+/// The CLI's one metric family: startup cost by phase, recorded by the serving path alone.
+mod metrics;
 /// systemd's notification protocol and the unit text that asks for it. `sd-notify` cannot
 /// link on a non-unix target (`std::os::unix::*`), so the whole module is the gate — there is
 /// no Windows stub.

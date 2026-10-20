@@ -6,6 +6,7 @@ exclude = ["vendor/soft-canonicalize"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 arrow = { version = "60", default-features = false }
@@ -35,6 +36,7 @@ handlebars = "6"
 hex = "0.4"
 hmac = "0.13"
 http = "1"
+itoa = "1"
 http-body = "1"
 http-body-util = "0.1"
 humantime-serde = "1.1"
@@ -60,7 +62,6 @@ rayon = "1"
 redb = "4.2"
 rust_decimal = "1"
 rustix = "1.1"
-rustls-pemfile = "2.2"
 s3s = "0.17"
 sd-notify = "0.5"
 secrecy = "0.10"

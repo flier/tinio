@@ -239,7 +239,7 @@ impl Stored {
             id: version::Id::from_wire(id),
             blob,
             size,
-            etag: ETag::new(etag).unwrap_or(ETag::EMPTY),
+            etag: etag.parse::<ETag>().unwrap_or(ETag::EMPTY),
             created: from_nanos(created),
             became_noncurrent,
             kind: Kind::from_wire(kind)?,
@@ -284,7 +284,7 @@ impl Stored {
             id: version::Id::from_wire(id),
             blob,
             size,
-            etag: ETag::new(etag).unwrap_or(ETag::EMPTY),
+            etag: etag.parse::<ETag>().unwrap_or(ETag::EMPTY),
             created,
             became_noncurrent,
             kind,
@@ -385,13 +385,13 @@ pub fn encode_blob(blob: &BlobRef) -> String {
 pub fn decode_blob(wire: &str) -> Option<BlobRef> {
     let (hash, rest) = wire.split_once(':')?;
     let (len, rest) = rest.split_once(':')?;
-    let hash = BlockHash::new(hash).ok()?;
+    let hash = hash.parse::<BlockHash>().ok()?;
     let len = len.parse::<u64>().ok()?;
     let mut blocks = Vec::new();
     for entry in rest.split(',') {
         let (block_hash, block_len) = entry.split_once(':')?;
         blocks.push(BlockRef {
-            hash: BlockHash::new(block_hash).ok()?,
+            hash: block_hash.parse::<BlockHash>().ok()?,
             len: block_len.parse::<u64>().ok()?,
         });
     }

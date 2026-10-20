@@ -364,7 +364,7 @@ forward!(meta::BucketMeta {
     owners(buckets: &[bucket::Name]) -> Result<Vec<Option<acl::OwnerId>>, RowError>;
     record(bucket: &bucket::Name, created: SystemTime) -> Result<(), RowError>;
     create(bucket: &bucket::Name, row: &meta::bucket::Row) -> Result<(), RowError>;
-    record_if_absent(bucket: &bucket::Name, now: SystemTime) -> Result<SystemTime, RowError>;
+    record_if_absent(bucket: &bucket::Name, now: SystemTime) -> Result<(SystemTime, bool), RowError>;
     record_full(bucket: &bucket::Name, row: &meta::bucket::Row) -> Result<(), RowError>;
     set_tags(bucket: &bucket::Name, tags: &object::Tags) -> Result<bool, RowError>;
     set_tags_or_create(bucket: &bucket::Name, tags: &object::Tags, now: SystemTime) -> Result<(), RowError>;

@@ -33,8 +33,8 @@ pub const RESERVED_SEGMENT: &str = ".tinio";
 /// [`Key::is_reserved`]; backends refuse writes to reserved keys with
 /// `AccessDenied` (FR-020).
 ///
-/// Deref/AsRef expose the inner string; `"dir/file.txt".into()` builds a
-/// key from a trusted literal (panics on invalid input).
+/// Deref/AsRef expose the inner string. A fixture calls [`key`] and
+/// `expect`; wire input goes through [`key`] and handles the error.
 ///
 /// # Examples
 ///
@@ -56,10 +56,6 @@ pub const RESERVED_SEGMENT: &str = ".tinio";
 ///
 /// let reserved = object::key("a/.tinio/b").unwrap(); // syntactically legal
 /// assert!(reserved.is_reserved());
-///
-/// // Trusted-literal convenience.
-/// let from_literal: object::Key = "dir/file.txt".into();
-/// assert_eq!(from_literal, k);
 /// ```
 #[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[cfg_attr(feature = "sqlx", sqlx(transparent))]
@@ -91,18 +87,6 @@ pub fn key(key: impl Into<String>) -> Result<Key, storage::Error> {
     Ok(Key(key))
 }
 
-impl From<&str> for Key {
-    /// Trusted-input convenience (panics on invalid keys — use [`key`] for
-    /// untrusted input).
-    #[expect(
-        clippy::expect_used,
-        reason = "literal: the documented literal API — a `From<&str>` call site is a compile-time object-key fixture, wire input goes through `key`"
-    )]
-    fn from(key: &str) -> Self {
-        self::key(key).expect("valid object key")
-    }
-}
-
 /// Metadata of a stored object (key, size, mtime, ETag, tags, checksum,
 /// owner, ACL, version identity).
 ///
@@ -117,15 +101,17 @@ impl From<&str> for Key {
 /// use std::time::SystemTime;
 ///
 /// use tinio_core::{
-///     acl,
-///     object::{Info, Tags},
+///     ETag, acl,
+///     object::{self, Info, Tags},
 /// };
 ///
 /// let info = Info {
-///     key: "dir/file.txt".into(),
+///     key: object::key("dir/file.txt").expect("a valid object key"),
 ///     size: 4,
 ///     last_modified: SystemTime::UNIX_EPOCH,
-///     etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+///     etag: "d41d8cd98f00b204e9800998ecf8427e"
+///         .parse::<ETag>()
+///         .expect("a valid etag"),
 ///     tags: Tags::empty(),
 ///     checksum: None,
 ///     owner: None,
@@ -440,17 +426,12 @@ mod tests {
 
     #[test]
     fn object_key_from_trusted_literals() {
-        let key: Key = "dir/file.txt".into();
+        let key = key("dir/file.txt").expect("a valid object key");
         assert_eq!(key.as_ref(), "dir/file.txt");
         // An owned string takes the validated ctor (wire payloads).
         let key2 = super::key("dir/file.txt".to_string()).unwrap();
         assert_eq!(key, key2);
-    }
-
-    #[test]
-    #[should_panic]
-    fn object_key_from_invalid_panics() {
-        let _: Key = "../evil".into();
+        assert!(super::key("../evil").is_err());
     }
 
     #[test]
@@ -462,10 +443,12 @@ mod tests {
     fn object_info_carries_etag_size_mtime() {
         let t = SystemTime::UNIX_EPOCH;
         let o = Info {
-            key: "dir/file.txt".into(),
+            key: key("dir/file.txt").expect("a valid object key"),
             size: 5,
             last_modified: t,
-            etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+            etag: "d41d8cd98f00b204e9800998ecf8427e"
+                .parse::<ETag>()
+                .expect("a valid etag"),
             tags: Tags::empty(),
             checksum: None,
             owner: None,

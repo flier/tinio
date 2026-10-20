@@ -159,6 +159,7 @@ enum Handler<R: Read> {
 }
 
 impl<R: Read> Reader<R> {
+    #[tracing::instrument(target = "tinio::s3", level = "debug", name = "json.reader", skip_all)]
     pub fn new(reader: R, params: Params, from: &FromClause) -> Self {
         let inner = match params.ty {
             Type::Lines => Handler::Lines(Box::new(lines::Lines::new(reader, from))),

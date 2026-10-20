@@ -32,6 +32,7 @@
 
 #[cfg(feature = "acl")]
 use s3s::auth::Credentials;
+use tracing::{Span, field};
 
 #[cfg(feature = "acl")]
 use crate::_core::acl::Acl;
@@ -446,6 +447,18 @@ impl<S: Storage> S3Backend<S> {
     /// The key of a request input, validated (FR-006).
     pub(crate) fn key(&self, raw: String) -> Result<object::Key, S3Error> {
         object::key(raw).map_err(|_| s3_error!(InvalidArgument, "invalid object key"))
+    }
+
+    /// Record the object identity on the operation span (`tinio.s3.operation`).
+    ///
+    /// The handler runs inside the decorator's span; a second span per handler
+    /// would split one operation's identity across two rows.
+    pub(crate) fn record_operation_identity(bucket: &bucket::Name, key: Option<&object::Key>) {
+        let span = Span::current();
+        span.record("bucket", field::display(bucket));
+        if let Some(key) = key {
+            span.record("key", field::display(key));
+        }
     }
 
     /// The source of a `CopyObject`/`UploadPartCopy` request into a

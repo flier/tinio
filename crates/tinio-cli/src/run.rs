@@ -3,16 +3,18 @@
 //! [`run()`] is the public entry; [`command_line`] is the two-pass parse both entry points
 //! share; [`on_runtime`] is the process's one runtime, built last.
 
-use std::{env, ffi::OsString, future::Future, iter, process::ExitCode};
+use std::{env, ffi::OsString, future::Future, iter, process::ExitCode, sync::OnceLock};
 
 use either::{Either, Left, Right};
 use tokio::runtime::Builder;
+use tracing::subscriber::set_global_default;
 
 #[cfg(feature = "lifecycle")]
 use crate::commands::lifecycle;
 #[cfg(feature = "api")]
 use crate::commands::{status, stop};
 use crate::{
+    _server::log,
     Error,
     cli::{self, Cli, Command, Provenance},
     commands::{doctor, start, start::Server},
@@ -20,6 +22,31 @@ use crate::{
     resolve::{self, Located},
     sandbox, service,
 };
+
+/// The bootstrap subscriber's reload handles — the one `set_global_default` this process makes.
+static BOOTSTRAP: OnceLock<log::Handles> = OnceLock::new();
+
+/// Install the fmt-only subscriber before anything is parsed, so a bad config, a failed resolution
+/// or a confinement event reaches stderr. No access-log file, no OTLP and no thread: the daemon
+/// fork and the confinement meet nothing an exporter started.
+fn bootstrap_logging() {
+    if BOOTSTRAP.get().is_some() {
+        return;
+    }
+    let Ok(logging) = log::build_bootstrap() else {
+        return;
+    };
+    if set_global_default(logging.subscriber).is_err() {
+        // Another subscriber owns this process (a test's recorder); the run keeps it.
+        return;
+    }
+    let _ = BOOTSTRAP.set(logging.handles);
+}
+
+/// The reload handles `bootstrap_logging` installed, when this process installed the bootstrap.
+pub(crate) fn reload_handle() -> Option<&'static log::Handles> {
+    BOOTSTRAP.get()
+}
 
 /// Entry point for the `tinio` CLI.
 ///
@@ -31,7 +58,11 @@ use crate::{
 /// ```no_run
 /// let code = tinio_cli::run();
 /// ```
+#[tracing::instrument(target = "tinio::cli", level = "info", skip_all, name = "cli.run")]
 pub fn run() -> ExitCode {
+    // The log exists before the parser does, which is what makes a refusal readable and lets the
+    // confinement's own events reach stderr; the run swaps the full stack after it confines.
+    bootstrap_logging();
     // The SCM's dispatcher, before any parser sees argv (decision 22): a process the SCM
     // started is a service rather than a command line, and the dispatcher answers `Err`
     // immediately for every other process — so an ordinary `tinio doctor` pays nothing for

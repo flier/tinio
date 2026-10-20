@@ -112,6 +112,8 @@
 //! # }
 //! ```
 
+use tracing::instrument;
+
 use crate::{
     _core::{
         ListObjectsParams, ObjectListing,
@@ -158,6 +160,12 @@ where
     ///
     /// Whatever the content plane or the row plane answers, and a heal's own
     /// failures other than a vanished key (which is skipped).
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %params.bucket)
+    )]
     pub async fn list_objects(
         &self,
         params: ListObjectsParams,

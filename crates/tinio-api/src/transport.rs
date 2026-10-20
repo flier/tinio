@@ -74,6 +74,8 @@ use tokio::{
 };
 use tokio::{net::TcpListener as TokioTcpListener, sync::watch};
 #[cfg(feature = "tls")]
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+#[cfg(feature = "tls")]
 use tokio_rustls::{TlsAcceptor, rustls::ServerConfig, server::TlsStream};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA};
@@ -85,7 +87,6 @@ use crate::pipe;
 use crate::{
     Error,
     bind::{self, Channel},
-    metrics::Gauges,
     router::{Auth, Context, Shared, router},
     state::{State, remove_if_present},
 };
@@ -196,6 +197,12 @@ pub async fn serve_local(
 ///
 /// `serve_local`'s unix arm and `serve_tcp` are its callers on every platform; `serve_https` is
 /// the third (Task 6), so all three transports stop on the plane's one channel.
+#[tracing::instrument(
+    target = "tinio::api",
+    level = "debug",
+    skip_all,
+    name = "tinio.api.shutdown"
+)]
 pub(crate) async fn until_stopped(mut stop: watch::Receiver<bool>) {
     let _ = stop.changed().await;
 }
@@ -1091,22 +1098,17 @@ pub async fn serve_https(
 /// client certificate would be a second scheme nobody configured.
 #[cfg(feature = "tls")]
 fn tls_config(cert: &Path, key: &Path) -> Result<Arc<ServerConfig>, Error> {
-    let certs = rustls_pemfile::certs(&mut io::BufReader::new(
-        fs::File::open(cert).map_err(Error::Io)?,
-    ))
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|err| Error::Transport(format!("{}: {err}", cert.display())))?;
+    let certs = CertificateDer::pem_reader_iter(fs::File::open(cert).map_err(Error::Io)?)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| Error::Transport(format!("{}: {err}", cert.display())))?;
     if certs.is_empty() {
         return Err(Error::Transport(format!(
             "{}: no certificate",
             cert.display()
         )));
     }
-    let key = rustls_pemfile::private_key(&mut io::BufReader::new(
-        fs::File::open(key).map_err(Error::Io)?,
-    ))
-    .map_err(|err| Error::Transport(format!("{}: {err}", key.display())))?
-    .ok_or_else(|| Error::Transport(format!("{}: no private key", key.display())))?;
+    let key = PrivateKeyDer::from_pem_reader(fs::File::open(key).map_err(Error::Io)?)
+        .map_err(|err| Error::Transport(format!("{}: {err}", key.display())))?;
 
     // No process-level provider installation needed, and two reasons — the only two that hold.
     // **One provider is compiled in**: the workspace pin (`tokio-rustls` with
@@ -1348,7 +1350,7 @@ impl Transport {
 ///     root: PathBuf::from("/srv/data"),
 ///     host: "127.0.0.1".to_string(),
 ///     stop,
-///     gauges: None,
+///     metrics_requires_token: false,
 ///     token: None,
 ///     #[cfg(feature = "lifecycle")]
 ///     lifecycle: None,
@@ -1374,13 +1376,8 @@ pub struct Options {
     /// The shutdown channel `/stop` sends on — the same channel the CLI's signal handlers
     /// flip and `DataPlane::serve` reads (decision 12).
     pub stop: watch::Sender<bool>,
-    /// The scrape-time gauge source the plane's `/metrics` serves, or `None` for a plane
-    /// without one (the route then answers the contract's `404`, `management-api.md:23`). It is
-    /// an input rather than something the plane builds because only the caller can: the
-    /// registry side is `tinio-server`'s, and `tinio-api` must not depend on that crate (design
-    /// decision 23 — cargo refuses the cycle). The **reader task** that runs the source's
-    /// expensive half starts with the plane, in [`Plane::serve`].
-    pub gauges: Option<Arc<Gauges>>,
+    /// Require the control token for `/metrics` too (default `false`).
+    pub metrics_requires_token: bool,
     /// The token this plane serves with, when the caller supplies one instead of letting the
     /// plane generate it.
     ///
@@ -1394,8 +1391,8 @@ pub struct Options {
     /// and every in-place platform — and it is what [`Plane::publish`] is for.
     pub token: Option<String>,
     /// The lifecycle admin the plane's three `/buckets/{bucket}/lifecycle` routes are served
-    /// from, or `None` for a plane that does not serve them (LC14). **An input for the same
-    /// reason [`Options::gauges`] is**: only the caller holds the storage those routes read, and
+    /// from, or `None` for a plane that does not serve them (LC14). **An input because only the
+    /// caller holds the storage those routes read**, and
     /// `tinio-api` must not depend on the crate that owns it (cargo's cycle rule). A build
     /// without the `lifecycle` feature has no field and no trait (LC15), and a run whose `[s3]
     /// lifecycle` is off passes `None` (LC23) — both causes answer the three routes' `404`, so
@@ -1517,7 +1514,7 @@ impl SocketFile {
 ///     root: PathBuf::from("/srv/data"),
 ///     host: "127.0.0.1".to_string(),
 ///     stop,
-///     gauges: None,
+///     metrics_requires_token: false,
 ///     token: None,
 ///     #[cfg(feature = "lifecycle")]
 ///     lifecycle: None,
@@ -1610,8 +1607,8 @@ impl Plane {
     ///         root: "/srv/data".into(),
     ///         host: "127.0.0.1".to_string(),
     ///         stop,
-    ///         gauges: None,
     ///         // The launcher's token, when this plane is the child it confined.
+    ///         metrics_requires_token: false,
     ///         token: None,
     ///         #[cfg(feature = "lifecycle")]
     ///         lifecycle: None,
@@ -1746,8 +1743,8 @@ impl Plane {
     ///         root: PathBuf::from("/srv/data"),
     ///         host: "127.0.0.1".to_string(),
     ///         stop,
-    ///         gauges: None,
     ///         // The launcher's token, when this plane is the child it confined.
+    ///         metrics_requires_token: false,
     ///         token: None,
     ///         #[cfg(feature = "lifecycle")]
     ///         lifecycle: None,
@@ -1826,7 +1823,7 @@ impl Plane {
     ///     root: PathBuf::from("/srv/data"),
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
-    ///     gauges: None,
+    ///     metrics_requires_token: false,
     ///     token: None,
     ///     #[cfg(feature = "lifecycle")]
     ///     lifecycle: None,
@@ -1908,7 +1905,7 @@ impl Plane {
     ///     root: PathBuf::from("/srv/data"),
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
-    ///     gauges: None,
+    ///     metrics_requires_token: false,
     ///     token: None,
     ///     #[cfg(feature = "lifecycle")]
     ///     lifecycle: None,
@@ -1923,8 +1920,8 @@ impl Plane {
         // to be met with a clone — of three `Option`s, which is why it was affordable, and of
         // nothing the assemble reads, which is why the take is the same shape with no copy. What
         // stays behind is `Selection::default()`, and nothing downstream looks at it: the assemble
-        // reads the token, the root, the host, the stop channel, the gauges and the state dir, and
-        // the transport `select` just built is its answer to the selection.
+        // reads the token, the root, the host, the stop channel and the state dir, and the
+        // transport `select` just built is its answer to the selection.
         let mut selection = mem::take(&mut options.selection);
         if let Some(LocalForm::Unix(path)) = &mut selection.local {
             *path = resolve_socket_path(path, &options.state_dir);
@@ -1954,10 +1951,6 @@ impl Plane {
     /// object they were handed to be the channel at the path that selection names — meeting by
     /// construction, which is the launcher's and the platform crate's to guarantee, as
     /// [`Plane::adopt`] states; nothing here re-derives or compares the two.
-    ///
-    /// The caller's source travels in with the context and nowhere else, so the route's default
-    /// state stays `None` (`Context::new`): a plane built without one has no `/metrics`, and the
-    /// API tests can assert both halves of that.
     fn assemble(options: Options, transport: Transport) -> Result<Self, Error> {
         let state = state_for(options.token.clone(), transport.identity(), &options.root)?;
         let socket = match &transport {
@@ -1967,7 +1960,7 @@ impl Plane {
             _ => None,
         };
         let context = Context::new(state, options.host, transport.auth(), options.stop)
-            .with_gauges(options.gauges);
+            .with_metrics_requires_token(options.metrics_requires_token);
         #[cfg(feature = "lifecycle")]
         let context = context.with_lifecycle(options.lifecycle);
         let shared = Arc::new(context);
@@ -2005,7 +1998,7 @@ impl Plane {
     ///     root: PathBuf::from("/srv/data"),
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
-    ///     gauges: None,
+    ///     metrics_requires_token: false,
     ///     token: None,
     ///     #[cfg(feature = "lifecycle")]
     ///     lifecycle: None,
@@ -2020,16 +2013,9 @@ impl Plane {
             .release_transport()
             .ok_or_else(|| Error::Internal("the plane is already serving".to_string()))?;
 
-        // The metrics reader starts here, the one place that has both the `Arc<Gauges>` and the
-        // runtime: it watches this same channel, so it exits with the plane rather than being
-        // aborted. Holding the handle is what makes that visible in this frame, and nothing joins
-        // it — a dropped `JoinHandle` only **detaches** its task, so `let _ = ...` here would
-        // leave the very same loop running; what ends it is the channel, not this function's
-        // return. A plane with `gauges: None` starts nothing.
-        let _reader = self
-            .shared
-            .gauges()
-            .map(|gauges| gauges.spawn_reader(stop.clone()));
+        // No reader task here: the composition root owns the one that refreshes the registry
+        // (the CLI starts it before the planes serve), and this plane only gathers what that task
+        // published. A scrape therefore never waits on it.
         serve_transport(transport, self.shared.clone(), stop).await
     }
 
@@ -2056,7 +2042,7 @@ impl Plane {
     ///     root: PathBuf::from("/srv/data"),
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
-    ///     gauges: None,
+    ///     metrics_requires_token: false,
     ///     token: None,
     ///     #[cfg(feature = "lifecycle")]
     ///     lifecycle: None,
@@ -2109,7 +2095,7 @@ impl Plane {
     ///     root: PathBuf::from("/srv/data"),
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
-    ///     gauges: None,
+    ///     metrics_requires_token: false,
     ///     token: None,
     ///     #[cfg(feature = "lifecycle")]
     ///     lifecycle: None,
@@ -2286,7 +2272,6 @@ mod tests {
         client::{self, Call, RawResponse, Report},
         router::{Auth, Context, StatusBody},
         state::State,
-        test_support::{Counting, gauged},
     };
 
     /// A `GET` call with the token when the leg has one: every request these tests make is one,
@@ -2332,7 +2317,7 @@ mod tests {
             root: dir.to_path_buf(),
             host: "127.0.0.1".to_string(),
             stop,
-            gauges: None,
+            metrics_requires_token: false,
             token: None,
             #[cfg(feature = "lifecycle")]
             lifecycle: None,
@@ -2583,7 +2568,7 @@ mod tests {
             root: dir.path().to_path_buf(),
             host: "127.0.0.1".to_string(),
             stop,
-            gauges: None,
+            metrics_requires_token: false,
             token: None,
             #[cfg(feature = "lifecycle")]
             lifecycle: None,
@@ -2613,7 +2598,7 @@ mod tests {
         let state =
             State::new(addr.to_string(), Some(addr.port()), Path::new("/srv/data")).expect("state");
         let (tx, stop) = watch::channel(false);
-        let (shared, _) = gauged(Context::new(state, "127.0.0.1", Auth::for_bind(addr), tx));
+        let shared = Arc::new(Context::new(state, "127.0.0.1", Auth::for_bind(addr), tx));
         let token = shared.state.token.expose_secret().as_str().to_owned();
 
         let serving = tokio::spawn(serve_tcp(listener, shared, stop));
@@ -2655,7 +2640,7 @@ mod tests {
         )
         .expect("state");
         let (tx, stop) = watch::channel(false);
-        let (shared, _) = gauged(Context::new(state, "0.0.0.0", Auth::for_bind(bound), tx));
+        let shared = Arc::new(Context::new(state, "0.0.0.0", Auth::for_bind(bound), tx));
         let token = shared.state.token.expose_secret().as_str().to_owned();
 
         let serving = tokio::spawn(serve_tcp(listener, shared, stop));
@@ -3041,7 +3026,7 @@ mod tests {
                 root: dir.path().to_path_buf(),
                 host: "127.0.0.1".to_string(),
                 stop,
-                gauges: None,
+                metrics_requires_token: false,
                 token: None,
                 #[cfg(feature = "lifecycle")]
                 lifecycle: None,
@@ -3106,10 +3091,6 @@ mod tests {
     // client → `shutdown()` — plus the OS state a live run has to be read back for: the socket
     // file, the pipe's single-instance refusal, and the local channel dialled the
     // way the CLI dials it.
-    //
-    // The double the gauges' half uses is [`crate::test_support::Counting`], the crate's one
-    // definition of those counts, and its reader is driven through `Plane::serve` exactly as the
-    // CLI drives it.
     // ---------------------------------------------------------------------------------------
 
     /// How long the CLI gives a drain before it stops waiting (design decision 12's bound): the
@@ -3218,7 +3199,6 @@ mod tests {
         async fn start_with(
             dirs: &Dirs,
             selection: Selection,
-            gauges: Option<Arc<Gauges>>,
             bind: impl FnOnce(Options) -> Result<Plane, Error>,
         ) -> Self {
             let (stop, rx) = watch::channel(false);
@@ -3229,7 +3209,7 @@ mod tests {
                     root: dirs.root().to_path_buf(),
                     host: "127.0.0.1".to_string(),
                     stop: stop.clone(),
-                    gauges,
+                    metrics_requires_token: false,
                     token: None,
                     #[cfg(feature = "lifecycle")]
                     lifecycle: None,
@@ -3258,8 +3238,8 @@ mod tests {
         }
 
         /// [`Running::start_with`] on [`Plane::bind`]: the CLI's own single-instance path.
-        async fn start(dirs: &Dirs, selection: Selection, gauges: Option<Arc<Gauges>>) -> Self {
-            Self::start_with(dirs, selection, gauges, Plane::bind).await
+        async fn start(dirs: &Dirs, selection: Selection) -> Self {
+            Self::start_with(dirs, selection, Plane::bind).await
         }
 
         /// [`Running::start_with`]'s **adopted** twin, and the shape a confined child runs: the
@@ -3275,10 +3255,7 @@ mod tests {
             selection: Selection,
             inherited: StdUnixListener,
         ) -> Self {
-            Self::start_with(dirs, selection, None, |options| {
-                Plane::adopt(options, inherited)
-            })
-            .await
+            Self::start_with(dirs, selection, |options| Plane::adopt(options, inherited)).await
         }
 
         fn token(&self) -> String {
@@ -3406,19 +3383,11 @@ mod tests {
         .expect("request")
     }
 
-    /// The plane's source: the crate's [`Counting`] double, at the ttl the leg needs.
-    fn gauges(source: &Arc<Counting>, ttl: Duration) -> Arc<Gauges> {
-        // The clone keeps the double's concrete type so a leg can read its counters back; the
-        // coercion to the trait object happens at the argument, which is where the seam is.
-        let source = Arc::clone(source);
-        Arc::new(Gauges::new(source, ttl))
-    }
-
     #[tokio::test]
     async fn the_cli_sequence_answers_status_and_leaves_nothing_behind() {
         let dirs = Dirs::new();
         let local = dirs.local();
-        let running = Running::start(&dirs, local_selection(&local), None).await;
+        let running = Running::start(&dirs, local_selection(&local)).await;
         assert!(running.report.running, "the plane answers for its own root");
 
         let status = running.status();
@@ -3449,42 +3418,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_reader_starts_with_the_plane_and_stops_with_it() {
-        let dirs = Dirs::new();
-        let local = dirs.local();
-        let source = Arc::new(Counting::default());
-        let running = Running::start(
-            &dirs,
-            local_selection(&local),
-            Some(gauges(&source, Duration::from_millis(20))),
-        )
-        .await;
-
-        // Advanced while serving, and with no scrape at all: the reader scans once at start and then
-        // once per ttl.
-        sleep(Duration::from_millis(120)).await;
-        let scanned = source.scans();
-        assert!(
-            scanned >= 2,
-            "the reader scanned with the plane and kept its cadence: {scanned}"
-        );
-
-        running.stop(&dirs).await;
-
-        // Frozen after the plane stopped, which is what this leg can show. A grace window first,
-        // because the task stops on its own wake-up; *why* it stopped (the shared channel) is
-        // `metrics.rs`'s unit test's assertion, not this one's.
-        sleep(Duration::from_millis(60)).await;
-        let frozen = source.scans();
-        sleep(Duration::from_millis(120)).await;
-        assert_eq!(
-            source.scans(),
-            frozen,
-            "the reader stops with the plane rather than scanning on"
-        );
-    }
-
     /// The unix stale-socket probe-then-reclaim, driven through the plane: a file left by a crashed
     /// instance must not block a restart, and what the bind then records is the socket it bound.
     #[cfg(unix)]
@@ -3498,7 +3431,7 @@ mod tests {
         assert!(socket.exists(), "the residue is there before the bind");
 
         let local = LocalForm::Unix(socket.clone());
-        let running = Running::start(&dirs, local_selection(&local), None).await;
+        let running = Running::start(&dirs, local_selection(&local)).await;
         assert_eq!(
             running.report.state.as_ref().expect("state").control_name,
             socket.to_string_lossy(),
@@ -3574,7 +3507,7 @@ mod tests {
     async fn the_pipe_refuses_a_second_instance() {
         let dirs = Dirs::new();
         let local = dirs.local();
-        let running = Running::start(&dirs, local_selection(&local), None).await;
+        let running = Running::start(&dirs, local_selection(&local)).await;
 
         // The single-instance claim, as the CLI's second start meets it: the same name, refused.
         let (stop, _rx) = watch::channel(false);
@@ -3584,7 +3517,7 @@ mod tests {
             root: dirs.root().to_path_buf(),
             host: "127.0.0.1".to_string(),
             stop,
-            gauges: None,
+            metrics_requires_token: false,
             token: None,
             #[cfg(feature = "lifecycle")]
             lifecycle: None,
@@ -3618,7 +3551,7 @@ mod tests {
             root: PathBuf::from("/srv/data"),
             host: "127.0.0.1".to_string(),
             stop: stop.clone(),
-            gauges: None,
+            metrics_requires_token: false,
             token: None,
             #[cfg(feature = "lifecycle")]
             lifecycle: None,

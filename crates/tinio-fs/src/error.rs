@@ -24,6 +24,7 @@ use garde::{Error as GardeError, Path as GardePath, Report};
 
 use crate::{
     _core::{pipeline, storage},
+    _util::metrics::{Backend, WriteFailureKind, WriteOp, record_write_failure},
     database::{self, Error as DatabaseError},
 };
 
@@ -153,6 +154,23 @@ impl Error {
     }
 }
 
+/// The closed failure class of a failed fs write, as the shared
+/// `tinio_storage_write_failures_total` family's `kind` label spells it: a
+/// read-only refusal is its own class, every other failure is `io`.
+pub(crate) fn write_failure_kind(err: &Error) -> WriteFailureKind {
+    if err.is_read_only() {
+        WriteFailureKind::ReadOnly
+    } else {
+        WriteFailureKind::Io
+    }
+}
+
+/// Record one failed fs write under its bounded operation — the one home of
+/// this backend's label, so no call site can spell it differently.
+pub(crate) fn record_failed_write(op: WriteOp, err: &Error) {
+    record_write_failure(Backend::Fs, op, write_failure_kind(err));
+}
+
 impl From<database::Error> for Error {
     fn from(err: database::Error) -> Self {
         match err {
@@ -203,6 +221,7 @@ mod tests {
     use super::*;
     use crate::{
         _core::{
+            object,
             pipeline::Error::{Dropped, ShutDown},
             storage::{COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT, Error::*},
         },
@@ -234,7 +253,10 @@ mod tests {
             (Error::Io(IoError::other("boom")), "I/O error: boom"),
             (Error::InvalidPath("a/../b".into()), "invalid path: a/../b"),
             (invalid_value(report), "invalid options:"),
-            (Error::Storage(NoSuchKey("x".into())), "no such object: `x`"),
+            (
+                Error::Storage(NoSuchKey(object::key("x").expect("a valid object key"))),
+                "no such object: `x`",
+            ),
             (
                 root_not_directory(&path),
                 "storage root is not a directory: /data/root",

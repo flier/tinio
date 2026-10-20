@@ -11,8 +11,8 @@
 //! unmatched path — so rewriting the call as `.layer(...)` would answer `401` without a token
 //! for an unrouted request, instead of leaking nothing with the contract's plain `404`
 //! (`management-api.md:50`). **Every route this crate serves is therefore registered before the
-//! `.route_layer(...)` line** — the invariant a new endpoint has to keep, and why every route is
-//! registered inside `router()`, above that line, rather than after it. On the local
+//! `.route_layer(...)` lines** — the invariant a new endpoint has to keep, and why every route
+//! is registered inside `router()`, above them, rather than after them. On the local
 //! channel the open paths are exactly the two read endpoints, `/metrics` and `/openapi.json`; a
 //! TCP transport bound to a loopback address keeps **`/metrics`** open too — a scraper cannot
 //! send a custom header, which is a specific reason and not a general trust in localhost —
@@ -26,12 +26,13 @@
 use std::{
     net::SocketAddr,
     sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 use axum::{
     Json, Router,
     extract::{Request, State as AxumState},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -39,6 +40,7 @@ use axum::{
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
+use tracing::{Span, field, instrument};
 #[cfg(feature = "openapi")]
 use utoipa::openapi::OpenApi as OpenApiSchema;
 
@@ -46,7 +48,7 @@ use utoipa::openapi::OpenApi as OpenApiSchema;
 use crate::lifecycle::{self, LifecycleAdmin};
 #[cfg(feature = "openapi")]
 use crate::openapi::document;
-use crate::{Error, ErrorBody, metrics::Gauges, state::State};
+use crate::{Error, metrics, state::State};
 
 /// The token rule that applies to this plane.
 ///
@@ -139,6 +141,14 @@ impl Auth {
     /// );
     /// ```
     pub fn guards(self, path: &str) -> bool {
+        self.guards_with(path, false)
+    }
+
+    /// [`Self::guards`], with the configured `/metrics` switch.
+    pub fn guards_with(self, path: &str, metrics_requires_token: bool) -> bool {
+        if metrics_requires_token && path == "/metrics" {
+            return true;
+        }
         match self {
             // The local channel: the two read endpoints are open, everything else that is
             // routed — `/status`, `/stop`, and any route registered before the layer — is
@@ -194,11 +204,8 @@ pub struct Context {
     /// The data plane's port, set once at the readiness point by `Plane::publish` (Task 5) —
     /// the same value `state` records — and reported as `None` by `/status` until then.
     pub port: Arc<OnceLock<u16>>,
-    /// The scrape-time gauge source `/metrics` gathers, attached at construction
-    /// ([`Context::with_gauges`]) and read back through [`Context::gauges`]. Private for that
-    /// reason: a plane carries what it was built with, so a source cannot be patched onto a
-    /// context after the fact.
-    gauges: Option<Arc<Gauges>>,
+    /// Require the control token for `/metrics` too (default `false`).
+    pub metrics_requires_token: bool,
     /// The lifecycle admin the three `/buckets/{bucket}/lifecycle` routes are served from,
     /// attached at construction ([`Context::with_lifecycle`]). **`None` means those routes do
     /// not exist**: a build without the `lifecycle` feature has no admin to inject (LC15) and a
@@ -230,8 +237,7 @@ impl Context {
     /// let context = Context::new(state, "127.0.0.1", Auth::Loopback, stop);
     /// assert_eq!(context.state.port, None);
     /// assert_eq!(context.auth, Auth::Loopback);
-    /// // No source yet: a plane with no registry side has no `/metrics` at all
-    /// // (`Context::with_gauges` is where one is attached).
+    /// // Every context serves `/metrics`; the route gathers the process registry.
     /// ```
     pub fn new(
         state: State,
@@ -245,59 +251,16 @@ impl Context {
             auth,
             stop,
             port: Arc::new(OnceLock::new()),
-            gauges: None,
+            metrics_requires_token: false,
             #[cfg(feature = "lifecycle")]
             lifecycle: None,
         }
     }
 
-    /// The same context with a scrape-time gauge source attached, or with none.
-    ///
-    /// **`None` means the plane has no `/metrics`**: the handler answers the contract's plain
-    /// `404` rather than an empty `200`, so the endpoint's absence is something a scraper can
-    /// see (`management-api.md:23`). The source travels in at construction rather than being
-    /// assigned to a built context — a plane carries what it was built with, and the reader
-    /// task's input is fixed by the time [`Plane::bind`](crate::Plane::bind) returns.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use std::{path::Path, sync::Arc};
-    ///
-    /// use tinio_api::{
-    ///     metrics::{DEFAULT_TTL, Gauges, MetricsSource},
-    ///     router::{Auth, Context},
-    ///     state::State,
-    /// };
-    /// use tokio::sync::watch;
-    ///
-    /// struct Source;
-    ///
-    /// impl MetricsSource for Source {
-    ///     fn refresh(&self) {}
-    ///
-    ///     fn counts(&self) {}
-    /// }
-    ///
-    /// let state =
-    ///     State::new("tinio-0123456789abcdef.sock", None, Path::new("/srv/data")).expect("state");
-    /// let (stop, _rx) = watch::channel(false);
-    /// let gauges = Arc::new(Gauges::new(Arc::new(Source), DEFAULT_TTL));
-    /// // A context built with a source serves `/metrics`; `with_gauges(None)` is the one a
-    /// // caller with no registry side builds.
-    /// let context = Context::new(state, "127.0.0.1", Auth::Local, stop).with_gauges(Some(gauges));
-    /// assert_eq!(context.auth, Auth::Local);
-    /// ```
-    pub fn with_gauges(mut self, gauges: Option<Arc<Gauges>>) -> Self {
-        self.gauges = gauges;
+    /// Require the control token for `/metrics` too.
+    pub fn with_metrics_requires_token(mut self, required: bool) -> Self {
+        self.metrics_requires_token = required;
         self
-    }
-
-    /// The attached gauge source, when there is one — what the `/metrics` handler serves from
-    /// and what [`Plane::serve`](crate::Plane::serve) starts the reader task for. Crate-private:
-    /// the source is an input to construction, not something a caller patches in or reads out.
-    pub(crate) fn gauges(&self) -> Option<&Arc<Gauges>> {
-        self.gauges.as_ref()
     }
 
     /// The same context with a lifecycle admin attached, or with none (LC14).
@@ -309,8 +272,7 @@ impl Context {
     /// configurations replaced. The rules stay where they are, which is what makes turning the
     /// capability back on resume enforcement with the rules that were already there.
     ///
-    /// The admin travels in at construction for [`Context::with_gauges`]'s reason: a plane
-    /// carries what it was built with.
+    /// The admin travels in at construction so a plane carries what it was built with.
     ///
     /// # Examples
     ///
@@ -359,7 +321,7 @@ impl Context {
     ///     Context::new(state, "127.0.0.1", Auth::Local, stop).with_lifecycle(Some(Arc::new(Admin)));
     /// assert!(
     ///     format!("{context:?}").contains("<injected>"),
-    ///     "the admin is opaque in `Debug`, as the gauge source is"
+    ///     "the admin is opaque in `Debug`"
     /// );
     /// ```
     #[cfg(feature = "lifecycle")]
@@ -490,7 +452,7 @@ pub struct InvalidBody {
 
 /// Builds the router for `shared`.
 ///
-/// **Every route goes before the `.route_layer(...)` line** — why that ordering and that layer
+/// **Every route goes before the `.route_layer(...)` lines** — why that ordering and that layer
 /// kind are load-bearing is the module doc's rule, stated there once with its axum citations.
 /// `/metrics` is registered here for it, and so is `/openapi.json` under the `openapi` feature:
 /// it carries the API schema, which is exactly what the token exists to protect on a bind that
@@ -531,9 +493,40 @@ pub fn router(shared: Shared) -> Router {
     // transport has to present the token — a hidden route would be served unchecked.
     #[cfg(feature = "openapi")]
     let routes = routes.route("/openapi.json", get(openapi_json));
+    // The observation layer is outermost, so the 401s the token layer answers
+    // and the `/metrics` scrape itself are counted; an unmatched path still
+    // never reaches either layer (the module doc's `route_layer` rule).
     routes
         .route_layer(middleware::from_fn_with_state(shared.clone(), authorize))
+        .route_layer(middleware::from_fn(observe_http))
         .with_state(shared)
+}
+
+/// One layer for the three HTTP families and the request's span: every routed management
+/// request, including the refused one and the scrape itself. The span is the unit here — the
+/// axum tower layers stay unspanned — and lives on [`api_request`]. `status` is recorded after
+/// the response exists; the path is the request's, with no query.
+async fn observe_http(request: Request, next: Next) -> Response {
+    let start = Instant::now();
+    let _in_flight = metrics::InFlightGuard::new();
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let response = api_request(method.clone(), path, request, next).await;
+    metrics::record_http_request(method.as_str(), response.status().as_u16(), start.elapsed());
+    response
+}
+
+#[instrument(
+    level = "info",
+    target = "tinio::api",
+    name = "tinio.api.request",
+    skip_all,
+    fields(method = %method, path = %path, status = field::Empty, close_line = false)
+)]
+async fn api_request(method: Method, path: String, request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    Span::current().record("status", u64::from(response.status().as_u16()));
+    response
 }
 
 async fn authorize(
@@ -543,7 +536,7 @@ async fn authorize(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if shared.auth.guards(path) {
+    if shared.auth.guards_with(path, shared.metrics_requires_token) {
         // `X-Tinio-Token`, or `Authorization: Bearer <token>` as an alias — the alias is what
         // lets a Prometheus scrape reach `/metrics` over TCP (`management-api.md:15`).
         let presented = headers
@@ -655,28 +648,13 @@ async fn stop(AxumState(shared): AxumState<Shared>) -> (StatusCode, Json<StopBod
 fn stop_doc() {}
 
 /// `GET /metrics`: the Prometheus text exposition (`management-api.md:53-55`).
-async fn metrics(AxumState(shared): AxumState<Shared>) -> Response {
-    // Deliberate and contractual: a plane whose source was never attached has no `/metrics`,
-    // so a scraper sees the endpoint's absence rather than an empty 200 (decision 8's
-    // round-2 ruling — keep the 404, change the contract). The body is this crate's error shape
-    // (`ErrorBody`, `{"error": "..."}`) like every other failure the plane answers, so a caller
-    // parses one format; the message keeps the sentence that says what is missing.
-    let Some(gauges) = shared.gauges() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: "metrics are not attached".to_string(),
-            }),
-        )
-            .into_response();
-    };
-    // Cheap half only, and no `await`: the storage scan is the reader task's (`spawn_reader`),
-    // so this handler never touches the backend and never scans — it refreshes the pipeline
-    // families the caller's adapter republishes and gathers the registry the reader has
-    // already filled. A scrape's cost is therefore independent of the root's size and of how
-    // often the endpoint is hit.
-    gauges.refresh();
-    match gauges.render() {
+///
+/// The whole handler is the registry gather and the encode ([crate::metrics::render]). No number
+/// is refreshed here and no storage is read: the composition root's reader task keeps the
+/// pipeline, write-lock and storage families fresh on its own `ttl`, so a scrape's cost is the
+/// registry's size and a stalled scan cannot reach this request at all.
+async fn metrics() -> Response {
+    match metrics::render() {
         Ok(text) => (
             StatusCode::OK,
             [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
@@ -693,7 +671,7 @@ async fn metrics(AxumState(shared): AxumState<Shared>) -> Response {
 
 /// The Prometheus text exposition, `text/plain; version=0.0.4; charset=utf-8`.
 ///
-/// `404` when the plane carries no gauge source: the absence is served, not an empty `200`.
+/// Every plane serves it: the route gathers the process registry, and no family is injected.
 #[cfg(feature = "openapi")]
 #[expect(
     dead_code,
@@ -703,10 +681,7 @@ async fn metrics(AxumState(shared): AxumState<Shared>) -> Response {
     get,
     path = "/metrics",
     tag = "management",
-    responses(
-        (status = 200, description = "The three metric layers, in the Prometheus text format"),
-        (status = 404, description = "The plane carries no gauge source")
-    )
+    responses((status = 200, description = "The metric layers, in the Prometheus text format"))
 )]
 fn metrics_doc() {}
 

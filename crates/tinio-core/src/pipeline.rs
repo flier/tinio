@@ -56,6 +56,7 @@ use std::{
 use async_trait::async_trait;
 use derive_more::Debug;
 use futures::channel::oneshot;
+use tracing::instrument;
 
 /// Unit-success [`Task::Output`]: `Ok(())` or a type-erased error.
 pub type RunOutput = Result<(), Box<dyn StdError + Send + Sync>>;
@@ -379,7 +380,14 @@ impl<O> Runner<O> for InlineRunner
 where
     O: Send + 'static,
 {
+    #[instrument(
+        level = "debug",
+        target = "tinio::pipeline",
+        skip(self, task),
+        fields(kind = task.kind())
+    )]
     async fn enqueue(&self, mut task: Box<dyn Task<Output = O>>) -> Result<Completion<O>, Error> {
+        // `async_trait` boxes the method, so the span rides the future.
         if self.shut_down.load(Ordering::Relaxed) {
             return Err(Error::ShutDown);
         }

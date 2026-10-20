@@ -133,7 +133,7 @@ impl Row {
     ) -> Option<Self> {
         let (owner, grants) = acl.into_parts();
         Some(Self {
-            etag: ETag::new(etag).ok()?,
+            etag: etag.parse::<ETag>().ok()?,
             size,
             mtime,
             identity,
@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn the_object_part_conversions_round_trip() {
         let part = multipart::ObjectPart {
-            part_number: 3.into(),
+            part_number: multipart::part_number(3).expect("a valid part number"),
             size: 50,
             checksum: None,
         };
@@ -693,7 +693,7 @@ mod tests {
     fn put_preserving_carries_the_recorded_elements_over() {
         let row = object_row(ETAG, "", tag_set(), Acl::default_private(None)).unwrap();
         let refreshed = row.with_identity(&Identity {
-            etag: ETag::new("900150983cd24fb0d6963f7d28e17f72").unwrap(),
+            etag: "900150983cd24fb0d6963f7d28e17f72".parse::<ETag>().unwrap(),
             size: 11,
             mtime: SystemTime::UNIX_EPOCH,
             file_identity: 3,

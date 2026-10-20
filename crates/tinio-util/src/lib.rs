@@ -41,6 +41,11 @@
 //! - [`lockmap`] — the evicting per-key lock map (multipart part-write
 //!   locks, per-object conditional-PUT locks, per-bucket directory
 //!   mutation locks).
+//! - [`metrics`] — the five cross-backend Prometheus families (write failures,
+//!   pass duration/failures, read-only, corrupt rows): one declaration on the
+//!   default registry, because a second backend registering a name is
+//!   `AlreadyReg`. Backends call `record_*`; the module names no `tracing`,
+//!   `tinio-core` or `tokio` type.
 //! - [`pacing`] — [`sleep_checked`](pacing::sleep_checked), the chunked
 //!   sleep that ends the moment a `watch` shutdown channel flips (the
 //!   backends' scanner and sweeper pacing).
@@ -98,6 +103,7 @@ pub mod bench;
 pub mod env;
 pub mod fsutil;
 pub mod lockmap;
+pub mod metrics;
 pub mod pacing;
 pub mod path;
 pub mod process;

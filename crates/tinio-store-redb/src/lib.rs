@@ -64,10 +64,14 @@ pub use self::{
     acl::{decode_acl_wire, decode_owner_wire},
     compact::{Compaction, Stats, compact_if_needed, needs_compact},
     content::RedbContent,
-    driver::{Driver, WriteLockSnapshot},
+    driver::Driver,
     error::Error,
     open::{Integrity, Open, check_integrity, meta_db_path, open, open_read_only},
 };
+
+/// The write-lock histogram snapshot lives in `tinio-core`, beside the bucket bounds it is
+/// positional with; re-exported here so a store consumer keeps naming it through its backend.
+pub use crate::_core::WriteLockSnapshot;
 
 /// The shared metadata implementation: the four metadata contracts
 /// over one [`Driver`] — `BucketMeta`, `ObjectMeta` and `UploadMeta`

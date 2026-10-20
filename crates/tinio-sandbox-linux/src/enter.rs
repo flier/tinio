@@ -31,7 +31,7 @@ use crate::{
     caps::{self, Cap},
     jail::{EXPOSE_STEP, jail_root, mirror_under},
     mechanism::{Resolved, fail, refused, step, unshare},
-    metrics::{ReadOnlyArm, record_read_only_arm},
+    metrics::{ReadOnlyArm, record_model, record_read_only_arm},
     options::Options,
     plan::{Mount, MountKind, OverlayDirs, plan},
     seccomp,
@@ -46,7 +46,7 @@ use crate::{
 /// The name is a parameter so the error names the map that failed without
 /// re-deriving it from the path. The span records which map and what it says
 /// (shared §7).
-#[instrument(level = "debug", skip(file), ret)]
+#[instrument(target = "tinio::sandbox", level = "debug", skip(file))]
 fn write_map(file: &mut fs::File, name: &'static str, contents: &str) -> Result<()> {
     file.write_all(contents.as_bytes()).map_err(step(name))
 }
@@ -90,7 +90,7 @@ impl crate::Backend {
     /// syscall, named by the step — and for the thread precondition, which is
     /// the one refusal here that is not a syscall's answer but this sequence's
     /// own.
-    #[instrument(skip_all, fields(model = ?opts.model(), euid = opts.euid()))]
+    #[instrument(target = "tinio::sandbox", level = "info", skip_all, fields(model = ?opts.model(), euid = opts.euid()))]
     pub(crate) fn enter(&mut self, sandbox: &Sandbox, opts: &Options) -> Result<Confinement> {
         // **The forced `/proc/self/fd` fallback, resolved once for the run
         // instead of once per bind.** [`bind_exposure`] used to read
@@ -195,7 +195,7 @@ struct Prepared {
 }
 
 /// Validate the request and build the mount plan, before anything irreversible.
-#[instrument(skip_all, fields(model = ?opts.model()))]
+#[instrument(target = "tinio::sandbox", level = "debug", skip_all, fields(model = ?opts.model()))]
 fn validate_and_plan(sandbox: &Sandbox, opts: &Options) -> Result<Prepared> {
     // 1. Validate everything a mistake could be made about, while the
     //    process can still be repaired by exiting.
@@ -252,7 +252,7 @@ fn validate_and_plan(sandbox: &Sandbox, opts: &Options) -> Result<Prepared> {
 
 /// Probe, refuse an unavailable or conflicting model, and name the one
 /// mechanism that runs. `ret` is the Info event for which model ran (shared §7).
-#[instrument(skip_all, ret, fields(requested = ?opts.model(), euid = opts.euid()))]
+#[instrument(target = "tinio::sandbox", level = "debug", skip_all, fields(requested = ?opts.model(), euid = opts.euid()))]
 fn resolve_model(opts: &Options) -> Result<Mechanism> {
     // **The probe and the table moved to `Options::resolve`, and the move is the point**: the
     // facade's run-time gate (`tinio_sandbox::can_confine`, asked by the CLI before a start
@@ -263,6 +263,10 @@ fn resolve_model(opts: &Options) -> Result<Mechanism> {
     // a refusal costs nothing — real root's `CAP_SYS_ADMIN` as the fallback, and
     // `Resolved::Unavailable` when neither is available.
     let resolved = opts.resolve()?;
+    // Family 21: the model is recorded where the resolution answers, so the value a caller states
+    // after the confinement and the value a scrape reads are one. `Unavailable` records nothing —
+    // no model ran, and the refusal below is the answer.
+    record_model(resolved);
 
     let resolved = match resolved {
         // **The refusal *is* the mapping, and the shape this function used to
@@ -635,7 +639,9 @@ fn task_count(dir: &Path) -> Result<usize> {
 }
 
 /// The jail root inside `$TMPDIR` — created before the first `unshare`.
-#[instrument(skip_all, fields(jail = %jail.display()))]
+///
+/// **No field, for `pivot_into_jail`'s reason**: the path is the host's, not the span's.
+#[instrument(target = "tinio::sandbox", level = "info", skip_all)]
 fn create_jail_root(jail: &Path) -> Result<()> {
     // 2. The jail root, **inside `$TMPDIR`** — the first host resource the
     //    confinement touches, and the one whose failure names nothing on its
@@ -664,7 +670,7 @@ fn create_jail_root(jail: &Path) -> Result<()> {
 /// `resolved` is [`Prepared`]'s resolved model rather than the request — the
 /// field keeps its name and its `resolved` log field because that is what it
 /// is (shared §7).
-#[instrument(skip_all, fields(resolved = ?resolved))]
+#[instrument(target = "tinio::sandbox", level = "debug", skip_all, fields(resolved = ?resolved))]
 fn enter_user_namespace(
     resolved: Mechanism,
     opts: &Options,
@@ -698,7 +704,7 @@ fn enter_user_namespace(
 }
 
 /// The private mount namespace, then the tree made private for `pivot_root`.
-#[instrument(level = "debug", ret)]
+#[instrument(target = "tinio::sandbox", level = "debug")]
 fn enter_mount_namespace() -> Result<()> {
     // 4. The private mount namespace, now that the maps exist. One thread
     //    still, which is what makes both unshares legal (design §10).
@@ -726,8 +732,9 @@ fn enter_mount_namespace() -> Result<()> {
 /// The mounts, in plan order. The Info event for the exposure set that landed is
 /// [`announce_exposures`]'s (shared §7).
 #[instrument(
+    target = "tinio::sandbox",
+    level = "debug",
     skip_all,
-    ret,
     fields(mounts = mounts.len(), exposures = ?sandbox.exposures())
 )]
 fn apply_planned_mounts(
@@ -786,7 +793,10 @@ fn announce_exposures(exposures: &[Exposure], mounts: usize) {
 }
 
 /// Pivot into the jail and detach the old root.
-#[instrument(level = "debug", skip_all, ret, fields(jail = %jail.display()))]
+///
+/// **The jail's path is not a field.** It is a host path outside the served root, and the
+/// operator reads it in the refusal the step returns; the span carries the step alone.
+#[instrument(target = "tinio::sandbox", level = "info", skip_all)]
 fn pivot_into_jail(jail: &Path) -> Result<()> {
     // 8. The pivot. `put_old` must already exist inside the new root, and
     //    the jail is a tmpfs we own, so creating it writes nothing to the
@@ -1596,7 +1606,7 @@ fn overlay_mount_options(source: &Path, upper: &Path, work: &Path) -> Result<CSt
     })
 }
 
-#[instrument(level = "debug", skip_all, ret, fields(retained = ?keep, effective = field::Empty))]
+#[instrument(target = "tinio::sandbox", level = "debug", skip_all, fields(retained = ?keep, effective = field::Empty))]
 fn drop_capabilities(keep: &[Cap]) -> Result<()> {
     // **The retained set is announced before anything is given up**, so a run
     // that dies part-way through the sweep still says which policy it was

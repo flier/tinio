@@ -420,6 +420,7 @@ pub fn permission_remedy(kind: ServiceManagerKind, level: ServiceLevel) -> &'sta
 /// # Ok(())
 /// # }
 /// ```
+#[tracing::instrument(target = "tinio::cli", level = "debug", skip_all, name = "service.run")]
 pub fn run(args: Args) -> Result<ExitCode, Error> {
     let verb = args.verb;
     let root = resolve::resolve_root(args.dir.as_deref(), &resolve::current_dir()?)?;

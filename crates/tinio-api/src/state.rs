@@ -327,6 +327,12 @@ impl State {
     ///     State::new("/run/tinio/tinio-0123456789abcdef.sock", Some(9000), root).expect("state");
     /// state.write(Path::new("/run/tinio")).expect("write");
     /// ```
+    #[tracing::instrument(
+        target = "tinio::api",
+        level = "debug",
+        skip_all,
+        name = "tinio.api.state_write"
+    )]
     pub fn write(&self, state_dir: &Path) -> Result<(), Error> {
         fs::create_dir_all(state_dir).map_err(Error::Io)?;
         let text = serde_json::to_string_pretty(self).map_err(|err| Error::State {

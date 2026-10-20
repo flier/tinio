@@ -10,6 +10,8 @@ use md5::{Digest, Md5};
 use tokio::{fs, time::timeout};
 
 use super::*;
+#[cfg(unix)]
+use crate::_core::multipart;
 // MultipartOps' direct callers here are the #[cfg(unix)] fast-path
 // tests — cfg-gated like the import above, or windows clippy reports
 // it unused while the unix build cannot resolve the trait methods.
@@ -160,7 +162,7 @@ async fn copy_of_a_multipart_source_yields_the_content_md5() {
             &b,
             &k,
             &upload.upload_id,
-            1.into(),
+            multipart::part_number(1).unwrap(),
             body(vec![b'a'; min]),
             None,
         )
@@ -171,7 +173,7 @@ async fn copy_of_a_multipart_source_yields_the_content_md5() {
             &b,
             &k,
             &upload.upload_id,
-            2.into(),
+            multipart::part_number(2).unwrap(),
             body(b"part-two-"),
             None,
         )
@@ -237,7 +239,11 @@ async fn missing_bucket_is_no_such_bucket() {
     let (_root, storage) = storage();
     let ghost = bucket::name("ghost").unwrap();
     let err: StorageError = storage
-        .put_object(&ghost, &"a".into(), body(b"x"))
+        .put_object(
+            &ghost,
+            &object::key("a").expect("a valid object key"),
+            body(b"x"),
+        )
         .await
         .unwrap_err()
         .into();
@@ -360,7 +366,11 @@ async fn delete_of_a_directory_without_slash_is_204() {
     let b = bucket(&storage).await;
     // 'dir' exists as a directory (a folder marker was PUT).
     storage
-        .put_object(&b, &"dir/".into(), body(b""))
+        .put_object(
+            &b,
+            &object::key("dir/").expect("a valid object key"),
+            body(b""),
+        )
         .await
         .unwrap();
     // DELETE 'dir' (no trailing slash): idempotent 204, the
@@ -403,7 +413,11 @@ async fn folder_marker_semantics() {
     // A non-empty directory is left in place.
     storage.put_object(&b, &marker, body(b"")).await.unwrap();
     storage
-        .put_object(&b, &"dir/file.txt".into(), body(b"x"))
+        .put_object(
+            &b,
+            &object::key("dir/file.txt").expect("a valid object key"),
+            body(b"x"),
+        )
         .await
         .unwrap();
     storage.delete_object(&b, &marker).await.unwrap();
@@ -498,7 +512,11 @@ async fn head_of_folder_marker_is_no_such_key() {
     let (_root, storage) = storage();
     let b = bucket(&storage).await;
     storage
-        .put_object(&b, &"dir/".into(), body(b""))
+        .put_object(
+            &b,
+            &object::key("dir/").expect("a valid object key"),
+            body(b""),
+        )
         .await
         .unwrap();
     let err: StorageError = storage

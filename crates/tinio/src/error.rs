@@ -8,9 +8,9 @@
 //! # Examples
 //!
 //! ```rust
-//! use tinio::{StorageError, storage::Error::*};
+//! use tinio::{StorageError, bucket, storage::Error::*};
 //!
-//! let err: StorageError = NoSuchBucket("data".into());
+//! let err: StorageError = NoSuchBucket(bucket::name("data").expect("a valid bucket name"));
 //! assert_eq!(err.to_string(), "no such bucket: `data`");
 //! ```
 

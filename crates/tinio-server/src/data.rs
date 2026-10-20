@@ -1,9 +1,11 @@
 //! The hyper data plane (task T051).
 //!
 //! Hosts the s3s [`S3Service`] over hyper/hyper-util: a tower middleware
-//! wraps every request to record the access-log event (`tinio::access`
-//! target, T052), the HTTP metrics (request count/duration/in-flight),
-//! and the upload/download byte counters on the streaming bodies (T054).
+//! opens the `tinio.http.request` admission span (target `tinio::http`),
+//! emits the access-log event inside it (`tinio::access` target, T052)
+//! and counts the upload/download bytes on the streaming bodies (T054).
+//! The HTTP families belong to the management plane (`tinio-api`), not
+//! this listener.
 //! The service itself is the s3s service over a stack of decorators: the
 //! [`MetricS3`] metrics/access-log wrapper, the write policy
 //! ([`S3ReadonlyBackend`], read-only planes only), the capability gate
@@ -44,17 +46,22 @@ use hyper_util::{
 use io::Error as IoError;
 use s3s::{
     Body as S3Body,
-    auth::{S3Auth, SecretKey},
-    s3_error,
+    auth::SecretKey,
     service::{S3Service, S3ServiceBuilder},
 };
+#[cfg(not(any(feature = "acl", feature = "copy")))]
+use s3s::{auth::S3Auth, s3_error};
 use time::{OffsetDateTime, format_description, format_description::BorrowedFormatItem};
 use tokio::{net::TcpListener, sync::watch};
 use tower::Service as TowerService;
-use tracing::{callsite::DefaultCallsite, dispatcher, metadata};
+use tracing::{callsite::DefaultCallsite, dispatcher, instrument, metadata};
 
 #[cfg(feature = "acl")]
-use crate::_auth::{AclAccess, ConfigAuth, Identity};
+use crate::_auth::AclAccess;
+#[cfg(any(feature = "acl", feature = "copy"))]
+use crate::_auth::{ConfigAuth, Identity, User, derive_canonical_id};
+#[cfg(any(feature = "acl", feature = "copy"))]
+use crate::_core::acl::{DEFAULT_OWNER_DISPLAY_NAME, default_owner_id};
 #[cfg(feature = "cors")]
 use crate::backend::cors::{self, apply_cors_headers, bucket_from_uri};
 use crate::{
@@ -69,13 +76,13 @@ use crate::{
 
 /// The scrape-time metrics refresh (F49): the hook refreshes the
 /// scrape-computed families (`tinio_server::metrics::refresh` — the CLI's
-/// adapter wires it to the pipelines' `Stats` and the storage's
+/// reader tick wires it to the pipelines' `Stats` and the storage's
 /// write-lock snapshot) so that whoever gathers the registry finds them
 /// current.
 ///
 /// **The scrape lives on the management plane** (`tinio-api`'s
-/// token-gated `/metrics`), which the CLI's own `MetricsSource` adapter
-/// drives: this hook is what that adapter's cheap half calls. Nothing in
+/// token-gated `/metrics`), which the CLI's reader tick drives: this hook is
+/// what that tick's cheap half calls. Nothing in
 /// this file serves the path — the data-plane listener answers `/metrics`
 /// as the bucket named `metrics`, like any other first path segment (the
 /// interim unauthenticated data-plane route was removed when the
@@ -86,25 +93,55 @@ use crate::{
 /// ```rust
 /// use tinio_server::MetricsRefresh;
 ///
-/// // The shape the CLI's `MetricsSource` adapter holds.
+/// // The shape the CLI's reader tick holds.
 /// let refresh: MetricsRefresh = std::sync::Arc::new(|| {});
 /// refresh();
 /// ```
 pub type MetricsRefresh = Arc<dyn Fn() + Send + Sync>;
 
-/// The single static SigV4 credential pair as an s3s auth provider.
-/// Unlike `SimpleAuth` (which answers `NotSignedUp`), an unknown access
-/// key answers AWS's `InvalidAccessKeyId` — the code aws cli and the
-/// FR-008 interop scenario expect for a wrong key.
+/// The static pair's provider: [`ConfigAuth`] over a one-user identity map,
+/// so the credential lookup — its `tinio::auth` span, its `result` field
+/// and its metric — is the acl plane's and runs once. The owner element is
+/// the built-in default: this path carries no identity in the backend.
+#[cfg(any(feature = "acl", feature = "copy"))]
+fn static_auth(access_key: &str, secret_key: &str) -> ConfigAuth {
+    let user = User {
+        access_key: access_key.to_owned(),
+        canonical_id: derive_canonical_id(access_key),
+        display_name: DEFAULT_OWNER_DISPLAY_NAME.to_owned(),
+        secret: SecretKey::from(secret_key),
+    };
+    ConfigAuth::new(Arc::new(Identity::new(
+        [(access_key.to_owned(), user)].into_iter().collect(),
+        default_owner_id(),
+        DEFAULT_OWNER_DISPLAY_NAME.to_owned(),
+    )))
+}
+
+/// The pair's provider in a bare build — the only one with no `tinio-auth`
+/// edge, so the only one where no shared lookup exists to reuse. Unlike
+/// `SimpleAuth` (which answers `NotSignedUp`), an unknown access key
+/// answers AWS's `InvalidAccessKeyId` — the code aws cli and the FR-008
+/// interop scenario expect for a wrong key.
+#[cfg(not(any(feature = "acl", feature = "copy")))]
 struct StaticAuth {
     access_key: String,
     secret_key: SecretKey,
 }
 
+#[cfg(not(any(feature = "acl", feature = "copy")))]
 #[async_trait::async_trait]
 impl S3Auth for StaticAuth {
+    #[tracing::instrument(
+        level = "info",
+        target = "tinio::auth",
+        skip_all,
+        fields(result = tracing::field::Empty)
+    )]
     async fn get_secret_key(&self, access_key: &str) -> s3s::S3Result<SecretKey> {
-        if access_key == self.access_key {
+        let found = access_key == self.access_key;
+        tracing::Span::current().record("result", if found { "found" } else { "unknown" });
+        if found {
             Ok(self.secret_key.clone())
         } else {
             Err(s3_error!(
@@ -112,6 +149,15 @@ impl S3Auth for StaticAuth {
                 "The AWS Access Key Id you provided does not exist in our records."
             ))
         }
+    }
+}
+
+/// The bare build's provider: the same pair, compared in place.
+#[cfg(not(any(feature = "acl", feature = "copy")))]
+fn static_auth(access_key: &str, secret_key: &str) -> StaticAuth {
+    StaticAuth {
+        access_key: access_key.to_owned(),
+        secret_key: SecretKey::from(secret_key),
     }
 }
 
@@ -192,9 +238,9 @@ impl DataPlane {
     ///
     /// Unsigned requests stay allowed only when no auth provider is set; with
     /// one set, s3s requires signed requests to verify against these
-    /// credentials. Used by the `serve` example so the US1 interop harness
-    /// works with real (always-signing) S3 clients; superseded by the
-    /// config-based auth provider in US3 (T082/T083).
+    /// credentials. The provider is the acl plane's `ConfigAuth` over a
+    /// one-user identity, so this constructor reuses that lookup — span,
+    /// metric and refusal included — instead of a second one.
     pub fn new_with_auth<S: Storage>(
         storage: S,
         plane: impl Into<PlaneConfig>,
@@ -205,10 +251,7 @@ impl DataPlane {
         let storage = Arc::new(storage);
         let backend = S3Backend::new_shared(Arc::clone(&storage), plane.caps);
         let mut builder = Self::service_builder(plane, backend);
-        builder.set_auth(StaticAuth {
-            access_key: access_key.to_string(),
-            secret_key: secret_key.into(),
-        });
+        builder.set_auth(static_auth(access_key, secret_key));
         #[cfg(feature = "cors")]
         {
             if let Some(lookup) = Self::cors_lookup(&storage, &plane.caps) {
@@ -358,8 +401,18 @@ impl Service<Request<Incoming>> for WithPeer {
     }
 }
 
-/// The tower middleware over the s3s service: access-log events, HTTP
-/// metrics, and byte counters.
+/// Per-process monotonic id recorded on the admission span; one per
+/// request, cheap enough for the hot path, and never formatted unless a
+/// subscriber is listening.
+static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn next_request_id() -> u64 {
+    REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The tower middleware over the s3s service: the request admission span,
+/// access-log events and byte counters.
 #[derive(Clone)]
 pub struct DataPlaneService {
     inner: S3Service,
@@ -368,17 +421,6 @@ pub struct DataPlaneService {
     /// decoration on every non-preflight response.
     #[cfg(feature = "cors")]
     cors: Option<Arc<dyn cors::Lookup>>,
-}
-
-/// Decrements `HTTP_IN_FLIGHT` when dropped — on request completion and
-/// on cancellation (a dropped service future), so a client disconnect
-/// cannot leak the gauge.
-struct InFlightGauge;
-
-impl Drop for InFlightGauge {
-    fn drop(&mut self) {
-        metrics::http_in_flight_dec();
-    }
 }
 
 impl DataPlaneService {
@@ -394,13 +436,17 @@ impl DataPlaneService {
 
     fn call_with_peer(&self, req: Request<Incoming>, peer: SocketAddr) -> ServiceFuture {
         let start = Instant::now();
-        metrics::http_in_flight_inc();
-        // Decrements when the future completes AND when hyper drops it
-        // (client disconnect mid-request) — a cancelled future must not
-        // leak the gauge. Moved into the future below.
-        let inflight = InFlightGauge;
 
         let method = req.method().as_str().to_string();
+        // The path exists only for the admission span's field: a filtered-out span pays no
+        // allocation (the access line derives its own path from the URI).
+        let path = request_span_enabled().then(|| req.uri().path().to_string());
+        let request_id = next_request_id();
+        // The admission span: `tower::Service::call` is the unit, so an
+        // `#[instrument]` helper wraps the service future (the method itself
+        // would close before the first poll). The access event below is emitted
+        // inside it, so the access line shares the trace; the access gate and
+        // the counting bodies stay unspanned.
         // The access-log fields are built only when a subscriber listens
         // on the `tinio::access` target — tracing would filter the event,
         // but the strings (and the `nginx_time` clock read) would still be
@@ -454,96 +500,162 @@ impl DataPlaneService {
         #[cfg(feature = "cors")]
         let cors = self.cors.clone();
         let future = TowerService::call(&mut service, req);
-        Box::pin(async move {
-            // Its `Debug` form, boxed: s3s 0.17 made `HttpError` an `Error` (with
-            // `into_std_error` to unwrap it without the extra box), so the cheaper
-            // spelling exists — the text this records is deliberately unchanged.
-            let result = future
-                .await
-                .map_err(|e| IoError::other(format!("{e:?}")).into());
-            let elapsed = start.elapsed();
-            let upload_bytes = upload_counter.load(Ordering::Relaxed);
-            metrics::record_upload_bytes(upload_bytes);
-            // The gauge is released here (normal completion) or with the
-            // future itself (cancellation).
-            drop(inflight);
-
-            // One metric + access-log record per request: the status and
-            // body bytes come from the response, 500/0 for transport
-            // failures.
-            let (status, body_bytes, result) = match result {
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    // Task-10 CORS decoration of the ACTUAL response (the
-                    // preflight route answers OPTIONS itself; this covers
-                    // every other operation): the Access-Control-* headers
-                    // of the rule that matches the request's Origin +
-                    // method — `rule_for` is first-origin-match with the
-                    // method validated WITHIN that rule (no fall-through).
-                    // s3s encodes op errors as Ok(Response) bodies, so 4xx
-                    // XML answers are decorated too — matches AWS. The
-                    // lookup is `None` unless feature + capability are on,
-                    // which short-circuits everything below. (The mut
-                    // shadow is cfg'd: feature-off builds leave the
-                    // binding plain.)
-                    #[cfg(feature = "cors")]
-                    let mut response = response;
-                    #[cfg(feature = "cors")]
-                    // OPTIONS is skipped outright: the preflight route
-                    // answers it, and no rule may allow OPTIONS — so
-                    // `rule_for` cannot match and the per-request config
-                    // read would be wasted on every preflight.
-                    if method != "OPTIONS"
-                        && let (Some(cors), Some(origin)) = (cors.as_deref(), origin.as_deref())
-                        && let Some(uri) = uri.as_ref()
-                        && let Some(bucket) = bucket_from_uri(uri)
-                        && let Some(config) = cors.get(&bucket).await
-                        && let Some(rule) = config.rule_for(origin, &method)
-                    {
-                        // The shared decoration (the preflight route's
-                        // common header set — the two must never answer
-                        // differently; the Q11/S1 semantics live there).
-                        apply_cors_headers(response.headers_mut(), rule, origin);
-                    }
-                    // Count download bytes on the response body (recorded
-                    // when the stream ends); the access log uses the
-                    // response Content-Length (known upfront).
-                    let (parts, body) = response.into_parts();
-                    let download_counter = Arc::new(AtomicU64::new(0));
-                    let counted = CountingBody::new(
-                        body,
-                        Arc::clone(&download_counter),
-                        CountingKind::Download,
-                    );
-                    let response = Response::from_parts(parts, counted);
-                    let body_bytes = response
-                        .headers()
-                        .get(CONTENT_LENGTH)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    (status, body_bytes, Ok(response))
-                }
-                Err(err) => (500, 0, Err(err)),
-            };
-            metrics::record_http_request(&method, status, elapsed);
-            if let Some((remote_addr, request, referer, user_agent)) = access_log {
-                let fields = AccessFields::new(
-                    remote_addr,
-                    "-".to_string(),
-                    nginx_time(),
-                    request,
-                    status,
-                    body_bytes,
-                    referer,
-                    user_agent,
-                    format!("{:.3}", elapsed.as_secs_f64()),
-                );
-                emit_access(&fields);
-            }
-            result
-        })
+        Box::pin(http_request(
+            start,
+            RequestTrace {
+                method,
+                path,
+                request_id,
+                access_log,
+            },
+            upload_counter,
+            future,
+            #[cfg(feature = "cors")]
+            cors,
+            #[cfg(feature = "cors")]
+            origin,
+            #[cfg(feature = "cors")]
+            uri,
+        ))
     }
+}
+
+type DataPlaneResponse = Result<Response<CountingBody<S3Body>>, Box<dyn StdError + Send + Sync>>;
+
+/// The request identity the admission span and the access line share.
+struct RequestTrace {
+    method: String,
+    /// The path for the admission span's field; `None` when the span is filtered out.
+    path: Option<String>,
+    request_id: u64,
+    access_log: Option<(String, String, String, String)>,
+}
+
+#[instrument(
+    level = "info",
+    target = "tinio::http",
+    name = "tinio.http.request",
+    skip_all,
+    fields(method = %trace.method, path = %trace.path.as_deref().unwrap_or("-"), request_id = trace.request_id, close_line = false)
+)]
+async fn http_request<F>(
+    start: Instant,
+    trace: RequestTrace,
+    upload_counter: Arc<AtomicU64>,
+    work: F,
+    #[cfg(feature = "cors")] cors: Option<Arc<dyn cors::Lookup>>,
+    #[cfg(feature = "cors")] origin: Option<String>,
+    #[cfg(feature = "cors")] uri: Option<http::Uri>,
+) -> DataPlaneResponse
+where
+    F: Future<
+            Output = Result<
+                Response<S3Body>,
+                <S3Service as TowerService<Request<CountingBody<Incoming>>>>::Error,
+            >,
+        > + Send,
+{
+    // Its `Debug` form, boxed: s3s 0.17 made `HttpError` an `Error` (with
+    // `into_std_error` to unwrap it without the extra box), so the cheaper
+    // spelling exists — the text this records is deliberately unchanged.
+    let result = work
+        .await
+        .map_err(|e| IoError::other(format!("{e:?}")).into());
+    let elapsed = start.elapsed();
+    let upload_bytes = upload_counter.load(Ordering::Relaxed);
+    metrics::record_upload_bytes(upload_bytes);
+
+    // One access-log record per request: the status and body bytes
+    // come from the response, 500/0 for transport failures.
+    let (status, body_bytes, result) = match result {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            // Task-10 CORS decoration of the ACTUAL response (the
+            // preflight route answers OPTIONS itself; this covers
+            // every other operation): the Access-Control-* headers
+            // of the rule that matches the request's Origin +
+            // method — `rule_for` is first-origin-match with the
+            // method validated WITHIN that rule (no fall-through).
+            // s3s encodes op errors as Ok(Response) bodies, so 4xx
+            // XML answers are decorated too — matches AWS. The
+            // lookup is `None` unless feature + capability are on,
+            // which short-circuits everything below. (The mut
+            // shadow is cfg'd: feature-off builds leave the
+            // binding plain.)
+            #[cfg(feature = "cors")]
+            let mut response = response;
+            #[cfg(feature = "cors")]
+            // OPTIONS is skipped outright: the preflight route
+            // answers it, and no rule may allow OPTIONS — so
+            // `rule_for` cannot match and the per-request config
+            // read would be wasted on every preflight.
+            if trace.method != "OPTIONS"
+                && let (Some(cors), Some(origin)) = (cors.as_deref(), origin.as_deref())
+                && let Some(uri) = uri.as_ref()
+                && let Some(bucket) = bucket_from_uri(uri)
+                && let Some(config) = cors.get(&bucket).await
+                && let Some(rule) = config.rule_for(origin, &trace.method)
+            {
+                // The shared decoration (the preflight route's
+                // common header set — the two must never answer
+                // differently; the Q11/S1 semantics live there).
+                apply_cors_headers(response.headers_mut(), rule, origin);
+            }
+            // Count download bytes on the response body (recorded
+            // when the stream ends); the access log uses the
+            // response Content-Length (known upfront).
+            let (parts, body) = response.into_parts();
+            let download_counter = Arc::new(AtomicU64::new(0));
+            let counted =
+                CountingBody::new(body, Arc::clone(&download_counter), CountingKind::Download);
+            let response = Response::from_parts(parts, counted);
+            let body_bytes = response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            (status, body_bytes, Ok(response))
+        }
+        Err(err) => (500, 0, Err(err)),
+    };
+    if let Some((remote_addr, request, referer, user_agent)) = trace.access_log {
+        let fields = AccessFields::new(
+            remote_addr,
+            "-".to_string(),
+            nginx_time(),
+            request,
+            status,
+            body_bytes,
+            referer,
+            user_agent,
+            format!("{:.3}", elapsed.as_secs_f64()),
+        );
+        emit_access(&fields);
+    }
+    result
+}
+
+/// The static callsite of the admission span's allocation gate — see
+/// [`request_span_enabled`]. Checked against the live dispatcher for the same
+/// reason as [`ACCESS_LOG_CALLSITE`].
+static REQUEST_SPAN_CALLSITE: LazyLock<&'static DefaultCallsite> = LazyLock::new(|| {
+    tracing::callsite! {
+        name: "tinio.http.request",
+        kind: metadata::Kind::SPAN,
+        target: "tinio::http",
+        level: tracing::Level::INFO,
+        fields: (method, path, request_id),
+    }
+});
+
+/// Whether the admission span is enabled — the gate on the per-request path
+/// allocation. The check follows the CURRENT dispatcher rather than
+/// [`tracing::enabled!`]'s frozen first appraisal (see [`ACCESS_LOG_CALLSITE`]).
+#[inline]
+fn request_span_enabled() -> bool {
+    use tracing::Callsite;
+    dispatcher::get_default(|d| d.enabled(REQUEST_SPAN_CALLSITE.metadata()))
 }
 
 /// The static callsite of the access-log gate — see
@@ -704,17 +816,13 @@ fn strip_query(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::{HashMap, VecDeque},
-        fmt::Debug,
-        io,
-        sync::Mutex,
-        thread,
-        time::Duration,
-    };
+    use std::{collections::VecDeque, io, thread, time::Duration};
 
     use futures::task;
     use http_body::{Body as _, Frame};
+    #[cfg(any(feature = "acl", feature = "copy"))]
+    use prometheus::default_registry;
+    use tinio_util::testing::spans;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
@@ -722,74 +830,21 @@ mod tests {
         task::JoinHandle,
         time::sleep,
     };
-    use tracing::{
-        Event, Metadata, Subscriber, field,
-        field::Field,
-        span::{self, Id},
-        subscriber::with_default,
-    };
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::prelude::*;
 
     use super::*;
-    use crate::_mem::MemoryStorage;
     #[cfg(feature = "cors")]
+    use crate::_core::cors;
     use crate::{
         _core::{
-            bucket, cors, object,
+            acl::Acl,
+            bucket, object,
             storage::{BucketOps, ObjectOps},
         },
+        _mem::MemoryStorage,
         _util::testing::body,
     };
-
-    /// One captured event: the target and its key/value fields.
-    type CaptureEvent = (String, HashMap<String, String>);
-
-    /// A bare subscriber capturing `(target, fields)` of every event —
-    /// enough to assert the access-log records without pulling in a
-    /// subscriber dependency.
-    #[derive(Clone, Default)]
-    struct CaptureSubscriber {
-        events: Arc<Mutex<Vec<CaptureEvent>>>,
-    }
-
-    impl Subscriber for CaptureSubscriber {
-        fn enabled(&self, _: &Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
-            Id::from_u64(1)
-        }
-
-        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
-
-        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
-
-        fn event(&self, event: &Event<'_>) {
-            let mut fields = HashMap::new();
-            event.record(&mut Fields(&mut fields));
-            self.events
-                .lock()
-                .unwrap()
-                .push((event.metadata().target().to_string(), fields));
-        }
-
-        fn enter(&self, _: &span::Id) {}
-
-        fn exit(&self, _: &span::Id) {}
-    }
-
-    struct Fields<'a>(&'a mut HashMap<String, String>);
-
-    impl field::Visit for Fields<'_> {
-        fn record_str(&mut self, field: &Field, value: &str) {
-            self.0.insert(field.name().to_string(), value.to_string());
-        }
-
-        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
-            self.0
-                .insert(field.name().to_string(), format!("{value:?}"));
-        }
-    }
 
     /// One raw HTTP/1.1 request over a fresh connection (`Connection:
     /// close`); the response body is read to EOF.
@@ -941,16 +996,6 @@ mod tests {
         assert_eq!(metrics::STORAGE_DOWNLOAD_BYTES.get(), before);
     }
 
-    #[test]
-    fn inflight_gauge_decrements_on_drop() {
-        let _window = metrics::test_lock::window();
-        metrics::HTTP_IN_FLIGHT.set(5);
-        {
-            let _gauge = InFlightGauge;
-        }
-        assert_eq!(metrics::HTTP_IN_FLIGHT.get(), 4);
-    }
-
     #[tokio::test]
     async fn serve_stops_on_shutdown_and_warns_on_a_bad_connection() {
         // The accept loop: a garbage connection is served and dropped
@@ -996,6 +1041,50 @@ mod tests {
             "{body_text}"
         );
         shutdown.send(true).unwrap();
+    }
+
+    #[cfg(any(feature = "acl", feature = "copy"))]
+    #[tokio::test]
+    async fn the_static_pair_answers_through_the_shared_lookup() {
+        // `new_with_auth` serves its pair through the acl plane's
+        // `ConfigAuth`: an unknown key is the same refusal and books the
+        // shared family, so no request performs a second, uninstrumented
+        // lookup.
+        use s3s::auth::S3Auth;
+
+        let before = credential_lookups("unknown");
+        let auth = static_auth("AKID", "secret");
+        let err = auth.get_secret_key("WHO").await.err().unwrap();
+        assert_eq!(err.code().as_str(), "InvalidAccessKeyId");
+        assert!(
+            credential_lookups("unknown") > before,
+            "the shared credential-lookup family must move"
+        );
+        let secret = auth.get_secret_key("AKID").await.unwrap();
+        assert_eq!(secret.expose(), "secret");
+    }
+
+    /// The shared credential-lookup counter at `result`, read out of the
+    /// default registry.
+    #[cfg(any(feature = "acl", feature = "copy"))]
+    fn credential_lookups(result: &str) -> f64 {
+        default_registry()
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == "tinio_auth_credential_lookups_total")
+            .and_then(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .find(|metric| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == "result" && label.value() == result)
+                    })
+                    .map(|metric| metric.get_counter().value())
+            })
+            .unwrap_or(0.0)
     }
 
     #[cfg(feature = "cors")]
@@ -1594,9 +1683,9 @@ mod tests {
         // empty under parallel load. The current-thread executor pins
         // every task to the capture thread (same rationale as the INLINE
         // comment above).
-        let capture = CaptureSubscriber::default();
+        let capture = spans::Capture::new();
         let capture2 = capture.clone();
-        with_default(capture, || {
+        with_default(tracing_subscriber::registry().with(capture), || {
             runtime::Builder::new_current_thread()
                 .enable_io()
                 .build()
@@ -1635,29 +1724,119 @@ mod tests {
             });
         });
 
-        let events = capture2.events.lock().unwrap();
+        let events = capture2.events();
         let access: Vec<_> = events
             .iter()
-            .filter(|(target, _)| target == ACCESS_TARGET)
+            .filter(|event| event.target == ACCESS_TARGET)
             .collect();
         assert_eq!(access.len(), 1, "{events:?}");
-        let (_, fields) = access[0];
-        assert_eq!(fields.get("remote_addr"), Some(&"127.0.0.1".to_string()));
+        let fields = access[0];
+        assert_eq!(fields.field("remote_addr"), Some("127.0.0.1"));
         assert_eq!(
-            fields.get("request"),
-            Some(&"GET /missing-bucket/key HTTP/1.1".to_string())
+            fields.field("request"),
+            Some("GET /missing-bucket/key HTTP/1.1")
         );
-        assert_eq!(fields.get("status"), Some(&"404".to_string()));
-        assert_eq!(
-            fields.get("http_user_agent"),
-            Some(&"test-agent/1.0".to_string())
-        );
+        assert_eq!(fields.field("status"), Some("404"));
+        assert_eq!(fields.field("http_user_agent"), Some("test-agent/1.0"));
         // The presigned referer query is stripped (FR-017).
-        assert_eq!(
-            fields.get("http_referer"),
-            Some(&"https://example.com/x".to_string())
-        );
-        assert!(fields.contains_key("time_local"));
-        assert!(fields.contains_key("request_time"));
+        assert_eq!(fields.field("http_referer"), Some("https://example.com/x"));
+        assert!(fields.field("time_local").is_some());
+        assert!(fields.field("request_time").is_some());
+    }
+
+    #[test]
+    fn admission_span_wraps_each_request_and_its_access_event() {
+        // One `tinio::http` span per request with the method, the path
+        // (query stripped) and a request id; the access event is emitted
+        // inside that span. A 404 and a 200 both produce exactly one span.
+        let capture = spans::Capture::new();
+        let capture2 = capture.clone();
+        with_default(tracing_subscriber::registry().with(capture), || {
+            runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let storage = MemoryStorage::new().unwrap();
+                    let name = bucket::name("data").unwrap();
+                    storage
+                        .create_bucket(&name, None, &Acl::default_private(None))
+                        .await
+                        .unwrap();
+                    storage
+                        .put_object(
+                            &name,
+                            &object::key("key").unwrap(),
+                            body(b"payload"),
+                        )
+                        .await
+                        .unwrap();
+                    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                        .await
+                        .unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    let plane = DataPlane::new(storage, Capabilities::default());
+
+                    for (request, expected) in [
+                        (
+                            "GET /missing-bucket/key?x=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                            404,
+                        ),
+                        (
+                            "GET /data/key HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                            200,
+                        ),
+                    ] {
+                        let client = thread::spawn(move || {
+                            runtime::Builder::new_current_thread()
+                                .enable_io()
+                                .build()
+                                .unwrap()
+                                .block_on(raw_request(addr, request))
+                        });
+                        let (stream, peer) = listener.accept().await.unwrap();
+                        let io = TokioIo::new(stream);
+                        let service = WithPeer {
+                            service: (*plane.service).clone(),
+                            peer,
+                        };
+                        Builder::new(TokioExecutor::new())
+                            .serve_connection(io, service)
+                            .await
+                            .unwrap();
+                        let (status, _) = client.join().unwrap();
+                        assert_eq!(status, expected);
+                    }
+                });
+        });
+
+        let spans = capture2.spans();
+        let http: Vec<_> = spans
+            .iter()
+            .filter(|span| span.target == "tinio::http")
+            .collect();
+        assert_eq!(http.len(), 2, "{spans:?}");
+        for span in &http {
+            assert_eq!(span.name, "tinio.http.request");
+            assert_eq!(span.level, tracing::Level::INFO);
+            assert_eq!(span.field("method"), Some("GET"));
+            assert!(span.field("request_id").is_some(), "{span:?}");
+        }
+        // The query is stripped; both the 404 and the 200 path survive.
+        assert_eq!(http[0].field("path"), Some("/missing-bucket/key"));
+        assert_eq!(http[1].field("path"), Some("/data/key"));
+        assert_ne!(http[0].field("request_id"), http[1].field("request_id"));
+
+        // The access event rides the span: one event per request, each
+        // emitted inside its own request span.
+        let events = capture2.events();
+        let access: Vec<_> = events
+            .iter()
+            .filter(|event| event.target == ACCESS_TARGET)
+            .collect();
+        assert_eq!(access.len(), 2, "{events:?}");
+        for (event, span) in access.iter().zip(&http) {
+            assert_eq!(event.span, Some(span.id));
+        }
     }
 }

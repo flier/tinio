@@ -379,6 +379,7 @@ mod enabled {
 
     use async_trait::async_trait;
     use tokio::fs;
+    use tracing::instrument;
 
     // The version identity a write path must record for the version it is
     // about to publish: the top-level `Plan`, shared with the feature-off
@@ -1043,6 +1044,12 @@ mod enabled {
         /// overlapped the flip could act on the old state after the flip
         /// answered (orderable, but only by an argument; the lock makes the
         /// serialization the obvious reading).
+        #[instrument(
+            level = "debug",
+            target = "tinio::storage",
+            skip(self, state),
+            fields(bucket = %bucket)
+        )]
         async fn set_bucket_versioning(&self, bucket: &Name, state: State) -> Result<(), Error> {
             self.ensure_bucket(bucket).await?;
             let _guard = self.lock_bucket_mutations(bucket).await;
@@ -1115,6 +1122,12 @@ mod enabled {
         /// store's one-null rule displace the superseded null version's history
         /// row, and closing that is a model decision — where a current marker's
         /// identity lives — not a call.
+        #[instrument(
+            level = "debug",
+            target = "tinio::storage",
+            skip(self, version),
+            fields(bucket = %bucket, key = %key)
+        )]
         async fn delete_object_version(
             &self,
             bucket: &Name,

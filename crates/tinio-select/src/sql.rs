@@ -137,6 +137,7 @@ pub(crate) const CLAUSE_KEYWORDS: &[&str] = &[
 ];
 
 /// Parse + validate one S3 Select expression.
+#[tracing::instrument(target = "tinio::s3", level = "debug", skip_all)]
 pub fn parse(sql: &str) -> Result<QueryPlan, Error> {
     if sql.len() > MAX_EXPRESSION {
         return Err(Error::Parse("expression exceeds 256 KiB".into()));

@@ -130,6 +130,7 @@ pub struct Reader<R: Read> {
 }
 
 impl<R: Read> Reader<R> {
+    #[tracing::instrument(target = "tinio::s3", level = "debug", name = "csv.reader", skip_all)]
     pub fn new(reader: R, params: Params) -> Self {
         let mut b = ReaderBuilder::new();
         b.delimiter(params.field_delimiter)

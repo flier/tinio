@@ -5,14 +5,12 @@ use axum::{
     http::{Request, StatusCode},
 };
 use http_body_util::BodyExt;
+use tinio_util::testing::metrics::exposition;
 use tokio::sync::watch;
 use tower::ServiceExt;
 
 use super::*;
-use crate::{
-    state::State,
-    test_support::{self, Counting},
-};
+use crate::state::State;
 
 /// `state` records the control name and the router only passes it through — the value
 /// here is an arbitrary recorded name (the derived default is Task 1's, and no arm
@@ -31,22 +29,22 @@ fn shared(auth: Auth) -> (Shared, watch::Receiver<bool>) {
     (Arc::new(Context::new(state(), "127.0.0.1", auth, tx)), rx)
 }
 
-/// [`shared`] with a gauge source attached — the state `/metrics` answers `200` from, and
-/// the reason `Context::new`'s `None` default is the 404 its own test pins. The reader task
-/// is deliberately **not** started: nothing here asserts the cadence, and the double and its
-/// gauges are [`test_support`]'s, so there is one definition of both.
-fn gauged(auth: Auth) -> (Shared, watch::Receiver<bool>, Arc<Counting>) {
-    let (tx, rx) = watch::channel(false);
-    let (shared, source) = test_support::gauged(Context::new(state(), "127.0.0.1", auth, tx));
-    (shared, rx, source)
-}
-
-fn get(path: &str, token: Option<&str>) -> Request<Body> {
-    let mut builder = Request::builder().uri(path).method("GET");
+fn request(method: &str, path: &str, token: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri(path).method(method);
     if let Some(token) = token {
         builder = builder.header("x-tinio-token", token);
     }
     builder.body(Body::empty()).expect("request")
+}
+
+fn get(path: &str, token: Option<&str>) -> Request<Body> {
+    request("GET", path, token)
+}
+
+/// HEAD is answered by the GET routes and is this test's method alone, so the
+/// exact family counts below cannot race the other tests.
+fn head(path: &str, token: Option<&str>) -> Request<Body> {
+    request("HEAD", path, token)
 }
 
 #[tokio::test]
@@ -113,30 +111,32 @@ async fn a_token_that_differs_in_one_byte_is_refused() {
 
 #[tokio::test]
 async fn the_local_channel_does_not_guard_metrics() {
-    // The route exists now, so the middleware's rule and the handler are asserted together:
-    // a guarded route answers 401 before its handler runs, an open one reaches it — and the
-    // scrape drove the cheap half, the counter the folded integration leg read back.
-    let (shared, _rx, source) = gauged(Auth::Local);
+    // The route exists, so the middleware's rule and the handler are asserted together: a
+    // guarded route answers 401 before its handler runs, an open one reaches it.
+    let (shared, _rx) = shared(Auth::Local);
     let response = router(shared)
         .oneshot(get("/metrics", None))
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        source.refreshes() >= 1,
-        "the scrape refreshed the cheap half"
-    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let text = String::from_utf8(body.to_vec()).expect("utf8");
+    assert!(text.contains("tinio_http_in_flight"), "{text}");
 }
 
 #[tokio::test]
-async fn metrics_answers_200_with_gauges_attached_and_follows_the_bind_rule() {
-    // The route's first fixed point: with a source attached, the open side of the rule
-    // serves a scrape without a token (`management-api.md:23`), and the handler is what
-    // answers — the status is the concrete `200`, not "anything but a 401". What the scrape
-    // runs is the cheap half alone: the storage scan is the reader task's, and no request
-    // ever reaches it.
+async fn metrics_answers_200_and_follows_the_bind_rule() {
+    // The open side of the rule serves a scrape without a token
+    // (`management-api.md:23`), and the handler is what answers — the status is the concrete
+    // `200`, not "anything but a 401". The body is the process registry: a scrape reads no
+    // storage and refreshes nothing, so a flood of them costs the registry's own size.
     for auth in [Auth::Local, Auth::Loopback] {
-        let (shared, _rx, source) = gauged(auth);
+        let (shared, _rx) = shared(auth);
         let response = router(shared.clone())
             .oneshot(get("/metrics", None))
             .await
@@ -150,34 +150,19 @@ async fn metrics_answers_200_with_gauges_attached_and_follows_the_bind_rule() {
             "text/plain; version=0.0.4; charset=utf-8",
             "{auth:?}"
         );
-        assert_eq!(
-            source.refreshes(),
-            1,
-            "one scrape refreshes the cheap half once: {auth:?}"
-        );
-        assert_eq!(source.scans(), 0, "and never scans: {auth:?}");
-
-        // **...and the flood does not move either number**: the burst the retired
-        // `management.rs` leg drove, folded in here — every one of the eight is the handler's
-        // cheap half, and the scan count stays where the reader task's cadence put it (none,
-        // for a source whose reader is deliberately not started).
-        for _ in 0..8 {
-            let response = router(shared.clone())
-                .oneshot(get("/metrics", None))
-                .await
-                .expect("response");
-            assert_eq!(response.status(), StatusCode::OK, "{auth:?}");
-        }
-        assert_eq!(
-            source.refreshes(),
-            9,
-            "every scrape refreshes the cheap half: {auth:?}"
-        );
-        assert_eq!(source.scans(), 0, "no scrape scans the storage: {auth:?}");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        // The observation layer is outer to this request, so its own families are in the body.
+        assert!(text.contains("tinio_http_in_flight"), "{auth:?}: {text}");
     }
     // A reachable bind requires the token, and presenting it reaches the same handler —
     // the leg that makes the 401 a guard rather than a missing route.
-    let (shared, _rx, _source) = gauged(Auth::Tcp);
+    let (shared, _rx) = shared(Auth::Tcp);
     let untokened = router(shared.clone())
         .oneshot(get("/metrics", None))
         .await
@@ -192,43 +177,6 @@ async fn metrics_answers_200_with_gauges_attached_and_follows_the_bind_rule() {
 }
 
 #[tokio::test]
-async fn a_plane_without_a_gauge_source_has_no_metrics_endpoint() {
-    // The route's second fixed point (decision 8's round-2 ruling): a plane whose source was
-    // never attached answers the contract's `404` rather than an empty `200`, so a scraper
-    // sees the endpoint's absence. It holds on the open side — where nothing but the handler
-    // can be answering — and behind the token on a reachable bind, which is also what shows
-    // the token check runs *before* the handler.
-    for auth in [Auth::Local, Auth::Loopback] {
-        let (shared, _rx) = shared(auth);
-        let response = router(shared)
-            .oneshot(get("/metrics", None))
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{auth:?}");
-        // The body is what makes this the handler's answer rather than an unrouted path's
-        // (both are `404`): the absence keeps this crate's error shape.
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        let text = String::from_utf8(body.to_vec()).expect("utf8");
-        assert!(
-            text.contains(r#""error""#) && text.contains("metrics are not attached"),
-            "the absence keeps this crate's error shape: {text}"
-        );
-    }
-    let (shared, _rx) = shared(Auth::Tcp);
-    let token = shared.state.token.expose_secret().as_str().to_owned();
-    let response = router(shared)
-        .oneshot(get("/metrics", Some(&token)))
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
 async fn a_loopback_tcp_plane_opens_metrics_and_nothing_else() {
     // Loopback opens `/metrics` for one stated reason — a Prometheus scrape cannot send a
     // custom header — and that reason does not cover the two control endpoints, which stay
@@ -237,7 +185,7 @@ async fn a_loopback_tcp_plane_opens_metrics_and_nothing_else() {
     // `openapi` feature, so it cannot stand in this loop: in the default graph it is
     // unrouted and answers axum's built-in 404 instead of reaching the token check at all.
     // The route's own rule is asserted by the `openapi`-gated test below.
-    let (shared, _rx, _source) = gauged(Auth::Loopback);
+    let (shared, _rx) = shared(Auth::Loopback);
     let open = router(shared.clone())
         .oneshot(get("/metrics", None))
         .await
@@ -257,7 +205,7 @@ async fn tcp_requires_the_token_on_every_registered_endpoint() {
     // `/metrics` joins this loop here, the task that registers the route — an unrouted path
     // answers axum's built-in 404 and never reaches the token check (see the module doc), so
     // a guarded `401` on it is only meaningful now that the route exists.
-    let (shared, _rx, _source) = gauged(Auth::Tcp);
+    let (shared, _rx) = shared(Auth::Tcp);
     for path in ["/status", "/stop", "/metrics"] {
         let response = router(shared.clone())
             .oneshot(get(path, None))
@@ -334,6 +282,60 @@ async fn an_unknown_path_is_404_with_or_without_the_token() {
     assert_eq!(without_token.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn the_http_families_count_every_management_request_including_401_and_metrics() {
+    // The observation layer is outer to the token layer and on the routes
+    // themselves: a refused request and the scrape both land in the families,
+    // while an unmatched path still never reaches a layer (the module doc).
+    let (shared, _rx) = shared(Auth::Local);
+    let token = shared.state.token.expose_secret().as_str().to_owned();
+    let statuses: Vec<StatusCode> = {
+        let requests = [
+            head("/status", Some(&token)),
+            head("/status", None),
+            head("/metrics", None),
+        ];
+        let mut answers = Vec::new();
+        for request in requests {
+            answers.push(
+                router(shared.clone())
+                    .oneshot(request)
+                    .await
+                    .expect("response")
+                    .status(),
+            );
+        }
+        answers
+    };
+    // 200 served, 401 refused, 200 for the scrape — the third is the route's own
+    // answer, so `/metrics` was observed.
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::UNAUTHORIZED, StatusCode::OK]
+    );
+
+    let text = exposition();
+    // The 200 is two requests (the served one and the scrape), the 401 one.
+    for (status, count) in [(200, 2), (401, 1)] {
+        assert!(
+            text.contains(&format!(
+                r#"tinio_http_requests_total{{method="HEAD",status="{status}"}} {count}"#
+            )),
+            "status {status} is counted: {text}"
+        );
+    }
+    assert!(
+        text.contains(r#"tinio_http_request_duration_seconds_count{method="HEAD"} 3"#),
+        "one duration per observed request: {text}"
+    );
+    // The gauge's value is not asserted: other tests run requests in parallel,
+    // so its presence is the declaration the layer's guard has to make.
+    assert!(
+        text.contains("tinio_http_in_flight"),
+        "the in-flight guard touched its family: {text}"
+    );
+}
+
 #[cfg(feature = "openapi")]
 #[tokio::test]
 async fn openapi_json_serves_the_document_under_the_paths_own_rule() {
@@ -376,4 +378,12 @@ async fn openapi_json_serves_the_document_under_the_paths_own_rule() {
         .await
         .expect("response");
     assert_eq!(tokened.status(), StatusCode::OK);
+}
+
+#[test]
+fn metrics_can_require_the_token() {
+    assert!(Auth::Local.guards_with("/metrics", true));
+    assert!(!Auth::Local.guards_with("/metrics", false));
+    assert!(Auth::Loopback.guards_with("/metrics", true));
+    assert!(Auth::Tcp.guards_with("/metrics", false));
 }

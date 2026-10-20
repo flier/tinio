@@ -271,6 +271,7 @@ impl<S: Storage> S3Backend<S> {
     ) -> S3Result<S3Response<dto::SelectObjectContentOutput>> {
         let bucket = self.bucket(req.input.bucket)?;
         let key = self.key(req.input.key)?;
+        Self::record_operation_identity(&bucket, Some(&key));
         // X6: the parse+validate is CPU-bound — a 256 KiB adversarial
         // expression (token walk, positions table) must not run unbounded
         // on a tokio worker; the §1.1 "CPU never on a worker" rule applies

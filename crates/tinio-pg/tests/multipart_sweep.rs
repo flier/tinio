@@ -29,7 +29,7 @@ use tinio_core::{
     cleanup::CleanupOptions,
     lifecycle,
     meta::BucketMeta,
-    object,
+    multipart, object,
     storage::{BucketOps, ListUploadsParams, MultipartOps},
 };
 use tinio_pg::{
@@ -267,7 +267,14 @@ async fn an_upload_still_receiving_parts_survives_a_long_ago_initiation() {
     let idle = upload(&storage, &data, "idle.bin").await;
     for (key, upload_id) in [(&live_key, &live), (&idle_key, &idle)] {
         storage
-            .upload_part(&data, key, upload_id, 1.into(), body("part"), None)
+            .upload_part(
+                &data,
+                key,
+                upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body("part"),
+                None,
+            )
             .await
             .expect("the part is written just now");
         backdate(&db, &data, upload_id, Duration::from_secs(2 * 3600)).await;

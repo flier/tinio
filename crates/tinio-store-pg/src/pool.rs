@@ -30,7 +30,7 @@
 //! The dsn carries the password; the parsed options hold it and nothing else
 //! does. Every rendering this module produces is the redacted form (PG5).
 
-use std::{env, mem, ops::Deref, time::Duration};
+use std::{env, mem, ops::Deref, sync::Arc, time::Duration};
 
 use derive_more::Debug;
 use futures::{future::BoxFuture, stream::BoxStream};
@@ -45,6 +45,7 @@ use sqlx::{
 use crate::{
     Access,
     error::{Error, redact_userinfo},
+    metrics::{PoolHandle, attach},
 };
 
 /// The default pool size (`[storage.pg] pool` overrides it).
@@ -459,6 +460,10 @@ pub struct Pool {
     /// Skipped by `Debug` like the driver's pool and the raw dsn: the rendering is the identity.
     #[debug(skip)]
     redacted: String,
+    /// The pool's handle in the connection gauge: held (never read) so the
+    /// scrape-time collector sees a live pool and a dropped one leaves.
+    #[debug(skip)]
+    _metrics: Arc<PoolHandle>,
 }
 
 /// The lazy pool both constructors build: the size, the acquire timeout and the
@@ -611,6 +616,7 @@ impl Pool {
             max_connections = max_connections.max(1),
             "postgres pool opened"
         );
+        let metrics = attach(pool.clone(), max_connections);
         Ok(Self {
             pool,
             mode: parsed.mode(),
@@ -619,6 +625,7 @@ impl Pool {
             access: parsed.access(),
             options,
             redacted: parsed.redacted().to_owned(),
+            _metrics: metrics,
         })
     }
 
@@ -655,6 +662,7 @@ impl Pool {
             self.max_connections(),
             self.pool.options().get_acquire_timeout(),
         );
+        let metrics = attach(pool.clone(), self.max_connections());
         Ok(Self {
             pool,
             mode: self.mode,
@@ -663,6 +671,7 @@ impl Pool {
             access,
             options,
             redacted: self.redacted.clone(),
+            _metrics: metrics,
         })
     }
 

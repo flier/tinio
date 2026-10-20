@@ -123,4 +123,55 @@ State transitions: `stopped` → `starting` (bind port + control channel, write 
 
 ## Metrics (read-only views, not persisted)
 
-HTTP: `tinio_http_requests_total{method,status}`, `tinio_http_request_duration_seconds{method}`, `tinio_http_in_flight`. S3: `tinio_s3_operations_total{op,status}`, `tinio_s3_operation_duration_seconds{op}`. Storage: `tinio_storage_buckets_total`, `tinio_storage_objects_total` (reader-cadence 30 s), `tinio_storage_bytes_total` (reader-cadence 30 s), `tinio_storage_upload_bytes_total`, `tinio_storage_download_bytes_total`, `tinio_storage_objects_uploaded_total{op}`, `tinio_storage_objects_deleted_total`, `tinio_storage_multipart_in_progress`. Versioning (declared by `tinio-fs`, the crate that observes the sweep, and gathered by the same process-global registry): `tinio_storage_blocks_reclaimed_total` (block files reclaimed by the block sweep, cumulative), `tinio_storage_bytes_reclaimed_total` (bytes reclaimed, cumulative), `tinio_storage_noncurrent_versions_total` (noncurrent versions retained across versioned buckets, as of the last sweep pass), `tinio_storage_block_bytes` (total bytes held by the versioned buckets' block stores, as of the last sweep pass — the size signal the `[s3] block_bytes_warn` threshold compares against), `tinio_storage_blocks_corrupt_total` (stored blocks that failed verification against their own content hash, cumulative across the doctor's and the post-repair startup verify passes). Sandbox (Linux: the confinement the serving process applies to its own process, so each family is declared by `tinio-sandbox-linux`, the crate that observes it, and gathered by the same process-global registry `/metrics` renders): `tinio_sandbox_read_only_arm{arm}` (`remount` | `overlay` — the read-only mechanism the run's exposures actually took), `tinio_sandbox_seccomp_skipped` (1 when this architecture has no syscall table, so outbound connections are not blocked; 0 when the filter landed).
+One in-memory Prometheus registry, process-global and reset on restart; `/metrics` renders it. Bucket, object and byte gauges come from one reader task's 30 s full scan — never a request scan. One declaring crate per family, the observer: the HTTP families move from `tinio-server` to `tinio-api` (the crate rendering `/metrics`, whose management router's one middleware observes them); the five versioning families stay in `tinio-fs`; the five cross-backend storage families are declared once in `tinio-util`, the crate every backend links. Renames are breaking: no alias, nothing grandfathered.
+
+| Family | Type | Labels | Unit | Owner | Rationale |
+|---|---|---|---|---|---|
+| `tinio_http_requests_total` | counter | method, status | count | tinio-api | management requests, 401 and `/metrics` included |
+| `tinio_http_request_duration_seconds` | histogram | method | seconds | tinio-api | management request latency |
+| `tinio_http_in_flight` | gauge | — | requests | tinio-api | management requests in flight |
+| `tinio_auth_credential_lookups_total` | counter | result | count | tinio-auth | unknown-key rate — credential probing |
+| `tinio_auth_authorizations_total` | counter | decision | count | tinio-auth | allow/deny aggregate — the security decision |
+| `tinio_cli_startup_seconds` | histogram | phase | seconds | tinio-cli | startup cost by phase (`resolve`/`config`/`repair`/`bind`/`ready`) |
+| `tinio_storage_blocks_reclaimed_total` | counter | — | blocks | tinio-fs | block files reclaimed by the block sweep, cumulative |
+| `tinio_storage_bytes_reclaimed_total` | counter | — | bytes | tinio-fs | bytes reclaimed by the block sweep, cumulative |
+| `tinio_storage_noncurrent_versions` | gauge | — | versions | tinio-fs | noncurrent versions retained as of the last sweep pass |
+| `tinio_storage_block_bytes` | gauge | — | bytes | tinio-fs | bytes held by the versioned block stores, last sweep pass; the size signal `[s3] block_bytes_warn` compares |
+| `tinio_storage_blocks_corrupt_total` | counter | — | blocks | tinio-fs | blocks failing content-hash verify, cumulative across verify passes |
+| `tinio_lifecycle_pass_duration_seconds` | histogram | — | seconds | tinio-lifecycle | lifecycle cycle cost |
+| `tinio_lifecycle_actions_total` | counter | kind, outcome | count | tinio-lifecycle | per-action outcome — a failing action does not abort the pass |
+| `tinio_storage_read_heals_total` | counter | kind | count | tinio-ops | read-path heals — a write inside a read |
+| `tinio_sandbox_confinement_total` | counter | mechanism, outcome | count | tinio-sandbox | launches by mechanism and outcome; a refusal pages |
+| `tinio_sandbox_confinement_seconds` | histogram | mechanism | seconds | tinio-sandbox | confinement cost per launch |
+| `tinio_sandbox_readiness_total` | counter | result | count | tinio-sandbox-core | child readiness outcome |
+| `tinio_sandbox_child_exit_total` | counter | outcome | count | tinio-sandbox-core | supervised child exit outcome |
+| `tinio_sandbox_model` | gauge | model | enum | tinio-sandbox-linux | confinement model this run took |
+| `tinio_sandbox_read_only_arm` | gauge | arm | 0/1 | tinio-sandbox-linux | read-only mechanism the exposures took (`remount`, `overlay`) |
+| `tinio_sandbox_seccomp_skipped` | gauge | — | 0/1 | tinio-sandbox-linux | 1 when this architecture has no syscall table; 0 when the filter landed |
+| `tinio_s3_select_scanned_bytes_total` | counter | format | bytes | tinio-select | scan cost by framing |
+| `tinio_s3_select_rows_returned_total` | counter | format | rows | tinio-select | rows returned by framing |
+| `tinio_s3_operations_total` | counter | op, status | count | tinio-server | data-plane operations by op and status |
+| `tinio_s3_operation_duration_seconds` | histogram | op | seconds | tinio-server | data-plane latency by op |
+| `tinio_s3_errors_total` | counter | op, code | count | tinio-server | wire error codes by op |
+| `tinio_pipeline_queue_depth` | gauge | pipeline | tasks | tinio-server | queued tasks per lane |
+| `tinio_pipeline_in_flight` | gauge | pipeline | tasks | tinio-server | executing tasks per lane |
+| `tinio_pipeline_task_duration_seconds` | histogram | pipeline | seconds | tinio-server | per-lane task duration |
+| `tinio_pipeline_tasks_total` | counter | pipeline, outcome | count | tinio-server | task outcomes (`ok`/`error`/`panic`/`refused`) |
+| `tinio_pipeline_enqueue_wait_seconds` | histogram | pipeline | seconds | tinio-server | queue wait — saturation before execution |
+| `tinio_storage_buckets` | gauge | — | buckets | tinio-server | current bucket count |
+| `tinio_storage_objects` | gauge | — | objects | tinio-server | current object count |
+| `tinio_storage_bytes` | gauge | — | bytes | tinio-server | current object bytes |
+| `tinio_storage_upload_bytes_total` | counter | — | bytes | tinio-server | bytes streamed into storage |
+| `tinio_storage_download_bytes_total` | counter | — | bytes | tinio-server | bytes streamed out of storage |
+| `tinio_storage_objects_uploaded_total` | counter | op | count | tinio-server | objects written, by op |
+| `tinio_storage_objects_deleted_total` | counter | — | count | tinio-server | objects deleted |
+| `tinio_storage_multipart_in_progress` | gauge | — | uploads | tinio-server | multipart uploads in progress |
+| `tinio_storage_write_lock_wait_seconds` | histogram | — | seconds | tinio-server | write-lock wait before the write transaction |
+| `tinio_storage_write_lock_hold_seconds` | histogram | — | seconds | tinio-server | write transaction duration including fsync |
+| `tinio_storage_pool_connections` | gauge | state | connections | tinio-store-pg | pool occupancy by state |
+| `tinio_storage_write_failures_total` | counter | backend, op, kind | count | tinio-util | write failures across backends |
+| `tinio_storage_pass_duration_seconds` | histogram | pass | seconds | tinio-util | background pass duration |
+| `tinio_storage_pass_failures_total` | counter | pass, section | count | tinio-util | failed pass sections — a partial pass otherwise looks healthy |
+| `tinio_storage_read_only` | gauge | backend | 0/1 | tinio-util | read-only degradation by backend, set at open |
+| `tinio_storage_corrupt_rows_total` | counter | backend | rows | tinio-util | corrupt rows met on read |
+| `tinio_storage_supersede_total` | counter | result | count | tinio-version | supersede outcome — the contention signal |

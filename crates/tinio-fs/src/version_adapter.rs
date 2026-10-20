@@ -274,7 +274,7 @@ impl BucketMeta for Rows {
         &self,
         bucket: &bucket::Name,
         now: SystemTime,
-    ) -> Result<SystemTime, <Self as Metadata>::Error> {
+    ) -> Result<(SystemTime, bool), <Self as Metadata>::Error> {
         <RedbMetadata as BucketMeta>::record_if_absent(&self.engine, bucket, now)
             .await
             .map_err(Into::into)
@@ -1063,7 +1063,7 @@ mod tests {
             version_id: id.map(|id| version::Id::new(id).unwrap()),
             version_seq: seq,
             is_delete_marker: false,
-            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
             size: metadata.len(),
             mtime: to_nanos(metadata.modified().unwrap()),
             file_identity: fsutil::file_identity(&path, &metadata),
@@ -1163,7 +1163,7 @@ mod tests {
         assert_eq!(row.kind, Kind::Object);
         assert_eq!(
             row.etag,
-            ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
             "the row carries the ETag the object_meta row recorded (here deliberately \
              not the content's MD5), never a hash of the bytes"
         );
@@ -1307,7 +1307,7 @@ mod tests {
             .unwrap()
             .expect("the committed row survives");
         assert_eq!(
-            (row.seq, row.id.as_ref().map(version::Id::as_str), row.kind),
+            (row.seq, row.id.as_ref().map(|id| id.as_str()), row.kind),
             (0, None, Kind::Object),
             "the null version's identity reads as absent, never as its wire"
         );

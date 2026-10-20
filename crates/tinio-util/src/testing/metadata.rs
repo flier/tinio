@@ -165,7 +165,7 @@ pub fn lifecycle_config(id: &str) -> lifecycle::Config {
 }
 
 fn etag(value: &str) -> ETag {
-    ETag::new(value).expect("a valid ETag literal")
+    value.parse::<ETag>().expect("a valid ETag literal")
 }
 
 /// One decoded object row with the given content identity.
@@ -1915,11 +1915,15 @@ where
 
     // Record_if_absent keeps the first recorded time; record_full upserts.
     let kept = bucket_name("conf-bucket-kept");
-    assert_eq!(store.record_if_absent(&kept, t0()).await.unwrap(), t0());
+    assert_eq!(
+        store.record_if_absent(&kept, t0()).await.unwrap(),
+        (t0(), true),
+        "the first sight inserts the row"
+    );
     assert_eq!(
         store.record_if_absent(&kept, t1()).await.unwrap(),
-        t0(),
-        "a second record_if_absent must not move the recorded time"
+        (t0(), false),
+        "a second record_if_absent must not move the recorded time and reports no insert"
     );
     let mut upsert = bucket_at(t1());
     upsert.tags = tags(&[("stage", "rewritten")]);

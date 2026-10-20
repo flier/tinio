@@ -127,7 +127,7 @@ pub fn decode_owner(wire: &str) -> Option<OwnerId> {
 
 /// Encode an owner element: the empty wire for no owner.
 pub fn encode_owner(owner: Option<&OwnerId>) -> String {
-    owner.map(OwnerId::as_str).unwrap_or_default().to_owned()
+    owner.map(|id| id.as_str().to_owned()).unwrap_or_default()
 }
 
 /// Decode the tag-set element: an empty or corrupt wire self-heals to the
@@ -273,13 +273,14 @@ pub trait BucketMeta: Send + Sync + 'static {
     where
         Self: Metadata;
 
-    /// Insert the row at `now` when absent and answer the stored creation
-    /// time; an existing row's other elements ride untouched.
+    /// Insert the row at `now` when absent and answer the stored creation time together with
+    /// whether this call inserted it (`true`) or found an existing row (`false`); an existing
+    /// row's other elements ride untouched.
     async fn record_if_absent(
         &self,
         bucket: &bucket::Name,
         now: SystemTime,
-    ) -> Result<SystemTime, <Self as Metadata>::Error>
+    ) -> Result<(SystemTime, bool), <Self as Metadata>::Error>
     where
         Self: Metadata;
 

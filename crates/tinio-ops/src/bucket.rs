@@ -73,6 +73,8 @@
 
 use std::time::SystemTime;
 
+use tracing::instrument;
+
 use crate::{
     _core::{
         Bucket, BucketsListing, ListBucketsParams, acl,
@@ -112,6 +114,12 @@ where
     ///
     /// `AlreadyExists` when the policy inserts and the store already has the
     /// bucket; the content plane's or the row plane's own failures otherwise.
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %name)
+    )]
     pub async fn create_bucket(
         &self,
         name: &bucket::Name,
@@ -176,6 +184,12 @@ where
     /// `NotEmpty` while the bucket holds content, an object row or an
     /// in-progress upload — and whatever the backend's hook answers, including
     /// `NoSuchBucket` for a store whose rows are the buckets.
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %name)
+    )]
     pub async fn delete_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
         if !self.content.is_empty(name).await.map_err(projected)? {
             return Err(storage::not_empty(name));
@@ -215,6 +229,7 @@ where
                         self.meta
                             .record_if_absent(name, now)
                             .await
+                            .map(|(created, _)| created)
                             .map_err(projected),
                         now,
                         "the bucket head's first sight",
@@ -527,12 +542,11 @@ where
                 .merge_lifecycle_or_create(name, rules, SystemTime::now())
                 .await
                 .map_err(projected)?,
-            BucketRow::Guaranteed => {
-                self.meta
-                    .merge_lifecycle(name, rules)
-                    .await
-                    .map_err(projected)?
-            }
+            BucketRow::Guaranteed => self
+                .meta
+                .merge_lifecycle(name, rules)
+                .await
+                .map_err(projected)?,
         };
         match merged {
             lifecycle::Merged::Absent => Err(storage::no_such_bucket(name)),
@@ -1160,7 +1174,7 @@ mod tests {
     /// which is the backend's own and never crosses this contract.
     fn object_row() -> meta_object::Row {
         meta_object::Row {
-            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
             size: 0,
             mtime: SystemTime::now(),
             identity: 0,

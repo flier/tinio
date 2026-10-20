@@ -86,6 +86,7 @@ impl Compression {
 /// decoders read concatenated member streams to EOF exactly as AWS reads
 /// them (review 2026-09-05b) — `gzip`/`bzip2` CLI output is multi-member;
 /// a single-member decoder would silently stop at the first stream.
+#[tracing::instrument(target = "tinio::s3", level = "debug", skip_all)]
 pub fn decompressed(
     compression: Option<Compression>,
     r: Box<dyn Read + Send>,

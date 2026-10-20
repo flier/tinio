@@ -281,7 +281,7 @@ impl Row {
     }
 
     /// The version's recorded ETag — the row's `etag` element decoded with
-    /// [`ETag::new`]. The empty element (a delete marker, or a row written
+    /// [`str::parse`]. The empty element (a delete marker, or a row written
     /// by a writer that recorded none) and a domain-invalid element
     /// self-heal to the empty-content ETag, like every other stored
     /// metadata wire; the element is never a content hash of the row's
@@ -313,7 +313,7 @@ impl Row {
     /// assert_eq!(row.etag().as_str(), "d41d8cd98f00b204e9800998ecf8427e");
     /// ```
     pub fn etag(&self) -> ETag {
-        ETag::new(&self.etag).unwrap_or(ETag::EMPTY)
+        self.etag.parse::<ETag>().unwrap_or(ETag::EMPTY)
     }
 
     /// The version's tag set — an empty or corrupt wire self-heals to the
@@ -515,6 +515,7 @@ impl Row {
     /// # Examples
     ///
     /// ```rust
+    /// use tinio_core::object;
     /// use tinio_store_redb::version::{Kind, Row};
     ///
     /// let row = Row {
@@ -531,7 +532,7 @@ impl Row {
     ///     acl: String::new(),
     ///     seq: 1,
     /// };
-    /// let info = row.info(&"a.txt".into(), true);
+    /// let info = row.info(&object::key("a.txt").expect("a valid object key"), true);
     /// assert_eq!(info.size, 5);
     /// assert_eq!(info.version_id.unwrap().as_str(), "abc");
     /// ```

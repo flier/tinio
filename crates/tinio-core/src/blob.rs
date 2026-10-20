@@ -27,6 +27,7 @@ use bytes::Bytes;
 use derive_more::{AsRef, Deref, Display};
 use futures::Stream;
 use sha2::{Digest, Sha256};
+use tracing::instrument;
 
 use crate::{
     ByteRange,
@@ -42,7 +43,7 @@ use crate::{
 ///
 /// let hash = BlockHash::of(b"hello");
 /// assert_eq!(hash.to_hex().len(), 64);
-/// assert_eq!(BlockHash::new(&hash.to_hex()).unwrap(), hash);
+/// assert_eq!(hash.to_hex().parse::<BlockHash>().unwrap(), hash);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, AsRef, Deref, Display)]
 #[as_ref(forward)]
@@ -64,6 +65,7 @@ impl BlockHash {
     ///     "the address is a function of the content"
     /// );
     /// ```
+    #[instrument(target = "tinio::storage", level = "trace", skip_all)]
     pub fn of(bytes: &[u8]) -> Self {
         Self::from_digest(Sha256::digest(bytes).into())
     }
@@ -97,13 +99,19 @@ impl BlockHash {
     /// let hex = BlockHash::of(b"hello").to_hex();
     ///
     /// assert_eq!(hex.len(), 64);
-    /// assert_eq!(BlockHash::new(&hex).unwrap().to_hex(), hex);
+    /// assert_eq!(hex.parse::<BlockHash>().unwrap().to_hex(), hex);
     /// ```
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
+}
 
-    /// Parse the hex form — the constructor for untrusted input.
+impl FromStr for BlockHash {
+    type Err = ParseError;
+
+    /// Parse the hex form. A wrong length and a non-hex character are the same
+    /// error: `decode_to_slice` rejects both, and the digest is never copied
+    /// out of an intermediate `Vec`.
     ///
     /// # Examples
     ///
@@ -111,37 +119,13 @@ impl BlockHash {
     /// use tinio_core::blob::BlockHash;
     ///
     /// let hash = BlockHash::of(b"hello");
-    /// assert_eq!(BlockHash::new(&hash.to_hex()).unwrap(), hash);
-    /// assert!(BlockHash::new("not hex").is_err());
+    /// assert_eq!(hash.to_hex().parse::<BlockHash>().unwrap(), hash);
+    /// assert!("not hex".parse::<BlockHash>().is_err());
     /// ```
-    pub fn new(hash: &str) -> Result<Self, ParseError> {
-        // Decoded straight into the fixed array: `decode_to_slice` rejects a
-        // wrong length and a non-hex character alike, so both failure modes
-        // collapse into this constructor's one error, and the digest is never
-        // copied out of an intermediate `Vec`.
+    fn from_str(hash: &str) -> Result<Self, Self::Err> {
         let mut digest = [0u8; 32];
         hex::decode_to_slice(hash, &mut digest).map_err(|_| ParseError(hash.to_owned()))?;
         Ok(Self(digest))
-    }
-}
-
-impl FromStr for BlockHash {
-    type Err = ParseError;
-
-    fn from_str(hash: &str) -> Result<Self, Self::Err> {
-        Self::new(hash)
-    }
-}
-
-impl From<&str> for BlockHash {
-    /// Trusted-input convenience (panics on a malformed hash — use
-    /// [`BlockHash::new`] for untrusted input).
-    #[expect(
-        clippy::expect_used,
-        reason = "literal: the documented literal API — a `From<&str>` call site is a compile-time block-hash fixture, stored hashes go through `BlockHash::new`"
-    )]
-    fn from(hash: &str) -> Self {
-        Self::new(hash).expect("valid block hash")
     }
 }
 
@@ -152,7 +136,7 @@ impl From<&str> for BlockHash {
 /// ```rust
 /// use tinio_core::blob::{BlockHash, ParseError};
 ///
-/// let err: ParseError = BlockHash::new("not hex").unwrap_err();
+/// let err: ParseError = "not hex".parse::<BlockHash>().unwrap_err();
 /// assert_eq!(err.to_string(), "invalid block reference: not hex");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -695,19 +679,19 @@ mod tests {
             hex, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
             "the address is the SHA-256 of the bytes"
         );
-        assert_eq!(BlockHash::new(&hex).unwrap(), hash);
+        assert_eq!(hex.parse::<BlockHash>().unwrap(), hash);
         assert_eq!(hash.to_string(), hex);
         assert_eq!(BlockHash::from_str(&hex).unwrap(), hash);
     }
 
     #[test]
     fn a_block_hash_rejects_anything_that_is_not_64_hex_characters() {
-        assert!(BlockHash::new("").is_err());
-        assert!(BlockHash::new("zz").is_err());
-        assert!(BlockHash::new(&"a".repeat(63)).is_err());
-        assert!(BlockHash::new(&"a".repeat(65)).is_err());
+        assert!("".parse::<BlockHash>().is_err());
+        assert!("zz".parse::<BlockHash>().is_err());
+        assert!("a".repeat(63).parse::<BlockHash>().is_err());
+        assert!("a".repeat(65).parse::<BlockHash>().is_err());
         assert!(
-            BlockHash::new(&"A".repeat(64)).is_ok(),
+            "A".repeat(64).parse::<BlockHash>().is_ok(),
             "uppercase hex is the same address"
         );
     }
@@ -936,7 +920,9 @@ mod tests {
         // the only shape that reaches the decode's own validity check: 64
         // characters, one of them not hex.
         let input = format!("{}g", "a".repeat(63));
-        let err = BlockHash::new(&input).expect_err("64 characters, one of them not hex");
+        let err = input
+            .parse::<BlockHash>()
+            .expect_err("64 characters, one of them not hex");
         assert_eq!(err.0, input, "the error preserves the input it refused");
         assert_eq!(err.to_string(), format!("invalid block reference: {input}"));
 
@@ -945,7 +931,7 @@ mod tests {
         let non_ascii = "é".repeat(32);
         assert_eq!(non_ascii.len(), 64);
         assert!(
-            BlockHash::new(&non_ascii).is_err(),
+            non_ascii.parse::<BlockHash>().is_err(),
             "64 bytes of non-ASCII is not an address"
         );
     }
@@ -953,15 +939,14 @@ mod tests {
     #[test]
     fn a_block_hash_from_str_trusts_the_hex_form() {
         let hash = BlockHash::of(b"hello");
-        assert_eq!(BlockHash::from(hash.to_hex().as_str()), hash);
-    }
-
-    #[test]
-    #[should_panic(expected = "valid block hash")]
-    fn a_block_hash_from_str_panics_on_a_malformed_hash() {
-        // `From<&str>` is the trusted-input path: a malformed hash must panic
-        // rather than quietly address some other block.
-        let _hash = BlockHash::from("not a hash");
+        assert_eq!(
+            hash.to_hex()
+                .as_str()
+                .parse::<BlockHash>()
+                .expect("a valid block hash"),
+            hash
+        );
+        assert!("not a hash".parse::<BlockHash>().is_err());
     }
 
     #[test]

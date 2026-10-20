@@ -50,6 +50,7 @@ use tokio::{
     fs::{self, File},
     io::{AsyncReadExt, AsyncWriteExt},
 };
+use tracing::instrument;
 use uuid::Uuid;
 
 use crate::{
@@ -67,9 +68,13 @@ use crate::{
     _store_redb::{
         RedbMetadata, object_part, part, part_checksum, part_stamp, upload, upload_checksum,
     },
-    _util::lockmap::{Guard, Map},
+    _util::{
+        lockmap::{Guard, Map},
+        metrics::WriteOp,
+    },
     Error,
     database::{self, Driver},
+    error::record_failed_write,
     fsutil,
     fsutil::ok_if_missing,
     path::MULTIPART_DIR_NAME,
@@ -389,6 +394,12 @@ impl Store {
     /// through `Hooks::lock_part` (never nested — the two paths never call one
     /// another). This entry point serves standalone/embedded callers and this
     /// module's own tests.
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub async fn put_part(
         &self,
         bucket: &bucket::Name,
@@ -466,6 +477,12 @@ impl Store {
         clippy::too_many_arguments,
         reason = "the rename-and-record section's field set — bucket, key, upload id, part number, the staged temp, etag and the tee slot — both callers forward them unchanged"
     )]
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     async fn publish_part(
         &self,
         bucket: &bucket::Name,
@@ -485,12 +502,16 @@ impl Store {
         let _lock = self.part_lock(bucket, upload_id).await;
         if let Err(err) = fs::create_dir_all(&dir).await {
             let _ = fs::remove_file(&temp).await;
-            return Err(err.into());
+            let err = Error::from(err);
+            record_failed_write(WriteOp::Part, &err);
+            return Err(err);
         }
         let part = part_path(&dir, n);
         if let Err(err) = fs::rename(&temp, &part).await {
             let _ = fs::remove_file(&temp).await;
-            return Err(err.into());
+            let err = Error::from(err);
+            record_failed_write(WriteOp::Part, &err);
+            return Err(err);
         }
         // The contract's `put_part` re-checks the upload INSIDE the
         // transaction that writes the PARTS + PART_CHECKSUMS rows: an
@@ -511,7 +532,9 @@ impl Store {
         {
             let _ = fs::remove_file(&part).await;
             let _ = fs::remove_dir(&dir).await;
-            return Err(database::map_contract_error(err));
+            let err = database::map_contract_error(err);
+            record_failed_write(WriteOp::Part, &err);
+            return Err(err);
         }
         // The part file's own stat; the digest committed atomically with the
         // part row.
@@ -649,7 +672,7 @@ impl Store {
             .map_err(Error::from)?;
         if let Some(hex) = stored {
             // A domain-invalid record: fall through to the recompute.
-            if let Ok(etag) = ETag::new(&hex) {
+            if let Ok(etag) = hex.parse::<ETag>() {
                 return Ok(etag);
             }
         }
@@ -1240,7 +1263,7 @@ mod tests {
             ETag,
             acl::Acl,
             checksum::Algorithm,
-            multipart::MIN_PART_BYTES,
+            multipart::{self, MIN_PART_BYTES},
             storage::{Error as StorageError, group_and_paginate_ordered, uploads_order},
         },
         _util::testing::body,
@@ -1553,7 +1576,14 @@ mod tests {
             value: checksum::Value("y/Q5Jg==".into()),
         });
         store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), Some(slot))
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"x"),
+                Some(slot),
+            )
             .await
             .unwrap();
         store.abort(&b, &k, &upload.upload_id).await.unwrap();
@@ -1599,7 +1629,14 @@ mod tests {
             value: checksum::Value("y/Q5Jg==".into()),
         });
         store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), Some(slot))
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"x"),
+                Some(slot),
+            )
             .await
             .unwrap();
         let (parts, _, _) = store
@@ -1648,7 +1685,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"x"),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1698,7 +1742,14 @@ mod tests {
             .await
             .unwrap();
         let part = store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"x"),
+                None,
+            )
             .await
             .unwrap();
         let completed = [CompletedPart {
@@ -1775,7 +1826,14 @@ mod tests {
             };
             let data = vec![i as u8; size];
             let part = store
-                .put_part(&b, &k, &upload.upload_id, i.into(), body(data), None)
+                .put_part(
+                    &b,
+                    &k,
+                    &upload.upload_id,
+                    multipart::part_number(i).expect("a valid part number"),
+                    body(data),
+                    None,
+                )
                 .await
                 .unwrap();
             completed.push(CompletedPart {
@@ -1823,11 +1881,25 @@ mod tests {
             .await
             .unwrap();
         let p1 = store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"x"),
+                None,
+            )
             .await
             .unwrap();
         let p2 = store
-            .put_part(&b, &k, &upload.upload_id, 2.into(), body(b"yy"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(2).expect("a valid part number"),
+                body(b"yy"),
+                None,
+            )
             .await
             .unwrap();
         let part_dir = state.path().join("multipart/data").join(&upload.upload_id);
@@ -1861,7 +1933,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"x"),
+                None,
+            )
             .await
             .unwrap();
         let bucket = b.clone();
@@ -2034,7 +2113,14 @@ mod tests {
             .unwrap();
         for n in 1..=4u32 {
             store
-                .put_part(&b, &k, &upload.upload_id, n.into(), body(b"x"), None)
+                .put_part(
+                    &b,
+                    &k,
+                    &upload.upload_id,
+                    multipart::part_number(n).expect("a valid part number"),
+                    body(b"x"),
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -2080,7 +2166,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"x"),
+                None,
+            )
             .await
             .unwrap();
         assert!(
@@ -2112,8 +2205,22 @@ mod tests {
             .unwrap();
         let id = upload.upload_id.clone();
         let (a, b2) = tokio::join!(
-            store.put_part(&b, &k, &id, 1.into(), body(b"AAAA"), None),
-            store.put_part(&b, &k, &id, 1.into(), body(b"BBBB"), None),
+            store.put_part(
+                &b,
+                &k,
+                &id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"AAAA"),
+                None
+            ),
+            store.put_part(
+                &b,
+                &k,
+                &id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"BBBB"),
+                None
+            ),
         );
         a.unwrap();
         b2.unwrap();
@@ -2195,7 +2302,7 @@ mod tests {
                     &b,
                     &k,
                     &upload.upload_id,
-                    ((i + 1) as u32).into(),
+                    multipart::part_number((i + 1) as u32).expect("a valid part number"),
                     body(data.clone()),
                     None,
                 )
@@ -2230,7 +2337,7 @@ mod tests {
                             &b,
                             &k,
                             &upload_id,
-                            3.into(),
+                            multipart::part_number(3).expect("a valid part number"),
                             body(format!("part-3-overwrite-{i}")),
                             None,
                         )
@@ -2312,7 +2419,7 @@ mod tests {
                         &b,
                         &k,
                         &upload.upload_id,
-                        n.into(),
+                        multipart::part_number(n).expect("a valid part number"),
                         body(vec![n as u8; size]),
                         None,
                     )
@@ -2487,7 +2594,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"aaa"),
+                None,
+            )
             .await
             .unwrap();
         let (parts, truncated, next) = store
@@ -2555,7 +2669,14 @@ mod tests {
         // >= the 5 MiB minimum the verify loop enforces.
         let big = vec![b'a'; MIN_PART_BYTES as usize];
         let p1 = store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(big.clone()), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(big.clone()),
+                None,
+            )
             .await
             .unwrap();
         // An out-of-band part file with no record (the final part may be
@@ -2565,11 +2686,11 @@ mod tests {
         let recomputed = ETag::from_content(b"bbb");
         let completed = [
             CompletedPart {
-                part_number: 1.into(),
+                part_number: multipart::part_number(1).expect("a valid part number"),
                 etag: p1.etag,
             },
             CompletedPart {
-                part_number: 2.into(),
+                part_number: multipart::part_number(2).expect("a valid part number"),
                 etag: recomputed,
             },
         ];
@@ -2612,7 +2733,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(vec![b'b'; min - 1]),
                 None,
             )
@@ -2623,7 +2744,7 @@ mod tests {
                 &b,
                 &k,
                 &upload.upload_id,
-                2.into(),
+                multipart::part_number(2).expect("a valid part number"),
                 body(b"x".to_vec()),
                 None,
             )
@@ -2680,7 +2801,14 @@ mod tests {
             .await
             .unwrap();
         let part = store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"aaa"),
+                None,
+            )
             .await
             .unwrap();
         let dir = state.path().join("multipart/data").join(&upload.upload_id);
@@ -2725,7 +2853,14 @@ mod tests {
             .await
             .unwrap();
         let part = store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"aaa"),
+                None,
+            )
             .await
             .unwrap();
         let dir = state.path().join("multipart/data").join(&upload.upload_id);
@@ -2771,7 +2906,14 @@ mod tests {
             .await
             .unwrap();
         let err = store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"aaa"),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -2809,7 +2951,14 @@ mod tests {
             .await
             .unwrap();
         let err = store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"aaa"),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -2849,14 +2998,28 @@ mod tests {
             .await
             .unwrap();
         store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"aaa"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"aaa"),
+                None,
+            )
             .await
             .unwrap();
         let dir = state.path().join("multipart/data").join(&upload.upload_id);
         fs::remove_file(dir.join("part-1")).await.unwrap();
         fs::create_dir(dir.join("part-1")).await.unwrap();
         let err = store
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"bbb"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"bbb"),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -2925,7 +3088,7 @@ mod tests {
                     let data: Vec<u8> = (0..*size).map(|j| (i * 31 + j) as u8).collect();
                     expected.extend_from_slice(&data);
                     let part = store
-                        .put_part(&b, &key, &upload.upload_id, ((i + 1) as u32).into(), body(data), None)
+                        .put_part(&b, &key, &upload.upload_id, multipart::part_number((i + 1) as u32).expect("a valid part number"), body(data), None)
                         .await
                         .unwrap();
                     parts.push(part);
@@ -2975,8 +3138,8 @@ mod tests {
                     .create(&b, &key, None, object::Tags::empty(), None, &Acl::default_private(None)).await.unwrap();
                 let first_data: Vec<u8> = (0..first).map(|i| i as u8).collect();
                 let second_data: Vec<u8> = (0..second).map(|i| (i as u8).wrapping_mul(7)).collect();
-                let p1 = store.put_part(&b, &key, &upload.upload_id, n.into(), body(first_data.clone()), None).await.unwrap();
-                let p2 = store.put_part(&b, &key, &upload.upload_id, n.into(), body(second_data.clone()), None).await.unwrap();
+                let p1 = store.put_part(&b, &key, &upload.upload_id, multipart::part_number(n).expect("a valid part number"), body(first_data.clone()), None).await.unwrap();
+                let p2 = store.put_part(&b, &key, &upload.upload_id, multipart::part_number(n).expect("a valid part number"), body(second_data.clone()), None).await.unwrap();
                 prop_assert_eq!(p1.part_number, p2.part_number);
                 // The stored part is the second write.
                 let (listed, truncated, _) = store.list_parts(&b, &key, &upload.upload_id, None, 1000).await.unwrap();

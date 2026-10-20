@@ -171,7 +171,7 @@ fn meta_row_round_trips_the_eleven_element_shape() {
         version_id: None,
         version_seq: 0,
         is_delete_marker: false,
-        etag: ETag::new(ETAG).unwrap(),
+        etag: ETAG.parse::<ETag>().unwrap(),
         size: 1,
         mtime: 2,
         file_identity: 0,

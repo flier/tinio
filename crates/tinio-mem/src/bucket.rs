@@ -203,7 +203,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        _core::{CompletedPart, MultipartOps, ObjectOps, acl::Acl, object, storage::Error::*},
+        _core::{
+            CompletedPart, MultipartOps, ObjectOps, acl::Acl, multipart, object, storage::Error::*,
+        },
         _store_redb::{bucket, bucket_lifecycle},
         _util::testing::{body, metadata::lifecycle_config},
         testutil::{other_owner_id, owner_id},
@@ -377,7 +379,7 @@ mod tests {
                     &doomed,
                     &pending,
                     &upload.upload_id,
-                    1.into(),
+                    multipart::part_number(1).expect("a valid part number"),
                     body(b"orphan!".to_vec()),
                     None,
                 )
@@ -574,7 +576,7 @@ mod tests {
                 &bucket,
                 &key,
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(b"part".to_vec()),
                 None,
             )

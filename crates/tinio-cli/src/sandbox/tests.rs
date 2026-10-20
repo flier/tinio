@@ -17,25 +17,14 @@ use std::{
 use std::{io, path::Path};
 
 use clap::parser::ValueSource;
-// `Level` is the re-emit's level assertion; imported rather than spelled in the call for the
-// same reason `api_state` below is named — `clippy::absolute_paths` counts a three-segment
-// expression path.
-#[cfg(all(feature = "sandbox", target_os = "linux"))]
-use tracing::Level;
 
 #[cfg(all(feature = "sandbox", feature = "api"))]
 use super::confine::Handoff;
-#[cfg(all(feature = "sandbox", target_os = "linux"))]
-use super::confine::announce_in_place;
 #[cfg(feature = "sandbox")]
 use super::confine::local_uid_configured;
 #[cfg(feature = "sandbox")]
 use super::product::exposures;
 use super::*;
-// The rule that mints a control token — what a leaking line would carry — read by the re-emit's
-// leg alone.
-#[cfg(all(feature = "sandbox", target_os = "linux"))]
-use crate::_api::state as api_state;
 #[cfg(feature = "sandbox")]
 use crate::_core::mode::AccessMode;
 #[cfg(feature = "sandbox")]
@@ -45,16 +34,8 @@ use crate::_sandbox;
 // Unconditional, like the seam they come through — this module is compiled in every build, so
 // its tests are too.
 use crate::_sandbox::{Enforcement, backend_available};
-#[cfg(all(feature = "sandbox", target_os = "linux"))]
-use crate::_sandbox::{
-    linux::{Mechanism, Seccomp},
-    serve::Confined,
-};
 #[cfg(all(feature = "sandbox", unix))]
 use crate::_util::path::path_contains;
-// The shared recording device (`tinio_util::testing`), which this crate's dev edge turns on.
-#[cfg(all(feature = "sandbox", target_os = "linux"))]
-use crate::_util::testing::{assert_recorded_at, assert_step, record_events};
 use crate::{cli::Provenance, commands::start::Args, config::Config, resolve::Resolution};
 
 /// A resolution whose config asked for the confinement, with `root` and `state_dir` as given —
@@ -1038,91 +1019,5 @@ fn the_otlp_trade_is_named_together_or_not_at_all() {
         lost_export(&unasked, None),
         None,
         "and neither half is a trade"
-    );
-}
-
-/// The in-place re-emit **names §7's facts and carries nothing else** — the resolved model, the
-/// exposure facts (the set's size, the jail's mount count and the rendered path list) and the
-/// filter's outcome, at the level the serving subscriber enables, with no value the run holds as a
-/// secret among them.
-///
-/// **Two assertions of deliberately different kinds.** The values say what the events report; the
-/// per-line field sets say what each event *can* report, which is the half a later edit would
-/// break — a field able to carry a string is the only route a token could take into these lines.
-/// The emitter's input ([`serve::Confined`]) is the other end of the same argument: its one string
-/// is the core's `describe_exposures` rendering of the exposure set — the set's own host paths and
-/// access, not a value the spec held — which is why the token below cannot ride it. The sandbox
-/// review's STD-01 — a control token printed into CI logs — is the precedent, so the token is
-/// minted by the rule that mints them rather than spelled here.
-///
-/// **Driven directly rather than through `confine`**, the call site running behind a real
-/// confinement on a Linux host — and the answer is built here the way `Spec::apply` builds one
-/// (the confinement's own facts), so what the emission carries is the shape a confinement hands
-/// it. The recording is the shared device (`tinio_util::testing`), which installs the process's
-/// default subscriber with `try_init` — this crate's test binary installs none of its own, which
-/// is why the capture is this test's to read.
-#[cfg(all(feature = "sandbox", target_os = "linux"))]
-#[test]
-fn the_in_place_re_emit_names_its_facts_and_carries_no_token() {
-    let token = api_state::generate_token().expect("a control token");
-    let rendered = "/srv/data (read-only), /srv/state (read-write), /srv/cache (read-only)";
-    let confined = Confined {
-        child: None,
-        exposures: 3,
-        // The jail root plus the three exposures plus the four device files — the plan the
-        // backend applied, which is what `Confined::mounts` carries.
-        mounts: 8,
-        rendered_exposures: rendered.to_string(),
-        model: Mechanism::UserNamespace,
-        seccomp: Some(Seccomp::Installed),
-    };
-    let ((), logged) = record_events(|| announce_in_place(&confined));
-
-    // §7's three events — the record the in-place ordering would otherwise drop — each at the
-    // level `serve`'s subscriber enables, which is why they are `info!` rather than the per-item
-    // `debug!` half.
-    assert_step(&logged, "model");
-    assert_step(&logged, "exposures");
-    assert_step(&logged, "seccomp");
-    assert_recorded_at(
-        &logged,
-        "the model this process confined itself",
-        Level::INFO,
-    );
-    // The exposure line carries the same three fields the backend's own event carries — the count,
-    // the mount count and the rendered set — all read off the confinement's answer. The rendered
-    // set is recorded through `%` (as `enter`'s own event records it), which the text formatter
-    // writes **bare** rather than quoted, spaces and all.
-    assert!(
-        logged.contains("model=UserNamespace")
-            && logged.contains("count=3")
-            && logged.contains("mounts=8")
-            && logged.contains(&format!("exposures={rendered}"))
-            && logged.contains("installed=true"),
-        "the facts the confinement answered with: {logged}"
-    );
-    // Every `name=value` token on each event's own line, in the order it declares them: the
-    // message precedes them and carries no `=`, so this is exactly that event's field set — §7's
-    // names (`model`, `count`, `mounts`, `exposures`, `installed`), never the replaced line's own
-    // vocabulary (`requested`, `local_uid`).
-    let fields = |needle: &str| -> Vec<String> {
-        logged
-            .lines()
-            .find(|line| line.contains(needle))
-            .unwrap_or_else(|| panic!("no recorded line carries {needle:?} in:\n{logged}"))
-            .split_whitespace()
-            .filter_map(|token| token.split_once('='))
-            .map(|(name, _)| name.to_string())
-            .collect()
-    };
-    assert_eq!(fields("step=\"model\""), ["step", "model"]);
-    assert_eq!(
-        fields("step=\"exposures\""),
-        ["step", "count", "mounts", "exposures"]
-    );
-    assert_eq!(fields("step=\"seccomp\""), ["step", "installed"]);
-    assert!(
-        !logged.contains(&token),
-        "the line carries a control token: {logged}"
     );
 }

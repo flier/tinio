@@ -18,10 +18,10 @@ use crate::storage::{self, Error::*};
 /// ```rust
 /// use std::time::SystemTime;
 ///
-/// use tinio_core::bucket::Bucket;
+/// use tinio_core::bucket::{self, Bucket};
 ///
 /// let bucket = Bucket {
-///     name: "data".into(),
+///     name: bucket::name("data").expect("a valid bucket name"),
 ///     creation_time: SystemTime::UNIX_EPOCH,
 /// };
 /// assert_eq!(bucket.name.as_ref(), "data");
@@ -36,13 +36,13 @@ pub struct Bucket {
 
 /// A validated bucket name (FR-012).
 ///
-/// Constructed via [`name`], which enforces the S3 naming rules:
-/// 3–63 chars, lowercase letters/digits/dots/hyphens, no leading/trailing
-/// dot or hyphen, no adjacent dots; a leading dot is additionally rejected
-/// as a reserved-name collision (FR-020).
+/// Constructed via [`name`], which enforces the S3 naming rules: 3–63
+/// chars, lowercase letters/digits/dots/hyphens, no leading/trailing dot or
+/// hyphen, no adjacent dots; a leading dot is additionally rejected as a
+/// reserved-name collision (FR-020).
 ///
-/// Deref/AsRef expose the inner string; `"data".into()` builds a name from
-/// a trusted literal (panics on invalid input).
+/// Deref/AsRef expose the inner string. A fixture calls [`name`] and
+/// `expect`; wire input goes through [`name`] and handles the error.
 ///
 /// # Examples
 ///
@@ -58,9 +58,6 @@ pub struct Bucket {
 /// for bad in ["ab", "Big_Name", "-lead", "a..b"] {
 ///     assert!(matches!(bucket::name(bad), Err(InvalidBucketName(_))));
 /// }
-///
-/// let from_literal: bucket::Name = "my-bucket".into();
-/// assert_eq!(from_literal, name);
 /// ```
 #[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[cfg_attr(feature = "sqlx", sqlx(transparent))]
@@ -76,18 +73,6 @@ pub fn name(name: impl Into<String>) -> Result<Name, storage::Error> {
         return Err(InvalidBucketName(name));
     }
     Ok(Name(name))
-}
-
-impl From<&str> for Name {
-    /// Trusted-input convenience (panics on invalid names — use [`name`] for
-    /// untrusted input).
-    #[expect(
-        clippy::expect_used,
-        reason = "literal: the documented literal API — a `From<&str>` call site is a compile-time bucket-name fixture, wire input goes through `name`"
-    )]
-    fn from(name: &str) -> Self {
-        self::name(name).expect("valid bucket name")
-    }
 }
 
 fn validate_bucket_name(name: &str) -> garde::Result {
@@ -141,7 +126,7 @@ mod tests {
         assert_eq!(n.as_ref(), "my-bucket");
         assert_eq!(n.to_string(), "my-bucket");
         assert_eq!(String::from(n.clone()), "my-bucket");
-        let from_literal: Name = "my-bucket".into();
+        let from_literal = name("my-bucket").expect("a valid bucket name");
         assert_eq!(from_literal, n);
         assert!(name("Big").is_err());
     }
@@ -155,20 +140,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn bucket_name_from_invalid_panics() {
-        let _: Name = "Big".into();
-    }
-
-    #[test]
     fn bucket_equality() {
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let name = name("data").expect("a valid bucket name");
         let b = Bucket {
-            name: "data".into(),
+            name: name.clone(),
             creation_time: t,
         };
         let b2 = Bucket {
-            name: "data".into(),
+            name,
             creation_time: t,
         };
         assert_eq!(b, b2);

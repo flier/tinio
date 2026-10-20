@@ -138,7 +138,7 @@ pub fn validate(
     ): (&str, u64, u64, u64, &str, &str, &str, &str, &str, u64, bool),
 ) -> Option<Stored> {
     Some(Stored {
-        etag: ETag::new(etag).ok()?,
+        etag: etag.parse::<ETag>().ok()?,
         size,
         mtime,
         file_identity,
@@ -289,7 +289,7 @@ where
     ///                     "data",
     ///                     key,
     ///                     &object_meta::Stored {
-    ///                         etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+    ///                         etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
     ///                         size: 0,
     ///                         mtime: 0,
     ///                         file_identity: 0,

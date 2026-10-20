@@ -152,8 +152,10 @@ macro_rules! tinio_s3_ops {
                 #[gated(acl: "acl")]
                 fn put_object_acl (PutObjectAclInput) -> PutObjectAclOutput;
                 #[handler(op_put_object)]
+                #[on_ok(crate::metrics::object_uploaded("PutObject"))]
                 fn put_object (PutObjectInput) -> PutObjectOutput;
                 #[handler(op_delete_object)]
+                #[on_ok(crate::metrics::object_deleted())]
                 fn delete_object (DeleteObjectInput) -> DeleteObjectOutput;
                 #[handler(op_delete_objects)]
                 #[gated(delete_objects)]
@@ -169,6 +171,7 @@ macro_rules! tinio_s3_ops {
                 fn delete_object_tagging (DeleteObjectTaggingInput) -> DeleteObjectTaggingOutput;
                 #[handler(op_copy_object)]
                 #[gated(copy_object: "copy")]
+                #[on_ok(crate::metrics::object_uploaded("CopyObject"))]
                 fn copy_object (CopyObjectInput) -> CopyObjectOutput;
                 #[handler(op_rename_object)]
                 #[gated(copy_object: "copy")]
@@ -185,7 +188,10 @@ macro_rules! tinio_s3_ops {
                 fn upload_part_copy (UploadPartCopyInput) -> UploadPartCopyOutput;
                 #[handler(op_complete_multipart_upload)]
                 #[gated(multipart: "multipart")]
-                #[on_ok(crate::metrics::multipart_in_progress_dec())]
+                #[on_ok({
+                    crate::metrics::multipart_in_progress_dec();
+                    crate::metrics::object_uploaded("CompleteMultipartUpload");
+                })]
                 fn complete_multipart_upload (CompleteMultipartUploadInput) -> CompleteMultipartUploadOutput;
                 #[handler(op_abort_multipart_upload)]
                 #[gated(multipart: "multipart")]

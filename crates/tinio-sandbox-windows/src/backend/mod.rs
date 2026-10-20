@@ -225,6 +225,7 @@ impl BackendTrait for Backend {
     /// # Ok(())
     /// # }
     /// ```
+    #[tracing::instrument(target = "tinio::sandbox", level = "info", skip_all)]
     fn confine(&mut self, sandbox: &Sandbox, plan: &LaunchPlan) -> Result<Confinement> {
         // **The host's own gate, and it sits above everything this crate does.** The CLI asks the
         // same question before it writes its state directory; this one protects every other
@@ -306,6 +307,7 @@ struct PreparedLaunch<'a> {
 /// **`Admission` is the ordering proof and nothing else**: the body never reads it, and it is
 /// taken by value so a caller must have asked the host first. It is what replaced the
 /// source-reading test that pinned the gate above this call.
+#[tracing::instrument(target = "tinio::sandbox", level = "debug", skip_all)]
 fn prepare_launch<'a>(
     _admitted: Admission,
     options: &Options,
@@ -485,6 +487,7 @@ struct Spawned {
 /// the frame is where it travels: `plan.token()`, serialized here, is the one
 /// place the platform turns the plan into the child's stdin. See [`Spawned`] for
 /// the two channel halves the relay hands back.
+#[tracing::instrument(target = "tinio::sandbox", level = "debug", skip_all)]
 fn spawn_supervised_child(
     options: &Options,
     plan: &LaunchPlan,

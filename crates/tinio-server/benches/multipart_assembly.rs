@@ -26,7 +26,7 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tinio_core::{
     acl::Acl,
     bucket,
-    multipart::{CompletedPart, MIN_PART_BYTES},
+    multipart::{self, CompletedPart, MIN_PART_BYTES},
     object,
     storage::{BucketOps, MultipartOps, ObjectOps},
 };
@@ -83,7 +83,7 @@ fn multipart_assembly(c: &mut Criterion) {
                             &bname,
                             &key,
                             &upload.upload_id,
-                            (i as u32).into(),
+                            multipart::part_number(i as u32).unwrap(),
                             body(part_data.clone()),
                             None,
                         )

@@ -23,7 +23,7 @@ use crate::{
 /// use tinio_core::{ETag, PutObjectResult};
 ///
 /// let result = PutObjectResult {
-///     etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+///     etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
 /// };
 /// assert!(result.etag.as_str().starts_with("d41d8"));
 /// ```
@@ -104,7 +104,7 @@ impl TagWriteResult {
 ///         key: object::key("a.txt").unwrap(),
 ///         size: 5,
 ///         last_modified: SystemTime::UNIX_EPOCH,
-///         etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+///         etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
 ///         tags: object::Tags::empty(),
 ///         checksum: None,
 ///         owner: None,
@@ -494,7 +494,7 @@ mod tests {
             key: object::key("a.txt").unwrap(),
             size: 1,
             last_modified: SystemTime::UNIX_EPOCH,
-            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
             tags: object::Tags::empty(),
             checksum: None,
             owner: None,
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn put_and_get_results_construct() {
         let put = PutObjectResult {
-            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
         };
         assert_eq!(put.etag.as_str(), "d41d8cd98f00b204e9800998ecf8427e");
 
@@ -526,7 +526,7 @@ mod tests {
                 key: object::key("a.txt").unwrap(),
                 size: 0,
                 last_modified: SystemTime::UNIX_EPOCH,
-                etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+                etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
                 tags: object::Tags::empty(),
                 checksum: None,
                 owner: None,
@@ -546,7 +546,7 @@ mod tests {
             key: object::key("a.txt").unwrap(),
             size: 1,
             last_modified: SystemTime::UNIX_EPOCH,
-            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
             tags: object::Tags::empty(),
             checksum: None,
             owner: None,

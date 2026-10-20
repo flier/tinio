@@ -8,6 +8,7 @@
 //! headers) within that rule only — never falling through to a later rule.
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use tracing::instrument;
 
 /// RFC 3986 unreserved left alone on the stored wires (the CORS config and
 /// the ACL grants `uri=` element, which share [`crate::percent`]'s codec).
@@ -88,6 +89,7 @@ impl Config {
     /// validate method AND headers WITHIN that rule only — a rule that
     /// matches origin but fails method/headers returns `None` (deny) and
     /// never falls through to a later rule (see the matching-rules note).
+    #[instrument(target = "tinio::http", level = "debug", skip_all)]
     pub fn preflight<'a>(
         &'a self,
         origin: &'a str,

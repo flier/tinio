@@ -12,11 +12,16 @@ use std::{
 
 use futures::StreamExt;
 use smart_default::SmartDefault;
+use tracing::instrument;
 
 use crate::{
     _core::blob::{BlobRef, BlockHash, BlockStore, Entry},
+    _util::metrics::{Pass, PassTimer, Section, record_pass_failure},
     Error,
 };
+
+/// The `pass` label the block sweep records under.
+const BLOB_SWEEP_PASS: &str = Pass::BlobSweep.as_str();
 
 /// The blocks a sweep must keep: the union of the block lists of every live
 /// version. Built by the caller — the engine does not know what a version is.
@@ -237,7 +242,9 @@ impl<S: BlockStore> super::Store<S> {
     /// between the walk and the removal: those validate between
     /// [`Self::sweep_candidates`] and [`Self::remove_candidates`]. The walk
     /// streams: the store's listing is consumed entry by entry and never
-    /// held whole, and only the reclaimable entries are retained.
+    /// held whole, and only the reclaimable entries are retained. Its
+    /// duration is the `blob_sweep` pass sample — recorded whether it finds
+    /// candidates or not, so an empty pass still reports.
     ///
     /// # Examples
     ///
@@ -259,23 +266,39 @@ impl<S: BlockStore> super::Store<S> {
     /// # Ok(())
     /// # }
     /// ```
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        name = "tinio.storage.block_sweep",
+        fields(pass = BLOB_SWEEP_PASS)
+    )]
     pub async fn sweep_candidates(
         &self,
         live: &LiveSet,
         min_age: Duration,
         now: SystemTime,
     ) -> Result<SweepCandidates, Error> {
+        let _pass = PassTimer::new(Pass::BlobSweep);
         let mut candidates = SweepCandidates::default();
         // One walk of the whole store. An entry is judged before the next is
         // asked for, so the store's listing is consumed as a stream and never
         // held whole.
-        let mut walk = self
-            .blocks()
-            .walk(None)
-            .await
-            .map_err(|err| Error::Storage(err.into()))?;
+        let mut walk = match self.blocks().walk(None).await {
+            Ok(walk) => walk,
+            Err(err) => {
+                record_pass_failure(Pass::BlobSweep, Section::Walk);
+                return Err(Error::Storage(err.into()));
+            }
+        };
         while let Some(entry) = walk.next().await {
-            let entry = entry.map_err(|err| Error::Storage(err.into()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    record_pass_failure(Pass::BlobSweep, Section::Walk);
+                    return Err(Error::Storage(err.into()));
+                }
+            };
             candidates.scanned += 1;
             candidates.bytes_total += entry.len;
             if live.contains(&entry.hash) {
@@ -305,7 +328,7 @@ impl<S: BlockStore> super::Store<S> {
     /// publish and its row commit). A removal that fails (a sharing
     /// violation, a read-only residue) is logged and counted in
     /// [`SweepReport::failed`]; the pass continues, and the next one
-    /// retries it.
+    /// retries it. Each failure is counted under `blob_sweep`/`remove`.
     ///
     /// # Examples
     ///
@@ -325,6 +348,13 @@ impl<S: BlockStore> super::Store<S> {
     /// # Ok(())
     /// # }
     /// ```
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        name = "tinio.storage.block_remove",
+        fields(pass = BLOB_SWEEP_PASS)
+    )]
     pub async fn remove_candidates(
         &self,
         candidates: &SweepCandidates,
@@ -347,6 +377,7 @@ impl<S: BlockStore> super::Store<S> {
                     // work to do, and a transient sharing violation clears
                     // on its own.
                     report.failed += 1;
+                    record_pass_failure(Pass::BlobSweep, Section::Remove);
                     tracing::warn!(
                         hash = %entry.hash,
                         error = %err,

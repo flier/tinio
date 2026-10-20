@@ -18,27 +18,36 @@ use std::{
     fs::File,
     io::{self, Write},
     path::Path,
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
+    time::Instant,
 };
 
 #[cfg(feature = "config")]
 use garde::Validate;
+#[cfg(feature = "otel")]
+use opentelemetry::trace::TracerProvider as _;
+#[cfg(feature = "otel")]
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+#[cfg(feature = "otel")]
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use parse_display::{Display, FromStr};
 #[cfg(feature = "config")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smart_default::SmartDefault;
 use tracing::{
-    Event, Level, Subscriber,
+    Event, Id, Level, Subscriber,
     field::{Field, Visit},
+    span::{Attributes, Record},
 };
+#[cfg(feature = "otel")]
+use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{
-    Layer,
-    fmt::{
-        self,
-        writer::{BoxMakeWriter, MakeWriterExt},
-    },
+    EnvFilter, Layer,
+    filter::LevelFilter,
+    fmt::{self, writer::BoxMakeWriter},
     layer::{Context, SubscriberExt},
-    registry::LookupSpan,
+    registry::{LookupSpan, Registry},
+    reload,
 };
 
 /// Log level.
@@ -439,36 +448,230 @@ where
     }
 }
 
-/// Build the operational subscriber: fmt layers (text or JSON) at the
-/// configured verbosity plus the access-log layer writing to `access_path`.
-/// Errors (level `error` and above) always go to stderr too (FR-017). When
-/// the `otel` feature is compiled and `otel_endpoint` is `Some`, the OTLP
-/// export layer is attached (T053).
+/// The operational layers a subscriber runs: fmt, the close-only layer, the access log and, in an
+/// `otel` build with an endpoint, the OTLP export.
+pub type OperationalLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
+
+/// The retained OTLP provider: `None` when no endpoint is configured. Without the `otel` feature it
+/// is `Option<()>`, so the composition root compiles unchanged in both graphs.
+#[cfg(feature = "otel")]
+pub type OtelHandle = Option<SdkTracerProvider>;
+
+#[cfg(not(feature = "otel"))]
+pub type OtelHandle = Option<()>;
+
+/// The process's one provider. The export layer holds only a tracer, so dropping the provider on
+/// return from `build_layer` left every export empty; this keeps it alive until process teardown.
+static OTEL: OnceLock<OtelHandle> = OnceLock::new();
+
+/// Retain `handle` for the process lifetime; the first install wins.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::log::install_otel;
+///
+/// install_otel(None);
+/// ```
+pub fn install_otel(handle: OtelHandle) {
+    let _ = OTEL.set(handle);
+}
+
+/// Flush and stop the retained provider — the graceful-stop half. A no-op without the `otel`
+/// feature or when no endpoint was configured.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::log::shutdown_otel;
+///
+/// shutdown_otel();
+/// ```
+pub fn shutdown_otel() {
+    #[cfg(feature = "otel")]
+    if let Some(provider) = OTEL.get().and_then(Option::as_ref)
+        && let Err(error) = provider.shutdown()
+    {
+        tracing::warn!(error = %error, "the OTLP exporter did not stop cleanly");
+    }
+}
+
+/// The handle that swaps the installed subscriber's operational layers.
+pub type ReloadHandle = reload::Handle<OperationalLayer, Registry>;
+
+/// The handle that swaps the installed subscriber's `EnvFilter`.
+pub type FilterHandle = reload::Handle<EnvFilter, Registry>;
+
+/// The two handles a later phase reloads through.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::log::build_bootstrap;
+///
+/// let logging = build_bootstrap().expect("a bootstrap subscriber");
+/// let _ = (&logging.handles.layer, &logging.handles.filter);
+/// ```
+pub struct Handles {
+    /// The operational layers: fmt, the close-only layer, the access log and OTLP.
+    pub layer: ReloadHandle,
+    /// The `EnvFilter` the operational layers and the span levels obey.
+    pub filter: FilterHandle,
+}
+
+/// The subscriber the process installs — the fmt-only bootstrap in `main`, then the full stack
+/// inside the confinement — and the handles the second phase swaps through.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::log::build_bootstrap;
+///
+/// let logging = build_bootstrap().expect("a bootstrap subscriber");
+/// let _ = &logging.subscriber;
+/// ```
+pub struct Logging {
+    /// The operational stack: fmt, the close-only layer, the access log and OTLP.
+    pub subscriber: Box<dyn Subscriber + Send + Sync>,
+    /// The OTLP provider, retained by whoever owns the process (the composition root).
+    pub otel: OtelHandle,
+    /// What a later phase reloads the layers and filter through.
+    pub handles: Handles,
+}
+
+/// Build the process entry's bootstrap: fmt to stderr at the default verbosity, with no
+/// access-log file, no OTLP exporter and no thread, so it can be installed before anything is
+/// parsed (resolution, the daemon detach and the confinement all happen after it).
 ///
 /// # Errors
 ///
-/// `Io` when the access-log file cannot be opened for appending; OTLP
-/// exporter construction failures when the `otel` feature is enabled.
+/// The error arm of [`build_subscriber`]; this shape opens no file and builds no exporter.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::log::build_bootstrap;
+///
+/// let logging = build_bootstrap().expect("no file and no exporter is the infallible shape");
+/// let _ = &logging.handles.filter;
+/// ```
+pub fn build_bootstrap() -> Result<Logging, Box<dyn Error + Send + Sync>> {
+    build_subscriber(
+        Verbosity::default(),
+        Format::default(),
+        &AccessFormat::default(),
+        None,
+        None,
+    )
+}
+
+/// Build the process's subscriber: fmt layers (text or JSON), the
+/// close-only layer, the access log when `access_path` is `Some`, and the OTLP layer when the
+/// `otel` feature is compiled and `otel_endpoint` is `Some` (T053). Errors are always visible on
+/// stderr down to the configured verbosity (FR-017).
+///
+/// # Errors
+///
+/// `Io` when `access_path` is `Some` and the file cannot be opened for appending; OTLP exporter
+/// construction failures when the `otel` feature is enabled.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::log::{AccessFormat, Format, Verbosity, build_subscriber};
+///
+/// let logging = build_subscriber(
+///     Verbosity::default(),
+///     Format::default(),
+///     &AccessFormat::default(),
+///     None,
+///     None,
+/// )
+/// .expect("stderr needs no file");
+/// let _ = &logging.subscriber;
+/// ```
 pub fn build_subscriber(
     verbosity: Verbosity,
     format: Format,
     access_format: &AccessFormat,
-    access_path: &Path,
+    access_path: Option<&Path>,
     otel_endpoint: Option<&str>,
-) -> Result<Box<dyn Subscriber + Send + Sync>, Box<dyn Error + Send + Sync>> {
-    let access_file = File::options()
-        .create(true)
-        .append(true)
-        .open(access_path)?;
-    let access_layer = AccessLogLayer::new(access_format.clone(), access_file);
+) -> Result<Logging, Box<dyn Error + Send + Sync>> {
+    let (layer, otel) = build_layer(format, access_format, access_path, otel_endpoint)?;
+    Ok(build_logging(verbosity, layer, otel))
+}
 
+/// The process's one subscriber shape: the operational stack under the configured filter. Built
+/// once, inside the confinement, so nothing it starts lives outside the sandbox.
+fn build_logging(verbosity: Verbosity, layer: OperationalLayer, otel: OtelHandle) -> Logging {
+    let (reload_layer, layer_handle) = reload::Layer::new(layer);
+    let (filter_layer, filter_handle) = reload::Layer::new(build_filter(verbosity));
+    let subscriber = tracing_subscriber::registry().with(reload_layer.with_filter(filter_layer));
+    Logging {
+        subscriber: Box::new(subscriber),
+        otel,
+        handles: Handles {
+            layer: layer_handle,
+            filter: filter_handle,
+        },
+    }
+}
+
+/// The operational filter: the verbosity flag as the default directive, with `RUST_LOG` overriding
+/// it when set. The access target is pinned at `info` so the observer's own sink survives a lower
+/// level — the access log is not the operational stream.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::log::{Verbosity, build_filter};
+///
+/// let _filter = build_filter(Verbosity::Debug);
+/// ```
+pub fn build_filter(verbosity: Verbosity) -> EnvFilter {
     let level = match verbosity {
         Verbosity::Error => Level::ERROR,
         Verbosity::Warn => Level::WARN,
         Verbosity::Info => Level::INFO,
         Verbosity::Debug => Level::DEBUG,
     };
-    let stderr = BoxMakeWriter::new(io::stderr).with_max_level(level);
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::from_level(level).into())
+        .from_env_lossy();
+    // **`add_directive` takes the filter by value**, so the pinned access directive is either
+    // applied or the seeded filter is returned unchanged — never a second spelling of the builder
+    // chain. The literal is a valid directive by construction; the arm is spelled rather than
+    // unwrapped because a parse failure must not take the process's log down.
+    match "tinio::access=info".parse() {
+        Ok(directive) => filter.add_directive(directive),
+        Err(_) => filter,
+    }
+}
+
+/// Build the operational layers alone — what `build_subscriber` wraps for the process's one
+/// install, inside the confinement. The OTLP provider travels beside the layer; whoever owns the
+/// process retains it (dropping it here is what emptied the export).
+///
+/// # Errors
+///
+/// The same two arms `build_subscriber` documents.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::log::{AccessFormat, Format, build_layer};
+///
+/// let (layer, otel) = build_layer(Format::default(), &AccessFormat::default(), None, None)
+///     .expect("stderr needs no file");
+/// let _ = (layer, otel);
+/// ```
+pub fn build_layer(
+    format: Format,
+    access_format: &AccessFormat,
+    access_path: Option<&Path>,
+    otel_endpoint: Option<&str>,
+) -> Result<(OperationalLayer, OtelHandle), Box<dyn Error + Send + Sync>> {
+    let stderr = BoxMakeWriter::new(io::stderr);
     // **ANSI follows `NO_COLOR`, and the variable is the *only* thing consulted.**
     // `tracing-subscriber` turns ANSI on whenever its `ansi` feature is compiled in — it never asks
     // `isatty` — so a run whose stderr is a pipe, a journal or a CI step still gets escapes around
@@ -484,7 +687,7 @@ pub fn build_subscriber(
     // the confined server itself was serving requests — so that leg now exports `NO_COLOR`. The
     // JSON layer needs no counterpart: its field names are quoted keys, never styled.
     let ansi = env::var_os("NO_COLOR").is_none();
-    let op_layer = match format {
+    let op_layer: Box<dyn Layer<Registry> + Send + Sync> = match format {
         Format::Text => fmt::layer()
             .with_writer(stderr)
             .with_target(false)
@@ -496,38 +699,201 @@ pub fn build_subscriber(
             .with_target(false)
             .boxed(),
     };
-    let base = tracing_subscriber::registry()
-        .with(op_layer)
-        .with(access_layer);
+    let layer: OperationalLayer = match access_path {
+        Some(path) => {
+            let access_file = File::options().create(true).append(true).open(path)?;
+            Box::new(
+                op_layer
+                    .and_then(SpanCloseLayer)
+                    .and_then(AccessLogLayer::new(access_format.clone(), access_file)),
+            )
+        }
+        None => Box::new(op_layer.and_then(SpanCloseLayer)),
+    };
     #[cfg(feature = "otel")]
     if let Some(endpoint) = otel_endpoint {
-        return Ok(Box::new(base.with(otel_layer(endpoint)?)));
+        let (export, provider) = otel_layer::<Registry>(endpoint)?;
+        return Ok((Box::new(layer.and_then(export)), Some(provider)));
     }
     let _ = otel_endpoint;
-    Ok(Box::new(base))
+    Ok((layer, None))
 }
+
+/// Emits one event when a span closes, so a span that fires no event of its own still leaves a
+/// duration line. The level is the span's own: a T0 (info) span survives the default filter, while
+/// a T1 (debug) line appears only under `debug`.
+///
+/// A span that already logs its own duration declares `close_line = false` in its fields; the
+/// directive is read at creation, so the policy lives with the span rather than in a target list
+/// here.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_server::log::SpanCloseLayer;
+///
+/// let _layer = SpanCloseLayer;
+/// ```
+#[derive(Debug, Clone, Copy, SmartDefault)]
+pub struct SpanCloseLayer;
+
+/// A span's start and recorded fields, kept in its extensions until `on_close`.
+#[derive(Debug)]
+struct Started {
+    started: Instant,
+    fields: Vec<(&'static str, String)>,
+}
+
+/// Collects a span's fields for the close line.
+struct CloseFields<'a>(&'a mut Vec<(&'static str, String)>);
+
+/// Reads the one directive field a span may carry: `close_line = false` suppresses its close line
+/// (the span already logs its own duration). Absent means `true`.
+struct CloseDirective(bool);
+
+impl Visit for CloseDirective {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == "close_line" {
+            self.0 = value;
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn Debug) {}
+}
+
+impl Visit for CloseFields<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.push((field.name(), value.to_string()));
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.0.push((field.name(), value.to_string()));
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.0.push((field.name(), value.to_string()));
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.0.push((field.name(), value.to_string()));
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+        self.0.push((field.name(), format!("{value:?}")));
+    }
+}
+
+impl<S> Layer<S> for SpanCloseLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        // Only T0 spans earn a close line: a T1/T2 line is not part of the
+        // completion contract, and skipping it avoids an extension allocation
+        // per debug/trace span.
+        if *attrs.metadata().level() < Level::INFO {
+            return;
+        }
+        let mut directive = CloseDirective(true);
+        attrs.record(&mut directive);
+        if !directive.0 {
+            return;
+        }
+        let mut fields = Vec::new();
+        attrs.record(&mut CloseFields(&mut fields));
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(Started {
+                started: Instant::now(),
+                fields,
+            });
+        }
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(id) else {
+            return;
+        };
+        let mut extensions = span.extensions_mut();
+        if let Some(started) = extensions.get_mut::<Started>() {
+            values.record(&mut CloseFields(&mut started.fields));
+        }
+    }
+
+    fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(&id) else {
+            return;
+        };
+        let metadata = span.metadata();
+        let Some(started) = span.extensions_mut().remove::<Started>() else {
+            return;
+        };
+        let elapsed_ms = started.started.elapsed().as_secs_f64() * 1000.0;
+        let fields = started.fields;
+        // **A fixed target and a static level per arm, because a callsite's metadata is static**:
+        // the span's own target and level cannot be handed to `event!` at run time. The fixed
+        // target is `tinio`, so the seeded directive and `RUST_LOG` can both reach the line.
+        let name = metadata.name();
+        match *metadata.level() {
+            Level::ERROR => tracing::event!(
+                target: "tinio",
+                Level::ERROR,
+                span = name,
+                elapsed_ms,
+                fields = ?fields,
+                "span closed"
+            ),
+            Level::WARN => tracing::event!(
+                target: "tinio",
+                Level::WARN,
+                span = name,
+                elapsed_ms,
+                fields = ?fields,
+                "span closed"
+            ),
+            Level::INFO => tracing::event!(
+                target: "tinio",
+                Level::INFO,
+                span = name,
+                elapsed_ms,
+                fields = ?fields,
+                "span closed"
+            ),
+            Level::DEBUG | Level::TRACE => {}
+        }
+    }
+}
+
+/// The OTLP export pair: the bridged layer and the provider that must outlive it.
+#[cfg(feature = "otel")]
+pub type OtelLayer<S> = (Box<dyn Layer<S> + Send + Sync>, SdkTracerProvider);
 
 /// The OpenTelemetry export layer (task T053, behind the `otel` feature):
 /// an OTLP gRPC exporter at `endpoint` bridged into tracing. The endpoint
 /// falls back to `OTEL_EXPORTER_OTLP_ENDPOINT` when unset (config.md).
+///
+/// **The provider is returned, never dropped.** The layer borrows a tracer from it; a provider
+/// that goes out of scope here exports nothing, which is why the caller retains the pair.
 #[cfg(feature = "otel")]
-pub fn otel_layer<S>(
-    endpoint: &str,
-) -> Result<Box<dyn Layer<S> + Send + Sync>, Box<dyn Error + Send + Sync>>
+pub fn otel_layer<S>(endpoint: &str) -> Result<OtelLayer<S>, Box<dyn Error + Send + Sync>>
 where
     S: Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
 {
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-    use opentelemetry_sdk::trace::SdkTracerProvider;
-    use tracing_opentelemetry::OpenTelemetryLayer;
-
     let endpoint = if endpoint.is_empty() {
         env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:4317".to_string())
     } else {
         endpoint.to_string()
     };
+    let uri: http::Uri = endpoint
+        .parse()
+        .map_err(|err| format!("the OTLP endpoint is not a URI: {err}"))?;
+    let loopback = matches!(
+        uri.host(),
+        Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+    );
+    if uri.scheme_str() != Some("https") && !loopback {
+        return Err("the OTLP endpoint must use https outside loopback".into());
+    }
     let exporter = SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
@@ -536,7 +902,7 @@ where
         .with_batch_exporter(exporter)
         .build();
     let tracer = provider.tracer("tinio");
-    Ok(Box::new(OpenTelemetryLayer::new(tracer)))
+    Ok((Box::new(OpenTelemetryLayer::new(tracer)), provider))
 }
 
 #[cfg(test)]
@@ -547,6 +913,8 @@ mod tests {
         panic::{AssertUnwindSafe, catch_unwind},
     };
 
+    #[cfg(feature = "otel")]
+    use opentelemetry_sdk::trace::InMemorySpanExporter;
     use tracing::subscriber::with_default;
 
     use super::*;
@@ -741,10 +1109,11 @@ mod tests {
                 Verbosity::Info,
                 format,
                 &AccessFormat::Custom("$status $request".into()),
-                &path,
+                Some(&path),
                 None,
             )
-            .unwrap();
+            .unwrap()
+            .subscriber;
             with_default(sub, || {
                 tracing::info!(
                     target: ACCESS_TARGET,
@@ -759,6 +1128,36 @@ mod tests {
                 "{suffix} format: {content}"
             );
         }
+    }
+
+    #[test]
+    fn a_span_prints_one_close_line_and_a_directive_suppresses_it() {
+        // The close layer's own contract, without the seeded filter: one line per span, once, and
+        // none for a span that declares `close_line = false` (it logs its own duration).
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_writer(move || writer.clone())
+                    .with_target(false)
+                    .with_ansi(false),
+            )
+            .with(SpanCloseLayer);
+        with_default(subscriber, || {
+            tracing::info_span!(target: "tinio::storage", "put_object")
+                .in_scope(|| tracing::info!(target: "tinio::storage", "inside"));
+            tracing::info_span!(target: "tinio::http", "request", close_line = false)
+                .in_scope(|| {});
+            tracing::info_span!(target: "tinio::api", "status", close_line = false)
+                .in_scope(|| {});
+        });
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logged.matches("span closed").count(), 1, "{logged}");
+        assert!(logged.contains("put_object"), "{logged}");
+        assert_eq!(logged.matches("inside").count(), 1, "{logged}");
+        assert!(!logged.contains("request"), "{logged}");
+        assert!(!logged.contains("status"), "{logged}");
     }
 
     #[test]
@@ -779,10 +1178,11 @@ mod tests {
                     verbosity,
                     format,
                     &AccessFormat::Custom("$status $request".into()),
-                    &path,
+                    Some(&path),
                     None,
                 )
-                .expect("every verbosity/format combination builds");
+                .expect("every verbosity/format combination builds")
+                .subscriber;
                 with_default(sub, || {
                     tracing::info!(
                         target: ACCESS_TARGET,
@@ -798,6 +1198,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn otel_layer_retains_a_shut_downable_provider() {
+        // The regression: the provider used to be built and dropped inside `otel_layer`, so the
+        // layer's tracer exported nothing. The returned handle must be `Some`, and the retained
+        // install must reach a provider whose shutdown is callable. The exporter connects lazily,
+        // so building one needs no live collector — only a Tokio reactor, hence the async test.
+        let (layer, handle) = build_layer(
+            Format::Text,
+            &AccessFormat::Combined,
+            None,
+            Some("http://127.0.0.1:4317"),
+        )
+        .expect("the exporter builds without a live collector");
+        assert!(handle.is_some(), "an endpoint must yield a provider handle");
+        drop(layer);
+        install_otel(handle);
+        shutdown_otel();
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn otlp_refuses_plaintext_outside_loopback() {
+        assert!(
+            otel_layer::<tracing_subscriber::Registry>("http://collector.example:4317").is_err(),
+            "a remote endpoint must use https"
+        );
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn otel_in_memory_exporter_round_trips_a_span() {
+        // The bridge's contract without a collector: a closed `tinio::s3` span reaches the SDK's
+        // in-memory exporter with the tracing name, target and fields.
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("tinio-server-test");
+        let subscriber = tracing_subscriber::registry().with(OpenTelemetryLayer::new(tracer));
+        with_default(subscriber, || {
+            let span = tracing::info_span!(
+                target: "tinio::s3",
+                "put_object",
+                bucket = "bucket-a",
+                key = "object.txt"
+            );
+            span.in_scope(|| {});
+        });
+        let spans = exporter
+            .get_finished_spans()
+            .expect("the in-memory exporter reads its finished spans");
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let span = &spans[0];
+        assert_eq!(span.name, "put_object");
+        let attribute = |name: &str| {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == name)
+                .map(|kv| kv.value.as_str().into_owned())
+        };
+        assert_eq!(attribute("target").as_deref(), Some("tinio::s3"));
+        assert_eq!(attribute("bucket").as_deref(), Some("bucket-a"));
+        assert_eq!(attribute("key").as_deref(), Some("object.txt"));
+        provider
+            .shutdown()
+            .expect("the in-memory provider shuts down");
     }
 }
 

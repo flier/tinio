@@ -156,6 +156,8 @@
 
 use std::{sync::Arc, time::SystemTime};
 
+use tracing::instrument;
+
 use crate::{
     _core::{
         BodyStream, ETag, acl,
@@ -380,6 +382,12 @@ where
     /// concurrent abort), the content plane's own refusals (a store at its
     /// size limit answers its typed error before the publish), and the row
     /// plane's refusal of the part row.
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub async fn upload_part(
         &self,
         bucket: &bucket::Name,

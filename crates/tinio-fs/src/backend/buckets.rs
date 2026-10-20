@@ -587,7 +587,7 @@ mod tests {
         _core::{
             acl,
             acl::Acl,
-            object,
+            multipart, object,
             storage::{
                 BucketsListing, Error as StorageError, Error::*, ListBucketsParams, MultipartOps,
                 ObjectOps, VersionOps,
@@ -970,13 +970,20 @@ mod tests {
             .await
             .unwrap();
         storage
-            .put_object(&b, &"a.txt".into(), body(b"x"))
+            .put_object(
+                &b,
+                &object::key("a.txt").expect("a valid object key"),
+                body(b"x"),
+            )
             .await
             .unwrap();
         let err: StorageError = storage.delete_bucket(&b).await.unwrap_err().into();
         assert!(matches!(err, NotEmpty(_)));
         // Deleting the object frees the bucket.
-        storage.delete_object(&b, &"a.txt".into()).await.unwrap();
+        storage
+            .delete_object(&b, &object::key("a.txt").expect("a valid object key"))
+            .await
+            .unwrap();
         storage.delete_bucket(&b).await.unwrap();
     }
 
@@ -1107,7 +1114,7 @@ mod tests {
         let upload = storage
             .create_multipart_upload(
                 &b,
-                &"big.bin".into(),
+                &object::key("big.bin").expect("a valid object key"),
                 None,
                 object::Tags::empty(),
                 None,
@@ -1118,7 +1125,11 @@ mod tests {
         let err: StorageError = storage.delete_bucket(&b).await.unwrap_err().into();
         assert!(matches!(err, NotEmpty(_)));
         storage
-            .abort_multipart_upload(&b, &"big.bin".into(), &upload.upload_id)
+            .abort_multipart_upload(
+                &b,
+                &object::key("big.bin").expect("a valid object key"),
+                &upload.upload_id,
+            )
             .await
             .unwrap();
         storage.delete_bucket(&b).await.unwrap();
@@ -1182,10 +1193,17 @@ mod tests {
             .await
             .unwrap();
         storage
-            .put_object(&b, &"a.txt".into(), body(b"x"))
+            .put_object(
+                &b,
+                &object::key("a.txt").expect("a valid object key"),
+                body(b"x"),
+            )
             .await
             .unwrap();
-        storage.delete_object(&b, &"a.txt".into()).await.unwrap();
+        storage
+            .delete_object(&b, &object::key("a.txt").expect("a valid object key"))
+            .await
+            .unwrap();
         storage.delete_bucket(&b).await.unwrap();
         assert!(storage.bucket_store().load_all().await.unwrap().is_empty());
         assert!(storage.meta_store().walk(&b).await.unwrap().is_empty());
@@ -1229,7 +1247,14 @@ mod tests {
             .unwrap();
         storage
             .multipart_store()
-            .put_part(&b, &k, &upload.upload_id, 1.into(), body(b"x"), None)
+            .put_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                multipart::part_number(1).expect("a valid part number"),
+                body(b"x"),
+                None,
+            )
             .await
             .unwrap();
         // A versioned key: two PUTs leave a history row naming a stored

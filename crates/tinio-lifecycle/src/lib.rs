@@ -23,6 +23,7 @@ extern crate tinio_mem as _mem;
 extern crate tinio_util as _util;
 
 mod clock;
+mod metrics;
 mod runner;
 
 pub use self::{

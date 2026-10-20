@@ -18,6 +18,7 @@ garde = { workspace = true, optional = true, features = [
 ] }
 http.workspace = true
 http-body.workspace = true
+itoa.workspace = true
 hyper.workspace = true
 hyper-util = { workspace = true, features = [
     "server-auto",
@@ -29,6 +30,8 @@ mime_guess.workspace = true
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true, features = [
     "grpc-tonic",
+    "tls-ring",
+    "tls-webpki-roots",
 ] }
 opentelemetry_sdk = { workspace = true, optional = true }
 parse-display.workspace = true
@@ -85,6 +88,7 @@ futures.workspace = true
 hex.workspace = true
 http.workspace = true
 md-5.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 sha2.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
@@ -97,6 +101,10 @@ tinio-sandbox.workspace = true
 tinio-sandbox-linux = { workspace = true, features = ["testing"] }
 tinio-sandbox-windows = { workspace = true, features = ["testing"] }
 tinio-util = { workspace = true, features = ["bench", "state", "testing"] }
+
+[[test]]
+name = "otel_round_trip"
+required-features = ["otel"]
 
 [[test]]
 name = "sandbox_e2e"

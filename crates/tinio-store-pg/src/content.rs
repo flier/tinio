@@ -54,6 +54,7 @@ use std::{collections::HashMap, io, mem, time::SystemTime};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream;
+use parse_display::Display;
 use sqlx::{PgPool, query_file_as, query_file_scalar};
 use tinio_core::{
     bucket,
@@ -63,6 +64,7 @@ use tinio_core::{
     object,
     storage::{BodyStream, ByteRange},
 };
+use tinio_util::metrics::{Backend, record_corrupt_rows};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -75,26 +77,14 @@ use crate::{
 /// (the contract's `ContentKey` distinguishes object from part by shape, not
 /// by a stored tag), so it stays beside its only plane rather than on a
 /// contract type -- the store carries no parallel *contract* type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, derive_more::Display)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type, Display)]
 #[sqlx(type_name = "content_kind", rename_all = "lowercase")]
+#[display(style = "lowercase")]
 pub enum ContentKind {
     /// An object's chunks.
-    #[display("object")]
     Object,
     /// A multipart part's chunks.
-    #[display("part")]
     Part,
-}
-
-impl ContentKind {
-    /// The `content_kind` label. One match, so an array bind cannot spell the
-    /// wire differently from the enum.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Object => "object",
-            Self::Part => "part",
-        }
-    }
 }
 
 /// The content plane's chunk size: 1 MiB (PG2).
@@ -304,6 +294,7 @@ fn scan_key(bucket: &bucket::Name, ckey: &str) -> Result<object::Key, Error> {
 }
 
 fn corrupt_content(bucket: &bucket::Name, ckey: &str) -> Error {
+    record_corrupt_rows(Backend::Pg, 1);
     Error::Corrupt {
         bucket: bucket.clone(),
         key: ckey.to_owned(),
@@ -442,7 +433,7 @@ async fn drain_key(
     kind: ContentKind,
     ckey: &str,
 ) -> Result<(), Error> {
-    let kinds = vec![kind.as_str().to_owned()];
+    let kinds = vec![kind.to_string()];
     let ckeys = vec![ckey.to_owned()];
     sqlx::query_file!("sql/content/drain_keys.sql", bucket, &kinds, &ckeys)
         .execute(&mut **tx)
@@ -1422,7 +1413,7 @@ impl ObjectContent for PgStore {
         let mut ckeys = Vec::with_capacity(keys.len());
         for key in keys {
             let (kind, ckey) = content_key(key);
-            kinds.push(kind.as_str().to_owned());
+            kinds.push(kind.to_string());
             ckeys.push(ckey);
         }
         sqlx::query_file!("sql/content/drain_keys.sql", &wire, &kinds, &ckeys)

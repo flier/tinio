@@ -241,7 +241,7 @@ fn refused_by_the_kernel(diagnostic: String) -> Error {
 ///     rules: 4,
 ///     params: 1,
 /// };
-/// assert_eq!(applied.mechanism.as_str(), "sandbox-init");
+/// assert_eq!(applied.mechanism.to_string(), "sandbox-init");
 /// assert_eq!(applied.rules, 4);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

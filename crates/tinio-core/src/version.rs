@@ -9,7 +9,7 @@
 
 use std::{str::FromStr, time::SystemTime};
 
-use derive_more::{AsRef, Deref};
+use derive_more::Deref;
 use parse_display::{Display, FromStr};
 use uuid::Uuid;
 
@@ -77,9 +77,8 @@ pub fn mint() -> Id {
 /// ```
 #[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[cfg_attr(feature = "sqlx", sqlx(transparent))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Deref, AsRef)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Display, Deref)]
 #[display("{0}")]
-#[as_ref(forward)]
 pub struct Id(String);
 
 /// Validate and wrap a version identifier from an untrusted source.
@@ -110,11 +109,6 @@ pub fn id(id: impl Into<String>) -> Result<Id, Error> {
 }
 
 impl Id {
-    /// The raw wire form.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
     /// Read a wire value: the literal `null` is the null version, anything
     /// else must be a valid identifier.
     ///
@@ -171,7 +165,7 @@ impl Id {
 /// assert_eq!(version::wire_of(Some(&id)), "abc");
 /// ```
 pub fn wire_of(id: Option<&Id>) -> String {
-    id.map_or_else(|| "null".to_owned(), |id| id.as_str().to_owned())
+    id.map_or_else(|| "null".to_owned(), |id| id.to_string())
 }
 
 /// The address a request's `versionId` names: no version (the current one),
@@ -421,7 +415,7 @@ pub enum CurrentVersion {
 ///     is_delete_marker: false,
 ///     size: 4,
 ///     last_modified: SystemTime::UNIX_EPOCH,
-///     etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+///     etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
 /// };
 /// assert_eq!(entry.seq, 1);
 /// ```
@@ -686,7 +680,7 @@ pub enum ReadResult {
 ///     key: object::key("a.txt").unwrap(),
 ///     size: 4,
 ///     last_modified: SystemTime::UNIX_EPOCH,
-///     etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+///     etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
 ///     tags: object::Tags::empty(),
 ///     checksum: None,
 ///     owner: None,
@@ -813,7 +807,7 @@ mod tests {
             None,
             "the null version has no id"
         );
-        assert_eq!(address(Some("abc")).id().map(Id::as_str), Some("abc"));
+        assert_eq!(address(Some("abc")).id().map(|id| id.as_str()), Some("abc"));
         // The current and the null address answer the same `id()` — the
         // id alone cannot carry which one was named, `is_addressed` is the
         // one discriminant (the reason the handlers hold an address rather

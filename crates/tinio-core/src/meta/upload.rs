@@ -172,7 +172,7 @@ impl PartRow {
     pub fn from_raw(number: u32, etag: &str, algorithm: &str, value: &str) -> Option<Self> {
         Some(Self {
             number,
-            etag: ETag::new(etag).ok()?,
+            etag: etag.parse::<ETag>().ok()?,
             checksum: checksum::Part::from_wire_opt(algorithm, value),
             written_at: None,
         })
@@ -626,7 +626,7 @@ mod tests {
     fn a_part_row_round_trips_and_self_heals_its_etag_and_checksum() {
         let part = PartRow {
             number: 10,
-            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
             checksum: Some(checksum::Part {
                 algorithm: checksum::Algorithm::Crc32,
                 value: checksum::Value("NhCmhg==".into()),
@@ -649,7 +649,7 @@ mod tests {
     fn the_part_record_is_the_completion_view_of_a_part_row() {
         let row = PartRow {
             number: 2,
-            etag: ETag::new("900150983cd24fb0d6963f7d28e17f72").unwrap(),
+            etag: "900150983cd24fb0d6963f7d28e17f72".parse::<ETag>().unwrap(),
             checksum: None,
             written_at: None,
         };
@@ -672,7 +672,7 @@ mod tests {
         let upload_created = from_nanos(1_600_000_000_000_000_000);
         let mut row = PartRow {
             number: 1,
-            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
             checksum: None,
             written_at: Some(written),
         };
@@ -700,7 +700,7 @@ mod tests {
         for number in [0, 10_001, u32::MAX] {
             let row = PartRow {
                 number,
-                etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+                etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
                 checksum: None,
                 written_at: None,
             };

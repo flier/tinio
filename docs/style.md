@@ -24,7 +24,11 @@
 - Thin `lib.rs`/`mod.rs`; path-expose; `{Name, name}`; module fns.
 - Schema: drop prefix; `Config`+`Version`; table open/ensure via the crate's macro.
 - Parse only the operator's file (`Config::load`) or launcher text, never fabricated; build the struct; tests exempt.
-- ETag: `Single` / `Composed`; parse `ETag::new`; emit `Display`; content/composed constructors.
+- ETag: `Single` / `Composed`; parse `FromStr`; emit `Display`; content/composed constructors.
+
+## Instrumentation
+
+- `#[instrument]` on the function; never `.instrument()` — a hand-built future gets an annotated helper.
 
 ## Error & async
 

@@ -10,6 +10,23 @@
 - DB-backed legs pin 4 test threads (`--test-threads=4`; nextest test group) — a 4-conn pool per leg vs the fixture's `max_connections`.
 - DB legs fail closed: `TINIO_PG_REQUIRED` set in the DB job ⇒ a missing `TINIO_PG_DSN` aborts, never skips.
 
+## PostgreSQL fixture
+
+- The fixture is `tools/pg/docker-compose.yml`: postgres 18, host port 55432, user and database `tinio`.
+- Start it before the DB legs; the compose healthcheck gates readiness.
+- Run the DB legs and the sqlx cache check with the DSN below.
+- Set `TINIO_PG_REQUIRED=1` to fail closed; unset means the legs skip.
+
+```sh
+docker compose -f tools/pg/docker-compose.yml up -d
+export TINIO_PG_DSN='postgres://tinio:tinio@127.0.0.1:55432/tinio?sslmode=disable'
+cargo xtask sqlx check
+cargo test -p tinio-store-pg -p tinio-pg -- --test-threads=4
+docker compose -f tools/pg/docker-compose.yml down
+```
+
+- Stop with `down`; add `-v` only to reset the data volume.
+
 ## Harness & guards
 
 - Shared harness = lib behind a test feature; shared include = file-scope.
@@ -103,7 +120,18 @@
 
 ## macOS
 
-- macOS: real-Mac gate; off-Mac certifies nothing; fail closed without the host helper.
+- Real-Mac gate; off-Mac certifies nothing; fail closed without the host helper.
+- Fixture: `D:\docker\macos` (outside the repo); image preloaded; KVM lives in the `docker-desktop` WSL VM.
+- Nested virtualization required (Windows 11 + Docker Desktop); start, use console or SSH, stop gracefully.
+- Guest carries Rust and a crates mirror; sync the tree in, then run the macOS legs over SSH.
+- Two mechanisms; confinement serial; nested Seatbelt is environment; socket-path overflow: harness.
+
+```sh
+wsl -d docker-desktop -- sh -c 'ls -l /dev/kvm'
+docker compose -f D:/docker/macos/docker-compose.yml up -d
+ssh -p 2222 -i ~/.ssh/id_ed25519 flier@127.0.0.1
+docker compose -f D:/docker/macos/docker-compose.yml stop
+```
 - Two mechanisms (`TINIO_SANDBOX_MACOS_MECHANISM`), both green; confinement serial (parallel pass off).
 - Nested Seatbelt is environment; socket-path overflow: harness.
 

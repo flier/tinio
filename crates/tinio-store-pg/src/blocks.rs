@@ -811,7 +811,7 @@ fn limit_to_i64(limit: usize) -> i64 {
 /// Decode an address read back from the table: it was written by `to_hex`, so a
 /// failure is a corrupt stored row, reported rather than panicked on.
 fn decode_hash(raw: &str) -> Result<BlockHash, Error> {
-    BlockHash::new(raw).map_err(|err| {
+    raw.parse::<BlockHash>().map_err(|err| {
         Error::Storage(storage::io(io::Error::new(
             io::ErrorKind::InvalidData,
             err.to_string(),

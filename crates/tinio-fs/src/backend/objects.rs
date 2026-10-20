@@ -26,6 +26,7 @@ use std::{
 
 use futures::stream;
 use tokio::{fs, fs::File, runtime::Handle, task};
+use tracing::instrument;
 
 use super::{Error, FsStorage};
 /// The rename guard's home: `rename_object` calls the contract's defaulted
@@ -59,8 +60,10 @@ use crate::{
         version,
     },
     _ops::StagedBody as EngineStagedBody,
+    _util::metrics::WriteOp,
     backend::version::{Publication, Published},
     content::FsStaged,
+    error::record_failed_write,
     fsutil,
     meta::{Content, Verdict, gate},
     write::AtomicWriter,
@@ -277,6 +280,12 @@ impl FsStorage {
     /// `follow_symlinks` is disabled — it is invisible to the data plane,
     /// so the direct ops answer `NoSuchBucket` (matching the listing's
     /// empty answer and its absence from `list_buckets`).
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %name)
+    )]
     pub(crate) async fn ensure_bucket(&self, name: &bucket::Name) -> Result<PathBuf, Error> {
         let dir = match self.bucket_dir(name).await {
             Ok(dir) => dir,
@@ -303,6 +312,12 @@ impl FsStorage {
     /// Reject access resolving through a symlink when `follow_symlinks` is
     /// disabled (s3-surface.md). Checks every existing component of `path`
     /// (missing components are skipped — the parents may not exist yet).
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(key = %key)
+    )]
     pub(crate) async fn check_symlinks(&self, key: &object::Key, path: &Path) -> Result<(), Error> {
         if self.follow_symlinks {
             return Ok(());
@@ -647,6 +662,12 @@ impl FsStorage {
     /// temp, and its commit is [`Self::commit_marker`]'s — taken by every
     /// caller before the publish (the ops engine's `commit_object` adapter,
     /// the content plane's `publish`, the copy fast path).
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub(crate) async fn publish_object_file(
         &self,
         bucket: &bucket::Name,
@@ -691,6 +712,7 @@ impl FsStorage {
             Ok(published) => published,
             Err(err) => {
                 let _ = fs::remove_file(&temp).await;
+                record_failed_write(WriteOp::Put, &err);
                 return Err(err);
             }
         };
@@ -1212,6 +1234,12 @@ impl ObjectOps for FsStorage {
     /// fs's `MetadataFailure` is `Warn` (RI2): a row write refused after the
     /// publish is logged and the answer is still the committed object — the
     /// next read heals the row — and the published bytes are never taken back.
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        skip(self, staged, tags, owner, acl),
+        fields(bucket = %bucket, key = %key)
+    )]
     async fn commit_object(
         &self,
         bucket: &bucket::Name,
@@ -1271,6 +1299,12 @@ impl ObjectOps for FsStorage {
     /// tags/owner/ACL. A copy is a fresh object either way — it inherits
     /// neither the source's retained parts nor its owner/ACL, and its mtime is
     /// the copy time.
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        skip(self, src_bucket, src_key, tags, owner, acl, checksum),
+        fields(bucket = %dst_bucket, key = %dst_key)
+    )]
     async fn copy_object(
         &self,
         src_bucket: &bucket::Name,
@@ -1300,6 +1334,12 @@ impl ObjectOps for FsStorage {
         }
     }
 
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        skip(self, range),
+        fields(bucket = %bucket, key = %key)
+    )]
     async fn get_object(
         &self,
         bucket: &bucket::Name,
@@ -1355,6 +1395,12 @@ impl ObjectOps for FsStorage {
     /// directory sync are this crate's `move_object_file`) and the metadata by
     /// `ObjectMeta::move_`, one contract call each — the row, its retained
     /// parts and the source's metadata move together.
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        skip(self, src),
+        fields(bucket = %bucket, key = %dst)
+    )]
     async fn rename_object(
         &self,
         bucket: &bucket::Name,
@@ -1379,6 +1425,12 @@ impl ObjectOps for FsStorage {
             .map_err(Error::from)
     }
 
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        skip(self),
+        fields(bucket = %bucket, key = %key)
+    )]
     async fn delete_object(
         &self,
         bucket: &bucket::Name,

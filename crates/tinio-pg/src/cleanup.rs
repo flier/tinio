@@ -104,6 +104,7 @@ use crate::{
         blocks::PgBlocks,
         cleanup::{HistoryRow, OrphanPart},
     },
+    _util::metrics::{Pass, PassTimer, Section, record_pass_failure},
     Error,
 };
 
@@ -302,6 +303,12 @@ impl PgCleanup {
     ///
     /// A read-only store removes nothing — the mode's promise, read from the
     /// store rather than from the caller.
+    #[tracing::instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(dry_run = self.dry_run)
+    )]
     pub async fn abort_stale_uploads(&self) -> Result<u64, Error> {
         if self.multipart_ttl.is_none() {
             return Ok(0);
@@ -350,7 +357,14 @@ impl PgCleanup {
     /// An abandoned-upload failure is reported through the action stream rather
     /// than failing the pass: the repair actions already collected are still
     /// the caller's to drain, exactly as the two-call form answered them.
+    #[tracing::instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(dry_run = self.dry_run)
+    )]
     pub async fn pass(&self) -> Result<(ActionStream<Error>, u64), Error> {
+        let _pass = PassTimer::new(Pass::PgCleanup);
         let mut actions: Vec<Result<RepairAction, Error>> = Vec::new();
         let remove = self.may_remove();
         // A run with no lifecycle pass keeps the knobs when the rules cannot
@@ -359,10 +373,14 @@ impl PgCleanup {
         let owners = match self.lifecycle_configs().await {
             Ok(configs) => lifecycle::ActionOwners::from_configs(&configs, self.lifecycle_pass),
             Err(err) if !self.lifecycle_pass => {
+                record_pass_failure(Pass::PgCleanup, Section::Rules);
                 actions.push(Err(err));
                 lifecycle::ActionOwners::unread(false)
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                record_pass_failure(Pass::PgCleanup, Section::Rules);
+                return Err(err);
+            }
         };
         self.reclaim_orphan_chunks(remove, &mut actions).await;
         self.reclaim_orphan_parts(remove, &mut actions).await;
@@ -375,6 +393,7 @@ impl PgCleanup {
         let aborted = match aborted {
             Ok(aborted) => aborted,
             Err(err) => {
+                record_pass_failure(Pass::PgCleanup, Section::Uploads);
                 actions.push(Err(err));
                 0
             }
@@ -400,6 +419,7 @@ impl PgCleanup {
     /// reports the total it removed. Nothing is written before the page it
     /// belongs to is read, so a report is always the state the fix would have
     /// seen.
+    #[tracing::instrument(target = "tinio::storage", level = "debug", skip_all)]
     async fn reclaim_orphan_chunks(
         &self,
         remove: bool,
@@ -411,6 +431,7 @@ impl PgCleanup {
             let rows = match page {
                 Ok(rows) => rows,
                 Err(err) => {
+                    record_pass_failure(Pass::PgCleanup, Section::Chunks);
                     actions.push(Err(Error::from(err)));
                     return;
                 }
@@ -430,6 +451,7 @@ impl PgCleanup {
             match self.store.reclaim_orphan_chunks(&rows, self.grace).await {
                 Ok(gone) => reclaimed = reclaimed.saturating_add(gone),
                 Err(err) => {
+                    record_pass_failure(Pass::PgCleanup, Section::Chunks);
                     actions.push(Err(Error::from(err)));
                     return;
                 }
@@ -450,6 +472,7 @@ impl PgCleanup {
     /// run's removals are one statement per page, keyed by the keys it
     /// returned: a part's chunks and its head go in that one statement, so a
     /// page that fails part way cannot leave a head whose chunks are gone.
+    #[tracing::instrument(target = "tinio::storage", level = "debug", skip_all)]
     async fn reclaim_orphan_parts(
         &self,
         remove: bool,
@@ -460,11 +483,13 @@ impl PgCleanup {
             let rows: Vec<OrphanPart> = match page {
                 Ok(rows) => rows,
                 Err(err) => {
+                    record_pass_failure(Pass::PgCleanup, Section::Parts);
                     actions.push(Err(Error::from(err)));
                     return;
                 }
             };
             if remove && let Err(err) = self.store.reclaim_orphan_parts(&rows).await {
+                record_pass_failure(Pass::PgCleanup, Section::Parts);
                 actions.push(Err(Error::from(err)));
                 return;
             }
@@ -500,6 +525,7 @@ impl PgCleanup {
     /// A bucket whose rules own this action is skipped (LC21). A pass that
     /// cannot read the rules stands every bucket down; a run with no pass
     /// does not (LC23).
+    #[tracing::instrument(target = "tinio::storage", level = "debug", skip_all)]
     async fn expire_versions(
         &self,
         remove: bool,
@@ -516,6 +542,7 @@ impl PgCleanup {
             let page = match page {
                 Ok(page) => page,
                 Err(err) => {
+                    record_pass_failure(Pass::PgCleanup, Section::Versions);
                     actions.push(Err(Error::from(err)));
                     return;
                 }
@@ -591,7 +618,10 @@ impl PgCleanup {
                             seqs.len()
                         ),
                     })),
-                    Err(err) => actions.push(Err(Error::from(err))),
+                    Err(err) => {
+                        record_pass_failure(Pass::PgCleanup, Section::Versions);
+                        actions.push(Err(Error::from(err)));
+                    }
                 }
                 continue;
             }
@@ -612,10 +642,12 @@ impl PgCleanup {
     /// judges the store against it and the grace window, so a block a publish
     /// just stored but no row names yet is kept. A report names the candidates;
     /// a real run removes them and reports what went.
+    #[tracing::instrument(target = "tinio::storage", level = "debug", skip_all)]
     async fn reclaim_blocks(&self, remove: bool, actions: &mut Vec<Result<RepairAction, Error>>) {
         let live = match self.live_set().await {
             Ok(live) => live,
             Err(err) => {
+                record_pass_failure(Pass::PgCleanup, Section::Blocks);
                 actions.push(Err(err));
                 return;
             }
@@ -627,6 +659,7 @@ impl PgCleanup {
         {
             Ok(candidates) => candidates,
             Err(err) => {
+                record_pass_failure(Pass::PgCleanup, Section::Blocks);
                 actions.push(Err(Error::from(storage::Error::from(err))));
                 return;
             }
@@ -653,7 +686,10 @@ impl PgCleanup {
                     report.removed, report.bytes
                 ),
             })),
-            Err(err) => actions.push(Err(Error::from(storage::Error::from(err)))),
+            Err(err) => {
+                record_pass_failure(Pass::PgCleanup, Section::Blocks);
+                actions.push(Err(Error::from(storage::Error::from(err))));
+            }
         }
     }
 

@@ -526,7 +526,7 @@ mod tests {
     /// corrupt-row and range failures keep their identity.
     #[test]
     fn the_projection_keeps_the_content_block_and_range_variants() {
-        use tinio_core::{bucket, content::ContentKey, object, storage};
+        use tinio_core::{bucket, content::ContentKey, multipart, object, storage};
 
         let key = object::key("a.txt").unwrap();
         let upload_id = "6f1d0f4a-5c2e-4b8a-9f31-2d7c9e5a1b40".to_owned();
@@ -538,7 +538,7 @@ mod tests {
         );
         let projected: storage::Error = Error::MissingContent(ContentKey::Part {
             upload_id: upload_id.clone(),
-            number: 2.into(),
+            number: multipart::part_number(2).expect("a valid part number"),
         })
         .into();
         assert!(

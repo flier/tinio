@@ -77,6 +77,7 @@ const POLL: Duration = Duration::from_millis(100);
 ///
 /// `located` and `args` are `status`'s pair for the same reason: one discovery resolution for
 /// every non-launching command, and the authoritative parse's flags.
+#[tracing::instrument(target = "tinio::cli", level = "info", skip_all, name = "stop")]
 pub async fn run(args: Args, located: Located) -> Result<ExitCode, Error> {
     let (resolution, candidates) = client_resolution(args, located)?;
     // Decision 19's pair, tried in order, and the request goes only where a server answers:

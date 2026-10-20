@@ -9,6 +9,7 @@ publish = false
 async-trait.workspace = true
 futures.workspace = true
 md-5.workspace = true
+prometheus.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 

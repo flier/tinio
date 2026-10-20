@@ -7,7 +7,10 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+parse-display.workspace = true
+prometheus.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 tinio-blob.workspace = true
 tinio-core.workspace = true
@@ -17,6 +20,7 @@ bytes.workspace = true
 futures.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
 tinio-util = { workspace = true, features = ["testing"] }
 
 [lints.clippy]

@@ -58,7 +58,7 @@ impl Type<Postgres> for Acl {
 impl<'q> Encode<'q, Postgres> for Acl {
     fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
         let mut encoder = PgRecordEncoder::new(buf);
-        encoder.encode(self.owner.as_ref().map(OwnerId::as_str))?;
+        encoder.encode(self.owner.as_deref())?;
         encoder.encode(self.canonical_grants())?;
         encoder.finish();
         Ok(IsNull::No)

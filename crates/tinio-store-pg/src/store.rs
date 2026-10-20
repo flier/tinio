@@ -518,6 +518,7 @@ struct OwnershipInner {
 impl Ownership {
     /// Take the lock on a fresh dedicated connection, or report the session that
     /// holds it (PG12).
+    #[tracing::instrument(target = "tinio::storage", level = "info", skip_all)]
     async fn take(pool: &Pool) -> Result<Self, Error> {
         let connection = connect_dedicated(pool).await?;
         let ownership = Self {
@@ -592,6 +593,12 @@ impl Ownership {
     /// invisible until the next one, so a serving instance that spawns this with
     /// [`OWNERSHIP_RECHECK`] serves for up to 30 seconds with a lock it no
     /// longer holds.
+    ///
+    /// The span is the process's ownership scope: it opens with the guard and
+    /// closes on every exit path, the loss path included. It is `info` so the
+    /// default filter keeps the whole scope and its close line; the loss path's
+    /// `error` event remains the operator's immediate signal.
+    #[tracing::instrument(target = "tinio::storage", level = "info", skip_all)]
     pub async fn verify_with<A>(self, interval: Duration, on_loss: A) -> Result<(), Error>
     where
         A: FnOnce(OwnershipLoss),

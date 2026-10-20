@@ -161,7 +161,7 @@ pub(crate) async fn versioned_bucket(
         .await
         .unwrap();
     storage.set_bucket_versioning(&b, state).await.unwrap();
-    let key: object::Key = "notes.txt".into();
+    let key: object::Key = object::key("notes.txt").expect("a valid object key");
     for bytes in bodies {
         storage.put_object(&b, &key, body(*bytes)).await.unwrap();
     }

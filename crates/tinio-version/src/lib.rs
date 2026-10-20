@@ -36,6 +36,7 @@ pub extern crate tinio_core as _core;
 
 mod engine;
 mod error;
+mod metrics;
 mod plan;
 pub mod ports;
 

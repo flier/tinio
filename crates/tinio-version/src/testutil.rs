@@ -82,12 +82,12 @@ pub(crate) fn fixture() -> Fixture {
 
 /// A bucket name for the tests.
 pub(crate) fn bucket() -> Name {
-    Name::from("demo")
+    bucket::name("demo").expect("a valid bucket name")
 }
 
 /// A key for the tests.
 pub(crate) fn key() -> object::Key {
-    object::Key::from("notes.txt")
+    object::key("notes.txt").expect("a valid object key")
 }
 
 /// The contract double: every call the engine makes, over maps and one tempdir.
@@ -323,7 +323,7 @@ impl BucketMeta for Fake {
         &self,
         bucket: &bucket::Name,
         now: SystemTime,
-    ) -> Result<SystemTime, <Self as Metadata>::Error> {
+    ) -> Result<(SystemTime, bool), <Self as Metadata>::Error> {
         unimplemented!("the engine's double implements only the calls the engine makes")
     }
 

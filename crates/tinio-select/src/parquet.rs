@@ -91,6 +91,12 @@ pub struct ParquetReader {
 }
 
 impl ParquetReader {
+    #[tracing::instrument(
+        target = "tinio::s3",
+        level = "debug",
+        name = "parquet.reader",
+        skip_all
+    )]
     pub fn new(
         input: Cursor<Vec<u8>>,
         projection: Vec<String>,

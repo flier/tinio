@@ -459,7 +459,7 @@ mod tests {
         // The storage contract is exposed for setup/teardown.
         let storage = backend.storage();
         let err: storage::Error = storage
-            .head_bucket(&"data".into())
+            .head_bucket(&bucket::name("data").expect("a valid bucket name"))
             .await
             .unwrap_err()
             .into();
@@ -565,7 +565,11 @@ mod tests {
             .unwrap();
         let storage = backend.storage();
         storage
-            .put_object(&"data".into(), &"a.txt".into(), body(b"x"))
+            .put_object(
+                &bucket::name("data").expect("a valid bucket name"),
+                &object::key("a.txt").expect("a valid object key"),
+                body(b"x"),
+            )
             .await
             .unwrap();
         let err = backend

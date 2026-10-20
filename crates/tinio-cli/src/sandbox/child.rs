@@ -83,6 +83,7 @@ pub fn filter_argv(argv: Vec<OsString>) -> Result<(Vec<OsString>, Option<Adopted
 /// apply_self_confinement(&adopted)?;
 /// # Ok::<(), tinio_cli::Error>(())
 /// ```
+#[tracing::instrument(level = "debug", target = "tinio::cli", skip_all)]
 pub fn apply_self_confinement(adopted: &Adopted) -> Result<(), Error> {
     match _sandbox::apply_self_confinement(adopted) {
         // The launcher's own launch, and every process that is not a confined child.

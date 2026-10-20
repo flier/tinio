@@ -12,7 +12,7 @@
 
 use std::{ffi::OsString, io::Read};
 
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use crate::{
     error::Result,
@@ -168,6 +168,7 @@ pub fn filter_argv(
 /// let none = adopt(Vec::<OsString>::new(), io::empty()).unwrap();
 /// assert!(none.is_none());
 /// ```
+#[instrument(target = "tinio::sandbox", level = "info", skip_all)]
 pub fn adopt(
     args: impl IntoIterator<Item = OsString>,
     mut stdin: impl Read,

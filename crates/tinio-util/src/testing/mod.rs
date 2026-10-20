@@ -128,7 +128,9 @@ use tracing_subscriber::fmt::MakeWriter;
 pub mod blocks;
 pub mod http;
 pub mod metadata;
+pub mod metrics;
 pub mod sigv4;
+pub mod spans;
 
 use crate::_core::{
     BodyStream, ByteRange, CompletedPart, ETag, ListBucketsParams, ListObjectsParams,
@@ -182,7 +184,7 @@ pub fn json_keys(value: &serde_json::Value) -> Vec<String> {
 
 /// Build a validated [`ETag`] from a wire-format hex string (harness helper).
 pub fn etag(hex: &str) -> ETag {
-    ETag::new(hex).expect("valid etag")
+    hex.parse::<ETag>().expect("valid etag")
 }
 
 /// The lowercase hex of `bytes` — the wire form a digest, a signature or a
@@ -295,7 +297,14 @@ where
         .await
         .unwrap();
     let part = storage
-        .upload_part(b, key, &upload.upload_id, 1.into(), body(b"mp"), None)
+        .upload_part(
+            b,
+            key,
+            &upload.upload_id,
+            multipart::part_number(1).expect("a valid part number"),
+            body(b"mp"),
+            None,
+        )
         .await
         .unwrap();
     storage
@@ -1962,7 +1971,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
                 b,
                 &big,
                 &upload.upload_id,
-                ((i + 1) as u32).into(),
+                multipart::part_number((i + 1) as u32).expect("a valid part number"),
                 body(data.clone()),
                 None,
             )
@@ -2052,7 +2061,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &min_key,
             &failing.upload_id,
-            1.into(),
+            multipart::part_number(1).expect("a valid part number"),
             body(vec![b'u'; min - 1]),
             None,
         )
@@ -2063,7 +2072,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &min_key,
             &failing.upload_id,
-            2.into(),
+            multipart::part_number(2).expect("a valid part number"),
             body(b"x".to_vec()),
             None,
         )
@@ -2124,7 +2133,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &single_key,
             &single_upload.upload_id,
-            1.into(),
+            multipart::part_number(1).expect("a valid part number"),
             body(b"tiny".to_vec()),
             None,
         )
@@ -2226,7 +2235,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &abort_bin,
             &upload2.upload_id,
-            1.into(),
+            multipart::part_number(1).expect("a valid part number"),
             body(b"x"),
             None,
         )
@@ -2317,7 +2326,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &cs_big,
             &cs_upload.upload_id,
-            1.into(),
+            multipart::part_number(1).expect("a valid part number"),
             body(b"abc"),
             Some(slot),
         )
@@ -2356,7 +2365,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &cs_big,
             &cs_upload.upload_id,
-            1.into(),
+            multipart::part_number(1).expect("a valid part number"),
             body(b"xyz"),
             None,
         )
@@ -2384,7 +2393,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &cs_big,
             &cs_upload.upload_id,
-            1.into(),
+            multipart::part_number(1).expect("a valid part number"),
             body(b"abc"),
             Some(new_slot),
         )
@@ -2474,7 +2483,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &attrs,
             &upload.upload_id,
-            1.into(),
+            multipart::part_number(1).expect("a valid part number"),
             body(vec![b'q'; min]),
             Some(checksum_tee(Algorithm::Crc32, "y/Q5Jg==")),
         )
@@ -2485,7 +2494,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &attrs,
             &upload.upload_id,
-            2.into(),
+            multipart::part_number(2).expect("a valid part number"),
             body(b"tail"),
             Some(checksum_tee(Algorithm::Crc32, "NhCmhg==")),
         )
@@ -2580,7 +2589,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             b,
             &overwrite,
             &upload.upload_id,
-            1.into(),
+            multipart::part_number(1).expect("a valid part number"),
             body(b"tiny"),
             None,
         )
@@ -2663,7 +2672,14 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         .await
         .unwrap();
     let part = storage
-        .upload_part(b, &moved, &upload.upload_id, 1.into(), body(b"again"), None)
+        .upload_part(
+            b,
+            &moved,
+            &upload.upload_id,
+            multipart::part_number(1).expect("a valid part number"),
+            body(b"again"),
+            None,
+        )
         .await
         .unwrap();
     storage
@@ -2758,7 +2774,14 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         "the upload state must carry the create-time owner and grant set",
     );
     let part = storage
-        .upload_part(b, &owned, &upload.upload_id, 1.into(), body(b"tiny"), None)
+        .upload_part(
+            b,
+            &owned,
+            &upload.upload_id,
+            multipart::part_number(1).expect("a valid part number"),
+            body(b"tiny"),
+            None,
+        )
         .await
         .unwrap();
     let completed = storage

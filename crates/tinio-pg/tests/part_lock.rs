@@ -19,8 +19,7 @@ use tinio_core::{
     bucket,
     content::ContentKey,
     meta::UploadMeta,
-    multipart::PartNumber,
-    object,
+    multipart, object,
     storage::{BucketOps, MultipartOps},
 };
 use tinio_pg::{Access, PgStorage};
@@ -28,11 +27,11 @@ use tinio_util::testing::body;
 
 /// The part number both writers of a round write, and the content key the lock
 /// and the invariant are keyed by.
-fn part(upload_id: &str) -> ContentKey {
-    ContentKey::Part {
+fn part(upload_id: &str) -> Result<ContentKey, String> {
+    Ok(ContentKey::Part {
         upload_id: upload_id.to_owned(),
-        number: PartNumber::from(1u32),
-    }
+        number: multipart::part_number(1).map_err(|err| err.to_string())?,
+    })
 }
 
 /// Create the bucket and one multipart upload, and answer the upload's id.
@@ -92,7 +91,7 @@ async fn the_engine_waits_for_the_per_upload_part_lock() {
                     &bucket,
                     &key,
                     &upload_id,
-                    PartNumber::from(1u32),
+                    multipart::part_number(1).unwrap(),
                     body("held"),
                     None,
                 )
@@ -150,7 +149,7 @@ async fn concurrent_same_part_writes_keep_the_row_agreed_with_its_generation() {
                         &bucket,
                         &key,
                         &upload_id,
-                        PartNumber::from(1u32),
+                        multipart::part_number(1).unwrap(),
                         body("A"),
                         None,
                     )
@@ -168,7 +167,7 @@ async fn concurrent_same_part_writes_keep_the_row_agreed_with_its_generation() {
                         &bucket,
                         &key,
                         &upload_id,
-                        PartNumber::from(1u32),
+                        multipart::part_number(1).unwrap(),
                         body("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
                         None,
                     )
@@ -183,14 +182,18 @@ async fn concurrent_same_part_writes_keep_the_row_agreed_with_its_generation() {
         // The row the completion reads (its recorded ETag) and the generation a
         // reader would serve (the live span's length), read separately so a
         // mixture of the two writers is visible.
-        let rows =
-            UploadMeta::list_parts(first.store(), &bucket, &upload_id, PartNumber::from(1u32))
-                .await
-                .expect("the part rows");
+        let rows = UploadMeta::list_parts(
+            first.store(),
+            &bucket,
+            &upload_id,
+            multipart::part_number(1).unwrap(),
+        )
+        .await
+        .expect("the part rows");
         let row = rows.first().expect("a part row after both writers");
         let spans = first
             .store()
-            .live_lens(&bucket, &[part(&upload_id)])
+            .live_lens(&bucket, &[part(&upload_id).expect("a valid part number")])
             .await
             .expect("the live generation");
         let span = spans

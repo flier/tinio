@@ -21,9 +21,8 @@
 //! repair.
 
 #[cfg(feature = "versioning")]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::{
-    collections::HashSet,
     io::ErrorKind,
     path::Path,
     time::{Duration, SystemTime},
@@ -31,7 +30,10 @@ use std::{
 
 use smart_default::SmartDefault;
 use tokio::{fs, sync::watch};
+use tracing::instrument;
 
+#[cfg(feature = "versioning")]
+use crate::_core::bucket::Name;
 #[cfg(feature = "versioning")]
 use crate::{
     _blob::{LiveSet, SweepCandidates, SweepReport},
@@ -45,8 +47,11 @@ use crate::{
     metrics::{record_block_bytes, record_noncurrent_versions, record_sweep},
 };
 use crate::{
-    _core::{bucket::Name, lifecycle, multipart::DEFAULT_EXPIRE_DAYS, storage},
-    _util::pacing,
+    _core::{lifecycle, multipart::DEFAULT_EXPIRE_DAYS, storage},
+    _util::{
+        metrics::{Pass, PassTimer, Section, record_pass_failure},
+        pacing,
+    },
     backend::FsStorage,
     error::Error,
     fsutil::entries_of,
@@ -139,6 +144,9 @@ impl Options {
 /// Sweep cadence: one pass per hour. Not a config knob — the contract's
 /// `[s3]` section defines only the two TTLs (contracts/config.md).
 const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// The `pass` label this backend records its sweep under.
+const SWEEP_PASS: &str = Pass::FsSweep.as_str();
 
 /// Remove the files of `dir` older than `max_age`, skipping directories and
 /// entries that vanish underfoot — the shared walk of the state dir's `tmp/`
@@ -399,7 +407,14 @@ impl Sweeper {
     /// compact_threshold_percent` threshold the `compact_needed` marker is
     /// set, and the next startup compacts (meta-redb-spec §5.9). Best
     /// effort — an evaluation failure is logged, never a sweep failure.
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(pass = SWEEP_PASS)
+    )]
     pub async fn sweep_once(&self, now: SystemTime) -> Result<Summary, Error> {
+        let _pass = PassTimer::new(Pass::FsSweep);
         let mut summary = Summary::default();
         // The sections run independently: one failing section must not
         // cancel the others' work (one unreadable subtree would otherwise
@@ -413,23 +428,32 @@ impl Sweeper {
                 // rather than judge a governed bucket by the knob its rule
                 // displaced — unless this run builds no pass at all, whose
                 // knobs a rule was never going to displace (LC23).
+                record_pass_failure(Pass::FsSweep, Section::Rules);
                 first_error = first_error.or(Some(err));
                 lifecycle::ActionOwners::unread(self.options.lifecycle_pass)
             }
         };
         if let Err(err) = self.sweep_versioned(&mut summary, now, &governed).await {
+            record_pass_failure(Pass::FsSweep, Section::Versioned);
             first_error = first_error.or(Some(err));
         }
         if let Err(err) = self.sweep_orphan_blobs(&mut summary).await {
+            record_pass_failure(Pass::FsSweep, Section::OrphanBlobs);
             first_error = first_error.or(Some(err));
         }
         match self.sweep_tmp(now).await {
             Ok(temps) => summary.temp_files += temps,
-            Err(err) => first_error = first_error.or(Some(err)),
+            Err(err) => {
+                record_pass_failure(Pass::FsSweep, Section::Tmp);
+                first_error = first_error.or(Some(err));
+            }
         }
         match self.sweep_multipart(now, &governed).await {
             Ok(uploads) => summary.uploads = uploads,
-            Err(err) => first_error = first_error.or(Some(err)),
+            Err(err) => {
+                record_pass_failure(Pass::FsSweep, Section::Multipart);
+                first_error = first_error.or(Some(err));
+            }
         }
         self.evaluate_compact_needed().await;
         match first_error {
@@ -831,7 +855,7 @@ impl Sweeper {
                 .map(|age| age >= self.options.multipart_ttl())
                 .unwrap_or(false)
             {
-                tracing::info!(
+                tracing::trace!(
                     upload_id = %upload.upload_id,
                     "swept abandoned multipart upload"
                 );
@@ -915,7 +939,7 @@ mod tests {
             acl::Acl,
             bucket, lifecycle,
             meta::BucketMeta,
-            object,
+            multipart, object,
             storage::{BucketOps, MultipartOps},
         },
         _store_redb::RedbMetadata,
@@ -1368,7 +1392,7 @@ mod tests {
         storage
             .create_multipart_upload(
                 &b,
-                &"big.bin".into(),
+                &object::key("big.bin").expect("a valid object key"),
                 None,
                 object::Tags::empty(),
                 None,
@@ -1493,7 +1517,7 @@ mod tests {
         storage
             .create_multipart_upload(
                 &b,
-                &"big.bin".into(),
+                &object::key("big.bin").expect("a valid object key"),
                 None,
                 object::Tags::empty(),
                 None,
@@ -1819,7 +1843,7 @@ mod tests {
         storage
             .create_multipart_upload(
                 &b,
-                &"big.bin".into(),
+                &object::key("big.bin").expect("a valid object key"),
                 None,
                 object::Tags::empty(),
                 None,
@@ -1871,7 +1895,7 @@ mod tests {
         let upload = storage
             .create_multipart_upload(
                 &b,
-                &"big.bin".into(),
+                &object::key("big.bin").expect("a valid object key"),
                 None,
                 object::Tags::empty(),
                 None,
@@ -1882,9 +1906,9 @@ mod tests {
         storage
             .upload_part(
                 &b,
-                &"big.bin".into(),
+                &object::key("big.bin").expect("a valid object key"),
                 &upload.upload_id,
-                1.into(),
+                multipart::part_number(1).expect("a valid part number"),
                 body(b"x"),
                 None,
             )

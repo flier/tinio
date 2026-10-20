@@ -30,6 +30,7 @@
 use std::{io, time::SystemTime};
 
 use async_trait::async_trait;
+use tracing::instrument;
 
 use crate::{
     _core::{
@@ -233,6 +234,16 @@ impl VersionMeta for RedbMetadata {
         })
     }
 
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip(self),
+        fields(
+            bucket = %bucket,
+            key = %key,
+            version = id.as_deref().map_or("null", String::as_str),
+        )
+    )]
     async fn advance_slot(
         &self,
         bucket: &bucket::Name,
@@ -340,6 +351,17 @@ impl VersionMeta for RedbMetadata {
     /// commit. No monotonic guard applies: the backwards move to a real
     /// identity is this call's own definition, so
     /// [`VersionMeta::advance_slot`]'s rule stays absolute.
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip(self, row),
+        fields(
+            bucket = %bucket,
+            key = %key,
+            version = id.as_deref().map_or("null", String::as_str),
+            bytes = row.size,
+        )
+    )]
     async fn restore_slot(
         &self,
         bucket: &bucket::Name,
@@ -437,6 +459,18 @@ impl VersionMeta for RedbMetadata {
             .await
     }
 
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip(self, row),
+        fields(
+            bucket = %bucket,
+            key = %key,
+            version = row.id.as_deref().map_or("null", String::as_str),
+            kind = %row.kind,
+            bytes = row.size,
+        )
+    )]
     async fn put_version(
         &self,
         bucket: &bucket::Name,
@@ -692,7 +726,10 @@ mod tests {
     };
 
     use redb::WriteTransaction;
-    use tinio_util::testing::metadata::assert_version_conformance;
+    use tinio_util::testing::{
+        metadata::assert_version_conformance, spans::one_named,
+    };
+    use tracing::Level;
 
     use crate::{
         _core::{
@@ -710,6 +747,7 @@ mod tests {
         },
         Driver, Error, RedbMetadata,
         object_meta::{Stored as ObjectStored, Table as ObjectTable},
+        testutil::capture_spans,
         version::{Kind as RowKind, Row as VersionRow, Table as VersionTable, encode_blob},
     };
 
@@ -770,7 +808,7 @@ mod tests {
             .unwrap();
         let recorded = raw_row(&driver, &bucket, &key);
         assert_eq!(
-            recorded.version_id.as_ref().map(Id::as_str),
+            recorded.version_id.as_ref().map(|id| id.as_str()),
             Some("v1"),
             "the recorded identity is the slot's"
         );
@@ -874,7 +912,7 @@ mod tests {
             .await
             .unwrap()
             .expect("a recorded slot");
-        assert_eq!(slot.version.as_ref().map(Id::as_str), Some("v5"));
+        assert_eq!(slot.version.as_ref().map(|id| id.as_str()), Some("v5"));
 
         // The crash window's own re-run sits at the same sequence: allowed.
         store
@@ -966,7 +1004,7 @@ mod tests {
             .unwrap()
             .expect("a recorded slot");
         assert_eq!(
-            slot.version.as_ref().map(Id::as_str),
+            slot.version.as_ref().map(|id| id.as_str()),
             Some("v5"),
             "the slot the refused move would have rewound is untouched"
         );
@@ -1194,7 +1232,10 @@ mod tests {
             .await
             .unwrap();
         let recorded = raw_row(&store.driver(), &bucket, &key);
-        assert_eq!(recorded.version_id.as_ref().map(Id::as_str), Some("v1"));
+        assert_eq!(
+            recorded.version_id.as_ref().map(|id| id.as_str()),
+            Some("v1")
+        );
         assert_eq!(recorded.version_seq, 1);
     }
 
@@ -1261,7 +1302,10 @@ mod tests {
         );
         // …the recorded slot columns name the restored version…
         let recorded = raw_row(&store.driver(), &bucket, &key);
-        assert_eq!(recorded.version_id.as_ref().map(Id::as_str), Some("v1"));
+        assert_eq!(
+            recorded.version_id.as_ref().map(|id| id.as_str()),
+            Some("v1")
+        );
         assert_eq!(
             recorded.version_seq, 1,
             "the slot moved backwards, to the restored version's own sequence"
@@ -1345,7 +1389,7 @@ mod tests {
             .await
             .unwrap()
             .expect("a recorded slot");
-        assert_eq!(slot.version.as_ref().map(Id::as_str), Some("v1"));
+        assert_eq!(slot.version.as_ref().map(|id| id.as_str()), Some("v1"));
         assert!(
             slot.is_delete_marker,
             "the restored marker's bit survives the row it came from"
@@ -1434,7 +1478,7 @@ mod tests {
             .await
             .unwrap()
             .expect("a recorded slot");
-        assert_eq!(slot.version.as_ref().map(Id::as_str), Some("v2"));
+        assert_eq!(slot.version.as_ref().map(|id| id.as_str()), Some("v2"));
         assert_eq!(
             ObjectMeta::get(&store, &bucket, &key).await.unwrap(),
             before,
@@ -1488,7 +1532,7 @@ mod tests {
             .await
             .unwrap()
             .expect("a recorded slot");
-        assert_eq!(slot.version.as_ref().map(Id::as_str), Some("v2"));
+        assert_eq!(slot.version.as_ref().map(|id| id.as_str()), Some("v2"));
         let recorded = raw_row(&store.driver(), &bucket, &key);
         assert_eq!(recorded.version_seq, 2, "the slot stayed where it was");
     }
@@ -1643,7 +1687,7 @@ mod tests {
     /// can tell the row the call wrote from anything the store fabricated.
     fn caller_row(size: u64, identity: u64) -> CallerRow {
         CallerRow {
-            etag: ETag::new("0cc175b9c0f1b6a831c399e269772661").unwrap(),
+            etag: "0cc175b9c0f1b6a831c399e269772661".parse::<ETag>().unwrap(),
             size,
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             identity,
@@ -1709,5 +1753,61 @@ mod tests {
             .read(|txn| ObjectTable::open_readonly(txn)?.get(&bucket, &key))
             .unwrap()
             .expect("the slot's object row")
+    }
+
+    /// The three slot/version commits open one info span each on the storage
+    /// target: one span per contract call, not per row, and the identity the
+    /// commit moves is the recorded field.
+    #[tokio::test]
+    async fn version_commits_open_one_info_span_each() {
+        let capture = capture_spans();
+        let store = RedbMetadata::in_memory().unwrap();
+        let bucket = bucket::name("span-version").unwrap();
+        let key = object::key("slot.txt").unwrap();
+        bucket_with(&store, &bucket).await;
+        plant(&store, &bucket, &key, &[marker_version_row(1, "v1")]).await;
+
+        let watermark = capture.watermark();
+        store
+            .advance_slot(&bucket, &key, Some(Id::new("v1").unwrap()), 1)
+            .await
+            .unwrap();
+        store
+            .restore_slot(
+                &bucket,
+                &key,
+                &caller_row(5, 7),
+                Some(Id::new("v1").unwrap()),
+                1,
+            )
+            .await
+            .unwrap();
+        store
+            .put_version(&bucket, &key, &version_row_of(&stamped_row(2, "v2", 0)))
+            .await
+            .unwrap();
+
+        let spans = capture.spans_since(watermark);
+        let one = |name: &str| one_named(&spans, name);
+
+        let advance = one("advance_slot");
+        assert_eq!(advance.target, "tinio::storage");
+        assert_eq!(advance.level, Level::INFO);
+        assert_eq!(advance.field("bucket"), Some("span-version"));
+        assert_eq!(advance.field("key"), Some("slot.txt"));
+        assert_eq!(advance.field("version"), Some("v1"));
+
+        let restore = one("restore_slot");
+        assert_eq!(restore.target, "tinio::storage");
+        assert_eq!(restore.level, Level::INFO);
+        assert_eq!(restore.field("version"), Some("v1"));
+        assert_eq!(restore.field("bytes"), Some("5"));
+
+        let put = one("put_version");
+        assert_eq!(put.target, "tinio::storage");
+        assert_eq!(put.level, Level::INFO);
+        assert_eq!(put.field("version"), Some("v2"));
+        assert_eq!(put.field("kind"), Some("object"));
+        assert_eq!(put.field("bytes"), Some("1"));
     }
 }

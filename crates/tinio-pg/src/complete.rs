@@ -203,9 +203,10 @@ impl PgStorage {
             return Err(err);
         }
 
-        let stored = UploadMeta::list_parts(&*self.store, bucket, upload_id, 1.into())
-            .await
-            .map_err(storage::Error::from)?;
+        let stored =
+            UploadMeta::list_parts(&*self.store, bucket, upload_id, multipart::part_number(1)?)
+                .await
+                .map_err(storage::Error::from)?;
         if let Err(err) = self
             .store
             .drain_upload_checked(bucket, key, upload_id)
@@ -234,11 +235,13 @@ impl PgStorage {
         }
         let removed: Vec<ContentKey> = stored
             .iter()
-            .map(|part| ContentKey::Part {
-                upload_id: upload_id.to_owned(),
-                number: part.number.into(),
+            .map(|part| {
+                Ok(ContentKey::Part {
+                    upload_id: upload_id.to_owned(),
+                    number: multipart::part_number(part.number)?,
+                })
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
         self.remove_part_bytes_best_effort(bucket, &removed).await;
 
         Ok(object::Info {

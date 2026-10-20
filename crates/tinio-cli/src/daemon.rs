@@ -72,6 +72,12 @@ struct ReadyExpect {
 ///
 /// Unix: `Outcome::Child` returns into the sequence; the parent waits and `process::exit`s.
 /// Windows: this process spawns the child (argv minus `--daemon`) and waits the same way.
+#[tracing::instrument(
+    target = "tinio::cli",
+    level = "debug",
+    skip_all,
+    name = "daemon.detach"
+)]
 pub fn detach_if_requested(args: &Args, resolution: &Resolution) -> Result<(), Error> {
     if !args.daemon {
         return Ok(());
@@ -218,11 +224,17 @@ fn unix_detach(resolution: &Resolution, log_file: &Path, expect: ReadyExpect) ->
         Outcome::Parent(Ok(_)) => match await_ready(resolution, log_file, &expect) {
             Ok(()) => {
                 let _ = fs::remove_file(pid_path(&resolution.state_dir, &expect.token));
+                // **The event before the exit, and the reason it is explicit**: `process::exit`
+                // closes no span, so the waiting parent's `cli.run`/`start.run` would otherwise
+                // end with nothing in the trace saying that it exited here and why. The message
+                // names no path: the log file's location is the child's and is not this event's.
+                tracing::info!("the daemon is ready; the waiting parent exits");
                 process::exit(0);
             }
             Err(err) => {
                 // Same rule as the Windows arm: a reported failure must not leave the daemon up.
                 kill_recorded_daemon(&resolution.state_dir, &expect.token);
+                tracing::error!("the daemon did not become ready; the waiting parent exits");
                 eprintln!("tinio: {err}");
                 process::exit(1);
             }
@@ -263,10 +275,16 @@ fn windows_detach(
     expect.expected_pid = Some(child.id());
     tracing::info!(pid = child.id(), "detached: the child process serves");
     match await_ready(resolution, log_file, &expect) {
-        Ok(()) => process::exit(0),
+        Ok(()) => {
+            // The same explicit record the unix parent writes: `process::exit` closes no span,
+            // and the parent's own trace has to say that it ended here and on which answer.
+            tracing::info!("the daemon is ready; the waiting parent exits");
+            process::exit(0);
+        }
         Err(err) => {
             // Failure must not leave a "false fail, still running" child.
             kill_and_reap(&mut child);
+            tracing::error!("the daemon did not become ready; the waiting parent exits");
             eprintln!("tinio: {err}");
             process::exit(1);
         }

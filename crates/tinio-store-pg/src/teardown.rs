@@ -92,6 +92,12 @@ impl PgStore {
     ///
     /// `NoSuchBucket` when the bucket row is already gone, `NotEmpty` when an
     /// object row, an upload or a live generation still names the bucket.
+    #[tracing::instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %bucket)
+    )]
     pub async fn teardown_bucket(&self, bucket: &bucket::Name) -> Result<(), Error> {
         let mut tx = begin(self.pool()).await?;
         assert_bucket_row(&mut tx, bucket).await?;

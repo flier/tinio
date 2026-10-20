@@ -41,7 +41,7 @@ fn object_lifecycle_across_all_row_tables() {
     let h = handle();
     let now = SystemTime::UNIX_EPOCH;
     let key = object::key("big.bin").unwrap();
-    let etag = ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap();
+    let etag = "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap();
     let tags = Tags::from_pairs([("env".into(), "prod".into())]).unwrap();
 
     // 1. Create the bucket.

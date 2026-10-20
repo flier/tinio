@@ -23,6 +23,7 @@ pub mod doctor;
 pub mod errors;
 pub mod lifecycle;
 pub mod listing;
+pub mod metrics;
 pub mod multipart;
 pub mod objects;
 pub mod reserved_paths;
@@ -74,6 +75,9 @@ pub struct World {
     /// The last ListObjectsV2 request's parameters (listing.rs: the
     /// pagination step resumes from these).
     pub last_listing: ListingState,
+    /// The last `I sample the … counter` value (metrics.rs): the failed
+    /// request's error-counter assertion compares against it.
+    pub metric_sample: Option<f64>,
     /// @external scenarios only: a spawned `tinio server` + one client
     /// session (clients.rs); None for the in-process scenarios.
     pub ext: Option<External>,

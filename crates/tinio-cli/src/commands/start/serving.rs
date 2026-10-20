@@ -11,9 +11,16 @@ use std::{fmt::Display, future::ready, time::Duration};
 
 use futures::{StreamExt, future::BoxFuture};
 use tokio::sync::watch;
+#[cfg(feature = "api")]
+use tokio::task::JoinHandle;
+use tracing::instrument;
 
+#[cfg(feature = "api")]
+use crate::_core::storage::WriteLockSnapshot;
 #[cfg(feature = "lifecycle")]
 use crate::_lifecycle::{Options as LifecycleOptions, Runner, Seed, SystemClock};
+#[cfg(feature = "api")]
+use crate::resolve::Pipelines;
 use crate::{
     _core::{
         cleanup::{ActionStream, Cleanup, CleanupOptions, RepairAction, RepairKind},
@@ -38,6 +45,7 @@ use crate::{
 /// its first cycle applies.
 #[cfg(feature = "lifecycle")]
 pub(super) type LifecyclePass = (LifecycleOptions, Vec<Seed>);
+
 /// A build without the `lifecycle` feature: the shared signature carries no work.
 #[cfg(not(feature = "lifecycle"))]
 pub(super) type LifecyclePass = ();
@@ -71,7 +79,13 @@ pub(super) fn lifecycle_pass(
 /// One lifecycle pass as a future: the file's seed once, then the pass's own loop (LC13). The
 /// seed precedes the first pass, so a rule the file declares is enforced from the first cycle.
 #[cfg(feature = "lifecycle")]
-async fn seeded<S: Storage + Clone>(
+#[instrument(
+    level = "info",
+    target = "tinio::cli",
+    name = "tinio.cli.lifecycle",
+    skip_all
+)]
+async fn lifecycle<S: Storage + Clone>(
     storage: S,
     (options, seeds): LifecyclePass,
     stop: watch::Receiver<bool>,
@@ -79,6 +93,26 @@ async fn seeded<S: Storage + Clone>(
     let runner = Runner::new(Arc::new(storage), options, Arc::new(SystemClock), stop);
     runner.seed(&seeds).await;
     runner.run().await;
+}
+
+#[instrument(
+    level = "info",
+    target = "tinio::cli",
+    name = "tinio.cli.scan",
+    skip_all
+)]
+async fn scan(scanner: Scanner, stop: watch::Receiver<bool>) {
+    scanner.run(stop).await;
+}
+
+#[instrument(
+    level = "info",
+    target = "tinio::cli",
+    name = "tinio.cli.sweep",
+    skip_all
+)]
+async fn sweep(sweeper: Sweeper, stop: watch::Receiver<bool>) {
+    sweeper.run(stop).await;
 }
 
 /// The pg `Cleanup` handle both the startup repair and the background pass run — **one construction
@@ -159,6 +193,7 @@ const PG_PASS_CHUNK: Duration = Duration::from_secs(15);
 /// tick and watch a planted orphan, an expired version, a dead block and an abandoned upload go
 /// within it; the serving path names [`PG_PASS_DELAY`] and [`PG_PASS_CYCLE`].
 #[cfg(feature = "pg")]
+#[tracing::instrument(level = "info", target = "tinio::cli", skip_all)]
 pub(super) async fn pg_pass(
     storage: PgStorage,
     stop: watch::Receiver<bool>,
@@ -335,15 +370,7 @@ pub(super) trait ServingBackend: Storage + Clone + Send + Sync + 'static {
     /// contract's. The kind is the serving path's `Startup` on every backend — the `Full` kind
     /// belongs to `doctor --fix` and to the pg background pass ([`pg_pass`]), not to a start.
     fn repair<'a>(&'a self, resolution: &'a Resolution) -> BoxFuture<'a, bool> {
-        Box::pin(async move {
-            let cleanup = self.repair_cleanup(resolution);
-            drain_actions(
-                cleanup.repair(RepairKind::Startup).await,
-                self.repair_warnings(),
-                |_| {},
-            )
-            .await
-        })
+        Box::pin(startup_repair(self, resolution))
     }
 
     /// The cleanup [`repair`](Self::repair) runs — the backend-specific construction the loop
@@ -353,6 +380,23 @@ pub(super) trait ServingBackend: Storage + Clone + Send + Sync + 'static {
     /// The warnings [`repair`](Self::repair) writes: when a stage inside it fails, and when the
     /// repair itself cannot run at all.
     fn repair_warnings(&self) -> RepairWarnings;
+
+    /// The write-lock snapshot this backend publishes to `/metrics`, when it has a filesystem
+    /// write lane. Default: none — a backend whose writes are the store's rows (pg) hands out
+    /// no wait-duration distribution, and the reader publishes zeros rather than a fiction.
+    #[cfg(feature = "api")]
+    fn write_lock_stats(&self) -> Option<WriteLockSnapshot> {
+        None
+    }
+
+    /// The metrics reader over this backend (api builds only): one task refreshing the pipeline
+    /// gauges, the write-lock histograms and the storage scan on one `ttl`. The serving half
+    /// starts it before the planes serve and bounds its exit on the shutdown path.
+    #[cfg(feature = "api")]
+    fn metrics_reader(&self, pipelines: &Pipelines, stop: watch::Receiver<bool>) -> JoinHandle<()> {
+        let this = self.clone();
+        super::reader::spawn(pipelines, self.clone(), move || this.write_lock_stats(), stop)
+    }
 
     /// The post-repair block verification (the `versioning` feature). Default: nothing.
     #[cfg(feature = "versioning")]
@@ -409,6 +453,11 @@ impl ServingBackend for FsStorage {
     #[cfg(feature = "versioning")]
     fn versioning_warning<'a>(&'a self, caps: &'a Capabilities) -> BoxFuture<'a, Option<String>> {
         Box::pin(super::serve::versioning_disabled_warning(self, caps))
+    }
+
+    #[cfg(feature = "api")]
+    fn write_lock_stats(&self) -> Option<WriteLockSnapshot> {
+        Some(FsStorage::write_lock_stats(self))
     }
 
     fn background(
@@ -477,7 +526,7 @@ impl ServingBackend for PgStorage {
             );
             #[cfg(feature = "lifecycle")]
             if let Some(pass) = lifecycle {
-                let pass = seeded(storage, pass, stop);
+                let pass = self::lifecycle(storage, pass, stop);
                 let (_, _) = tokio::join!(residue, pass);
                 return;
             }
@@ -505,6 +554,22 @@ pub(super) fn fs_cleanup(storage: &FsStorage, resolution: &Resolution) -> FsClea
         },
     )
     .with_multipart_grace(multipart_grace_for(resolution))
+}
+
+#[instrument(
+    level = "info",
+    target = "tinio::cli",
+    name = "tinio.cli.repair",
+    skip_all
+)]
+async fn startup_repair<B: ServingBackend>(backend: &B, resolution: &Resolution) -> bool {
+    let cleanup = backend.repair_cleanup(resolution);
+    drain_actions(
+        cleanup.repair(RepairKind::Startup).await,
+        backend.repair_warnings(),
+        |_| {},
+    )
+    .await
 }
 
 /// The backend's background passes, on the serving half's one shutdown channel — the scanner and
@@ -552,18 +617,14 @@ async fn scanner_and_sweeper(
         // sweeper's passes would write the state dir the mode serves from.
         return;
     }
-    let scanner = Scanner::new(storage.clone(), scanner_options);
-    let sweeper = Sweeper::new(storage.clone(), sweep_options);
+    let scan = scan(Scanner::new(storage.clone(), scanner_options), stop.clone());
+    let sweep = sweep(Sweeper::new(storage.clone(), sweep_options), stop.clone());
     #[cfg(feature = "lifecycle")]
     if let Some(pass) = lifecycle {
-        let (_, _, _) = tokio::join!(
-            scanner.run(stop.clone()),
-            sweeper.run(stop.clone()),
-            seeded(storage, pass, stop),
-        );
+        let (_, _, _) = tokio::join!(scan, sweep, self::lifecycle(storage, pass, stop));
         return;
     }
-    let (_, _) = tokio::join!(scanner.run(stop.clone()), sweeper.run(stop));
+    let (_, _) = tokio::join!(scan, sweep);
 }
 
 /// The scanner options a resolved `[scanner]` section describes.

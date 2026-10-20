@@ -154,14 +154,18 @@ impl<'txn> table::Table<'txn, Def> {
     /// stored row's wires ride the re-insert (a first-sight upsert must
     /// not clear the tag set the tagging write just recorded — mirror the
     /// `put_full`-style callers, which keep all wires).
-    pub fn get_or_insert(&mut self, name: &str, now: SystemTime) -> Result<SystemTime, Error> {
-        let row = match self.0.get(name)? {
-            Some(guard) => BucketRow::from_value(guard.value()),
-            None => BucketRow::at(now),
-        };
+    pub fn get_or_insert(
+        &mut self,
+        name: &str,
+        now: SystemTime,
+    ) -> Result<(SystemTime, bool), Error> {
+        if let Some(guard) = self.0.get(name)? {
+            return Ok((BucketRow::from_value(guard.value()).created, false));
+        }
+        let row = BucketRow::at(now);
         let created = row.created;
         self.0.insert(name, row.to_value())?;
-        Ok(created)
+        Ok((created, true))
     }
 
     /// Remove the entry of `name` (idempotent).
@@ -305,7 +309,7 @@ mod tests {
             // The list/head first-sight upsert must keep the first time AND
             // the stored wires (never clear them).
             let recorded = t.get_or_insert("data", now + Duration::from_secs(1))?;
-            assert_eq!(recorded, now);
+            assert_eq!(recorded, (now, false));
             let row = t.row("data")?.unwrap();
             assert_eq!(
                 (row.created, row.tags, row.owner, row.acl, row.cors),

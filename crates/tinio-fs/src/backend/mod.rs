@@ -39,6 +39,7 @@ pub(crate) use objects::{StagedBytes, prune_parents, remove_object_file};
 #[cfg(windows)]
 use soft_canonicalize::soft_canonicalize;
 use tokio::fs;
+use tracing::instrument;
 // The publish plan's own type: the feature-off build has the file-backed
 // publish too, so the re-export is not gated (its module is).
 pub(crate) use version::Publication;
@@ -89,7 +90,11 @@ use crate::{
         decode_owner_wire, object_meta, object_part, upload, version as version_rows,
         version_index,
     },
-    _util::{lockmap, path::contains_under_any_spelling},
+    _util::{
+        lockmap,
+        metrics::{Backend, record_read_only},
+        path::contains_under_any_spelling,
+    },
     backend::version::stamp_superseded,
     bucket::Store as BucketStore,
     content::FsContent,
@@ -248,6 +253,7 @@ pub struct FsOptions {
 /// use tinio_core::{
 ///     bucket,
 ///     mode::AccessMode,
+///     object,
 ///     pipeline::InlineRunner,
 ///     storage::{
 ///         BucketOps, DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES,
@@ -282,10 +288,17 @@ pub struct FsOptions {
 ///         .await
 ///         .unwrap();
 ///     storage
-///         .put_object(&b, &"hello.txt".into(), body(b"hi"))
+///         .put_object(
+///             &b,
+///             &object::key("hello.txt").expect("a valid object key"),
+///             body(b"hi"),
+///         )
 ///         .await
 ///         .unwrap();
-///     let head = storage.head_object(&b, &"hello.txt".into()).await.unwrap();
+///     let head = storage
+///         .head_object(&b, &object::key("hello.txt").expect("a valid object key"))
+///         .await
+///         .unwrap();
 ///     assert_eq!(head.size, 2);
 /// });
 /// ```
@@ -468,6 +481,7 @@ impl FsStorage {
     /// canonicalized; [`Error::InvalidValue`] when `options` fail
     /// validation; [`Error::RootNotDirectory`] when the root is not a
     /// directory.
+    #[instrument(target = "tinio::storage", level = "info", skip_all)]
     pub fn new(root: impl Into<PathBuf>, options: FsOptions) -> Result<Self, Error> {
         let (canonical, state_dir, options) = Self::resolve(root.into(), options)?;
         let handle = if options.access.is_read_only() {
@@ -533,6 +547,7 @@ impl FsStorage {
     /// degrade). The **one** construction of the read-only arm, shared by
     /// [`FsStorage::new`] and [`FsStorage::new_from_db`], so no path can
     /// read a database the other would not.
+    #[instrument(target = "tinio::storage", level = "info", skip_all)]
     fn read_only_source(state_dir: &Path) -> Result<Arc<Driver>, Error> {
         match Driver::open_read_only(state_dir) {
             Ok(handle) => Ok(handle),
@@ -718,6 +733,9 @@ impl FsStorage {
         options: FsOptions,
         handle: Arc<Driver>,
     ) -> Result<Self, Error> {
+        // The one construction both open paths share: the read-only flag is
+        // recorded here so a degraded open and a fresh one report alike.
+        record_read_only(Backend::Fs, options.access.is_read_only());
         let FsOptions {
             follow_symlinks,
             state_dir: _,
@@ -868,6 +886,12 @@ impl FsStorage {
     /// for a link when following is disabled. With following enabled the
     /// lexical-validated join is returned (the policy is off and the
     /// proof is skipped — the current object-op contract).
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(key = %key)
+    )]
     pub(crate) async fn resolve_key(
         &self,
         bucket_dir: &Path,

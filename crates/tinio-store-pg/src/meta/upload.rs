@@ -374,7 +374,7 @@ impl StoredPart {
     /// The listing row; `None` is a domain-invalid ETag or part number.
     fn part(self) -> Option<PartRow> {
         let number = self.number()?;
-        let etag = ETag::new(&self.etag).ok()?;
+        let etag = self.etag.parse::<ETag>().ok()?;
         Some(PartRow {
             number,
             etag,
@@ -388,7 +388,7 @@ impl StoredPart {
     /// than through a listing row the answer would only clone.
     fn record(self) -> Option<PartRecord> {
         let number = self.number()?;
-        let etag = ETag::new(&self.etag).ok()?;
+        let etag = self.etag.parse::<ETag>().ok()?;
         Some(PartRecord {
             number,
             etag,

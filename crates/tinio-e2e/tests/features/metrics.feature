@@ -14,7 +14,7 @@
 # tests — `src/transport.rs`, `src/router.rs`, `src/client.rs` and
 # `src/openapi.rs`, where the retired `tests/management.rs` legs moved on
 # 2026-10-01 (`docs/superpowers/plans/2026-10-01-test-placement-cleanup.md`) —
-# the open form on the local channel, the 404 without a gauge source, and the
+# the open form on the local channel, the registry gathered without an injected source, and the
 # wrap-vs-scan counting — and **not here**: plan B's harness migration moved
 # this suite onto the `tinio` binary, and the control-channel scrape did not
 # come with it, so this file keeps the interception's absence alone.
@@ -28,3 +28,15 @@ Feature: Metrics endpoint
     Then the response status is 200
     When I send a "GET" request to "/metrics"
     Then the response status is 404
+
+  # The wire-error family, observed end to end through the in-process plane:
+  # `MetricS3`'s Err arm records the code the client receives, and the plane
+  # writes the same process-global registry the cucumber binary links. The
+  # assertion is the delta from the sample taken before the request — never
+  # an absolute value, because the registry is shared with every concurrent
+  # scenario.
+  Scenario: A failed S3 request increments the wire-error counter
+    Given I sample the "tinio_s3_errors_total" counter for op "GetObject" and code "NoSuchBucket"
+    When I send a "GET" request to "/ghost/key"
+    Then the response status is 404
+    And the "tinio_s3_errors_total" counter for op "GetObject" and code "NoSuchBucket" has increased

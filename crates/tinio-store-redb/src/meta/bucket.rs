@@ -71,9 +71,9 @@ fn merge_row(
     if !present && create_at.is_none() {
         return Ok(lifecycle::Merged::Absent);
     }
-    let current = LifecycleTable::open(txn)?.get(row)?.unwrap_or(lifecycle::Config {
-        rules: Vec::new(),
-    });
+    let current = LifecycleTable::open(txn)?
+        .get(row)?
+        .unwrap_or(lifecycle::Config { rules: Vec::new() });
     let config = match current.apply_rules(rules) {
         Ok(config) => config,
         Err(invalid) => return Ok(lifecycle::Merged::Refused(invalid)),
@@ -197,7 +197,7 @@ impl BucketMeta for RedbMetadata {
         &self,
         bucket: &bucket::Name,
         now: SystemTime,
-    ) -> Result<SystemTime, Error> {
+    ) -> Result<(SystemTime, bool), Error> {
         let bucket = bucket.to_string();
         self.driver
             .write(move |txn| BucketTable::open(txn)?.get_or_insert(&bucket, now))
@@ -575,7 +575,7 @@ mod tests {
     /// One valid object row to plant for the occupancy probe.
     fn held_row() -> Stored {
         Stored {
-            etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+            etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
             size: 0,
             mtime: 0,
             file_identity: 0,

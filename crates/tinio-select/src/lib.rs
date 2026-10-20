@@ -17,6 +17,7 @@ pub mod engine;
 mod error;
 pub mod events;
 pub mod json;
+pub mod metrics;
 pub mod output;
 #[cfg(feature = "parquet")]
 pub mod parquet;

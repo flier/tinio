@@ -332,10 +332,12 @@ pub fn step<Source: Into<io::Error>>(step_name: &'static str) -> impl Fn(Source)
 /// one wording, and so is the field the payload travels in — `error = %source`,
 /// the spelling [`refused`] already emits — so a query for one failure field
 /// does not miss half the failures. The other two fields are this constructor's
-/// own arguments, `step` and `path`, so a log is greppable by the directory a
-/// refusal was about rather than by prose inside the rendered error. `refused`,
-/// `fail` and `step` are unchanged and stay the shapes for a failure with no
-/// path of its own.
+/// own arguments, `step` and `path`, so a log is greppable by the leaf of the
+/// directory a refusal was about rather than by prose inside the rendered error.
+/// **`path` is the basename and not the path** — the returned `Error` keeps the
+/// whole path for the operator, while the event's field is the one part that does
+/// not hand a host path outside the served root to a log. `refused`, `fail` and
+/// `step` are unchanged and stay the shapes for a failure with no path of its own.
 ///
 /// # Examples
 ///
@@ -358,9 +360,18 @@ pub fn launch(
 ) -> Error {
     let path = path.into();
     let source = source.into();
+    // **The event carries the basename, never the host path.** The returned `Error` keeps the
+    // whole path — the operator needs it — while the log field is the leaf, because a launch
+    // failure's directory is a host path outside the served root and a log is a wider audience
+    // than the caller's own `Display`. A root path has no leaf, and the closed placeholder is
+    // that answer rather than the path spelled out again.
+    let basename = path.file_name().map_or_else(
+        || String::from("<root>"),
+        |name| name.to_string_lossy().into_owned(),
+    );
     error!(
         step = operation,
-        path = %path.display(),
+        path = %basename,
         error = %source,
         "sandbox step failed"
     );

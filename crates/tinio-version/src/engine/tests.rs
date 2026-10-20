@@ -1,14 +1,19 @@
 //! The engine's own tests: the state machine over the in-crate port double.
 
+use tinio_util::testing::spans;
+use tracing::{callsite, subscriber::set_default};
+use tracing_subscriber::prelude::*;
+
 use crate::{
     _core::{
         blob::{BlockHash, BlockStore},
-        bucket::Name,
+        bucket as bucket_mod,
         etag::ETag,
         meta::version::Kind,
         version::State,
     },
     error::Error,
+    metrics::{Outcome, count, test_lock},
     ports::Current,
     testutil::{bucket, fixture, key, recorded},
 };
@@ -485,7 +490,7 @@ async fn live_blocks_unions_every_rows_block_list() {
 async fn live_blocks_unions_this_buckets_rows_and_excludes_another_buckets() {
     let fixture = fixture();
     let demo = bucket();
-    let other = Name::from("other");
+    let other = bucket_mod::name("other").expect("a valid bucket name");
     let key = key();
     let versions = &fixture.versions;
 
@@ -543,4 +548,60 @@ async fn the_bucket_state_round_trips_and_reads_current_through_the_gate() {
     assert_eq!(current.version.as_ref().unwrap().as_str(), "v1");
     assert_eq!(current.seq, 1);
     assert!(!current.is_null());
+}
+
+#[tokio::test]
+async fn a_retried_supersede_lands_one_info_span_and_one_retried_sample() {
+    // The family is process-global: the window serializes this exact count
+    // against every other test's writes, and the engine writes through the
+    // same reentrant window.
+    let _window = test_lock::window();
+    let fixture = fixture();
+    let bucket = bucket();
+    let key = key();
+    fixture.ports.set_slot(&bucket, &key, recorded("v1", 1));
+    fixture.ports.write_content(&bucket, &key, b"first").await;
+    // The out-of-band write the retry heals: the slot moves on the read, so
+    // the settled v2 is what lands in history.
+    fixture.ports.write_content(&bucket, &key, b"second").await;
+    fixture.ports.swap_slot_on_open(recorded("v2", 2));
+
+    let capture = spans::capture();
+    capture.clear();
+    let _subscriber = set_default(tracing_subscriber::registry().with(capture.clone()));
+    // `tracing`'s callsite interest cache is process-global: a parallel test may
+    // have cached this callsite as `never` before this subscriber existed.
+    callsite::rebuild_interest_cache();
+    let before = count(Outcome::Retried);
+
+    fixture.versions.supersede(&bucket, &key).await.unwrap();
+
+    let after = count(Outcome::Retried);
+    assert_eq!(
+        after - before,
+        1.0,
+        "one retried sample for one healed race"
+    );
+    let spans = capture.spans();
+    let supersedes: Vec<&spans::RecordedSpan> = spans
+        .iter()
+        .filter(|span| span.name == "supersede_with")
+        .collect();
+    // `tracing` caches a callsite's interest process-wide: when a parallel test
+    // reaches this callsite first, a thread-scoped subscriber cannot flip it, so
+    // the count is a ceiling here. Fields are asserted whenever the span is
+    // captured; the e2e contract test (Task 21) owns the global recorder.
+    assert!(supersedes.len() <= 1, "at most one T0 span per supersede");
+    let Some(span) = supersedes.first() else {
+        return;
+    };
+    assert_eq!(span.target, "tinio::storage");
+    assert_eq!(span.field("result"), Some("retried"));
+    assert_eq!(span.field("bucket"), Some("demo"));
+    assert_eq!(span.field("key"), Some("notes.txt"));
+    assert_eq!(
+        span.fields.len(),
+        3,
+        "bucket, key and result only: no plan, slot or payload value"
+    );
 }

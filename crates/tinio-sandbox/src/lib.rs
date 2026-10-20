@@ -31,6 +31,12 @@ pub extern crate tinio_sandbox_windows as _windows;
 
 pub mod serve;
 
+/// The facade's two families — the confinement count and its duration — recorded where the
+/// platform's one backend call is made ([`serve`]'s applicator) and read from the process-global
+/// registry the management plane renders. Private: nothing outside this crate reads or writes
+/// them, and the platform crates' own families stay in their own modules.
+mod metrics;
+
 // The platform items each launcher crate answers, bound under one alias per platform so the
 // facade's own bodies call a two-segment path: `clippy::absolute_paths` is `warn` for this
 // crate, and a path written straight from the crate root is three segments or more. The
@@ -278,10 +284,10 @@ fn missing_handoff(step_name: &'static str, detail: String) -> Error {
 ///
 /// **The platform's own value, projected onto the one shape a caller can name on every target.**
 /// macOS's `tinio_sandbox_macos::apply::Applied` carries that crate's `Mechanism` enum, which
-/// exists on that target alone; the mechanism travels here as its wire spelling — the string the
-/// launch payload and `Mechanism::as_str` already share — so a caller reads the same three
-/// fields whichever platform built the value, and a target whose mechanism applies no
-/// confinement of its own never builds one at all.
+/// exists on that target alone; the mechanism travels here as its wire spelling — the string
+/// `Display` and the launch payload already share — so a caller reads the same three fields
+/// whichever platform built the value, and a target whose mechanism applies no confinement of
+/// its own never builds one at all.
 ///
 /// # Examples
 ///
@@ -367,8 +373,12 @@ pub fn apply_self_confinement(adopted: &Adopted) -> Result<Option<Applied>> {
             .map(|applied| {
                 applied.map(|applied| Applied {
                     // The platform's enum as the wire spelling, which is the name the launch
-                    // payload carried and the one an operator reads in the event.
-                    mechanism: applied.mechanism.as_str(),
+                    // payload carried and the one an operator reads in the event. The literals
+                    // match `Mechanism`'s `Display` (pinned by that crate's round-trip test).
+                    mechanism: match applied.mechanism {
+                        tinio_sandbox_macos::Mechanism::SandboxExec => "sandbox-exec",
+                        tinio_sandbox_macos::Mechanism::SandboxInit => "sandbox-init",
+                    },
                     rules: applied.rules,
                     params: applied.params,
                 })

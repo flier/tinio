@@ -39,6 +39,9 @@ pub mod enforcement;
 mod error;
 pub mod event;
 pub mod launcher;
+/// The launcher's two families — the readiness answer and the child's exit outcome — recorded
+/// where the wait answers and read from the process-global registry the management plane renders.
+mod metrics;
 pub mod sandbox;
 #[cfg(test)]
 pub(crate) mod testing;

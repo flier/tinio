@@ -26,6 +26,7 @@ use std::{
     ptr,
 };
 
+use derive_more::Deref;
 use sha2::{Digest, Sha256};
 use tinio_util::{fsutil::create_new_private, path::plain_spelling, wide::to_wide};
 use windows_sys::Win32::{
@@ -1012,8 +1013,10 @@ fn classified(step: &'static str, name: &str, hr: i32) -> Error {
 /// let sid = PackageSid::derive("tinio.sandbox.0123456789abcdef").unwrap();
 /// assert!(sid.as_str().starts_with("S-1-15-2-"));
 /// ```
+#[derive(Deref)]
 pub struct PackageSid {
     raw: PSID,
+    #[deref]
     text: String,
     name: String,
 }
@@ -1146,23 +1149,6 @@ impl PackageSid {
         })
     }
 
-    /// The `S-1-15-2-…` form: what a log line prints, what `icacls` is given
-    /// where a test or an operator runs it, and what a test compares against. One
-    /// accessor, not two — an earlier draft carried `sid_text` as a second name for
-    /// exactly this string.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use tinio_sandbox_windows::sid::PackageSid;
-    ///
-    /// let sid = PackageSid::derive("tinio.sandbox.0123456789abcdef").unwrap();
-    /// assert!(sid.as_str().starts_with("S-1-15-2-"), "{}", sid.as_str());
-    /// ```
-    pub fn as_str(&self) -> &str {
-        &self.text
-    }
-
     /// The profile's name — **the value this SID was created (or taken over)
     /// under**, which is the derivation's own name for the served root and not a
     /// second reading of it.
@@ -1176,8 +1162,8 @@ impl PackageSid {
     /// **The accessor is kept although no in-tree caller takes it**, and the ruling is
     /// recorded rather than re-derived: it is the type's public half for an operator-facing
     /// reader — the profile a run holds has a name, and the one way to spell it without
-    /// re-deriving is here — so it stays beside [`as_str`](Self::as_str) rather than being
-    /// removed with its last caller.
+    /// re-deriving is here — so it stays beside the `S-1-15-2-…` text (`Deref` to that
+    /// string) rather than being removed with its last caller.
     ///
     /// # Examples
     ///

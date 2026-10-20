@@ -39,6 +39,7 @@ use std::{
 use derive_more::Debug;
 use futures::{Stream, stream};
 use tokio::fs;
+use tracing::instrument;
 
 use crate::{
     _core::{
@@ -218,6 +219,11 @@ pub struct FsListing {
     meta_batch_bytes: u32,
 }
 
+/// The listing's streaming walk answer: one boxed stream per walk (the
+/// per-poll state machine borrows its own cursor across awaits, so it is
+/// `!Unpin` by construction).
+type WalkStream = Pin<Box<dyn Stream<Item = Result<WalkedFile, Error>> + Send + 'static>>;
+
 impl FsListing {
     /// Create a listing over `root`. The pipelines are mandatory (P4) —
     /// the scanner producer enqueues into them; offline contexts pass
@@ -278,12 +284,17 @@ impl FsListing {
     /// O(1) beyond the walk's own cursor state. The stream is boxed
     /// (one allocation per walk) because the per-poll state machine
     /// borrows its own cursor across awaits — `!Unpin` by construction.
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket)
+    )]
     pub(crate) async fn walk_files_streaming(
         &self,
         bucket: &bucket::Name,
         key_prefix: &str,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<WalkedFile, Error>> + Send + 'static>>, Error>
-    {
+    ) -> Result<WalkStream, Error> {
         // The lexical bucket mapping (path.rs): the validation supplements
         // — the reserved `.tinio` refusal (FR-020) and, on Windows, the
         // charset/aliasing refusal (F21) — answer the same clean error the

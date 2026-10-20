@@ -40,6 +40,8 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::lock::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+use tinio_util::metrics::{Backend, WriteFailureKind, WriteOp, record_write_failure};
+use tracing::{Span, field, instrument};
 
 use crate::{
     _core::{
@@ -63,6 +65,26 @@ use crate::{
 /// verbatim and the operator's subscriber decides what to keep.
 pub(crate) fn report(message: fmt::Arguments<'_>) {
     tracing::warn!("{message}");
+}
+
+/// The cap decision that refuses a write: the wrapper's one T0 decision, so
+/// its span is `info` while the wrapper's own spans are `debug`. The
+/// `(mem, op, cap)` family is `tinio-util`'s — this crate declares none —
+/// and the recording runs inside the span, so a refusal's trace and its
+/// aggregate agree. No key: the caller names the object, the refusal is
+/// this function's.
+fn cap_refusal(size: u64, limit: u64, op: WriteOp) -> Error {
+    let _span = tracing::info_span!(
+        target: "tinio::storage",
+        "mem.cap_check",
+        op = op.as_str(),
+        bytes = size,
+        limit,
+        outcome = "refused",
+    )
+    .entered();
+    record_write_failure(Backend::Mem, op, WriteFailureKind::Cap);
+    entity_too_large(size, limit)
 }
 
 /// The identity of a multipart part whose landed length is remembered: the
@@ -101,6 +123,7 @@ pub struct CountingStaged<C: ObjectContent> {
     inner: C::Staged,
     len: u64,
     cap: Option<u64>,
+    op: WriteOp,
 }
 
 #[async_trait]
@@ -117,7 +140,7 @@ where
         if let Some(cap) = self.cap
             && len > cap
         {
-            return Err(entity_too_large(len, cap));
+            return Err(cap_refusal(len, cap, self.op));
         }
         self.inner.write(chunk).await.map_err(Into::into)?;
         self.len = len;
@@ -206,6 +229,13 @@ pub struct CountingContent<C: ObjectContent> {
     /// same lock covers remove/rename/copy, whose deltas are read the same
     /// way; it is never taken again inside a critical section.
     accounting: AsyncMutex<()>,
+}
+
+/// Fill the operation span's `key` field: an object key renders, a part key has no name.
+fn record_key(key: &ContentKey) {
+    if let Some(object) = key.object() {
+        Span::current().record("key", field::display(object));
+    }
 }
 
 impl<C: ObjectContent> CountingContent<C>
@@ -368,7 +398,7 @@ where
                 }
                 Some(next as u64)
             })
-            .map_err(|_| entity_too_large(projected.get(), limit))?;
+            .map_err(|_| cap_refusal(projected.get(), limit, WriteOp::Put))?;
         Ok(())
     }
 
@@ -449,7 +479,7 @@ where
     /// write raw through this.
     pub(crate) fn check_object_bytes_unlocked(&self, len: u64) -> Result<(), Error> {
         match self.options.max_object_bytes {
-            Some(limit) if len > limit => Err(entity_too_large(len, limit)),
+            Some(limit) if len > limit => Err(cap_refusal(len, limit, WriteOp::Put)),
             _ => Ok(()),
         }
     }
@@ -587,6 +617,18 @@ where
     /// the accounting lock already, and the lock is not reentrant): it
     /// writes raw and meters with
     /// [`Self::adjust_total_with_credit_unlocked`].
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        name = "mem.publish",
+        skip(self, staged, releasing),
+        fields(
+            bucket = %bucket,
+            op = if key.is_part() { "part" } else { "object" },
+            bytes = staged.len,
+            key = field::Empty,
+        )
+    )]
     pub(crate) async fn publish_replacing(
         &self,
         bucket: &bucket::Name,
@@ -594,6 +636,7 @@ where
         key: &ContentKey,
         releasing: &[ContentKey],
     ) -> Result<(), Error> {
+        record_key(key);
         let landed = staged.len;
         if !self.counts_total() {
             return self
@@ -773,6 +816,10 @@ where
             inner,
             len: 0,
             cap: self.options.max_object_bytes,
+            op: match key {
+                ContentKey::Object(_) => WriteOp::Put,
+                ContentKey::Part { .. } => WriteOp::Part,
+            },
         })
     }
 
@@ -785,12 +832,25 @@ where
     /// recorded beside the bytes, and the compensation guard's premise is the
     /// key's latest publish — a publish that recorded no tag would leave the
     /// previous one looking current.
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        name = "mem.publish",
+        skip(self, staged),
+        fields(
+            bucket = %bucket,
+            op = if key.is_part() { "part" } else { "object" },
+            bytes = staged.len,
+            key = field::Empty,
+        )
+    )]
     async fn publish(
         &self,
         bucket: &bucket::Name,
         staged: Self::Staged,
         key: &ContentKey,
     ) -> Result<(), Error> {
+        record_key(key);
         let landed = staged.len;
         let _section = self.lock_accounting().await;
         self.publish_locked(bucket, staged.inner, landed, key)
@@ -805,6 +865,18 @@ where
     /// tag. The tag is recorded even without a total limit — the refusal the
     /// guard exists for (a drained bucket, a refused row) has nothing to do
     /// with capacity.
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        name = "mem.publish",
+        skip(self, staged, id),
+        fields(
+            bucket = %bucket,
+            op = if key.is_part() { "part" } else { "object" },
+            bytes = staged.len,
+            key = field::Empty,
+        )
+    )]
     async fn publish_tagged(
         &self,
         bucket: &bucket::Name,
@@ -812,22 +884,35 @@ where
         key: &ContentKey,
         id: PublishId,
     ) -> Result<(), Error> {
+        record_key(key);
         let landed = staged.len;
         let _section = self.lock_accounting().await;
         self.publish_locked(bucket, staged.inner, landed, key)
             .await?;
-        // Only a landed publish becomes the key's tag: a refusal or an inner
-        // failure leaves the previous publish's tag in place.
+        // Only a landed publish becomes the key's tag: a refusal or an
+        // inner failure leaves the previous publish's tag in place.
         self.record_publish_tag(bucket, key, id);
         Ok(())
     }
 
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        name = "mem.open",
+        skip(self, range),
+        fields(
+            bucket = %bucket,
+            op = if key.is_part() { "part" } else { "object" },
+            key = field::Empty,
+        )
+    )]
     async fn open(
         &self,
         bucket: &bucket::Name,
         key: &ContentKey,
         range: Option<ByteRange>,
     ) -> Result<BodyStream, Error> {
+        record_key(key);
         self.inner
             .open(bucket, key, range)
             .await
@@ -837,7 +922,19 @@ where
     /// Release what the removal drops — the plane's `stat` for an object,
     /// the remembered length for a part — with the read and the release in
     /// one critical section, after the bytes are gone.
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        name = "mem.remove",
+        skip(self),
+        fields(
+            bucket = %bucket,
+            op = if key.is_part() { "part" } else { "object" },
+            key = field::Empty,
+        )
+    )]
     async fn remove(&self, bucket: &bucket::Name, key: &ContentKey) -> Result<(), Error> {
+        record_key(key);
         if !self.counts_total() {
             return self.inner.remove(bucket, key).await.map_err(Into::into);
         }
@@ -1078,8 +1175,14 @@ where
 mod tests {
     use std::{
         io, slice,
-        sync::{Arc, atomic::AtomicBool},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
     };
+
+    use tinio_util::testing::spans::{self, one_named};
+    use tracing::Level;
 
     use super::*;
     use crate::{
@@ -1850,5 +1953,83 @@ mod tests {
             "the guard answers from the inner transaction, not from a read-back"
         );
         assert_eq!(content.total_bytes(), 0);
+    }
+
+    /// The cap refusal is the wrapper's one T0 decision: one `info` span
+    /// carries the size and the limit that refused it. Its
+    /// `(mem, put, cap)` aggregate is `tinio-util`'s family — this crate
+    /// declares none — and no key reaches either.
+    #[tokio::test]
+    async fn a_cap_refusal_carries_one_info_span() {
+        spans::install();
+        let capture = spans::capture();
+        let watermark = capture.watermark();
+        let content = counted(MemoryOptions {
+            max_object_bytes: Some(4),
+            max_total_bytes: None,
+        });
+        let bucket = bucket::name("cap-span").unwrap();
+        let key = object_key("a.bin");
+
+        let mut staged = content.stage(&bucket, &key).await.unwrap();
+        let err = staged
+            .write(Bytes::from_static(b"12345"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Storage(storage::Error::EntityTooLarge { size: 5, limit: 4 })
+        ));
+
+        let spans = capture.spans_since(watermark);
+        let refusals: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "mem.cap_check")
+            .collect();
+        assert_eq!(refusals.len(), 1, "one span per refused write: {spans:?}");
+        let span = refusals[0];
+        assert_eq!(span.target, "tinio::storage");
+        assert_eq!(span.level, Level::INFO);
+        assert_eq!(span.field("op"), Some("put"));
+        assert_eq!(span.field("bytes"), Some("5"));
+        assert_eq!(span.field("limit"), Some("4"));
+        assert_eq!(span.field("outcome"), Some("refused"));
+        assert!(
+            span.field("key").is_none(),
+            "the refusal is not keyed: {span:?}"
+        );
+    }
+
+    /// The wrapper's put, get and delete are T1 units: one `debug` span each,
+    /// on the shared storage target and under the same field allow-list.
+    #[tokio::test]
+    async fn the_counting_wrapper_spans_the_put_the_get_and_the_delete() {
+        spans::install();
+        let capture = spans::capture();
+        let watermark = capture.watermark();
+        let content = counted(MemoryOptions {
+            max_object_bytes: None,
+            max_total_bytes: None,
+        });
+        let bucket = bucket::name("spanned").unwrap();
+        let key = object_key("a.bin");
+
+        put(&content, &bucket, &key, b"hello").await.unwrap();
+        let body = content.open(&bucket, &key, None).await.unwrap();
+        content.remove(&bucket, &key).await.unwrap();
+        drop(body);
+
+        let spans = capture.spans_since(watermark);
+        for name in ["mem.publish", "mem.open", "mem.remove"] {
+            let span = one_named(&spans, name);
+            assert_eq!(span.target, "tinio::storage");
+            assert_eq!(span.level, Level::DEBUG);
+            assert_eq!(span.field("bucket"), Some("spanned"));
+            assert_eq!(span.field("op"), Some("object"));
+            assert_eq!(span.field("key"), Some("a.bin"));
+        }
+        let publish = one_named(&spans, "mem.publish");
+        assert_eq!(publish.field("bytes"), Some("5"));
+        assert!(spans.iter().all(|span| span.name != "mem.cap_check"));
     }
 }

@@ -571,6 +571,12 @@ mod enabled {
         /// A bucket that records no versions answers `plan: None` and the caller writes as it
         /// always would: the version-free path is a branch of the same operation, exactly as it
         /// is in the engine's own `put_object_versioned`.
+        #[tracing::instrument(
+            level = "info",
+            target = "tinio::storage",
+            skip_all,
+            fields(bucket = %bucket, key = %key)
+        )]
         pub(crate) async fn open_put_write(
             &self,
             bucket: &Name,
@@ -625,6 +631,12 @@ mod enabled {
 
         /// Close it: move the current slot to the identity the plan minted, after the row that
         /// records the version has landed. A no-op on a bucket that records none.
+        #[tracing::instrument(
+            level = "info",
+            target = "tinio::storage",
+            skip_all,
+            fields(bucket = %bucket, key = %key)
+        )]
         pub(crate) async fn close_put_write(
             &self,
             bucket: &Name,

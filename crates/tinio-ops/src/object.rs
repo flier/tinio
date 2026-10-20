@@ -155,6 +155,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use tracing::instrument;
+
 use crate::{
     _core::{
         ETag, acl,
@@ -170,7 +172,7 @@ use crate::{
         storage::{self, BodyStream, ByteRange, Error, GetObjectResult, TagWriteResult},
         version,
     },
-    BucketRow, MetadataFailure, StagedBody,
+    BucketRow, MetadataFailure, StagedBody, metrics,
     ops::{projected, served_without_writing},
 };
 
@@ -336,6 +338,12 @@ where
     /// would have produced is served, with one event, and nothing is
     /// persisted, the bucket row included — because a read is not failed by a
     /// store it cannot write (the crate's one read-path rule).
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub(crate) async fn healed_row(
         &self,
         bucket: &bucket::Name,
@@ -350,6 +358,9 @@ where
         {
             return Ok(row.clone());
         }
+        // One sample per row this read persists: a heal is the read path's own
+        // write, and it has no other aggregate signal.
+        metrics::record_read_heal(metrics::HealKind::ObjectRow);
         let etag = match &stored {
             Some(row) if composed_keep(row, entry) => row.etag.clone(),
             _ => self.content_etag(bucket, key).await?,
@@ -371,11 +382,17 @@ where
             // the lazy first sight — and it degrades exactly as the heal's own
             // write does, so a read-only store still serves.
             let now = SystemTime::now();
+            let recorded = self
+                .meta
+                .record_if_absent(bucket, now)
+                .await
+                .map_err(projected);
+            // The contract reports the insert: only a first sight is a heal.
+            if matches!(&recorded, Ok((_, true))) {
+                metrics::record_read_heal(metrics::HealKind::BucketRow);
+            }
             served_without_writing(
-                self.meta
-                    .record_if_absent(bucket, now)
-                    .await
-                    .map_err(projected),
+                recorded.map(|(created, _)| created),
                 now,
                 "the bucket row a lazy read-heal records",
             )?;
@@ -426,6 +443,12 @@ where
 
     /// The write's shared tail: publish the staged bytes at `key` and record
     /// the row the content now describes.
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     #[expect(
         clippy::too_many_arguments,
         reason = "the write's shared tail takes the operation's whole field set — bucket, key, staged body, tags, owner, ACL and the version bit — because both write paths forward it unchanged"
@@ -540,6 +563,12 @@ where
     /// The content plane hashes what it stores and takes the publish back only
     /// while the digest and the publish identity still name this call. The
     /// engine keeps no second copy of the object.
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     async fn compensate_publish(
         &self,
         bucket: &bucket::Name,
@@ -650,6 +679,12 @@ where
     ///
     /// The content plane's own refusals (a store at its size limit answers its
     /// typed error here, before publish) and a body stream's own failure.
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub async fn stage_body(
         &self,
         bucket: &bucket::Name,
@@ -709,6 +744,12 @@ where
     ///
     /// The content plane's own failures, and the row plane's under
     /// [`MetadataFailure::Fail`].
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub async fn commit_object(
         &self,
         bucket: &bucket::Name,
@@ -734,6 +775,12 @@ where
     /// `NoSuchKey` for a key the content plane does not hold, `InvalidRange`
     /// for a range the object cannot satisfy, and whatever the planes answer
     /// otherwise.
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub async fn get_object(
         &self,
         bucket: &bucket::Name,
@@ -799,6 +846,12 @@ where
     ///
     /// `NoSuchKey` when the source has no content, and the planes' own
     /// failures.
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %bucket, key = %src)
+    )]
     pub async fn rename_object(
         &self,
         bucket: &bucket::Name,
@@ -851,6 +904,12 @@ where
     /// # Errors
     ///
     /// Whatever the planes answer.
+    #[instrument(
+        target = "tinio::storage",
+        level = "info",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub async fn delete_object(
         &self,
         bucket: &bucket::Name,

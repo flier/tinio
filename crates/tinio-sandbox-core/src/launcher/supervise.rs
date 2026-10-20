@@ -8,9 +8,9 @@ use std::{
     time::Duration,
 };
 
-use tracing::{debug, error, info};
+use tracing::{Span, debug, error, field, info, instrument};
 
-use crate::{Attribution, error::Result, launcher::Terminal};
+use crate::{Attribution, error::Result, launcher::Terminal, metrics};
 
 /// A confined child the platform started. The core only ever waits for it, so
 /// the platform keeps its own handle — a `std::process::Child` for
@@ -509,22 +509,28 @@ impl Child {
     ///     Readiness::Reported(Terminal::Listening(addr))
     /// );
     /// ```
+    #[instrument(target = "tinio::sandbox", level = "info", skip_all)]
     pub fn wait_for_ready(&self, bound: Duration) -> Readiness {
         // **The three answers are read off the channel, not off a clock.** `recv_timeout` tells
         // the two failures apart itself — `Disconnected` is the relay ending, `Timeout` is the
         // bound running out — so a caller never has to time the call to recover the distinction,
         // which is what folding them into one `None` forced and what a `Disconnected` arriving
         // after the deadline got wrong.
-        let Some(ready) = self.ready.as_ref() else {
+        let readiness = match self.ready.as_ref() {
             // No channel was wired: nothing can ever be announced, so this is the relay-ended
             // answer rather than a wait on something that will not come.
-            return Readiness::Gone;
+            None => Readiness::Gone,
+            Some(ready) => match ready.recv_timeout(bound) {
+                Ok(terminal) => Readiness::Reported(terminal),
+                Err(RecvTimeoutError::Disconnected) => Readiness::Gone,
+                Err(RecvTimeoutError::Timeout) => Readiness::Elapsed,
+            },
         };
-        match ready.recv_timeout(bound) {
-            Ok(terminal) => Readiness::Reported(terminal),
-            Err(RecvTimeoutError::Disconnected) => Readiness::Gone,
-            Err(RecvTimeoutError::Timeout) => Readiness::Elapsed,
-        }
+        // Family 22: the answer is recorded where it is decided, so the value a caller reads and
+        // the value the scrape reports are one — and it survives the launch's exit on a platform
+        // whose launcher outlives the child.
+        metrics::record_readiness(metrics::Ready::from(&readiness));
+        readiness
     }
 
     /// Block until the child exits, then until its relay has finished.
@@ -570,8 +576,22 @@ impl Child {
     /// // step 8).
     /// assert_eq!(child.wait().expect("reaped").code(), Some(0));
     /// ```
+    #[instrument(
+        target = "tinio::sandbox",
+        level = "info",
+        skip_all,
+        fields(outcome = field::Empty)
+    )]
     pub fn wait(&mut self) -> Result<ExitStatus> {
         let status = (self.wait)();
+        // Family 23: how the wait ended, recorded where the status arrives rather than after the
+        // relay joins — an exit is the child's fact, and the join is this process's cleanup.
+        let outcome = match &status {
+            Ok(status) => metrics::Exit::of(status),
+            Err(_) => metrics::Exit::Error,
+        };
+        metrics::record_exit(outcome);
+        Span::current().record("outcome", field::display(outcome));
         // The child's own answer, which is what a stuck launcher needs to see:
         // an exit code that arrived, or the platform error that stopped one.
         match &status {
@@ -680,6 +700,7 @@ impl Child {
     /// let status = child.wait().expect("the child is reaped");
     /// assert!(matches!(child.attribution(&status), Attribution::Ran));
     /// ```
+    #[instrument(target = "tinio::sandbox", level = "info", skip_all)]
     pub fn attribution(&self, status: &ExitStatus) -> Attribution {
         if self.terminal().is_none() {
             // **The mechanism never got the child as far as announcing a server**,

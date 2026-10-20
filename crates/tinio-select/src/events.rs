@@ -41,6 +41,7 @@ use crate::{
     engine::Engine,
     error::Error,
     json,
+    metrics::{self, Format},
     output::{OutputMode, serialize_row},
     record::{Compression, RangeFilter, RecordReader, ScanRange, decompressed},
     row::{Field, Record, Value, display},
@@ -132,7 +133,16 @@ pub fn select_iter(
     config: SelectConfig,
     input: Box<dyn Read + Send>,
 ) -> impl Iterator<Item = Result<SelectEvent, Error>> {
-    SelectIter::new(plan, config, input)
+    let format = match &config.input_format {
+        InputFormat::Csv(_) => Format::Csv,
+        InputFormat::Json(_) => Format::Json,
+        InputFormat::Parquet(_) => Format::Parquet,
+    };
+    // The stream is the unit: it has no call-shaped body, so the span is manual
+    // and held for the iterator's lifetime (created entering, re-entered per pull).
+    let span = tracing::info_span!(target: "tinio::s3", "select_iter", format = %format);
+    let held = span.clone();
+    span.in_scope(|| SelectIter::new(plan, config, input, held, format))
 }
 
 /// One serialized record over 1 MB — the output side of the 1 MB cap.
@@ -169,6 +179,7 @@ struct Tally {
     scanned: Scanned,
     processed: u64,
     returned: u64,
+    rows: u64,
     mode: CountMode,
 }
 
@@ -178,6 +189,7 @@ impl Tally {
             scanned,
             processed: 0,
             returned: 0,
+            rows: 0,
             mode: if spans {
                 CountMode::Spans { open: None }
             } else {
@@ -243,6 +255,14 @@ impl Tally {
 
     fn add_returned(&mut self, n: u64) {
         self.returned += n;
+    }
+
+    fn add_row(&mut self) {
+        self.rows += 1;
+    }
+
+    fn rows(&self) -> u64 {
+        self.rows
     }
 }
 
@@ -458,10 +478,23 @@ struct SelectIter {
     cadence: Cadence,
     packer: Packer,
     outbox: Outbox,
+    /// The stream span, held for the stream's lifetime: the close line's duration is
+    /// creation-to-drop. It is never entered — nothing the pulls run emits a span or event, and
+    /// entering per row would be O(rows).
+    _span: tracing::Span,
+    format: Format,
+    /// Metrics land once: at EOF, at the in-stream error, or on an early drop.
+    recorded: bool,
 }
 
 impl SelectIter {
-    fn new(plan: QueryPlan, config: SelectConfig, input: Box<dyn Read + Send>) -> Self {
+    fn new(
+        plan: QueryPlan,
+        config: SelectConfig,
+        input: Box<dyn Read + Send>,
+        span: tracing::Span,
+        format: Format,
+    ) -> Self {
         let SelectConfig {
             input_format,
             output,
@@ -494,7 +527,19 @@ impl SelectIter {
             cadence: Cadence::new(request_progress, cont, now),
             packer: Packer::new(),
             outbox: Outbox::new(error),
+            _span: span,
+            format,
+            recorded: false,
         }
+    }
+
+    /// Record this stream's cost once — EOF, in-stream error, or early drop.
+    fn record_stream(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        metrics::record_stream(self.format, self.tally.scanned(), self.tally.rows());
     }
 
     fn pump(&mut self) {
@@ -508,6 +553,7 @@ impl SelectIter {
             // then the error — dropping them would contradict the spec.
             self.flush_staged();
             self.outbox.fail(e);
+            self.record_stream();
         }
     }
 
@@ -592,6 +638,7 @@ impl SelectIter {
         if staged.too_large {
             Err(Error::TooLarge)
         } else {
+            self.tally.add_row();
             Ok(())
         }
     }
@@ -628,6 +675,7 @@ impl SelectIter {
         self.flush_staged();
         self.outbox.push(SelectEvent::Stats(self.tally.snapshot()));
         self.outbox.push(SelectEvent::End);
+        self.record_stream();
         Ok(())
     }
 }
@@ -652,6 +700,12 @@ impl Iterator for SelectIter {
         }
         self.outbox.finish();
         None
+    }
+}
+
+impl Drop for SelectIter {
+    fn drop(&mut self) {
+        self.record_stream();
     }
 }
 
@@ -727,6 +781,8 @@ mod tests {
     use std::io::{Cursor, Write as _};
 
     use bzip2::write::BzEncoder;
+    use tinio_util::testing::spans;
+    use tracing::Level;
 
     use super::*;
     use crate::{
@@ -753,6 +809,61 @@ mod tests {
         let mut r = vec![b'a'; n];
         r.push(b'\n');
         r
+    }
+
+    #[test]
+    fn the_stream_is_one_info_span_and_never_records_the_sql() {
+        let (capture, _recording) = spans::recording();
+        let sql = "SELECT * FROM S3Object s";
+        let config = SelectConfig {
+            input_format: InputFormat::Csv(params(None)),
+            ..Default::default()
+        };
+        let plan = parse(sql).expect("plan");
+        let events: Vec<_> =
+            select_iter(plan, config, Box::new(Cursor::new(b"1\n2\n".to_vec()))).collect();
+        assert_eq!(events.last(), Some(&Ok(SelectEvent::End)));
+
+        // The recorder is global; other tests' spans are not this thread's.
+        let spans = capture.spans_on_this_thread();
+        let streams: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "select_iter")
+            .collect();
+        assert_eq!(streams.len(), 1, "one span per stream: {spans:?}");
+        let stream = streams[0];
+        assert_eq!(stream.target, "tinio::s3");
+        assert_eq!(stream.level, Level::INFO);
+        assert_eq!(stream.parent, None);
+        assert_eq!(stream.fields.len(), 1, "only the framing: {stream:?}");
+        assert_eq!(stream.fields[0].0, "format");
+        assert_eq!(stream.fields[0].1, "csv");
+
+        let reader = spans
+            .iter()
+            .find(|span| span.name == "csv.reader")
+            .expect("the framing span");
+        assert_eq!(reader.target, "tinio::s3");
+        assert_eq!(reader.level, Level::DEBUG);
+        assert_eq!(
+            reader.parent,
+            Some(stream.id),
+            "framing nests under the stream"
+        );
+
+        let parse = spans
+            .iter()
+            .find(|span| span.name == "parse")
+            .expect("the parse span");
+        assert_eq!(parse.target, "tinio::s3");
+        assert_eq!(parse.level, Level::DEBUG);
+        assert!(parse.fields.is_empty(), "SQL is never a field: {parse:?}");
+        assert!(
+            !spans
+                .iter()
+                .any(|span| span.fields.iter().any(|(_, value)| value.contains(sql))),
+            "SQL text leaked into a span: {spans:?}"
+        );
     }
 
     #[test]

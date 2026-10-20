@@ -29,6 +29,7 @@ use bytes::Bytes;
 use derive_more::{From, Into};
 use futures::StreamExt;
 use md5::{Digest as _, Md5};
+use tracing::{Span, field, instrument};
 
 use crate::{
     bucket,
@@ -510,6 +511,12 @@ where
 /// let etag = ETag::Single(digest);
 /// store.publish(bucket, staged, &key).await?;
 /// ```
+#[instrument(
+    target = "tinio::storage",
+    level = "debug",
+    skip_all,
+    fields(bytes = field::Empty)
+)]
 pub async fn stage_body_md5<S>(
     staged: &mut S,
     body: BodyStream,
@@ -526,6 +533,7 @@ where
         hasher.update(&chunk);
         staged.write(chunk).await.map_err(Into::into)?;
     }
+    Span::current().record("bytes", landed);
     Ok((landed, hasher.finalize().into()))
 }
 
@@ -539,10 +547,16 @@ where
 /// # Errors
 ///
 /// The stream's own failure, projected the way the pump projects it.
+#[instrument(
+    target = "tinio::storage",
+    level = "debug",
+    skip_all,
+    fields(bytes = field::Empty)
+)]
 pub async fn hash_body(body: BodyStream) -> Result<[u8; 16], storage::Error> {
-    stage_body_md5(&mut Discard, body)
-        .await
-        .map(|(_, digest)| digest)
+    let (landed, digest) = stage_body_md5(&mut Discard, body).await?;
+    Span::current().record("bytes", landed);
+    Ok(digest)
 }
 
 /// The pump's sink for a caller that has no stage: every chunk is dropped.

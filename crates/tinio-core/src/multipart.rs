@@ -45,8 +45,7 @@ pub fn check_part_minimum(
 
 /// A validated multipart part number (`1..=10000`).
 ///
-/// Untrusted input goes through [`part_number`]. [`From<u32>`] is for
-/// trusted literals and panics on an out-of-range value.
+/// Untrusted input goes through [`part_number`].
 ///
 /// # Examples
 ///
@@ -59,8 +58,6 @@ pub fn check_part_minimum(
 ///     multipart::part_number(0),
 ///     Err(InvalidPartNumber(0))
 /// ));
-/// let trusted: multipart::PartNumber = 7.into();
-/// assert_eq!(u32::from(trusted), 7);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, Deref, AsRef, Into)]
 #[display("{}", _0)]
@@ -74,32 +71,16 @@ pub fn part_number(n: u32) -> Result<PartNumber, storage::Error> {
     Ok(PartNumber(n))
 }
 
-impl From<u32> for PartNumber {
-    /// Trusted-input convenience (panics on an invalid number — use
-    /// [`part_number`] for untrusted input).
-    // A stored row's `u32` is the row's data, not this API's: the backends
-    // and this crate's projections read it through [`part_number`] (or the
-    // `TryFrom<PartRow>` projection for `multipart::ObjectPart`), which
-    // refuses it with `InvalidPartNumber` instead of panicking.
-    #[expect(
-        clippy::expect_used,
-        reason = "literal: the trusted-number API — every call site is a compile-time part-number literal; a stored row's number goes through `part_number()`"
-    )]
-    fn from(n: u32) -> Self {
-        part_number(n).expect("valid part number")
-    }
-}
-
 /// One part in a [`crate::MultipartOps::complete_multipart_upload`] request
 /// (S3 `CompleteMultipartUpload`: ordered `{partNumber, ETag}`).
 ///
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::{CompletedPart, ETag};
+/// use tinio_core::{CompletedPart, ETag, multipart};
 ///
 /// let part = CompletedPart {
-///     part_number: 1.into(),
+///     part_number: multipart::part_number(1).expect("a valid part number"),
 ///     etag: ETag::from_content(b"abc"),
 /// };
 /// assert_eq!(u32::from(part.part_number), 1);
@@ -119,12 +100,12 @@ pub struct CompletedPart {
 /// ```rust
 /// use std::time::SystemTime;
 ///
-/// use tinio_core::{MultipartUpload, acl, object};
+/// use tinio_core::{MultipartUpload, acl, bucket, object};
 ///
 /// let upload = MultipartUpload {
 ///     upload_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479".into(),
-///     bucket: "data".into(),
-///     key: "big.bin".into(),
+///     bucket: bucket::name("data").expect("a valid bucket name"),
+///     key: object::key("big.bin").expect("a valid object key"),
 ///     initiated_at: SystemTime::UNIX_EPOCH,
 ///     checksum: None,
 ///     tags: object::Tags::empty(),
@@ -164,12 +145,14 @@ pub struct MultipartUpload {
 /// ```rust
 /// use std::time::SystemTime;
 ///
-/// use tinio_core::PartInfo;
+/// use tinio_core::{PartInfo, multipart};
 ///
 /// let part = PartInfo {
-///     part_number: 1.into(),
+///     part_number: multipart::part_number(1).expect("a valid part number"),
 ///     size: 5_242_880,
-///     etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+///     etag: "d41d8cd98f00b204e9800998ecf8427e"
+///         .parse()
+///         .expect("a valid etag"),
 ///     last_modified: SystemTime::UNIX_EPOCH,
 ///     checksum: None,
 /// };
@@ -197,10 +180,10 @@ pub struct PartInfo {
 /// # Examples
 ///
 /// ```rust
-/// use tinio_core::multipart::ObjectPart;
+/// use tinio_core::multipart::{self, ObjectPart};
 ///
 /// let part = ObjectPart {
-///     part_number: 1.into(),
+///     part_number: multipart::part_number(1).expect("a valid part number"),
 ///     size: 5_242_880,
 ///     checksum: None,
 /// };
@@ -224,9 +207,11 @@ mod tests {
     #[test]
     fn part_info_round_trip() {
         let p = PartInfo {
-            part_number: 7.into(),
+            part_number: part_number(7).expect("a valid part number"),
             size: 100,
-            etag: "d41d8cd98f00b204e9800998ecf8427e".into(),
+            etag: "d41d8cd98f00b204e9800998ecf8427e"
+                .parse::<ETag>()
+                .expect("a valid etag"),
             last_modified: SystemTime::UNIX_EPOCH,
             checksum: None,
         };
@@ -238,8 +223,8 @@ mod tests {
     fn multipart_upload_state() {
         let m = MultipartUpload {
             upload_id: "uuid-v4".into(),
-            bucket: "data".into(),
-            key: "big.bin".into(),
+            bucket: bucket::name("data").expect("a valid bucket name"),
+            key: object::key("big.bin").expect("a valid object key"),
             initiated_at: SystemTime::UNIX_EPOCH,
             checksum: None,
             tags: object::Tags::empty(),
@@ -256,7 +241,7 @@ mod tests {
         // Mirrors `part_info_round_trip`: the completed-object part row
         // is plain data (no ETag, no timestamp — the S3 `ObjectPart`).
         let p = ObjectPart {
-            part_number: 7.into(),
+            part_number: part_number(7).expect("a valid part number"),
             size: 100,
             checksum: Some(checksum::Part {
                 algorithm: checksum::Algorithm::Crc32,
@@ -284,9 +269,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn part_number_from_invalid_panics() {
-        let _: PartNumber = 0.into();
+    fn part_number_rejects_zero() {
+        assert!(part_number(1).is_ok());
+        assert!(matches!(part_number(0), Err(InvalidPartNumber(0))));
     }
 
     #[test]

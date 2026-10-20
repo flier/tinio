@@ -21,6 +21,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use sqlx::{query_file_as, query_file_scalar};
 use time::OffsetDateTime;
+use tracing::instrument;
 
 use crate::{
     _core::{
@@ -462,6 +463,12 @@ impl PgStore {
     /// A current version carries no index entry, so none is written; the identity is read from
     /// the slot by every caller that needs it ([`VersionMeta::current_slot`] answers it, and
     /// [`VersionMeta::advance_slot`] derives the bit from a row only when one is there).
+    #[tracing::instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip_all,
+        fields(bucket = %bucket, key = %key)
+    )]
     pub async fn mark_current_marker(
         &self,
         bucket: &bucket::Name,
@@ -841,6 +848,12 @@ impl VersionMeta for PgStore {
             .map(|(_seq, current)| current))
     }
 
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip(self),
+        fields(bucket = %bucket, key = %key)
+    )]
     async fn advance_slot(
         &self,
         bucket: &bucket::Name,
@@ -897,6 +910,12 @@ impl VersionMeta for PgStore {
     /// the slot is written naming the restored version (a **backwards** move,
     /// so no monotonic guard applies — [`VersionMeta::advance_slot`]'s rule
     /// stays absolute); and the row the slot moves off is stamped noncurrent.
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip(self, row),
+        fields(bucket = %bucket, key = %key)
+    )]
     async fn restore_slot(
         &self,
         bucket: &bucket::Name,
@@ -984,6 +1003,12 @@ impl VersionMeta for PgStore {
         Ok(())
     }
 
+    #[instrument(
+        target = "tinio::storage",
+        level = "debug",
+        skip(self, row),
+        fields(bucket = %bucket, key = %key)
+    )]
     async fn put_version(
         &self,
         bucket: &bucket::Name,

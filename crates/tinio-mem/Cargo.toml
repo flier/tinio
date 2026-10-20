@@ -17,6 +17,7 @@ uuid = { workspace = true, features = ["v4"] }
 tinio-core.workspace = true
 tinio-ops.workspace = true
 tinio-store-redb.workspace = true
+tinio-util.workspace = true
 tinio-version = { workspace = true, optional = true }
 
 [features]
@@ -25,9 +26,10 @@ versioning = ["dep:tinio-version"]
 testing = []
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
 tinio-mem = { path = ".", features = ["versioning", "testing"] }
 tinio-util = { workspace = true, features = ["testing"] }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints.clippy]
 absolute_paths = "warn"

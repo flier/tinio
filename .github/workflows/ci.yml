@@ -945,7 +945,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     # The workflow's first `services:` block, mirroring the store's
-    # docker-compose fixture (crates/tinio-store-pg/docker-compose.yml): the
+    # docker-compose fixture (tools/pg/docker-compose.yml): the
     # same image, the same `tinio` user/password/database, the same UTF8 initdb
     # arg and the same pg_isready healthcheck. Inside a runner the server
     # listens on 5432 (the compose fixture only maps 55432:5432 on the host);

@@ -172,9 +172,9 @@ impl BucketMeta for PgStore {
         &self,
         bucket: &bucket::Name,
         now: SystemTime,
-    ) -> Result<SystemTime, Error> {
+    ) -> Result<(SystemTime, bool), Error> {
         let mut tx = begin(self.pool()).await?;
-        query_file!(
+        let result = query_file!(
             "sql/meta/bucket/record_if_absent.sql",
             bucket,
             to_timestamp(now)
@@ -185,7 +185,7 @@ impl BucketMeta for PgStore {
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(from_timestamp(created))
+        Ok((from_timestamp(created), result.rows_affected() > 0))
     }
 
     async fn record_full(&self, bucket: &bucket::Name, row: &BucketRow) -> Result<(), Error> {
@@ -520,7 +520,7 @@ mod tests {
             BucketMeta::record_if_absent(&store, &data, at(9))
                 .await
                 .unwrap(),
-            at(5)
+            (at(5), false)
         );
         db.drop_db().await;
     }

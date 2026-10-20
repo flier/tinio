@@ -250,6 +250,7 @@ pub fn resolve_flag(source: ValueSource, requested: bool, file: bool) -> bool {
 /// # Ok(())
 /// # }
 /// ```
+#[tracing::instrument(level = "debug", target = "tinio::cli", skip_all)]
 pub fn plan(
     resolution: &Resolution,
     args: &Args,

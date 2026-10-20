@@ -74,7 +74,7 @@ use tokio::{
     io::{BufReader, stdout as tokio_stdout},
     runtime::Builder as RuntimeBuilder,
 };
-use tracing::{Level, debug, enabled, error, info};
+use tracing::{Level, debug, enabled, error, info, instrument};
 
 // The tests' own copy of the predicate: the launch itself asks the pair's question through
 // `is_launcher_fd_arg`, so this one is only reached from `mod tests` below.
@@ -236,6 +236,7 @@ fn canonical_program() -> Result<PathBuf> {
 /// )?;
 /// # Ok::<(), tinio_sandbox_core::Error>(())
 /// ```
+#[instrument(target = "tinio::sandbox", level = "info", skip_all)]
 pub fn confine(sandbox: &Sandbox, plan: &LaunchPlan, options: Options) -> Result<Confinement> {
     let mechanism = options.mechanism();
     let program = canonical_program()?;
@@ -399,7 +400,7 @@ pub fn confine(sandbox: &Sandbox, plan: &LaunchPlan, options: Options) -> Result
         // reads back through `adopt`: the direct spawn cannot wrap anything this
         // launcher already wrote.
         let confinement = SandboxSpec {
-            mechanism: mechanism.as_str().to_owned(),
+            mechanism: mechanism.to_string(),
             profile: profile.text.clone(),
             // The pairs converted once above, moved in rather than converted a
             // second time (step 3's binding).
@@ -456,6 +457,7 @@ pub fn confine(sandbox: &Sandbox, plan: &LaunchPlan, options: Options) -> Result
 /// `sandbox-exec`, this binary under `sandbox-init` — and it is deliberately not
 /// the same value as the program element `confine` writes into a helper's argv:
 /// that element is this binary, and the helper is what runs it.
+#[instrument(target = "tinio::sandbox", level = "debug", skip_all)]
 fn spawn(
     child_argv: Vec<OsString>,
     command: PathBuf,

@@ -11,10 +11,11 @@ testing = []
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
-derive_more = { workspace = true, features = ["debug", "display"] }
+derive_more = { workspace = true, features = ["debug"] }
 futures.workspace = true
 hex.workspace = true
 parse-display.workspace = true
+prometheus.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = [
     "macros",

@@ -20,8 +20,6 @@ use crate::_api::{
     state::{self as api_state, State},
     transport::{LocalForm, bind_local, resolve_socket_path},
 };
-#[cfg(all(feature = "sandbox", target_os = "linux"))]
-use crate::_sandbox::{SECCOMP_SKIP_WARNING, linux::Seccomp};
 #[cfg(all(feature = "sandbox", feature = "api"))]
 use crate::commands::start::api_options;
 #[cfg(feature = "sandbox")]
@@ -69,30 +67,28 @@ use crate::{_sandbox::Child, Error, commands::start::Args, config::storage, reso
 ///   read nothing here: `launches_child` is false, this process confines itself, then binds its
 ///   own socket.
 ///
-/// **The tracing subscriber goes in through `install`, because its position is a rule about this
-/// call and not a choice the caller can make.** Two facts fix the two positions, and both are
-/// facts about the confinement this function performs:
+/// **The full stack goes in through `install`, because its position is a rule about this call
+/// and not a choice the caller can make.** The process entry has already installed a fmt-only
+/// bootstrap, so the confinement's own events reach stderr whatever happens here; `install`
+/// reloads that bootstrap with the full stack (the access log and OTLP when configured). Two
+/// facts fix the position:
 ///
 /// - A **launcher** target emits the events an operator reconstructs a failed launch with
 ///   *inside* the launch below — the backend's `step = "CreateProcessW"`, the profile's
-///   `taken_over=`, the ACL grant the launcher reports before it makes it — so the subscriber has
+///   `taken_over=`, the ACL grant the launcher reports before it makes it — so the full stack has
 ///   to exist **before** it. A launcher's confinement is its child's, applied at process creation,
 ///   so nothing in this process is left outside anything.
 /// - An **in-place** target applies the confinement to the **calling thread**: `unshare`, the
 ///   capability drop and `prctl(PR_SET_SECCOMP)` each bind this thread, so a thread alive at that
-///   moment stays outside the confinement for the life of the process. `build_subscriber` starts
-///   exactly such a thread when it is handed an OTLP endpoint in an `otel` build
-///   (`opentelemetry_sdk`'s batch exporter spawns its own), so on that arm the subscriber is built
-///   **after** the confinement — where its threads are inside the namespaces, the dropped
-///   capability set and the seccomp filter rather than beside them.
+///   moment stays outside the confinement for the life of the process. The OTLP exporter starts
+///   exactly such a thread when the full stack is built, so on that arm the reload happens
+///   **after** the confinement — where the thread is inside the namespaces, the dropped capability
+///   set and the seccomp filter rather than beside them.
 ///
 /// The caller therefore hands over **one action** rather than deciding where to put it:
-/// `install` is a `FnOnce`, so "installed twice" is not expressible, and every path out of this
+/// `install` is a `FnOnce`, so "reloaded twice" is not expressible, and every path out of this
 /// function — the two that confine nothing included — calls it exactly once, so "installed never"
-/// is not either. **What this replaced was a pair of `if platform_facts().launches_child` guards
-/// around this call site**, which put the ordering rule in the caller and left both failures
-/// expressible: a second `set_global_default` is silently discarded, taking the access-log handle
-/// and the exporter's thread with it, and a run that installed none serves with no log at all.
+/// is not either.
 ///
 /// The answer is `Option<Child>`: `None` is "this process is confined, carry on"; `Some(child)`
 /// is a confined child the caller drives with `tinio_sandbox::supervise`.
@@ -101,9 +97,8 @@ use crate::{_sandbox::Child, Error, commands::start::Args, config::storage, reso
 ///
 /// A configuration the payload cannot be read from, a bind that fails, and every failure the
 /// platform's own call reports — each fatal, because a confinement failure must not leave the
-/// process running unconfined (design §11). A failure of `install` itself — the second thing that
-/// can be built here — is fatal for the same reason: a run that cannot log is refused rather than
-/// served silently.
+/// process running unconfined (design §11). A failure to build the full stack is fatal for the
+/// same reason: a run that cannot log is refused rather than served silently.
 ///
 /// # Examples
 ///
@@ -133,13 +128,14 @@ use crate::{_sandbox::Child, Error, commands::start::Args, config::storage, reso
 /// let args = Args::default();
 /// // Nothing asked for the confinement: there is nothing to run.
 /// let request = Request { channel: None };
-/// // The subscriber the run owes, installed by the confinement at whichever position its
+/// // The full stack the run owes, reloaded by the confinement at whichever position its
 /// // target's shape requires — the example stands in for it with a no-op.
 /// let child = confine(&resolution, &args, &request, || Ok(()))?;
 /// assert!(child.is_none());
 /// # Ok(())
 /// # }
 /// ```
+#[tracing::instrument(level = "debug", target = "tinio::cli", skip_all)]
 pub fn confine(
     resolution: &Resolution,
     args: &Args,
@@ -187,27 +183,22 @@ fn confine_enabled(
     let spec = serve::Spec::from_sandbox(sandbox).local_uid(local_uid);
     if !facts.launches_child {
         let _ = args;
-        // **The confinement first, the subscriber second** — this thread is the one being
-        // confined, so every thread the subscriber starts has to start inside it. A confinement
-        // that failed returns through `?` with nothing installed, which is the same answer a
-        // process that never reached the subscriber gave before this parameter existed.
+        // **The confinement first, the full stack second** — this thread is the one being
+        // confined, so the exporter thread the reload starts has to start inside it. A confinement
+        // that failed returns through `?` with only the bootstrap in place, which is the same
+        // answer a process that never reached the reload gave before this parameter existed.
         //
-        // **The answer is the confinement's own** (`serve::Confined`): the resolved model, the
-        // exposure facts (the set's size, the jail's mount count and the rendered path list) and
-        // the filter's outcome come back on it, so nothing is pre-read from the spec this call
-        // consumes and no request is restated — the re-emit below states what the confinement
-        // applied rather than a second derivation of it.
+        // **The answer is the confinement's own** (`serve::Confined`), and the events behind it
+        // already reached stderr: the process entry installed its fmt-only bootstrap before the
+        // parse, so the confinement's own model, exposure and seccomp lines are live here rather
+        // than dropped. This arm then only reloads the operational layers; it re-emits nothing.
         let confined = spec.apply().map_err(sandbox_err)?;
         install()?;
-        // **The re-emit this arm's ordering owes** — `announce_in_place`'s doc owns what it says
-        // and why, and the `cfg` is the target whose in-place arm can succeed.
-        #[cfg(target_os = "linux")]
-        announce_in_place(&confined);
         return Ok(confined.child);
     }
-    // **The subscriber first, the launch second**: everything the launcher reports from here on
-    // — the grants, the profile, `CreateProcessW` — is emitted by the calls below, and a
-    // subscriber built after them would see none of it.
+    // **The full stack first, the launch second**: everything the launcher reports from here on
+    // — the grants, the profile, `CreateProcessW` — is emitted by the calls below, and a reload
+    // after them would see none of it.
     install()?;
     let listener = StdTcpListener::bind(resolution.address()?)?;
     let spec = spec
@@ -254,80 +245,6 @@ fn confine_enabled(
 #[cfg(feature = "sandbox")]
 pub(super) fn local_uid_configured(config: &identity::Config) -> bool {
     !identity::owner_uids_for(config).is_empty()
-}
-
-/// The `sandbox-shared.md` §7 record this process owes **after** confining itself in place — the
-/// events the confinement emitted into nothing, said once the subscriber exists.
-///
-/// **Why a re-emit rather than a second install point.** The subscriber's position is a rule about
-/// this confinement and not a choice the caller can make: on this arm every thread `build_subscriber`
-/// starts has to start inside the namespaces, the dropped capability set and the filter, so the
-/// subscriber is built *after* `apply`. `tracing` drops an event emitted before a subscriber
-/// exists, so the events the confinement itself emits (`enter`'s `model` and `exposures`, the
-/// capabilities' and `capset`'s lines, and `seccomp`'s install-or-skip) are written into nothing on
-/// this arm, however real the facts behind them are.
-///
-/// **What is said again is §7's own record, and every value comes off the confinement's own
-/// answer** ([`serve::Confined`], which `Spec::apply` carries back): the *resolved* mechanism
-/// (never the request — `Auto` became one of the two against a live probe, and that is a
-/// confinement-time decision this line must not take a second time), the exposure set's size, the
-/// mount count and the rendered path list (the exposure event's whole field set), and the network
-/// filter's outcome. Nothing here re-derives a fact, pre-reads a spec `apply` consumes, or reads
-/// the environment.
-///
-/// **This replaces a line with a vocabulary of its own** — `step = "confined in place"` with
-/// fields `requested`/`count`/`local_uid`. It could not name the resolved model (`apply` dropped
-/// it with the backend), so it stated the operator's *request* under a name of its own; the
-/// exposure count was read off the spec at the call site before `apply` consumed it; and
-/// `local_uid` was a request fact the confinement had already answered. The step names below are
-/// §7's, so an operator greps the in-place arm's record with the same words as a launcher arm's.
-///
-/// **This is the Linux arm's alone.** `platform_facts().launches_child` is false only here, and a
-/// target with no backend is refused by `plan` before `confine` is ever entered — so a launcher
-/// platform has no re-emit to make (its subscriber is installed *before* the launch, and sees
-/// everything already).
-///
-/// **`pub(super)` because the call site is not a test's to reach**: the arm runs after a real
-/// confinement, and the crate's own test drives the emission instead — asserting §7's fields, the
-/// level `serve` enables and that nothing the run holds as a secret is among them.
-#[cfg(all(feature = "sandbox", target_os = "linux"))]
-pub(super) fn announce_in_place(confined: &serve::Confined) {
-    // §7's model event: the resolved mechanism, which is exactly what the replaced line could not
-    // state.
-    tracing::info!(
-        step = "model",
-        model = ?confined.model,
-        "the model this process confined itself with"
-    );
-    // §7's exposure event, **in full**: `count` and `mounts` are the two numbers the backend's own
-    // exposure event carries and the rendered path list is its third field — all three ride
-    // [`serve::Confined`] back, so this line states the same facts the confinement's own event
-    // stated into nothing rather than a count alone.
-    tracing::info!(
-        step = "exposures",
-        count = confined.exposures,
-        mounts = confined.mounts,
-        exposures = %confined.rendered_exposures,
-        "the exposure set this process confined itself to"
-    );
-    // §7's filter event: the install, or the one degradation this run must name — the backend's own
-    // `warn!` was emitted before the subscriber existed, so this is the record that survives (and
-    // the reason the values ride `Confined` back at all). **The sentence is the shared definition**
-    // (`SECCOMP_SKIP_WARNING`), with this arm's own clause about what still holds appended, so the
-    // two warning lines cannot drift apart.
-    match confined.seccomp {
-        Some(Seccomp::Installed) => tracing::info!(
-            step = "seccomp",
-            installed = true,
-            "the network filter this process installed"
-        ),
-        Some(Seccomp::SkippedUnsupportedArch) => tracing::warn!(
-            step = "seccomp",
-            installed = false,
-            "{SECCOMP_SKIP_WARNING}; the directory confinement still holds"
-        ),
-        None => {}
-    }
 }
 
 /// How long the launcher waits for the child's readiness frame — **the bound the `state` publish

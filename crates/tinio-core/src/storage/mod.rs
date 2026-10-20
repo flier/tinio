@@ -81,6 +81,35 @@ pub const WRITE_LOCK_BUCKET_BOUNDS_US: [u64; 6] = [10, 100, 1_000, 5_000, 20_000
 /// overflow bucket (`>100k µs`).
 pub const WRITE_LOCK_BUCKETS: usize = WRITE_LOCK_BUCKET_BOUNDS_US.len() + 1;
 
+/// A read-only snapshot of the write-lock histograms
+/// (pipeline-spec.md §4), as plain data shared across crates: the
+/// filesystem backend produces it and the metrics layer consumes it,
+/// without either naming the other.
+///
+/// Two distributions are recorded per write transaction — the **wait**
+/// (the `begin_write` return, roughly the single-writer lock wait) and the
+/// **total** (the commit/abort return, the whole transaction including
+/// fsync). Per-distribution `count`, `sum` and `max` let the metrics layer
+/// derive p50/p90/p99 approximations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteLockSnapshot {
+    /// Wait-duration counts per bucket (index per
+    /// [`WRITE_LOCK_BUCKET_BOUNDS_US`]).
+    pub wait_buckets: [u64; WRITE_LOCK_BUCKETS],
+    /// Total-duration counts per bucket.
+    pub total_buckets: [u64; WRITE_LOCK_BUCKETS],
+    /// Write transactions recorded.
+    pub count: u64,
+    /// Sum of wait durations, microseconds.
+    pub wait_sum_us: u64,
+    /// Maximum wait duration, microseconds.
+    pub wait_max_us: u64,
+    /// Sum of total durations, microseconds.
+    pub total_sum_us: u64,
+    /// Maximum total duration, microseconds.
+    pub total_max_us: u64,
+}
+
 /// The lifecycle-rule read the background pass needs beyond the S3 surface:
 /// every stored configuration in one scan. The pass intersects it with
 /// [`BucketOps::list_buckets`] so a row whose bucket vanished out of band is

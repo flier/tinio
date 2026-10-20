@@ -117,6 +117,7 @@ impl Error {
 /// A stored `OBJECT_META` row failed domain validation.
 #[inline]
 pub(crate) fn corrupt_meta(key: impl Into<String>, source: storage::Error) -> Error {
+    record_corrupt_rows(Backend::Fs, 1);
     Error::CorruptMeta {
         key: key.into(),
         source,
@@ -132,6 +133,7 @@ use std::{
 };
 
 use redb::{Database, ReadTransaction, WriteTransaction};
+use tracing::instrument;
 
 pub use crate::_store_redb::{
     WriteLockSnapshot,
@@ -145,6 +147,7 @@ use crate::{
         compact::compact_if_needed as compact_if_needed_impl,
         open::{check_integrity as check_integrity_impl, open as open_impl},
     },
+    _util::metrics::{Backend, record_corrupt_rows},
 };
 
 /// The fs-facing state-database driver: the shared
@@ -236,6 +239,7 @@ impl Driver {
     /// Run `f` against a write transaction — committed on success, aborted
     /// on error, timed into the write-lock histograms, and executed on the
     /// tokio blocking pool (a commit is an fsync).
+    #[instrument(target = "tinio::storage", level = "debug", skip_all)]
     pub async fn write<T>(
         self: &Arc<Self>,
         f: impl FnOnce(&mut WriteTransaction) -> Result<T, Error> + Send + 'static,
@@ -313,6 +317,7 @@ const META_DB_MODE: u32 = 0o600;
 /// database (corrupted state — the metadata is derivable and the file can
 /// be deleted for a rebuild); [`Error::UnsupportedVersion`] on a version
 /// mismatch.
+#[instrument(target = "tinio::storage", level = "info", skip_all, name = "fs.open")]
 pub fn open(state_dir: &Path) -> Result<Open, Error> {
     #[cfg(unix)]
     {
