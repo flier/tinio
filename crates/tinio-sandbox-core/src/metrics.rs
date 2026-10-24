@@ -146,10 +146,7 @@ mod tests {
         let _window = test_lock::window();
         let before = counter("tinio_sandbox_readiness_total", &[("result", "gone")]);
         record_readiness(Ready::Gone);
-        assert_registered(&[
-            "tinio_sandbox_readiness_total",
-            "tinio_sandbox_child_exit_total",
-        ]);
+        assert_registered(&["tinio_sandbox_readiness_total"]);
         assert_eq!(
             counter("tinio_sandbox_readiness_total", &[("result", "gone")]) - before,
             1.0
@@ -176,6 +173,7 @@ mod tests {
         let _window = test_lock::window();
         let before = counter("tinio_sandbox_child_exit_total", &[("outcome", "failure")]);
         record_exit(Exit::Failure);
+        assert_registered(&["tinio_sandbox_child_exit_total"]);
         assert_eq!(
             counter("tinio_sandbox_child_exit_total", &[("outcome", "failure")]) - before,
             1.0

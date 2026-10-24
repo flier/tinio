@@ -184,6 +184,7 @@ mod tests {
         fs::write(state.path().join("state"), format!("token: {token}")).expect("write `state`");
         let state_path = state.path().to_str().expect("a UTF-8 temp path").to_owned();
 
+        record_model(Resolved::Root);
         record_read_only_arm(ReadOnlyArm::Remount);
         record_seccomp(Seccomp::SkippedUnsupportedArch);
         assert_registered(&[

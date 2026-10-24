@@ -1,8 +1,8 @@
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
 #[cfg(windows)]
 use std::os::windows::fs::symlink_dir;
 use std::{io::Error as IoError, thread, time::Duration};
+#[cfg(unix)]
+use std::{os::unix::fs::symlink, time::SystemTime};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -1732,7 +1732,7 @@ async fn a_fast_copy_over_a_locked_null_version_is_refused() {
     let lock = object_lock::Lock {
         retention: Some(object_lock::Retention {
             mode: object_lock::Mode::Governance,
-            retain_until: std::time::SystemTime::now() + std::time::Duration::from_secs(3_600),
+            retain_until: SystemTime::now() + Duration::from_secs(3_600),
         }),
         legal_hold: object_lock::LegalHold::Off,
     };
@@ -1744,7 +1744,7 @@ async fn a_fast_copy_over_a_locked_null_version_is_refused() {
             version_object_lock::Table::open(txn)?.put(
                 &plant_bucket,
                 &plant_key,
-                &crate::_core::version::wire_of(None),
+                &version::wire_of(None),
                 &planted,
             )?;
             Ok(())
@@ -1792,11 +1792,7 @@ async fn a_fast_copy_over_a_locked_null_version_is_refused() {
         .handle()
         .read(move |txn| -> Result<bool, database::Error> {
             Ok(version_object_lock::Table::open_readonly(txn)?
-                .get(
-                    &b.to_string(),
-                    &dst.to_string(),
-                    &crate::_core::version::wire_of(None),
-                )?
+                .get(&b.to_string(), &dst.to_string(), &version::wire_of(None))?
                 .is_some())
         })
         .unwrap();

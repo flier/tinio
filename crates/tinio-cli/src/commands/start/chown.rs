@@ -8,6 +8,7 @@
 use std::path::Path;
 #[cfg(unix)]
 use std::{
+    io,
     os::unix::fs::{DirBuilderExt, chown},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -50,7 +51,7 @@ pub(crate) fn ensure_chown_privilege(config: &identity::Config, dir: &Path) -> R
 /// uid (to 0) — allowed only with root euid or CAP_CHOWN — and clean up (the 0700 dir stays
 /// removable even after the file is root-owned).
 #[cfg(unix)]
-fn probe_chown(dir: &Path) -> std::io::Result<()> {
+fn probe_chown(dir: &Path) -> io::Result<()> {
     use std::{
         fs,
         fs::{DirBuilder, File},

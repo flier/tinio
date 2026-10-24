@@ -2906,7 +2906,7 @@ mod tests {
 
     /// Commit one recorded version of `key` owned by `owner`, answering its
     /// identity (the R23 per-entry fixtures).
-    #[cfg(feature = "acl")]
+    #[cfg(all(feature = "acl", feature = "versioning"))]
     async fn commit_version(
         storage: &MemoryStorage,
         b: &bucket::Name,
@@ -2934,7 +2934,7 @@ mod tests {
             .to_string()
     }
 
-    #[cfg(feature = "acl")]
+    #[cfg(all(feature = "acl", feature = "versioning"))]
     #[tokio::test]
     async fn delete_objects_gates_each_entry_on_the_addressed_version() {
         // R23: the batch's per-key gate follows each entry's version
@@ -3012,7 +3012,7 @@ mod tests {
         assert_eq!(errors[0].code.as_deref(), Some("AccessDenied"));
     }
 
-    #[cfg(feature = "acl")]
+    #[cfg(all(feature = "acl", feature = "versioning"))]
     #[tokio::test]
     async fn delete_objects_toggle_off_stays_version_agnostic() {
         // The ACL toggle is off: the per-key gate keeps its "ACL off
@@ -3114,7 +3114,7 @@ mod tests {
         assert_eq!(err.code().as_str(), "NoSuchVersion", "{err:?}");
     }
 
-    #[cfg(feature = "acl")]
+    #[cfg(all(feature = "acl", feature = "versioning"))]
     #[tokio::test]
     async fn delete_objects_refuses_an_addressed_marker_per_key() {
         // A marker is a real version but holds no ACL, so `version_acl`
