@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO buckets (name, created, tags, acl, cors)\nVALUES ($1, $2, '{}', $3, '')\nON CONFLICT (\n    name) DO UPDATE SET acl.grants = ($3::acl).grants\nWHERE (buckets.acl).grants IS DISTINCT FROM ($3::acl).grants\nRETURNING (xmax = 0) AS inserted\n",
+  "query": "INSERT INTO buckets (name, created, tags, acl, cors)\nVALUES ($1, $2, '{}', $3, '')\nON CONFLICT (\n    name) DO UPDATE\n    SET acl.grants = ($3::acl).grants\n    WHERE (buckets.acl).grants IS DISTINCT FROM ($3::acl).grants\nRETURNING (xmax = 0) AS inserted\n",
   "describe": {
     "columns": [
       {
@@ -76,5 +76,5 @@
       null
     ]
   },
-  "hash": "a6c37dae1b5680cfe7696ff3b9aae952f834428e496d6f4f227522e4a0788705"
+  "hash": "3c4ada3daa3a90ec1684761a571e324ba0ff869c57da44648121558866a22686"
 }

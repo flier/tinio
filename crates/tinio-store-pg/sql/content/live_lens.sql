@@ -5,5 +5,5 @@ SELECT
 FROM content_heads
 WHERE
     bucket = $1
-    AND ckey = ANY ($2)
+    AND ckey = any($2)
     AND live_seq IS NOT NULL

@@ -25,7 +25,7 @@ env:
   # every ~6 weeks. Nightly is used only for rustfmt (no sccache), so it
   # stays on the moving channel unless a pinned date is desired for a fully
   # deterministic fmt gate.
-  RUST_STABLE: "1.98.1"
+  RUST_STABLE: "1.99.1"
   RUST_NIGHTLY: "nightly"
 
 permissions:
@@ -130,7 +130,7 @@ jobs:
     # output moves between releases.
     runs-on: ubuntu-latest
     env:
-      SQRRUFF_VERSION: "0.41.0"
+      SQRRUFF_VERSION: "0.43.0"
     steps:
       - *checkout
       - name: install sqruff
