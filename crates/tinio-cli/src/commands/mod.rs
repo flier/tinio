@@ -1,10 +1,13 @@
-//! The five command implementations: `start` (server/start), `status`, `stop`, `doctor` and
-//! the `service` verbs' driver.
+//! The command implementations: `start` (server/start), `status`, `stop`, `doctor`, the
+//! `service` verbs' driver, and the plane-backed groups (`lifecycle`, `object-lock`,
+//! `retention`, `legalhold`).
 //!
-//! Only `status` and `stop` are compiled out with the `api` feature — `doctor` diagnoses the
-//! always-present layers, so it exists in both builds and only its plane-dependent half is
-//! gated (`cli::Command`'s doc states the rule). Each module owns its own resolution through
-//! `resolve`, so no command re-derives a root, a mode or a state directory.
+//! The plane-backed groups are compiled out with their own features, which all require `api`:
+//! `lifecycle` needs the `lifecycle` feature and `object-lock`, `retention` and `legalhold` need
+//! `object-lock`; `status` and `stop` need `api` itself. `doctor` diagnoses the always-present
+//! layers, so it exists in both builds and only its plane-dependent half is gated
+//! (`cli::Command`'s doc states the rule). Each module owns its own resolution through `resolve`,
+//! so no command re-derives a root, a mode or a state directory.
 //!
 //! **The two client commands share one resolution and one probe** (`client_resolution` — the
 //! gate-independent body `status`, `stop`, `doctor` and the unit fixture all call — and
@@ -13,8 +16,17 @@
 //! either half is exactly the drift the rule exists to prevent.
 
 pub mod doctor;
+#[cfg(feature = "object-lock")]
+pub mod legalhold;
 #[cfg(feature = "lifecycle")]
 pub mod lifecycle;
+#[cfg(feature = "object-lock")]
+pub mod object_lock;
+/// The CLI's shared management-plane vocabulary (`object-lock`, `retention` and `legalhold`).
+#[cfg(feature = "object-lock")]
+pub mod plane;
+#[cfg(feature = "object-lock")]
+pub mod retention;
 pub mod start;
 #[cfg(feature = "api")]
 pub mod status;
@@ -25,6 +37,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{ArgAction, Args};
 
+#[cfg(any(feature = "lifecycle", feature = "object-lock"))]
+use crate::_api::State;
 #[cfg(feature = "api")]
 use crate::_api::client::{self, Report};
 use crate::{
@@ -299,6 +313,29 @@ pub(crate) async fn probe_pair(candidates: &[PathBuf]) -> Result<Answer, Error> 
     // Unreachable in practice — `state_dir_candidates` always answers with two directories — and
     // an error rather than a panic, because the pair is not this function's to know the length of.
     stopped.ok_or_else(|| Error::Operational("no state directory to probe".into()))
+}
+
+/// The state of the server that answers for the root `args` names, or the refusal a root with
+/// nothing running gets.
+///
+/// **The pair `status` and `stop` probe and not a third search**: [`client_resolution`] resolves
+/// the root and decision 19's candidate pair, [`probe_pair`] asks the one a server is live in — so
+/// a plane-backed verb reaches the same server `tinio status` reports for that root. The
+/// lifecycle group and the three Object Lock groups all call this one helper; it is the one
+/// definition of "the server for this root".
+#[cfg(any(feature = "lifecycle", feature = "object-lock"))]
+pub(crate) async fn server_state(args: DirArgs, located: Located) -> Result<State, Error> {
+    let (resolution, candidates) = client_resolution(args, located)?;
+    let Answer { report, .. } = probe_pair(&candidates).await?;
+    if report.running
+        && let Some(state) = report.state
+    {
+        return Ok(state);
+    }
+    Err(Error::Operational(format!(
+        "no running server for {}",
+        resolution.root.display()
+    )))
 }
 
 /// Whether this run is a **pg** one — its root is the synthetic root `locate`'s pg arm derived, so

@@ -20,6 +20,8 @@ mod error;
 #[cfg(feature = "lifecycle")]
 pub mod lifecycle;
 pub mod metrics;
+#[cfg(feature = "object-lock")]
+pub mod object_lock;
 #[cfg(feature = "openapi")]
 pub mod openapi;
 #[cfg(windows)]

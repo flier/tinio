@@ -14,8 +14,6 @@
 //! the contract's plain `404`. Both causes are one mechanism, and what it protects is the stored
 //! rules: a plane that cannot serve a configuration must never be able to replace it.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -27,8 +25,10 @@ use axum::{
 
 use crate::{
     _core::{bucket, lifecycle, storage},
-    ErrorBody,
-    router::{InvalidBody, Shared},
+    router::{
+        InvalidBody, Shared,
+        admin::{admit, failure as admin_failure, refusal},
+    },
 };
 
 /// The plane's only door to a bucket's stored configuration (LC14).
@@ -302,14 +302,14 @@ pub(crate) fn mount(routes: Router<Shared>) -> Router<Shared> {
 /// admin at all (LC15, LC23) — because they are the same answer to this endpoint: there is
 /// nothing to serve here. Neither touches the stored rules.
 async fn lifecycle_get(AxumState(shared): AxumState<Shared>, Path(wire): Path<String>) -> Response {
-    let (admin, bucket) = match admit(&shared, wire) {
+    let (admin, bucket) = match admit(shared.lifecycle(), wire, "lifecycle is not served here") {
         Ok(found) => found,
         Err(refused) => return refused.response(),
     };
     match admin.get(&bucket).await {
         Ok(Some(config)) => Json(config).into_response(),
-        Ok(None) => lifecycle_refusal(StatusCode::NOT_FOUND, "no lifecycle configuration"),
-        Err(err) => lifecycle_failure(err),
+        Ok(None) => refusal(StatusCode::NOT_FOUND, "no lifecycle configuration"),
+        Err(err) => failure(err),
     }
 }
 
@@ -327,7 +327,7 @@ async fn lifecycle_put(
     Path(wire): Path<String>,
     body: Result<Json<lifecycle::Config>, JsonRejection>,
 ) -> Response {
-    let (admin, bucket) = match admit(&shared, wire) {
+    let (admin, bucket) = match admit(shared.lifecycle(), wire, "lifecycle is not served here") {
         Ok(found) => found,
         Err(refused) => return refused.response(),
     };
@@ -338,7 +338,7 @@ async fn lifecycle_put(
         // error, a member of the wrong type).
         Err(rejection) => {
             tracing::debug!(error = %rejection, "the lifecycle body is not the model");
-            return lifecycle_refusal(
+            return refusal(
                 rejection.status(),
                 "the body is not a lifecycle configuration",
             );
@@ -349,7 +349,7 @@ async fn lifecycle_put(
     }
     match admin.put(&bucket, &config).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => lifecycle_failure(err),
+        Err(err) => failure(err),
     }
 }
 
@@ -360,56 +360,14 @@ async fn lifecycle_delete(
     AxumState(shared): AxumState<Shared>,
     Path(wire): Path<String>,
 ) -> Response {
-    let (admin, bucket) = match admit(&shared, wire) {
+    let (admin, bucket) = match admit(shared.lifecycle(), wire, "lifecycle is not served here") {
         Ok(found) => found,
         Err(refused) => return refused.response(),
     };
     match admin.delete(&bucket).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => lifecycle_failure(err),
+        Err(err) => failure(err),
     }
-}
-
-/// Why [`admit`] refused a request.
-enum Admission {
-    /// No admin was injected (LC15, LC23).
-    Absent,
-    /// The route segment is not a bucket name.
-    InvalidName,
-}
-
-impl Admission {
-    /// The plane's answer for this refusal.
-    fn response(self) -> Response {
-        match self {
-            Self::Absent => lifecycle_absent(),
-            Self::InvalidName => lifecycle_refusal(StatusCode::NOT_FOUND, "no such bucket"),
-        }
-    }
-}
-
-/// The admin and the bucket every route's handler needs. **The admin is taken
-/// before anything else**, so a plane carrying none answers `404` whatever the
-/// request looks like.
-fn admit(
-    shared: &Shared,
-    wire: String,
-) -> Result<(Arc<dyn LifecycleAdmin>, bucket::Name), Admission> {
-    let Some(admin) = shared.lifecycle() else {
-        return Err(Admission::Absent);
-    };
-    let Ok(bucket) = bucket::name(wire) else {
-        return Err(Admission::InvalidName);
-    };
-    Ok((Arc::clone(admin), bucket))
-}
-
-/// The plane's answer when no admin was injected: the contract's `404`, in this crate's error
-/// shape so a caller reads one format. **One mechanism for both causes** — LC15's stripped build
-/// and LC23's disabled capability — and what it protects is the stored rules: a plane that cannot
-/// serve a configuration must never be able to replace it.
-fn lifecycle_absent() -> Response {
-    lifecycle_refusal(StatusCode::NOT_FOUND, "lifecycle is not served here")
 }
 
 /// A refused configuration: `400` with the model's own verdict carrying the offending rule's ID
@@ -423,36 +381,14 @@ fn lifecycle_invalid(invalid: lifecycle::Invalid) -> Response {
     (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
-/// This crate's error body with `status`: the shape every failure this plane answers carries.
-fn lifecycle_refusal(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        Json(ErrorBody {
-            error: message.to_string(),
-        }),
-    )
-        .into_response()
-}
-
-/// A storage failure as the plane's status: a read-only run's refusal is `403` — the one status the
-/// plane maps itself, because the runs are not S3 operations (LC18) — a missing bucket is `404`, and
-/// everything else is a `500` whose detail stays in the log, as it does for every other internal
-/// failure this crate answers.
+/// A storage failure as the plane's status: the shared read-only/404/500 mapping (LC18), with
+/// no group-specific refusal of its own.
 ///
 /// **The read-only refusal has two shapes**, and both are `403`: the pg handle answers
 /// `AccessDenied`, while the filesystem handle is refused at its state database and keeps the
 /// contract's read-only marker ([`storage::Error::is_read_only`]). Nothing was written on either.
-fn lifecycle_failure(err: storage::Error) -> Response {
-    tracing::warn!(error = %err, "a lifecycle request failed");
-    if err.is_read_only() || matches!(&err, storage::Error::AccessDenied(_)) {
-        return lifecycle_refusal(StatusCode::FORBIDDEN, "access denied");
-    }
-    match err {
-        storage::Error::NoSuchBucket(_) => {
-            lifecycle_refusal(StatusCode::NOT_FOUND, "no such bucket")
-        }
-        _ => lifecycle_refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
-    }
+fn failure(err: storage::Error) -> Response {
+    admin_failure("a lifecycle request failed", err, |_| None)
 }
 
 // Never called — `status_doc` carries why.

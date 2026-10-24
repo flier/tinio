@@ -10,7 +10,7 @@
 use std::{collections::HashMap, time::SystemTime};
 
 use async_trait::async_trait;
-use sqlx::{query, query_as, query_file, query_file_scalar};
+use sqlx::{query, query_as, query_file, query_file_as, query_file_scalar};
 use time::OffsetDateTime;
 
 use crate::{
@@ -21,10 +21,11 @@ use crate::{
             BucketMeta,
             bucket::{Row as BucketRow, decode_cors},
         },
-        object,
+        object, object_lock, storage,
+        version::State,
     },
-    Error, begin,
-    meta::{acl_composite, assert_bucket_row, project},
+    Error, PgTx, begin,
+    meta::{acl_composite, assert_bucket_row, bucket_row_present, project, version::StoredState},
     store::PgStore,
     timestamp::{from_timestamp, to_timestamp},
 };
@@ -51,9 +52,59 @@ struct Stored {
     cors: String,
 }
 
+/// One row of `lock_get.sql`: the configuration's enabled bit and rule wire,
+/// both NULL when the bucket stores no configuration (the left join's arm).
+/// The presence of the outer row is the bucket's, so an absent bucket and a
+/// bucket with no configuration cannot be confused.
+struct StoredConfig {
+    enabled: Option<bool>,
+    rule: Option<String>,
+}
+
 /// A row's CORS column: the config's wire, or the empty sentinel for none.
 fn cors_wire(cors: Option<&cors::Config>) -> String {
     cors.map(|cors| cors.to_wire()).unwrap_or_default()
+}
+
+/// Clear the bucket's Object Lock configuration inside the caller's
+/// transaction (OL4): a writer that installs or replaces a bucket row clears a
+/// stale configuration in the same write, so a rule never protects a bucket
+/// state that write replaced. A bucket's other element writers keep it.
+pub(in crate::meta) async fn clear_config(
+    tx: &mut PgTx,
+    bucket: &bucket::Name,
+) -> Result<(), Error> {
+    sqlx::query!("DELETE FROM bucket_object_lock WHERE bucket = $1", bucket)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// The shared body of a bucket-row write: insert the row (a taken name is
+/// `AlreadyExists`, writing nothing) and clear any Object Lock configuration a
+/// row left behind out of band would otherwise inherit (OL4). The caller's own
+/// transaction carries whatever else the write implies — the versioning state
+/// and the Object Lock write for `create_bucket_with_lock`.
+async fn insert_bucket_row(
+    tx: &mut PgTx,
+    bucket: &bucket::Name,
+    row: &BucketRow,
+) -> Result<(), Error> {
+    let acl = acl_composite(row.owner.as_ref(), &row.acl.grants);
+    let inserted = query_file!(
+        "sql/meta/bucket/create.sql",
+        bucket,
+        to_timestamp(row.created),
+        (&row.tags) as _,
+        acl as _,
+        cors_wire(row.cors.as_ref())
+    )
+    .execute(&mut **tx)
+    .await?;
+    if inserted.rows_affected() == 0 {
+        return Err(Error::AlreadyExists(bucket.clone()));
+    }
+    clear_config(tx, bucket).await
 }
 
 #[async_trait]
@@ -141,29 +192,21 @@ impl BucketMeta for PgStore {
     }
 
     async fn record(&self, bucket: &bucket::Name, created: SystemTime) -> Result<(), Error> {
+        let mut tx = begin(self.pool()).await?;
         query_file!("sql/meta/bucket/record.sql", bucket, to_timestamp(created))
-            .execute(self.pool())
+            .execute(&mut *tx)
             .await?;
+        // OL4: a bucket-row writer clears the Object Lock configuration in the
+        // same write; the row's other elements are cleared too, so the
+        // configuration cannot describe a bucket state this write replaced.
+        clear_config(&mut tx, bucket).await?;
+        tx.commit().await?;
         Ok(())
     }
 
     async fn create(&self, bucket: &bucket::Name, row: &BucketRow) -> Result<(), Error> {
-        let acl = acl_composite(row.owner.as_ref(), &row.acl.grants);
         let mut tx = begin(self.pool()).await?;
-        let inserted = query_file!(
-            "sql/meta/bucket/create.sql",
-            bucket,
-            to_timestamp(row.created),
-            (&row.tags) as _,
-            acl as _,
-            cors_wire(row.cors.as_ref())
-        )
-        .execute(&mut *tx)
-        .await?;
-        if inserted.rows_affected() == 0 {
-            tx.rollback().await?;
-            return Err(Error::AlreadyExists(bucket.clone()));
-        }
+        insert_bucket_row(&mut tx, bucket, row).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -181,6 +224,11 @@ impl BucketMeta for PgStore {
         )
         .execute(&mut *tx)
         .await?;
+        if result.rows_affected() > 0 {
+            // OL4: only a first-sight insert is a bucket-row write here; an
+            // existing row (and the configuration beside it) rides.
+            clear_config(&mut tx, bucket).await?;
+        }
         let created = query_file_scalar!("sql/meta/bucket/bucket_created_at.sql", bucket)
             .fetch_one(&mut *tx)
             .await?;
@@ -201,6 +249,9 @@ impl BucketMeta for PgStore {
         )
         .execute(&mut *tx)
         .await?;
+        // OL4: this is the lazy policy's re-create (a store whose buckets
+        // outlive their rows adopts an existing record the same way).
+        clear_config(&mut tx, bucket).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -222,14 +273,27 @@ impl BucketMeta for PgStore {
         tags: &object::Tags,
         now: SystemTime,
     ) -> Result<(), Error> {
-        query_file!(
+        let mut tx = begin(self.pool()).await?;
+        // OL4: the first-sight insert is a bucket-row writer and clears a
+        // stale Object Lock configuration; an existing row rides. The answer is
+        // the write's own effect (`xmax = 0` names a row this statement
+        // inserted), never a pre-read: under Read Committed a concurrent
+        // `create_bucket_with_lock` can commit its row and configuration
+        // between a presence read and the insert, and the pre-read would then
+        // clear a configuration that is not stale.
+        let inserted = query_file_scalar!(
             "sql/meta/bucket/set_tags_or_create.sql",
             bucket,
             to_timestamp(now),
             tags as _
         )
-        .execute(self.pool())
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        if inserted == Some(true) {
+            clear_config(&mut tx, bucket).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -264,14 +328,24 @@ impl BucketMeta for PgStore {
         now: SystemTime,
     ) -> Result<(), Error> {
         let acl = acl_composite(None, grants);
-        query_file!(
+        let mut tx = begin(self.pool()).await?;
+        // OL4: the same write-effect rule `set_tags_or_create` states: only a
+        // row this statement inserted is first sight, so a concurrent
+        // `create_bucket_with_lock` cannot lose its configuration to a
+        // presence read taken before its commit.
+        let inserted = query_file_scalar!(
             "sql/meta/bucket/set_grants_or_create.sql",
             bucket,
             to_timestamp(now),
             acl as _
         )
-        .execute(self.pool())
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+        if inserted == Some(true) {
+            clear_config(&mut tx, bucket).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -366,394 +440,118 @@ impl BucketMeta for PgStore {
         tx.commit().await?;
         Ok(())
     }
+
+    /// The bucket's Object Lock configuration, or `None` when the bucket
+    /// stores none. A missing bucket is `NoSuchBucket`, the lifecycle read's
+    /// presence rule (OL4).
+    async fn object_lock(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Option<object_lock::Config>, Error> {
+        let row = query_file_as!(StoredConfig, "sql/meta/bucket/lock_get.sql", bucket)
+            .fetch_optional(self.pool())
+            .await?;
+        let Some(row) = row else {
+            return Err(Error::NoSuchBucket(bucket.clone()));
+        };
+        // A corrupt rule decodes to no rule while the enabled bit — the fact
+        // that drives enforcement — survives (OL4).
+        Ok(row.enabled.map(|enabled| {
+            object_lock::Config::from_rule_wire(enabled, row.rule.as_deref().unwrap_or_default())
+        }))
+    }
+
+    /// Store the bucket's configuration. A missing bucket writes nothing and
+    /// answers `false`; the bucket row's lock is taken in the same
+    /// transaction, so the presence decision cannot race a delete.
+    ///
+    /// OL13: the same transaction reads the versioning state and refuses a
+    /// bucket that is not `Enabled`. A concurrent suspend takes the bucket
+    /// row's lock and reads the configuration (R21), so the two writers
+    /// serialize on one row and cannot commit the enabled configuration on a
+    /// `Suspended` bucket.
+    async fn set_object_lock(
+        &self,
+        bucket: &bucket::Name,
+        config: &object_lock::Config,
+    ) -> Result<bool, Error> {
+        let mut tx = begin(self.pool()).await?;
+        if !bucket_row_present(&mut tx, bucket).await? {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let state = query_file_as!(StoredState, "sql/meta/version/bucket_state.sql", bucket)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if state.map(|state| state.state) != Some(State::Enabled) {
+            tx.rollback().await?;
+            return Err(Error::Storage(storage::invalid_bucket_state(bucket)));
+        }
+        query_file!(
+            "sql/meta/bucket/lock_upsert.sql",
+            bucket,
+            config.enabled,
+            config.rule_wire()
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Remove the bucket's configuration. The answer is the bucket's presence,
+    /// exactly as the lifecycle clear answers it: a bucket that stores no
+    /// configuration is still `true`, and only a missing bucket is `false`.
+    async fn clear_object_lock(&self, bucket: &bucket::Name) -> Result<bool, Error> {
+        let mut tx = begin(self.pool()).await?;
+        if !bucket_row_present(&mut tx, bucket).await? {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        clear_config(&mut tx, bucket).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
+impl PgStore {
+    /// Create a bucket with Object Lock enabled: the bucket row, its
+    /// `Enabled` versioning state and the configuration commit as one
+    /// transaction (OL13), so a crash can leave no partial lock-enabled
+    /// bucket. `AlreadyExists` when the name is taken; the caller supplies a
+    /// request-validated configuration.
+    ///
+    /// # Errors
+    ///
+    /// `AlreadyExists` when the bucket row is there already, and the driver's
+    /// answer when a statement fails.
+    pub async fn create_bucket_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        row: &BucketRow,
+        config: &object_lock::Config,
+    ) -> Result<(), Error> {
+        let mut tx = begin(self.pool()).await?;
+        insert_bucket_row(&mut tx, bucket, row).await?;
+        query_file!(
+            "sql/meta/version/set_bucket_state.sql",
+            bucket,
+            State::Enabled as _
+        )
+        .execute(&mut *tx)
+        .await?;
+        query_file!(
+            "sql/meta/bucket/lock_upsert.sql",
+            bucket,
+            config.enabled,
+            config.rule_wire()
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        future::Future,
-        slice::from_ref,
-        time::{Duration, SystemTime},
-    };
-
-    use tinio_util::testing::object_key;
-    use tokio::time::sleep;
-
-    use crate::{
-        _core::{
-            ETag,
-            acl::{Acl, AclGrants, GROUP_ALL_USERS, Grant, Grantee, GroupUri, OwnerId, Permission},
-            bucket::Name,
-            meta::{BucketMeta, bucket::Row as BucketRow, object::Row as ObjectRow},
-            object,
-        },
-        Error, PgStore, begin,
-        meta::{assert_bucket_row, object::upsert_object},
-        tests::fixtures::{bucket_tags, name, owner, scratch},
-        timestamp::{unix_micros, unix_seconds as at},
-    };
-
-    #[tokio::test]
-    async fn the_creation_time_round_trips_with_sub_second_precision() {
-        let Some((db, store)) = scratch().await else {
-            return;
-        };
-        let data = name("plane-bucket-micros");
-        let created = unix_micros(1_700_000_000_123_456);
-        BucketMeta::create(&store, &data, &BucketRow::at(created))
-            .await
-            .unwrap();
-        assert_eq!(
-            BucketMeta::created_at(&store, &data).await.unwrap(),
-            Some(created),
-            "timestamptz keeps the sub-second digits"
-        );
-        assert_eq!(
-            BucketMeta::row(&store, &data)
-                .await
-                .unwrap()
-                .unwrap()
-                .created,
-            created
-        );
-        db.drop_db().await;
-    }
-
-    #[tokio::test]
-    async fn the_bucket_row_round_trips_and_orders_by_bytes() {
-        let Some((db, store)) = scratch().await else {
-            return;
-        };
-        let data = name("plane-bucket-data");
-        let other = name("plane-bucket-other");
-        let mut row = BucketRow::at(at(10));
-        row.tags = bucket_tags(&[("env", "prod")]);
-        BucketMeta::create(&store, &data, &row).await.unwrap();
-        BucketMeta::create(&store, &other, &BucketRow::at(at(20)))
-            .await
-            .unwrap();
-        assert_eq!(
-            BucketMeta::created_at(&store, &data).await.unwrap(),
-            Some(at(10))
-        );
-        let reloaded = BucketMeta::row(&store, &data).await.unwrap().unwrap();
-        assert_eq!(reloaded.tags, row.tags);
-        assert_eq!(reloaded.created, at(10));
-        let all = BucketMeta::load_all(&store).await.unwrap();
-        assert_eq!(
-            all.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
-            vec![data.to_string(), other.to_string()],
-            "the listing orders the names by their UTF-8 bytes"
-        );
-        let many = BucketMeta::load_many(&store, &[other.clone(), name("plane-bucket-absent")])
-            .await
-            .unwrap();
-        assert_eq!(many, vec![Some(at(20)), None]);
-        // One answer per occurrence: a name asked for twice is answered twice,
-        // not `None` on its second read.
-        assert_eq!(
-            BucketMeta::load_many(&store, &[other.clone(), other.clone()])
-                .await
-                .unwrap(),
-            vec![Some(at(20)), Some(at(20))],
-            "a duplicated name answers its creation time per occurrence"
-        );
-        assert_eq!(
-            BucketMeta::owners(&store, from_ref(&data)).await.unwrap(),
-            vec![None]
-        );
-        assert!(matches!(
-            BucketMeta::create(&store, &data, &row).await,
-            Err(Error::AlreadyExists(_))
-        ));
-        db.drop_db().await;
-    }
-
-    #[tokio::test]
-    async fn the_element_setters_leave_a_missing_row_alone_and_the_creators_land() {
-        let Some((db, store)) = scratch().await else {
-            return;
-        };
-        let data = name("plane-bucket-setters");
-        assert!(
-            !BucketMeta::set_tags(&store, &data, &bucket_tags(&[("a", "b")]))
-                .await
-                .unwrap()
-        );
-        assert!(!BucketMeta::clear_tags(&store, &data).await.unwrap());
-        assert!(
-            !BucketMeta::set_acl(&store, &data, None, &AclGrants::new())
-                .await
-                .unwrap()
-        );
-        assert!(!BucketMeta::clear_cors(&store, &data).await.unwrap());
-        BucketMeta::set_tags_or_create(&store, &data, &bucket_tags(&[("a", "b")]), at(1))
-            .await
-            .unwrap();
-        assert_eq!(
-            BucketMeta::created_at(&store, &data).await.unwrap(),
-            Some(at(1))
-        );
-        BucketMeta::set_grants_or_create(
-            &store,
-            &data,
-            &Acl::default_private(Some(owner())).grants,
-            at(2),
-        )
-        .await
-        .unwrap();
-        // The creation time is the first writer's, never the second's.
-        assert_eq!(
-            BucketMeta::created_at(&store, &data).await.unwrap(),
-            Some(at(1))
-        );
-        assert_eq!(
-            BucketMeta::row(&store, &data).await.unwrap().unwrap().tags,
-            bucket_tags(&[("a", "b")])
-        );
-        // record clears the recorded elements; record_if_absent keeps the stamp.
-        BucketMeta::record(&store, &data, at(5)).await.unwrap();
-        let recorded = BucketMeta::row(&store, &data).await.unwrap().unwrap();
-        assert_eq!(recorded.created, at(5));
-        assert!(recorded.tags.is_empty());
-        assert!(recorded.owner.is_none());
-        assert_eq!(
-            BucketMeta::record_if_absent(&store, &data, at(9))
-                .await
-                .unwrap(),
-            (at(5), false)
-        );
-        db.drop_db().await;
-    }
-
-    #[tokio::test]
-    async fn acl_elements_round_trip_and_the_bucket_lifecycle_is_idempotent() {
-        let Some((db, store)) = scratch().await else {
-            return;
-        };
-        let data = name("plane-bucket-acl");
-        BucketMeta::create(&store, &data, &BucketRow::at(at(1)))
-            .await
-            .unwrap();
-        let owner = owner();
-        let grants = Acl::default_private(Some(owner.clone())).grants;
-        assert!(
-            BucketMeta::set_acl(&store, &data, Some(&owner), &grants)
-                .await
-                .unwrap()
-        );
-        let reloaded = BucketMeta::row(&store, &data).await.unwrap().unwrap();
-        assert_eq!(reloaded.owner.as_ref(), Some(&owner));
-        assert_eq!(
-            reloaded.acl.grants, grants,
-            "the decoded ACL carries the grants; the owner rides the composite attribute"
-        );
-        assert_eq!(
-            BucketMeta::owners(&store, from_ref(&data)).await.unwrap(),
-            vec![Some(owner)]
-        );
-        assert!(
-            BucketMeta::set_tags(&store, &data, &bucket_tags(&[("x", "y")]))
-                .await
-                .unwrap()
-        );
-        assert!(BucketMeta::clear_tags(&store, &data).await.unwrap());
-        assert!(
-            BucketMeta::row(&store, &data)
-                .await
-                .unwrap()
-                .unwrap()
-                .tags
-                .is_empty()
-        );
-        // remove_if_empty removes a bucket with nothing in it and refuses an
-        // absent one.
-        BucketMeta::remove_if_empty(&store, &data).await.unwrap();
-        assert!(
-            BucketMeta::created_at(&store, &data)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(matches!(
-            BucketMeta::remove_if_empty(&store, &data).await,
-            Err(Error::NoSuchBucket(_))
-        ));
-        BucketMeta::remove(&store, &data).await.unwrap();
-        BucketMeta::remove(&store, &data).await.unwrap();
-        db.drop_db().await;
-    }
-
-    /// Every ACL shape the contract can hold round-trips through the stored
-    /// composite: an owner with no grants, a single grant, several grants (whose
-    /// stored order is canonical) and no owner at all.
-    #[tokio::test]
-    async fn every_acl_shape_round_trips_through_the_composite() {
-        let Some((db, store)) = scratch().await else {
-            return;
-        };
-        let data = name("plane-bucket-acl-shapes");
-        BucketMeta::create(&store, &data, &BucketRow::at(at(1)))
-            .await
-            .unwrap();
-        let owner = owner();
-        let other = OwnerId::new("f".repeat(64)).expect("a second canonical id");
-        let canonical = Grant {
-            grantee: Grantee::Canonical(owner.clone()),
-            permission: Permission::FullControl,
-        };
-        let group = Grant {
-            grantee: Grantee::Group(GroupUri(GROUP_ALL_USERS.to_owned())),
-            permission: Permission::Read,
-        };
-        // The owner alone: the composite's grants are an empty array.
-        assert!(
-            BucketMeta::set_acl(&store, &data, Some(&owner), &AclGrants::new())
-                .await
-                .unwrap()
-        );
-        let reloaded = BucketMeta::row(&store, &data).await.unwrap().unwrap();
-        assert_eq!(reloaded.owner.as_ref(), Some(&owner));
-        assert!(reloaded.acl.grants.is_empty());
-        assert_eq!(
-            BucketMeta::owners(&store, from_ref(&data)).await.unwrap(),
-            vec![Some(owner.clone())]
-        );
-        // One grant.
-        let one = vec![canonical.clone()];
-        assert!(
-            BucketMeta::set_acl(&store, &data, Some(&other), &one)
-                .await
-                .unwrap()
-        );
-        let reloaded = BucketMeta::row(&store, &data).await.unwrap().unwrap();
-        assert_eq!(reloaded.owner.as_ref(), Some(&other));
-        assert_eq!(reloaded.acl.grants, one);
-        // Several grants, stored in the canonical order whatever order they
-        // arrive in.
-        let several = vec![group.clone(), canonical.clone()];
-        assert!(
-            BucketMeta::set_acl(&store, &data, Some(&other), &several)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            BucketMeta::row(&store, &data)
-                .await
-                .unwrap()
-                .unwrap()
-                .acl
-                .grants,
-            vec![canonical, group]
-        );
-        // No owner and no grant: the composite's owner attribute is NULL.
-        assert!(
-            BucketMeta::set_acl(&store, &data, None, &AclGrants::new())
-                .await
-                .unwrap()
-        );
-        let reloaded = BucketMeta::row(&store, &data).await.unwrap().unwrap();
-        assert!(reloaded.owner.is_none());
-        assert!(reloaded.acl.grants.is_empty());
-        assert_eq!(
-            BucketMeta::owners(&store, from_ref(&data)).await.unwrap(),
-            vec![None]
-        );
-        db.drop_db().await;
-    }
-
-    /// An object that commits while bucket removal is waiting on the bucket
-    /// lock is visible to the emptiness check. The check is the statement
-    /// after the lock, so it does not keep the snapshot from before the wait.
-    #[tokio::test]
-    async fn a_put_that_commits_while_remove_waits_keeps_the_bucket() {
-        let Some((db, store)) = scratch().await else {
-            return;
-        };
-        let data = name("plane-bucket-remove-race");
-        BucketMeta::create(&store, &data, &BucketRow::at(at(1)))
-            .await
-            .unwrap();
-        let racing = store.clone();
-        let bucket = data.clone();
-        let err = object_commits_while_delete_waits(&store, &data, async move {
-            BucketMeta::remove_if_empty(&racing, &bucket).await
-        })
-        .await
-        .expect_err("the object landed before the delete could commit");
-        assert!(matches!(err, Error::NotEmpty(_)));
-        assert!(BucketMeta::row(&store, &data).await.unwrap().is_some());
-        db.drop_db().await;
-    }
-
-    /// The same wait, for the store's own bucket teardown
-    /// (`PgStore::teardown_bucket`, `crate::teardown`), which drops the whole
-    /// namespace and shares the bucket-row lock with `remove_if_empty`. The
-    /// object committed while the teardown held no snapshot yet, so the bucket
-    /// stays.
-    #[tokio::test]
-    async fn a_put_that_commits_while_teardown_waits_keeps_the_bucket() {
-        let Some((db, store)) = scratch().await else {
-            return;
-        };
-        let data = name("plane-bucket-teardown-race");
-        BucketMeta::create(&store, &data, &BucketRow::at(at(1)))
-            .await
-            .unwrap();
-        let racing = store.clone();
-        let bucket = data.clone();
-        let err = object_commits_while_delete_waits(&store, &data, async move {
-            racing.teardown_bucket(&bucket).await
-        })
-        .await
-        .expect_err("the object landed before the teardown could commit");
-        assert!(matches!(err, Error::NotEmpty(_)));
-        assert!(BucketMeta::row(&store, &data).await.unwrap().is_some());
-        db.drop_db().await;
-    }
-
-    /// Hold the bucket lock, wait until `delete` is blocked on it, commit an
-    /// object, then let `delete` run.
-    async fn object_commits_while_delete_waits(
-        store: &PgStore,
-        bucket: &Name,
-        delete: impl Future<Output = Result<(), Error>> + Send + 'static,
-    ) -> Result<(), Error> {
-        let mut tx = begin(store.pool()).await?;
-        assert_bucket_row(&mut tx, bucket).await?;
-        let task = tokio::spawn(delete);
-        let mut saw_waiter = false;
-        for _ in 0..50 {
-            let waiting: i64 = sqlx::query_scalar!(
-                r#"SELECT count(*) AS "waiting!" FROM pg_locks WHERE NOT granted"#
-            )
-            .fetch_one(store.pool())
-            .await?;
-            if waiting > 0 {
-                saw_waiter = true;
-                break;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-        assert!(saw_waiter, "the delete never waited on the bucket lock");
-        let key = object_key("kept");
-        upsert_object(
-            &mut tx,
-            bucket,
-            &key,
-            &ObjectRow {
-                etag: ETag::EMPTY,
-                size: 0,
-                mtime: SystemTime::UNIX_EPOCH,
-                identity: 0,
-                tags: object::Tags::empty(),
-                checksum: None,
-                owner: None,
-                acl: Acl::default_private(None),
-            },
-        )
-        .await?;
-        tx.commit().await?;
-        task.await.expect("the delete task")
-    }
-}
+mod tests;

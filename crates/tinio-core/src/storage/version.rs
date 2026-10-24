@@ -1,9 +1,11 @@
 //! The version-scoped operations of the storage contract.
 
+use std::time::SystemTime;
+
 use async_trait::async_trait;
 
 use crate::{
-    ByteRange, acl, bucket, object,
+    ByteRange, acl, bucket, object, object_lock,
     storage::{self, Storage},
     version::{self, CurrentVersion, Id, ListParams, Listing, Marker, State},
 };
@@ -128,16 +130,24 @@ pub trait VersionOps: Send + Sync + 'static {
     }
 
     /// Permanently remove one version and answer what was removed.
+    ///
+    /// `bypass` is the governance bypass the request's authority granted
+    /// (OL11, OL15): [`object_lock::Bypass::Governance`] lets an unexpired
+    /// GOVERNANCE retention be deleted through; compliance and legal holds
+    /// refuse in either mode. A caller that has no authority to bypass (a
+    /// marker delete, a lifecycle rule, the sweeper) passes
+    /// [`object_lock::Bypass::None`].
     async fn delete_object_version(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
+        bypass: object_lock::Bypass,
     ) -> Result<Marker, <Self as Storage>::Error>
     where
         Self: Storage,
     {
-        let _ = (bucket, version);
+        let _ = (bucket, version, bypass);
         Err(refusal(key))
     }
 
@@ -229,6 +239,167 @@ pub trait VersionOps: Send + Sync + 'static {
         Self: Storage,
     {
         let _ = (bucket, version, acl);
+        Err(refusal(key))
+    }
+
+    /// The retention stored on a version — the server's read, and the
+    /// GET/HEAD lock-header echo (OL8, OL28).
+    ///
+    /// A backend that does not version or store locks keeps the fail-closed
+    /// default: an error, never `Ok(None)` — a security read is never
+    /// answered "unlocked" by a backend that cannot tell.
+    async fn get_object_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<Option<object_lock::Retention>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        let _ = (bucket, version);
+        Err(refusal(key))
+    }
+
+    /// The legal hold stored on a version (OL8, OL28). The default fails
+    /// closed for the same reason as [`VersionOps::get_object_retention`].
+    async fn get_object_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<object_lock::LegalHold, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        let _ = (bucket, version);
+        Err(refusal(key))
+    }
+
+    /// A version's whole lock in **one** store read (`retention` and hold
+    /// together) — the GET/HEAD echo's shape (OL8, OL28).
+    ///
+    /// The default composes the two single-value reads, so a backend that
+    /// cannot answer either one still fails closed; a backend whose rows hold
+    /// the lock in one place overrides it with the single read.
+    async fn object_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        let retention = self.get_object_retention(bucket, key, version).await?;
+        let legal_hold = self.get_object_legal_hold(bucket, key, version).await?;
+        let lock = object_lock::Lock {
+            retention,
+            legal_hold,
+        };
+        if lock.carries_fact() {
+            Ok(Some(lock))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Set or clear a version's retention — the server-reachable write seam
+    /// of S3 `PutObjectRetention` (OL5, OL11, OL23, R22).
+    ///
+    /// The address is the S3 version address ([`version::Address`]): `Current`
+    /// is resolved to the current slot's identity, `Null` to the null
+    /// version's, `Id` to the id. `requested: Some` sets the retention,
+    /// `None` clears it; "leave it alone" is not calling the method.
+    ///
+    /// The default **fails closed** for a backend that cannot store locks: an
+    /// error, never a success that would leave the caller believing the
+    /// retention applied. A real backend overrides this with its store's
+    /// atomic read-modify-write, which also asserts the identity is a
+    /// non-marker version, the bucket configuration is enabled and the bucket
+    /// is versioned `Enabled`.
+    ///
+    /// # Errors
+    ///
+    /// The store's classes: `NoSuchVersion` for a marker or an absent
+    /// identity, `InvalidBucketState` for a bucket without an enabled
+    /// configuration (or without `Enabled` versioning), `NoSuchBucket` for a
+    /// missing bucket, and `Locked` for a refused shortening or removal.
+    async fn set_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        requested: Option<&object_lock::Retention>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        let _ = (bucket, address, requested, bypass, now);
+        Err(refusal(key))
+    }
+
+    /// Set or clear a version's legal hold — the server-reachable write seam
+    /// of S3 `PutObjectLegalHold` (OL5, OL11, R22).
+    ///
+    /// The address resolution and the store's assertions are
+    /// [`VersionOps::set_retention`]'s; the retention is preserved and a legal
+    /// hold has no bypass. [`object_lock::LegalHold::Off`] clears the hold.
+    ///
+    /// # Errors
+    ///
+    /// The same classes as [`VersionOps::set_retention`].
+    async fn set_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        hold: object_lock::LegalHold,
+    ) -> Result<object_lock::Lock, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        let _ = (bucket, address, hold);
+        Err(refusal(key))
+    }
+
+    /// Apply the retention member and the legal-hold member in **one** store
+    /// transaction — the management plane's atomic object `PUT` (OL23).
+    ///
+    /// The address resolution is [`VersionOps::set_retention`]'s. `retention`
+    /// is three-state (`None` leaves, `Some(None)` clears, `Some(Some(_))`
+    /// sets) and `legal_hold` is two-state (`None` leaves, a value sets). A
+    /// refused retention applies neither member: the store answers its
+    /// `Locked` class and writes nothing. The legal hold itself never refuses
+    /// and has no bypass.
+    ///
+    /// The default **fails closed** for a backend that cannot store locks: an
+    /// error, never a success that would leave the caller believing either
+    /// member applied.
+    ///
+    /// # Errors
+    ///
+    /// The same classes as [`VersionOps::set_retention`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the combined write's field set — bucket, key, address, both members, bypass and clock — is the request's own"
+    )]
+    async fn update_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        retention: Option<Option<&object_lock::Retention>>,
+        legal_hold: Option<object_lock::LegalHold>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        let _ = (bucket, address, retention, legal_hold, bypass, now);
         Err(refusal(key))
     }
 }

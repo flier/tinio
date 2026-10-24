@@ -5,7 +5,8 @@ use std::os::unix::fs::symlink;
 use std::{
     fs::{read_dir, write},
     io::ErrorKind,
-    time::Duration,
+    path::Path,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use redb::{Database, ReadableDatabase, backends::InMemoryBackend};
@@ -16,11 +17,13 @@ use tokio::{fs, time};
 use super::*;
 #[cfg(windows)]
 use crate::testutil::link_directory;
+#[cfg(feature = "versioning")]
+use crate::testutil::{storage as test_storage, versioned_bucket};
 use crate::{
     _core::{
         acl::Acl,
         multipart::part_number,
-        object,
+        object, object_lock,
         storage::{
             BucketOps, Error as StorageError, ListPartsParams, MultipartOps, ObjectOps, VersionOps,
         },
@@ -73,6 +76,398 @@ async fn new_from_db_constructs_over_an_opened_database() {
         .await
         .unwrap();
     assert!(storage.bucket_names("").await.unwrap() == vec![b]);
+}
+
+/// Plant the partial lock-enabled bucket residue through the **raw store** —
+/// the per-store fixture the startup repair is tested against (R25).
+///
+/// The shape is a stored configuration with `enabled = true` while the
+/// bucket's versioning state is not `Enabled`. **It is not the create's crash
+/// residue**: `create_bucket_with_lock` runs create → enable versioning →
+/// write configuration, so a death between its last two steps leaves
+/// `Enabled` with no configuration (the versioning-first shape the repair
+/// leaves alone). The repair's shape comes from a caller that stores a
+/// configuration below the S3 surface — the storage-level put-config setter
+/// does, and only the S3 handler carries "versioning must already be
+/// `Enabled`" — or from external editing of the state database. **The S3 API
+/// cannot plant it** (it requires `Enabled` first and refuses `Suspended` on a
+/// lock-enabled bucket), so going through it would mask the very residue under
+/// test.
+fn plant_partial_lock_bucket(
+    root: &Path,
+    bucket: &str,
+    state: State,
+    config: &object_lock::Config,
+) {
+    use std::fs;
+
+    use crate::_store_redb::{bucket as bucket_rows, bucket_object_lock, bucket_versioning};
+
+    fs::create_dir_all(root.join(bucket)).unwrap();
+    let opened = database::open(&root.join(".tinio")).unwrap();
+    {
+        let mut txn = opened.db.begin_write().unwrap();
+        {
+            let mut buckets = bucket_rows::Table::open(&mut txn).unwrap();
+            buckets.put(bucket, UNIX_EPOCH).unwrap();
+        }
+        {
+            let mut states = bucket_versioning::Table::open(&mut txn).unwrap();
+            states.set(bucket, state).unwrap();
+        }
+        {
+            let mut configs = bucket_object_lock::Table::open(&mut txn).unwrap();
+            configs.set(bucket, config).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+}
+
+/// Plant the create's **versioning-first** residue: the bucket recorded
+/// `Enabled` and stores **no** configuration. It is indistinguishable from a
+/// legitimate versioned bucket, so the startup repair must leave it alone and
+/// invent no configuration (R25).
+fn plant_settled_versioned_bucket(root: &Path, bucket: &str) {
+    use std::fs;
+
+    use crate::_store_redb::{bucket as bucket_rows, bucket_versioning};
+
+    fs::create_dir_all(root.join(bucket)).unwrap();
+    let opened = database::open(&root.join(".tinio")).unwrap();
+    {
+        let mut txn = opened.db.begin_write().unwrap();
+        {
+            let mut buckets = bucket_rows::Table::open(&mut txn).unwrap();
+            buckets.put(bucket, UNIX_EPOCH).unwrap();
+        }
+        {
+            let mut states = bucket_versioning::Table::open(&mut txn).unwrap();
+            states.set(bucket, State::Enabled).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+}
+
+/// The stored versioning state of `bucket`, read raw after the storage has
+/// released the state database.
+fn stored_versioning(root: &Path, bucket: &str) -> Option<State> {
+    let opened = database::open(&root.join(".tinio")).unwrap();
+    let txn = opened.db.begin_read().unwrap();
+    crate::_store_redb::bucket_versioning::Table::open_readonly(&txn)
+        .unwrap()
+        .get(bucket)
+        .unwrap()
+}
+
+/// The stored Object Lock configuration of `bucket`, read raw.
+fn stored_config(root: &Path, bucket: &str) -> Option<object_lock::Config> {
+    let opened = database::open(&root.join(".tinio")).unwrap();
+    let txn = opened.db.begin_read().unwrap();
+    crate::_store_redb::bucket_object_lock::Table::open_readonly(&txn)
+        .unwrap()
+        .get(bucket)
+        .unwrap()
+}
+
+/// The fixture's configuration: enabled, one governance default retention.
+fn lock_config() -> object_lock::Config {
+    object_lock::Config {
+        enabled: true,
+        rule: Some(object_lock::Rule {
+            default_retention: object_lock::DefaultRetention {
+                mode: object_lock::Mode::Governance,
+                period: object_lock::Period::Days(30),
+            },
+        }),
+    }
+}
+
+/// OL31/R25: a **writable** open completes a partial lock-enabled bucket by
+/// enabling versioning — the configuration expresses the intent, and a lock is
+/// enforceable only on a versioned bucket. Both residue states (a bucket that
+/// recorded `Unversioned` and one suspended) are completed, and the stored
+/// configuration rides through untouched.
+#[tokio::test]
+async fn the_startup_repair_enables_versioning_on_a_partial_lock_enabled_bucket() {
+    let root = tempfile::tempdir().unwrap();
+    let config = lock_config();
+    plant_partial_lock_bucket(root.path(), "unversioned", State::Unversioned, &config);
+    plant_partial_lock_bucket(root.path(), "suspended", State::Suspended, &config);
+    plant_settled_versioned_bucket(root.path(), "settled");
+
+    // The writable open is the startup repair's one home.
+    drop(FsStorage::new(root.path(), fs_options()).unwrap());
+
+    for bucket in ["unversioned", "suspended"] {
+        assert_eq!(
+            stored_versioning(root.path(), bucket),
+            Some(State::Enabled),
+            "the repair enables versioning on `{bucket}`"
+        );
+        assert_eq!(
+            stored_config(root.path(), bucket),
+            Some(config.clone()),
+            "the configuration expresses the intent and rides through"
+        );
+    }
+    // The versioning-first residue is not the repair's shape: no configuration
+    // is invented and the state is untouched.
+    assert_eq!(
+        stored_versioning(root.path(), "settled"),
+        Some(State::Enabled),
+        "a legitimately versioned bucket keeps its state"
+    );
+    assert_eq!(
+        stored_config(root.path(), "settled"),
+        None,
+        "the repair never invents a configuration"
+    );
+}
+
+/// The repair is idempotent: a settled (already `Enabled`) bucket is not
+/// written again, and a second writable open leaves the same facts.
+#[tokio::test]
+async fn the_startup_repair_is_idempotent() {
+    let root = tempfile::tempdir().unwrap();
+    let config = lock_config();
+    plant_partial_lock_bucket(root.path(), "locked", State::Unversioned, &config);
+
+    drop(FsStorage::new(root.path(), fs_options()).unwrap());
+    assert_eq!(
+        stored_versioning(root.path(), "locked"),
+        Some(State::Enabled)
+    );
+
+    // The second open finds nothing partial and writes nothing.
+    drop(FsStorage::new(root.path(), fs_options()).unwrap());
+    assert_eq!(
+        stored_versioning(root.path(), "locked"),
+        Some(State::Enabled)
+    );
+    assert_eq!(stored_config(root.path(), "locked"), Some(config));
+
+    // The repair's own answer on the settled store: no bucket completed.
+    let opened = database::open(&root.path().join(".tinio")).unwrap();
+    assert_eq!(
+        super::repair_object_lock_state(&opened.db).unwrap().buckets,
+        Vec::<String>::new(),
+        "a settled store has no partial bucket to complete"
+    );
+}
+
+/// A future GOVERNANCE retention — a lock that refuses a bypass-less version
+/// delete, so the surviving row's enforcement is observable.
+fn future_governance_lock() -> object_lock::Lock {
+    object_lock::Lock {
+        retention: Some(object_lock::Retention {
+            mode: object_lock::Mode::Governance,
+            retain_until: UNIX_EPOCH + Duration::from_secs(4_102_444_800),
+        }),
+        legal_hold: object_lock::LegalHold::Off,
+    }
+}
+
+/// Plant one per-version lock row through the **raw store**: the startup
+/// repair's fixture is the stored state, not the S3 surface's write path.
+fn plant_lock_row(root: &Path, bucket: &str, key: &str, version: &str, lock: &object_lock::Lock) {
+    let opened = database::open(&root.join(".tinio")).unwrap();
+    let mut txn = opened.db.begin_write().unwrap();
+    {
+        let mut locks = crate::_store_redb::version_object_lock::Table::open(&mut txn).unwrap();
+        locks.put(bucket, key, version, lock).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+/// The stored lock row for one identity, read raw after the storage has
+/// released the state database.
+fn stored_lock(root: &Path, bucket: &str, key: &str, version: &str) -> Option<object_lock::Lock> {
+    let opened = database::open(&root.join(".tinio")).unwrap();
+    let txn = opened.db.begin_read().unwrap();
+    crate::_store_redb::version_object_lock::Table::open_readonly(&txn)
+        .unwrap()
+        .get(bucket, key, version)
+        .unwrap()
+}
+
+/// The number of stored per-version lock rows of `bucket`, read raw.
+fn lock_row_count(root: &Path, bucket: &str) -> usize {
+    let opened = database::open(&root.join(".tinio")).unwrap();
+    let txn = opened.db.begin_read().unwrap();
+    let table = crate::_store_redb::version_object_lock::Table::open_readonly(&txn).unwrap();
+    let mut count = 0;
+    table
+        .for_bucket(bucket, |_, _, _, _, _| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+    count
+}
+
+/// OL31/R25: a **writable** open removes every orphan per-version Object Lock
+/// row — a row whose identity resolves to neither a version row nor the key's
+/// current slot — while a lock on a live version rides through and still
+/// enforces. The second open finds no orphan, so the row count is unchanged.
+#[cfg(feature = "versioning")]
+#[tokio::test]
+async fn the_startup_repair_removes_orphan_lock_rows_and_keeps_an_owned_lock() {
+    use crate::{
+        _core::version as version_core, _store_redb::version_object_lock,
+        database::Error as DatabaseError,
+    };
+
+    let (root, storage) = test_storage();
+    let (b, key) = versioned_bucket(&storage, State::Enabled, &[b"first"]).await;
+    let id = storage
+        .head_object(&b, &key)
+        .await
+        .unwrap()
+        .version_id
+        .expect("an enabled write mints an identity");
+    let live = version_core::wire_of(Some(&id));
+    let orphan = "orphan-v1";
+    let lock = future_governance_lock();
+
+    let (bucket, name, planted, stale) = (
+        b.to_string(),
+        key.to_string(),
+        lock.clone(),
+        orphan.to_owned(),
+    );
+    storage
+        .handle()
+        .write(move |txn| -> Result<(), DatabaseError> {
+            let mut locks = version_object_lock::Table::open(txn)?;
+            locks.put(&bucket, &name, &live, &planted)?;
+            locks.put(&bucket, &name, &stale, &planted)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    drop(storage);
+
+    // The writable open is the repair's one home: the orphan goes and the
+    // owned row rides through.
+    let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+    assert_eq!(
+        storage
+            .get_object_retention(&b, &key, Some(&id))
+            .await
+            .unwrap(),
+        lock.retention,
+        "a lock on a live version survives the repair"
+    );
+    let err = storage
+        .delete_object_version(&b, &key, Some(&id), object_lock::Bypass::None)
+        .await
+        .expect_err("the surviving lock still enforces");
+    assert!(
+        matches!(err, Error::Storage(StorageError::Locked(_))),
+        "the surviving row refuses a bypass-less version delete: {err:?}"
+    );
+    drop(storage);
+
+    let bucket_name = b.to_string();
+    assert_eq!(
+        lock_row_count(root.path(), &bucket_name),
+        1,
+        "only the owned row remains"
+    );
+    assert_eq!(
+        stored_lock(root.path(), &bucket_name, &key.to_string(), orphan),
+        None,
+        "the orphan row is gone"
+    );
+
+    // A second open finds nothing to remove and commits nothing.
+    drop(FsStorage::new(root.path(), fs_options()).unwrap());
+    assert_eq!(
+        lock_row_count(root.path(), &bucket_name),
+        1,
+        "a second open writes nothing"
+    );
+    let opened = database::open(&root.path().join(".tinio")).unwrap();
+    assert!(
+        super::repair_object_lock_state(&opened.db)
+            .unwrap()
+            .orphans
+            .is_empty(),
+        "the repair's own answer on the settled store"
+    );
+}
+
+/// A **read-only** open never repairs orphan lock rows: the row stays exactly
+/// as planted and the run still serves (FR-023 amended).
+#[tokio::test]
+async fn a_read_only_open_leaves_an_orphan_lock_row_in_place() {
+    let root = tempfile::tempdir().unwrap();
+    plant_settled_versioned_bucket(root.path(), "locked");
+    let lock = future_governance_lock();
+    plant_lock_row(root.path(), "locked", "notes.txt", "orphan-v1", &lock);
+
+    let storage = FsStorage::new(
+        root.path(),
+        FsOptions {
+            access: AccessMode::ReadOnly,
+            ..fs_options()
+        },
+    )
+    .unwrap();
+    let b = name("locked").unwrap();
+    // Serving, not only constructing: the bucket's row is read.
+    storage
+        .head_bucket(&b)
+        .await
+        .expect("a read-only open serves the bucket");
+    drop(storage);
+
+    assert_eq!(
+        stored_lock(root.path(), "locked", "notes.txt", "orphan-v1"),
+        Some(lock),
+        "a read-only open must not remove the orphan"
+    );
+    assert_eq!(
+        lock_row_count(root.path(), "locked"),
+        1,
+        "the orphan row is untouched"
+    );
+}
+
+/// A **read-only** open never repairs: the residue stays exactly as planted
+/// and the run still serves (FR-023 amended).
+#[tokio::test]
+async fn a_read_only_open_leaves_the_partial_bucket_untouched_and_serves() {
+    let root = tempfile::tempdir().unwrap();
+    let config = lock_config();
+    plant_partial_lock_bucket(root.path(), "locked", State::Unversioned, &config);
+
+    let storage = FsStorage::new(
+        root.path(),
+        FsOptions {
+            access: AccessMode::ReadOnly,
+            ..fs_options()
+        },
+    )
+    .unwrap();
+    let b = name("locked").unwrap();
+    // Serving, not only constructing: the bucket's row is read.
+    storage
+        .head_bucket(&b)
+        .await
+        .expect("a read-only open serves the bucket");
+    drop(storage);
+
+    assert_eq!(
+        stored_versioning(root.path(), "locked"),
+        Some(State::Unversioned),
+        "a read-only open must not run the startup repair"
+    );
+    assert_eq!(
+        stored_config(root.path(), "locked"),
+        Some(config),
+        "the configuration is untouched"
+    );
 }
 
 #[tokio::test]
@@ -1071,6 +1466,7 @@ async fn state_dir_holds_only_redb_tmp_multipart_and_blobs() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -1131,6 +1527,125 @@ async fn state_dir_holds_only_redb_tmp_multipart_and_blobs() {
         upload_entries,
         ["part-1"],
         "no sidecars: {upload_entries:?}"
+    );
+}
+
+/// The current-version delete's crash window: lock pre-check → file removal →
+/// `expire_with`. A crash after the file goes but before the row transaction
+/// leaves the file gone, the `object_meta` slot still recording the identity,
+/// and the identity's lock row still stored. The read-heal already serves the
+/// key as the null version (the out-of-band-removal legs); this pins the lock
+/// side: the crashed identity stops resolving, a version-free retry clears the
+/// degraded slot, and the lock row the window left is the one the bucket
+/// teardown drains — it protects nothing once the version it named is gone
+/// (the crash could only happen after the pre-check let the delete through).
+#[cfg(feature = "versioning")]
+#[tokio::test]
+async fn the_current_version_delete_crash_window_leaves_a_recoverable_lock_residue() {
+    use crate::{
+        _core::version as version_core, _store_redb::version_object_lock,
+        database::Error as DatabaseError,
+    };
+
+    let (root, storage) = test_storage();
+    let (b, key) = versioned_bucket(&storage, State::Enabled, &[b"first"]).await;
+    let id = storage
+        .head_object(&b, &key)
+        .await
+        .unwrap()
+        .version_id
+        .expect("an enabled write mints an identity");
+
+    // An expired GOVERNANCE retention is a stored lock the delete's pre-check
+    // lets through — the state in which the window can be entered.
+    let lock = object_lock::Lock {
+        retention: Some(object_lock::Retention {
+            mode: object_lock::Mode::Governance,
+            retain_until: UNIX_EPOCH + Duration::from_secs(1),
+        }),
+        legal_hold: object_lock::LegalHold::Off,
+    };
+    let (bucket, name, wire, planted) = (
+        b.to_string(),
+        key.to_string(),
+        version_core::wire_of(Some(&id)),
+        lock,
+    );
+    storage
+        .handle()
+        .write(move |txn| -> Result<(), DatabaseError> {
+            version_object_lock::Table::open(txn)?.put(&bucket, &name, &wire, &planted)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let lock_present = |storage: FsStorage| {
+        let (bucket, name, wire) = (
+            b.to_string(),
+            key.to_string(),
+            version_core::wire_of(Some(&id)),
+        );
+        async move {
+            storage
+                .handle()
+                .read(move |txn| -> Result<bool, DatabaseError> {
+                    Ok(version_object_lock::Table::open_readonly(txn)?
+                        .get(&bucket, &name, &wire)?
+                        .is_some())
+                })
+                .unwrap()
+        }
+    };
+
+    // The crash: the file removal ran, `expire_with` did not.
+    fs::remove_file(root.path().join("data").join("notes.txt"))
+        .await
+        .unwrap();
+    assert!(
+        lock_present(storage.clone()).await,
+        "the window leaves the lock row behind"
+    );
+    assert!(
+        storage.get_object(&b, &key, None).await.is_err(),
+        "the file is gone, so the key reads as missed (the read-heal's null)"
+    );
+
+    // The recorded identity stops resolving: the read-heal is the nullable
+    // current version, so a version-addressed delete of the crashed identity
+    // answers `NoSuchVersion` and touches nothing.
+    assert!(
+        matches!(
+            storage
+                .delete_object_version(&b, &key, Some(&id), object_lock::Bypass::None)
+                .await
+                .unwrap_err(),
+            crate::Error::Storage(StorageError::NoSuchVersion(_))
+        ),
+        "the crashed identity no longer resolves"
+    );
+    assert!(lock_present(storage.clone()).await);
+
+    // A version-free retry clears the degraded slot. `expire_with` addressed
+    // by the read-heal's sequence (the null's 0) does not match the slot's
+    // recorded sequence, so the lock row survives this step: the crash window
+    // leaves it, and it is inert — the pre-check had already let the delete
+    // through. It resolves to no version once the slot row is cleared.
+    storage
+        .delete_object_version(&b, &key, None, object_lock::Bypass::None)
+        .await
+        .unwrap();
+    assert!(storage.get_object(&b, &key, None).await.is_err());
+    assert!(
+        lock_present(storage.clone()).await,
+        "the window's residue is the lock row the crash left behind"
+    );
+
+    // The bucket teardown drains the bucket's lock rows, so the residue is
+    // not stranded: the maintenance path reclaims it.
+    storage.delete_bucket(&b).await.unwrap();
+    assert!(
+        !lock_present(storage.clone()).await,
+        "the bucket drain reclaims the crash window's stale lock row"
     );
 }
 

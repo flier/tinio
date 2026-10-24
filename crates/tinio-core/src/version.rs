@@ -703,6 +703,105 @@ pub enum HeadResult {
     },
 }
 
+/// How a [`HeadResult`] resolved: a marker, an object, a miss, or another failure.
+///
+/// A miss is only [`storage::Error::NoSuchVersion`] or [`storage::Error::NoSuchKey`].
+/// Every other storage error is a failure. Each caller maps these four arms onto
+/// its own statuses.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::time::SystemTime;
+///
+/// use tinio_core::{storage, version};
+///
+/// let marker = version::split_head(Ok::<_, storage::Error>(version::HeadResult::Marker {
+///     id: None,
+///     last_modified: SystemTime::UNIX_EPOCH,
+/// }));
+/// assert!(matches!(marker, version::HeadSplit::Marker { .. }));
+/// ```
+#[derive(Debug)]
+pub enum HeadSplit {
+    /// The address names a delete marker.
+    Marker {
+        /// The marker's identifier (`None` = the null version).
+        id: Option<Id>,
+        /// When the marker was written.
+        last_modified: SystemTime,
+    },
+    /// The address names an object version.
+    Object(object::Info),
+    /// The address names nothing (`NoSuchVersion` or `NoSuchKey`).
+    Missing(storage::Error),
+    /// The head failed for a reason other than a miss.
+    Failed(storage::Error),
+}
+
+/// Split a version head into a marker, an object, a miss, or another failure.
+///
+/// The four arms are the whole classification. A caller that only has an object
+/// [`object::Info`] wraps it as [`HeadResult::Object`] before asking; this
+/// function does not read storage.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::time::SystemTime;
+///
+/// use tinio_core::{ETag, acl, object, storage, version};
+///
+/// let object = version::split_head(Ok::<_, storage::Error>(version::HeadResult::Object(
+///     object::Info {
+///         key: object::key("a.txt").unwrap(),
+///         size: 0,
+///         last_modified: SystemTime::UNIX_EPOCH,
+///         etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
+///         tags: object::Tags::empty(),
+///         checksum: None,
+///         owner: None,
+///         acl: acl::Acl::default_private(None),
+///         version_id: None,
+///         bucket_records_versions: false,
+///     },
+/// )));
+/// assert!(matches!(object, version::HeadSplit::Object(_)));
+///
+/// let missing_version = version::split_head(Err::<version::HeadResult, _>(
+///     storage::no_such_version("abc"),
+/// ));
+/// assert!(matches!(missing_version, version::HeadSplit::Missing(_)));
+///
+/// let key = object::key("a.txt").unwrap();
+/// let missing_key =
+///     version::split_head(Err::<version::HeadResult, _>(storage::no_such_key(&key)));
+/// assert!(matches!(missing_key, version::HeadSplit::Missing(_)));
+///
+/// let failed = version::split_head(Err::<version::HeadResult, _>(storage::invalid_version("")));
+/// assert!(matches!(failed, version::HeadSplit::Failed(_)));
+/// ```
+pub fn split_head<E>(result: Result<HeadResult, E>) -> HeadSplit
+where
+    E: Into<storage::Error>,
+{
+    match result {
+        Ok(HeadResult::Marker { id, last_modified }) => HeadSplit::Marker { id, last_modified },
+        Ok(HeadResult::Object(info)) => HeadSplit::Object(info),
+        Err(err) => {
+            let err = err.into();
+            if matches!(
+                err,
+                storage::Error::NoSuchVersion(_) | storage::Error::NoSuchKey(_)
+            ) {
+                HeadSplit::Missing(err)
+            } else {
+                HeadSplit::Failed(err)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;

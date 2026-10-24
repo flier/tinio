@@ -36,6 +36,7 @@ use garde::Validate;
 use getset::{CopyGetters, Getters};
 use lockmap::Map;
 pub(crate) use objects::{StagedBytes, prune_parents, remove_object_file};
+use redb::ReadableTable;
 #[cfg(windows)]
 use soft_canonicalize::soft_canonicalize;
 use tokio::fs;
@@ -46,8 +47,6 @@ pub(crate) use version::Publication;
 
 #[cfg(feature = "versioning")]
 use crate::_blob::{LocalBlocks, Store as BlobStore};
-#[cfg(feature = "versioning")]
-use crate::_core::version::State;
 /// The staged body of this backend's `ObjectOps` implementation: the ops
 /// engine's value (spec E8) over this crate's content-plane stage
 /// (`content::FsStaged`) — re-exported so callers can name
@@ -72,23 +71,23 @@ use crate::{
         checksum, lifecycle,
         meta::BucketMeta,
         mode::AccessMode,
-        object, pipeline,
+        object, object_lock, pipeline,
         storage::{
             self, COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT,
             DEFAULT_MAX_CONCURRENT_UPLOADS, META_BATCH_BYTES_MAX, META_BATCH_BYTES_MIN,
             META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN, Storage, no_such_bucket,
         },
         to_nanos,
-        version::Id,
+        version::{Id, State, wire_of},
     },
     _ops::{
         BucketOps as EngineBucketOps, BucketRow, Guard, Hooks, MetadataFailure,
         ObjectOps as EngineObjectOps,
     },
     _store_redb::{
-        RedbMetadata, bucket, bucket_lifecycle, bucket_versioning, decode_acl_wire,
-        decode_owner_wire, object_meta, object_part, upload, version as version_rows,
-        version_index,
+        RedbMetadata, bucket, bucket_lifecycle, bucket_object_lock, bucket_versioning,
+        decode_acl_wire, decode_owner_wire, lock_inspect, object_meta, object_part, upload,
+        upload_object_lock, version as version_rows, version_index, version_object_lock,
     },
     _util::{
         lockmap,
@@ -469,18 +468,215 @@ fn canonicalize_tolerating_a_denied_device_map(path: &Path) -> io::Result<PathBu
     canonicalize(path)
 }
 
+/// Complete every partial lock-enabled bucket and remove every orphan
+/// per-version Object Lock row on a **writable** open (OL31/R25), one read
+/// pass followed by one write pass.
+///
+/// Two residues are cleared together:
+///
+/// * A partial lock-enabled bucket is a stored configuration with
+///   `enabled = true` while the bucket's versioning state is not `Enabled`.
+///   **It is not the create's crash residue**: `create_bucket_with_lock` runs
+///   create → enable versioning → write configuration, so a death between its
+///   last two steps leaves `Enabled` with **no** configuration — the
+///   versioning-first shape that is indistinguishable from a legitimate
+///   versioned bucket and is left alone below. The repair's shape comes from a
+///   caller that stores a configuration below the S3 surface — the
+///   storage-level put-config setter stores a validated configuration whenever
+///   the bucket row exists, and only the S3 handler carries "versioning must
+///   already be `Enabled`" (OL13) — or from external editing of the state
+///   database (R25). The repair enables versioning — the configuration
+///   expresses the intent, and a lock is enforceable only on a versioned
+///   bucket.
+/// * An orphan is a lock row that resolves to neither an object version row
+///   nor the key's current slot. The ownership rule is
+///   [`lock_inspect::scan`]'s (`LockOwned`), the same rule the doctor reports
+///   by: reusing the scan keeps one definition of ownership instead of a
+///   second copy that could drift, and the doctor's report-only path is
+///   untouched because the scan itself writes nothing.
+///
+/// **One read pass.** A single read transaction collects both sets — the
+/// enabled buckets from the configuration table and the orphan rows from the
+/// lock table — so the pass never reads either table twice. **One write
+/// pass** then applies both fixes: it enables versioning on the buckets whose
+/// state is not already `Enabled`, removes exactly the orphan rows, and
+/// commits only when something was actually repaired. When the read pass
+/// found nothing to fix, no write transaction is opened (or the one that had
+/// to check the buckets' states is aborted), so a second open of the same
+/// root writes nothing (idempotent).
+///
+/// It is called from the writable open alone: a read-only open writes nothing
+/// by definition, and the doctor's `new_from_db` inspection path must stay
+/// report-only.
+fn repair_object_lock_state(db: &redb::Database) -> Result<LockRepair, database::Error> {
+    // The one read pass: the enabled buckets and the orphan lock rows.
+    let (enabled, orphans) = {
+        let txn = redb::ReadableDatabase::begin_read(db).map_err(_store_redb::Error::from)?;
+        let enabled: Vec<String> = {
+            let configs = bucket_object_lock::Table::open_readonly(&txn)?;
+            let mut buckets = Vec::new();
+            configs.for_each(|bucket, enabled, _rule| {
+                if enabled {
+                    buckets.push(bucket.to_owned());
+                }
+                Ok(())
+            })?;
+            buckets
+        };
+        // The doctor's rule, verbatim: collect the rows that carry a lock
+        // fact, then resolve each identity to a version. The rows are
+        // collected first so no table handle stays open across the
+        // ownership reads.
+        let stored: Vec<(String, String, String)> = {
+            let locks = version_object_lock::Table::open_readonly(&txn)?;
+            let mut rows = Vec::new();
+            for item in locks.iter().map_err(_store_redb::Error::from)? {
+                let (key, value) = item.map_err(_store_redb::Error::from)?;
+                let (bucket, object_key, version) = key.value();
+                let (mode, retain_until, legal_hold) = value.value();
+                // A row carrying no lock fact is not a lock: neither corrupt
+                // nor an orphan (the model's own wrapping rule).
+                if matches!(
+                    object_lock::Lock::from_columns(mode, retain_until, legal_hold),
+                    Ok(None)
+                ) {
+                    continue;
+                }
+                rows.push((bucket.to_owned(), object_key.to_owned(), version.to_owned()));
+            }
+            rows
+        };
+        let mut orphans = Vec::new();
+        for (bucket, key, version) in stored {
+            if !lock_owned(&txn, &bucket, &key, &version)? {
+                orphans.push(lock_inspect::OrphanLock {
+                    bucket,
+                    key,
+                    version,
+                });
+            }
+        }
+        (enabled, orphans)
+    };
+    if enabled.is_empty() && orphans.is_empty() {
+        return Ok(LockRepair {
+            buckets: Vec::new(),
+            orphans,
+        });
+    }
+    // The one write pass. A bucket already `Enabled` is settled: the repair
+    // never rewrites it, which is what makes a second open write nothing.
+    let mut txn = db.begin_write().map_err(_store_redb::Error::from)?;
+    let mut repaired = Vec::new();
+    {
+        let mut states = bucket_versioning::Table::open(&mut txn)?;
+        for bucket in enabled {
+            if states.get(&bucket)? != Some(State::Enabled) {
+                states.set(&bucket, State::Enabled)?;
+                repaired.push(bucket);
+            }
+        }
+    }
+    if !orphans.is_empty() {
+        let mut locks = version_object_lock::Table::open(&mut txn)?;
+        // Only the reported rows are touched; a valid lock on a live version
+        // is never in this list.
+        for orphan in &orphans {
+            locks.remove(&orphan.bucket, &orphan.key, &orphan.version)?;
+        }
+    }
+    if repaired.is_empty() && orphans.is_empty() {
+        let _ = txn.abort();
+        return Ok(LockRepair {
+            buckets: repaired,
+            orphans,
+        });
+    }
+    txn.commit().map_err(_store_redb::Error::from)?;
+    let repair = LockRepair {
+        buckets: repaired,
+        orphans,
+    };
+    if !repair.buckets.is_empty() {
+        tracing::info!(
+            buckets = ?repair.buckets,
+            "the startup repair enabled versioning on a partial object-lock bucket"
+        );
+    }
+    if !repair.orphans.is_empty() {
+        tracing::info!(
+            orphans = ?repair.orphans,
+            "the startup repair removed orphan object-lock rows"
+        );
+    }
+    Ok(repair)
+}
+
+/// The doctor's ownership rule over one read transaction: a lock belongs to a
+/// version when an object version row of that identity exists through the
+/// version index, or the key's current slot names the same identity and is not
+/// a marker (the row-less current version a versioned write commits). A marker
+/// owns no lock (R19), so a row under a marker's identity is an orphan. This
+/// mirrors [`lock_inspect::scan`]'s rule (the drain's own), kept in step with
+/// it because the merged startup repair reads its own transaction instead of
+/// the doctor's.
+fn lock_owned(
+    txn: &redb::ReadTransaction,
+    bucket: &str,
+    key: &str,
+    version: &str,
+) -> Result<bool, _store_redb::Error> {
+    let seq = version_index::Table::open_readonly(txn)?.seq_of(bucket, key, version)?;
+    if let Some(seq) = seq
+        && let Some(row) = version_rows::Table::open_readonly(txn)?.get(bucket, key, seq)?
+        && row.kind == version_rows::Kind::Object
+    {
+        return Ok(true);
+    }
+    Ok(object_meta::Table::open_readonly(txn)?
+        .get(bucket, key)?
+        .is_some_and(|slot| !slot.is_delete_marker && wire_of(slot.version_id.as_ref()) == version))
+}
+
+/// What one startup Object Lock repair pass found and fixed.
+struct LockRepair {
+    /// The partial lock-enabled buckets it completed.
+    buckets: Vec<String>,
+    /// The orphan per-version lock rows it removed.
+    orphans: Vec<lock_inspect::OrphanLock>,
+}
+
 impl FsStorage {
     /// Open (or create) the backend over `root` — the convenience path:
     /// open the state database, evaluate and run compaction while the
     /// handle is still exclusive, then construct the stores over the
     /// shared handle (meta-redb-spec §5.9, G1).
     ///
+    /// **The writable open also runs the Object Lock startup repair** (OL31):
+    /// a partial lock-enabled bucket — a stored configuration with
+    /// `enabled = true` while the bucket's versioning state is not `Enabled` —
+    /// is completed by enabling versioning, once, before this storage serves.
+    /// The shape is **not** the create's crash residue (a death between the
+    /// create's last two steps leaves `Enabled` with no configuration, which is
+    /// left alone): it comes from a caller that stores a configuration below
+    /// the S3 surface, where only that surface carries the "versioning must
+    /// already be `Enabled`" precondition, or from external editing of the
+    /// state database (R25). One read pass collects both that residue and
+    /// every orphan per-version lock row — a row whose version no longer
+    /// exists — and one write pass applies both fixes before serving, using the
+    /// doctor's own ownership rule so the two cannot disagree on what an
+    /// orphan is. A read-only open repairs nothing.
+    /// [`Self::new_from_db`] does not repair at all: it is the doctor's
+    /// report-only inspection path.
+    ///
     /// # Errors
     ///
     /// [`Error::Io`] when the root does not exist or cannot be
     /// canonicalized; [`Error::InvalidValue`] when `options` fail
     /// validation; [`Error::RootNotDirectory`] when the root is not a
-    /// directory.
+    /// directory. A startup repair that cannot write its transaction is
+    /// [`Error::Database`], so an unenforceable lock-enabled bucket is never
+    /// served silently.
     #[instrument(target = "tinio::storage", level = "info", skip_all)]
     pub fn new(root: impl Into<PathBuf>, options: FsOptions) -> Result<Self, Error> {
         let (canonical, state_dir, options) = Self::resolve(root.into(), options)?;
@@ -505,6 +701,11 @@ impl FsStorage {
                 options.compact_threshold_percent,
             )?;
             tracing::info!(?compaction, "startup state-database compaction");
+            // OL31/R25: complete the partial lock-enabled buckets and clear
+            // every orphan lock row before this writable open serves — one
+            // read pass and one write pass, and the only place either repair
+            // runs.
+            repair_object_lock_state(&db).map_err(Error::from)?;
             Driver::new(db)
         };
         Self::from_resolved(canonical, state_dir, options, handle)
@@ -525,6 +726,11 @@ impl FsStorage {
     /// at the **tool-state** dir and hands it here, from answering the
     /// metadata legs out of a database that is not the root's (or from
     /// leaving a second database behind for this path to use).
+    ///
+    /// **This path never runs the Object Lock startup repair** (OL31): its
+    /// consumer is `doctor`, whose report is the product and which must not
+    /// repair, so the partial lock-enabled bucket and the orphan lock rows it
+    /// reports are repaired by the next serving open ([`Self::new`]) instead.
     ///
     /// A read-write caller keeps its handle, exactly as before.
     pub fn new_from_db(
@@ -1051,8 +1257,7 @@ impl FsStorage {
     /// pointed at a root a versioned build wrote, and a deleted bucket must
     /// leave neither rows nor blocks behind.
     pub(crate) async fn remove_bucket_state(&self, bucket: &Name) -> Result<(), Error> {
-        let bucket = bucket.clone();
-        // The subtree path is taken before the transaction consumes the
+        let bucket = bucket.clone(); // The subtree path is taken before the transaction consumes the
         // name. The blocks sit under the state dir (which may be on
         // another volume), so they cannot ride the caller's tombstone
         // rename — they are removed here, in the call the caller holds the
@@ -1089,6 +1294,11 @@ impl FsStorage {
                 // the one place the row can leave (and the stale-bucket stage
                 // of `Cleanup`, which runs this same call, gets its half).
                 bucket_lifecycle::Table::open(txn)?.drain_bucket(&bucket)?;
+                // OL4/OL6: the Object Lock rows die with the bucket too —
+                // its configuration, its per-version locks (an orphan
+                // included) and its upload intents.
+                bucket_object_lock::Table::open(txn)?.drain_bucket(&bucket)?;
+                version_object_lock::Table::open(txn)?.drain_bucket(&bucket)?;
                 drain_bucket_uploads(txn, &bucket)?;
                 Ok(())
             })
@@ -1174,6 +1384,11 @@ impl FsStorage {
                         decode_acl_wire(&acl_wire),
                     )
                 };
+                // OL6: the intent the create stored with the upload row — the
+                // lock fixed then, so a mid-upload configuration change cannot
+                // alter it. Read before the drain that consumes the upload.
+                let lock = upload_object_lock::Table::open(txn)?
+                    .get(bucket.as_ref().as_str(), &upload_id)?;
                 drain_upload(txn, &bucket, &upload_id)?;
                 {
                     let mut table = object_meta::Table::open(txn)?;
@@ -1193,6 +1408,19 @@ impl FsStorage {
                             owner: owner.clone(),
                             acl: acl.clone(),
                         },
+                    )?;
+                }
+                // OL6, OL7: the stored intent commits with the completed
+                // version's row, in the same transaction that consumed the
+                // upload. A lock that carries neither a retention nor a hold is
+                // not stored.
+                if let Some(lock) = lock.filter(|lock| lock.carries_fact()) {
+                    let wire = wire_of(version_id.as_ref());
+                    version_object_lock::Table::open(txn)?.put(
+                        bucket.as_ref().as_str(),
+                        key.as_ref().as_str(),
+                        &wire,
+                        &lock,
                     )?;
                 }
                 {

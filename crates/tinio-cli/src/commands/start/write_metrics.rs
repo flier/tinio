@@ -9,7 +9,7 @@
 //! category impls are being checked (a supertrait cycle). The backends' own impls are concrete,
 //! so these are too.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use tinio_util::metrics::{Backend, WriteFailureKind, WriteOp, record_write_failure};
@@ -23,7 +23,7 @@ use crate::{
         bucket::{self, Bucket},
         checksum, cors, lifecycle,
         multipart::{CompletedPart, MultipartUpload, ObjectPart, PartInfo, PartNumber},
-        object,
+        object, object_lock,
         storage::{
             BodyStream, BucketOps, BucketsListing, Error, GetObjectResult, LifecycleRules,
             ListBucketsParams, ListObjectsParams, ListPartsParams, ListUploadsParams, MultipartOps,
@@ -105,6 +105,52 @@ impl BucketOps for MetricsStorage<FsStorage> {
     {
         self.inner
             .create_bucket(name, owner, acl)
+            .await
+            .map_err(|err| self.failed(WriteOp::Put, err))
+    }
+
+    /// Forwards the lock-enabled create (OL27/OL28): a default body here would
+    /// silently answer the contract's fail-closed refusal on the real server,
+    /// so every new method is forwarded explicitly.
+    async fn create_bucket_with_lock(
+        &self,
+        name: &bucket::Name,
+        owner: Option<&acl::OwnerId>,
+        acl: &Acl,
+        config: &object_lock::Config,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .create_bucket_with_lock(name, owner, acl, config)
+            .await
+            .map_err(|err| self.failed(WriteOp::Put, err))
+    }
+
+    /// Forwards the Object Lock configuration reads and writes (OL27/OL28): a
+    /// default body here would silently answer the contract's fail-closed
+    /// refusal on the real server.
+    async fn get_bucket_object_lock(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<Option<object_lock::Config>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner.get_bucket_object_lock(name).await
+    }
+
+    async fn put_bucket_object_lock(
+        &self,
+        name: &bucket::Name,
+        config: &object_lock::Config,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .put_bucket_object_lock(name, config)
             .await
             .map_err(|err| self.failed(WriteOp::Put, err))
     }
@@ -315,6 +361,24 @@ impl ObjectOps for MetricsStorage<FsStorage> {
             .map_err(|err| self.failed(WriteOp::Put, err))
     }
 
+    /// Forwards the effective write-lock resolution (OL27/OL28): every
+    /// backend's answer is forwarded untouched, so the serving path never
+    /// receives a defaulted "unlocked".
+    async fn resolve_write_lock(
+        &self,
+        bucket: &bucket::Name,
+        explicit: Option<&object_lock::Retention>,
+        legal_hold: object_lock::LegalHold,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .resolve_write_lock(bucket, explicit, legal_hold, now)
+            .await
+    }
+
     async fn commit_object(
         &self,
         bucket: &bucket::Name,
@@ -323,12 +387,13 @@ impl ObjectOps for MetricsStorage<FsStorage> {
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, <Self as Storage>::Error>
     where
         Self: Storage,
     {
         self.inner
-            .commit_object(bucket, key, staged, tags, owner, acl)
+            .commit_object(bucket, key, staged, tags, owner, acl, lock)
             .await
             .map_err(|err| self.failed(WriteOp::Put, err))
     }
@@ -355,13 +420,14 @@ impl ObjectOps for MetricsStorage<FsStorage> {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
         _checksum: Option<checksum::Recorded>,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, <Self as Storage>::Error>
     where
         Self: Storage,
     {
         self.inner
             .copy_object(
-                src_bucket, src_key, dst_bucket, dst_key, tags, owner, acl, _checksum,
+                src_bucket, src_key, dst_bucket, dst_key, tags, owner, acl, _checksum, lock,
             )
             .await
             .map_err(|err| self.failed(WriteOp::Put, err))
@@ -505,12 +571,13 @@ impl MultipartOps for MetricsStorage<FsStorage> {
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<MultipartUpload, <Self as Storage>::Error>
     where
         Self: Storage,
     {
         self.inner
-            .create_multipart_upload(bucket, key, checksum, tags, owner, acl)
+            .create_multipart_upload(bucket, key, checksum, tags, owner, acl, lock)
             .await
             .map_err(|err| self.failed(WriteOp::Put, err))
     }
@@ -696,12 +763,13 @@ impl VersionOps for MetricsStorage<FsStorage> {
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
+        bypass: object_lock::Bypass,
     ) -> Result<Marker, <Self as Storage>::Error>
     where
         Self: Storage,
     {
         self.inner
-            .delete_object_version(bucket, key, version)
+            .delete_object_version(bucket, key, version, bypass)
             .await
             .map_err(|err| self.failed(WriteOp::Delete, err))
     }
@@ -783,6 +851,105 @@ impl VersionOps for MetricsStorage<FsStorage> {
             .await
             .map_err(|err| self.failed(WriteOp::Put, err))
     }
+
+    /// The server's version-lock read (OL28): a decorator that did not forward
+    /// it would answer the contract's fail-closed default on the real server.
+    /// Reads forward untouched.
+    async fn get_object_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<Option<object_lock::Retention>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner.get_object_retention(bucket, key, version).await
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<object_lock::LegalHold, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner.get_object_legal_hold(bucket, key, version).await
+    }
+
+    /// The echo's single lock read (OL28): forwarded so the decorator does not
+    /// fall back to the default's two reads.
+    async fn object_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner.object_lock(bucket, key, version).await
+    }
+
+    /// The server's retention write (R22): a decorator that did not forward it
+    /// would answer the contract's fail-closed default on the real server.
+    async fn set_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        requested: Option<&object_lock::Retention>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .set_retention(bucket, key, address, requested, bypass, now)
+            .await
+            .map_err(|err| self.failed(WriteOp::Put, err))
+    }
+
+    /// The server's legal-hold write (R22), forwarded for the same reason.
+    async fn set_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        hold: object_lock::LegalHold,
+    ) -> Result<object_lock::Lock, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .set_legal_hold(bucket, key, address, hold)
+            .await
+            .map_err(|err| self.failed(WriteOp::Put, err))
+    }
+
+    /// The combined retention and legal-hold write (OL23): forwarded so the
+    /// decorator never answers the contract's fail-closed default.
+    async fn update_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        retention: Option<Option<&object_lock::Retention>>,
+        legal_hold: Option<object_lock::LegalHold>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .update_lock(bucket, key, address, retention, legal_hold, bypass, now)
+            .await
+            .map_err(|err| self.failed(WriteOp::Put, err))
+    }
 }
 
 #[async_trait]
@@ -830,6 +997,52 @@ impl BucketOps for MetricsStorage<PgStorage> {
     {
         self.inner
             .create_bucket(name, owner, acl)
+            .await
+            .map_err(|err| self.failed(WriteOp::Put, err))
+    }
+
+    /// Forwards the lock-enabled create (OL27/OL28): a default body here would
+    /// silently answer the contract's fail-closed refusal on the real server,
+    /// so every new method is forwarded explicitly.
+    async fn create_bucket_with_lock(
+        &self,
+        name: &bucket::Name,
+        owner: Option<&acl::OwnerId>,
+        acl: &Acl,
+        config: &object_lock::Config,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .create_bucket_with_lock(name, owner, acl, config)
+            .await
+            .map_err(|err| self.failed(WriteOp::Put, err))
+    }
+
+    /// Forwards the Object Lock configuration reads and writes (OL27/OL28): a
+    /// default body here would silently answer the contract's fail-closed
+    /// refusal on the real server.
+    async fn get_bucket_object_lock(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<Option<object_lock::Config>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner.get_bucket_object_lock(name).await
+    }
+
+    async fn put_bucket_object_lock(
+        &self,
+        name: &bucket::Name,
+        config: &object_lock::Config,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .put_bucket_object_lock(name, config)
             .await
             .map_err(|err| self.failed(WriteOp::Put, err))
     }
@@ -1041,6 +1254,24 @@ impl ObjectOps for MetricsStorage<PgStorage> {
             .map_err(|err| self.failed(WriteOp::Put, err))
     }
 
+    /// Forwards the effective write-lock resolution (OL27/OL28): every
+    /// backend's answer is forwarded untouched, so the serving path never
+    /// receives a defaulted "unlocked".
+    async fn resolve_write_lock(
+        &self,
+        bucket: &bucket::Name,
+        explicit: Option<&object_lock::Retention>,
+        legal_hold: object_lock::LegalHold,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .resolve_write_lock(bucket, explicit, legal_hold, now)
+            .await
+    }
+
     async fn commit_object(
         &self,
         bucket: &bucket::Name,
@@ -1049,12 +1280,13 @@ impl ObjectOps for MetricsStorage<PgStorage> {
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, <Self as Storage>::Error>
     where
         Self: Storage,
     {
         self.inner
-            .commit_object(bucket, key, staged, tags, owner, acl)
+            .commit_object(bucket, key, staged, tags, owner, acl, lock)
             .await
             .map_err(|err| self.failed(WriteOp::Put, err))
     }
@@ -1081,13 +1313,14 @@ impl ObjectOps for MetricsStorage<PgStorage> {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
         _checksum: Option<checksum::Recorded>,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, <Self as Storage>::Error>
     where
         Self: Storage,
     {
         self.inner
             .copy_object(
-                src_bucket, src_key, dst_bucket, dst_key, tags, owner, acl, _checksum,
+                src_bucket, src_key, dst_bucket, dst_key, tags, owner, acl, _checksum, lock,
             )
             .await
             .map_err(|err| self.failed(WriteOp::Put, err))
@@ -1232,12 +1465,13 @@ impl MultipartOps for MetricsStorage<PgStorage> {
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<MultipartUpload, <Self as Storage>::Error>
     where
         Self: Storage,
     {
         self.inner
-            .create_multipart_upload(bucket, key, checksum, tags, owner, acl)
+            .create_multipart_upload(bucket, key, checksum, tags, owner, acl, lock)
             .await
             .map_err(|err| self.failed(WriteOp::Put, err))
     }
@@ -1424,12 +1658,13 @@ impl VersionOps for MetricsStorage<PgStorage> {
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
+        bypass: object_lock::Bypass,
     ) -> Result<Marker, <Self as Storage>::Error>
     where
         Self: Storage,
     {
         self.inner
-            .delete_object_version(bucket, key, version)
+            .delete_object_version(bucket, key, version, bypass)
             .await
             .map_err(|err| self.failed(WriteOp::Delete, err))
     }
@@ -1508,6 +1743,105 @@ impl VersionOps for MetricsStorage<PgStorage> {
     {
         self.inner
             .set_version_acl(bucket, key, version, acl)
+            .await
+            .map_err(|err| self.failed(WriteOp::Put, err))
+    }
+
+    /// The server's version-lock read (OL28): a decorator that did not forward
+    /// it would answer the contract's fail-closed default on the real server.
+    /// Reads forward untouched.
+    async fn get_object_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<Option<object_lock::Retention>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner.get_object_retention(bucket, key, version).await
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<object_lock::LegalHold, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner.get_object_legal_hold(bucket, key, version).await
+    }
+
+    /// The echo's single lock read (OL28): forwarded so the decorator does not
+    /// fall back to the default's two reads.
+    async fn object_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner.object_lock(bucket, key, version).await
+    }
+
+    /// The server's retention write (R22), forwarded so the decorator never
+    /// answers the contract's fail-closed default.
+    async fn set_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        requested: Option<&object_lock::Retention>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .set_retention(bucket, key, address, requested, bypass, now)
+            .await
+            .map_err(|err| self.failed(WriteOp::Put, err))
+    }
+
+    /// The server's legal-hold write (R22), forwarded for the same reason.
+    async fn set_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        hold: object_lock::LegalHold,
+    ) -> Result<object_lock::Lock, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .set_legal_hold(bucket, key, address, hold)
+            .await
+            .map_err(|err| self.failed(WriteOp::Put, err))
+    }
+
+    /// The combined retention and legal-hold write (OL23): forwarded so the
+    /// decorator never answers the contract's fail-closed default.
+    async fn update_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        retention: Option<Option<&object_lock::Retention>>,
+        legal_hold: Option<object_lock::LegalHold>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        self.inner
+            .update_lock(bucket, key, address, retention, legal_hold, bypass, now)
             .await
             .map_err(|err| self.failed(WriteOp::Put, err))
     }

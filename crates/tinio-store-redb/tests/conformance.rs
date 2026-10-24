@@ -11,7 +11,8 @@
 
 use tinio_store_redb::RedbMetadata;
 use tinio_util::testing::metadata::{
-    assert_guarded_write_conformance, assert_metadata_conformance,
+    assert_guarded_write_conformance, assert_metadata_conformance, assert_object_lock_conformance,
+    assert_object_lock_upload_conformance,
 };
 
 #[tokio::test]
@@ -28,4 +29,21 @@ async fn metadata_conforms() {
 async fn guarded_writes_conform() {
     let store = RedbMetadata::in_memory().expect("the in-memory store opens");
     assert_guarded_write_conformance(&store).await;
+}
+
+/// Object Lock's bucket-configuration, per-version, delete, batch and drain
+/// rules (OL4–OL8, OL21) over the shared redb tables. The corrupt-row legs are
+/// the store's own (`meta/version.rs`, `meta/bucket.rs`): only it can plant a
+/// row its decoder rejects.
+#[tokio::test]
+async fn object_lock_conforms() {
+    let store = RedbMetadata::in_memory().expect("the in-memory store opens");
+    assert_object_lock_conformance(&store).await;
+}
+
+/// The multipart lock-intent contract over the same tables (OL6, OL21).
+#[tokio::test]
+async fn object_lock_upload_conforms() {
+    let store = RedbMetadata::in_memory().expect("the in-memory store opens");
+    assert_object_lock_upload_conformance(&store).await;
 }

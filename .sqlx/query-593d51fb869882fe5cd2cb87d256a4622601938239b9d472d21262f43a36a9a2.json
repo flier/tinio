@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO bucket_object_lock (bucket, enabled, rule)\nVALUES ($1, $2, $3)\nON CONFLICT (bucket) DO UPDATE SET\n    enabled = excluded.enabled,\n    rule = excluded.rule\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "593d51fb869882fe5cd2cb87d256a4622601938239b9d472d21262f43a36a9a2"
+}

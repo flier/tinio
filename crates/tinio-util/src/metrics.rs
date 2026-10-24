@@ -1,4 +1,4 @@
-//! The five cross-backend Prometheus families, declared once.
+//! The six cross-backend Prometheus families, declared once.
 //!
 //! A family two backends observe cannot live in either: the default registry
 //! is process-global, so the second `register_*` is `AlreadyReg`. This module
@@ -7,11 +7,13 @@
 //!
 //! Labels are bounded by their call sites — `backend` (`fs`, `mem`, `pg`),
 //! `op`/`kind` (the failed write and its closed failure class), `pass`
-//! (`fs_sweep`, `blob_sweep`, `pg_cleanup`) and `section` (the failing
-//! stage). No path, key, bucket or identifier may become a label.
+//! (`fs_sweep`, `blob_sweep`, `pg_cleanup`), `section` (the failing stage) and
+//! `operation`/`reason` (the Object Lock refusal class). No path, key, bucket
+//! or identifier may become a label.
 //!
-//! This is a metrics vocabulary, not a layer: no `tracing`, no `tinio-core`
-//! type, no `tokio`.
+//! This is a metrics vocabulary, not a layer: no `tracing`, no `tokio`, and
+//! only the model's [`RefusalReason`] from `tinio-core` — the one enum the
+//! `reason` label is projected from, so its domain cannot drift.
 //!
 //! # Examples
 //!
@@ -19,8 +21,9 @@
 //! use std::time::Duration;
 //!
 //! use tinio_util::metrics::{
-//!     Backend, FsSection, Pass, WriteFailureKind, WriteOp, record_corrupt_rows,
-//!     record_fs_pass_failure, record_pass_duration, record_read_only, record_write_failure,
+//!     Backend, FsSection, LockOperation, Pass, WriteFailureKind, WriteOp, record_corrupt_rows,
+//!     record_fs_pass_failure, record_pass_duration, record_protected_deletion, record_read_only,
+//!     record_write_failure,
 //! };
 //!
 //! record_write_failure(Backend::Fs, WriteOp::Put, WriteFailureKind::Io);
@@ -28,6 +31,10 @@
 //! record_fs_pass_failure(FsSection::Tmp);
 //! record_read_only(Backend::Fs, false);
 //! record_corrupt_rows(Backend::Fs, 1);
+//! record_protected_deletion(
+//!     LockOperation::Lifecycle,
+//!     tinio_core::object_lock::RefusalReason::Governance,
+//! );
 //! assert!(!prometheus::default_registry().gather().is_empty());
 //! ```
 
@@ -40,6 +47,7 @@ use prometheus::{
     HistogramVec, IntCounterVec, IntGaugeVec, register_histogram_vec, register_int_counter_vec,
     register_int_gauge_vec,
 };
+use tinio_core::object_lock::RefusalReason;
 
 /// Pass-duration buckets, in seconds: one pass ranges from a sub-second
 /// scan to the hour-scale sweep's walk.
@@ -80,6 +88,14 @@ static FAMILIES: LazyLock<Families> = LazyLock::new(|| Families {
         &["backend"]
     )
     .registered("tinio_storage_corrupt_rows_total"),
+    protected_deletions: register_int_counter_vec!(
+        "tinio_object_lock_protected_deletions_total",
+        "Permanent-delete refusals by a stored Object Lock, counted per refusal: \
+         the lifecycle pass counts refusals per pass, not distinct versions, by \
+         operation and reason",
+        &["operation", "reason"]
+    )
+    .registered("tinio_object_lock_protected_deletions_total"),
 });
 
 /// Registration helper: a duplicate or malformed family name is a source-level
@@ -104,7 +120,7 @@ impl<T> RegisteredExt<T> for Result<T, prometheus::Error> {
     }
 }
 
-/// The five families, held together so one `LazyLock` runs the five
+/// The six families, held together so one `LazyLock` runs the six
 /// registrations.
 struct Families {
     write_failures: IntCounterVec,
@@ -112,10 +128,11 @@ struct Families {
     pass_failures: IntCounterVec,
     read_only: IntGaugeVec,
     corrupt_rows: IntCounterVec,
+    protected_deletions: IntCounterVec,
 }
 
 /// A status code as a metric label: the common codes are static, the rest
-/// format into the caller's [`itoa::Buffer`].
+/// format into the caller's `itoa::Buffer`.
 #[macro_export]
 macro_rules! status_label {
     ($status:expr, $buffer:ident) => {
@@ -434,11 +451,85 @@ pub fn record_corrupt_rows(backend: Backend, count: u64) {
         .inc_by(count);
 }
 
+/// The operation whose permanent delete a stored Object Lock refused — the
+/// closed `operation` label of
+/// `tinio_object_lock_protected_deletions_total` (OL25).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockOperation {
+    /// A single `DeleteObject?versionId`.
+    DeleteObject,
+    /// A `DeleteObjects` batch entry.
+    DeleteObjects,
+    /// The lifecycle pass's noncurrent expiration. This label's counter is the
+    /// number of refusals the passes made, so a version the rule re-scans each
+    /// pass is counted once per pass.
+    Lifecycle,
+    /// A backend sweeper's retention pass.
+    Sweeper,
+}
+
+impl LockOperation {
+    /// The label value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeleteObject => "delete_object",
+            Self::DeleteObjects => "delete_objects",
+            Self::Lifecycle => "lifecycle",
+            Self::Sweeper => "sweeper",
+        }
+    }
+}
+
+/// The metric label for a model refusal reason (OL11, OL25).
+///
+/// The model's `Display` is the operator-facing text (`"legal hold"`, with a
+/// space), never a wire or label value, so the label is mapped explicitly.
+/// There is deliberately no mirror enum: a second type and a hand-written
+/// conversion would be the same fact twice, and the model's domain is already
+/// exactly the label set.
+fn reason_label(reason: RefusalReason) -> &'static str {
+    match reason {
+        RefusalReason::LegalHold => "legal_hold",
+        RefusalReason::Compliance => "compliance",
+        RefusalReason::Governance => "governance",
+    }
+}
+
+/// Record one permanent delete a stored Object Lock refused.
+///
+/// This is the one entry point for the family: the S3 delete sites, the
+/// lifecycle pass and the backends' sweepers all call it, passing the
+/// [`RefusalReason`] their `Locked` error carries straight through — so the
+/// family's two bounded labels have one producer and no path, key, bucket or
+/// version can become a series.
+///
+/// The counter is **per refusal, not per version**: a lifecycle pass that
+/// re-scans a still-protected version on every pass increments once per pass.
+/// Read it as "how often protection stopped a delete", not as a distinct-version
+/// gauge.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::object_lock::RefusalReason;
+/// use tinio_util::metrics::{LockOperation, record_protected_deletion};
+///
+/// record_protected_deletion(LockOperation::DeleteObject, RefusalReason::LegalHold);
+/// ```
+pub fn record_protected_deletion(operation: LockOperation, reason: RefusalReason) {
+    FAMILIES
+        .protected_deletions
+        .with_label_values(&[operation.as_str(), reason_label(reason)])
+        .inc();
+}
+
 #[cfg(test)]
 mod tests {
     use prometheus::{Encoder, TextEncoder, default_registry};
 
     use super::*;
+    #[cfg(feature = "testing")]
+    use crate::testing::metrics::protected_deletions;
 
     fn exposition() -> String {
         let mut buffer = Vec::new();
@@ -449,12 +540,13 @@ mod tests {
     }
 
     #[test]
-    fn the_five_families_render_their_recorded_values() {
+    fn the_six_families_render_their_recorded_values() {
         record_write_failure(Backend::Fs, WriteOp::Put, WriteFailureKind::Io);
         record_pass_duration(Pass::BlobSweep, Duration::from_millis(250));
         record_blob_pass_failure(BlobSection::Walk);
         record_read_only(Backend::Fs, true);
         record_corrupt_rows(Backend::Fs, 2);
+        record_protected_deletion(LockOperation::Lifecycle, RefusalReason::Compliance);
 
         let text = exposition();
         assert!(
@@ -481,5 +573,59 @@ mod tests {
             text.contains(r#"tinio_storage_corrupt_rows_total{backend="fs"}"#),
             "the corrupt-rows counter accumulates: {text}"
         );
+        assert!(
+            text.contains(
+                r#"tinio_object_lock_protected_deletions_total{operation="lifecycle",reason="compliance"}"#
+            ),
+            "the protected-deletions counter carries its two labels: {text}"
+        );
+    }
+
+    #[test]
+    fn the_protected_deletion_family_registers_once_with_both_label_domains() {
+        for operation in [
+            LockOperation::DeleteObject,
+            LockOperation::DeleteObjects,
+            LockOperation::Lifecycle,
+            LockOperation::Sweeper,
+        ] {
+            for reason in [
+                RefusalReason::LegalHold,
+                RefusalReason::Compliance,
+                RefusalReason::Governance,
+            ] {
+                record_protected_deletion(operation, reason);
+            }
+        }
+
+        let gathered = default_registry().gather();
+        assert_eq!(
+            gathered
+                .iter()
+                .filter(|family| family.name() == "tinio_object_lock_protected_deletions_total")
+                .count(),
+            1,
+            "the family is registered exactly once"
+        );
+        let text = exposition();
+        for operation in ["delete_object", "delete_objects", "lifecycle", "sweeper"] {
+            for reason in ["legal_hold", "compliance", "governance"] {
+                let series = format!(
+                    r#"tinio_object_lock_protected_deletions_total{{operation="{operation}",reason="{reason}"}}"#
+                );
+                assert!(
+                    text.contains(&series),
+                    "the family exposes {operation}/{reason}: {text}"
+                );
+                // The shared delta fixture (behind `testing`) reads the same
+                // series the exposition renders; every pair was recorded
+                // above, so the value can only have grown.
+                #[cfg(feature = "testing")]
+                assert!(
+                    protected_deletions(operation, reason) >= 1.0,
+                    "the shared fixture reads {operation}/{reason}"
+                );
+            }
+        }
     }
 }

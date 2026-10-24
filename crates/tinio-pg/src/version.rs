@@ -47,7 +47,7 @@ use tinio_core::{
     bucket::Name,
     content::{ContentKey, PublishId},
     meta::object::{PartRow, Row as ObjectRow},
-    object,
+    object, object_lock,
     storage::{TagWriteResult, VersionOps},
     version::{Id, Marker},
 };
@@ -89,6 +89,10 @@ impl crate::PgStorage {
     }
 
     /// No version plane: the write is the engine's version-free commit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the write's field set — bucket, key, staged body, tags, owner, ACL and the effective lock — is forwarded unchanged to the contract"
+    )]
     pub(crate) async fn commit_put(
         &self,
         bucket: &Name,
@@ -97,9 +101,10 @@ impl crate::PgStorage {
         tags: object::Tags,
         owner: Option<&OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, crate::Error> {
         self.objects()
-            .commit_object(bucket, key, staged, tags, owner, acl)
+            .commit_object(bucket, key, staged, tags, owner, acl, lock)
             .await
             .map_err(crate::Error::from)
     }
@@ -126,7 +131,8 @@ impl crate::PgStorage {
         &self,
         _bucket: &Name,
         _key: &object::Key,
-        _write: &OpenedWrite,
+        _write: &mut OpenedWrite,
+        _lock: Option<&object_lock::Lock>,
     ) -> Result<(), crate::Error> {
         Ok(())
     }
@@ -190,7 +196,7 @@ pub(crate) use self::enabled::{Plane, plane};
 
 #[cfg(feature = "versioning")]
 mod enabled {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::SystemTime};
 
     use async_trait::async_trait;
     use tinio_blob::Store;
@@ -203,7 +209,7 @@ mod enabled {
             object::{PartRow, Row as ObjectRow},
             version::Kind,
         },
-        object,
+        object, object_lock,
         storage::{self, ByteRange, TagWriteResult, VersionOps},
         version::{
             self, CurrentVersion, Entry, HeadResult, Id, ListParams, Listing, Marker, ReadResult,
@@ -335,8 +341,12 @@ mod enabled {
 
         async fn set_bucket_versioning(&self, bucket: &Name, state: State) -> Result<(), Error> {
             self.writable(Subject::Bucket(bucket))?;
-            self.objects()
-                .set_bucket_versioning(self.plane(), bucket, state)
+            // R21: the guarded store write takes the bucket row and refuses
+            // `Suspended` over an enabled Object Lock configuration, so a
+            // suspend cannot commit between a retention write's configuration
+            // and state reads (OL13). The engine's unguarded `set_state` would
+            // leave that window open.
+            VersionMeta::set_bucket_state_guarded(&*self.store, bucket, state)
                 .await
                 .map_err(Error::from)
         }
@@ -352,6 +362,7 @@ mod enabled {
             version: Option<&Id>,
             range: Option<ByteRange>,
         ) -> Result<ReadResult, Error> {
+            self.ensure_bucket(bucket).await?;
             self.objects()
                 .get_object_version(self.plane(), bucket, key, version, range)
                 .await
@@ -364,6 +375,7 @@ mod enabled {
             key: &object::Key,
             version: Option<&Id>,
         ) -> Result<HeadResult, Error> {
+            self.ensure_bucket(bucket).await?;
             self.objects()
                 .head_object_version(self.plane(), bucket, key, version)
                 .await
@@ -375,10 +387,11 @@ mod enabled {
             bucket: &Name,
             key: &object::Key,
             version: Option<&Id>,
+            bypass: object_lock::Bypass,
         ) -> Result<Marker, Error> {
             self.writable(Subject::Key(key))?;
             self.objects()
-                .delete_object_version(self.plane(), bucket, key, version)
+                .delete_object_version(self.plane(), bucket, key, version, bypass)
                 .await
                 .map_err(Error::from)
         }
@@ -470,6 +483,111 @@ mod enabled {
                 .await
                 .map_err(Error::from)
         }
+
+        /// Set or clear a version's retention (R22) — the engine body's
+        /// address resolution and the store's one atomic, row-locking write.
+        async fn set_retention(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            address: &version::Address,
+            requested: Option<&object_lock::Retention>,
+            bypass: object_lock::Bypass,
+            now: SystemTime,
+        ) -> Result<Option<object_lock::Lock>, Error> {
+            self.writable(Subject::Key(key))?;
+            self.objects()
+                .set_retention(self.plane(), bucket, key, address, requested, bypass, now)
+                .await
+                .map_err(Error::from)
+        }
+
+        /// Set or clear a version's legal hold (R22) — the same address
+        /// resolution and atomic store write, the retention preserved.
+        async fn set_legal_hold(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            address: &version::Address,
+            hold: object_lock::LegalHold,
+        ) -> Result<object_lock::Lock, Error> {
+            self.writable(Subject::Key(key))?;
+            self.objects()
+                .set_legal_hold(self.plane(), bucket, key, address, hold)
+                .await
+                .map_err(Error::from)
+        }
+
+        /// The combined retention and legal-hold update (OL23) — the same
+        /// address resolution and one atomic store write, so a refused
+        /// retention leaves neither member applied.
+        async fn update_lock(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            address: &version::Address,
+            retention: Option<Option<&object_lock::Retention>>,
+            legal_hold: Option<object_lock::LegalHold>,
+            bypass: object_lock::Bypass,
+            now: SystemTime,
+        ) -> Result<Option<object_lock::Lock>, Error> {
+            self.writable(Subject::Key(key))?;
+            self.objects()
+                .update_lock(
+                    self.plane(),
+                    bucket,
+                    key,
+                    address,
+                    retention,
+                    legal_hold,
+                    bypass,
+                    now,
+                )
+                .await
+                .map_err(Error::from)
+        }
+
+        /// A version's whole lock in one store read (OL8, OL28): the store's
+        /// `version_lock` already selects the retention and the hold from the
+        /// one row, so the GET/HEAD echo pays one read rather than the trait
+        /// default's two.
+        async fn object_lock(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            version: Option<&Id>,
+        ) -> Result<Option<object_lock::Lock>, Error> {
+            VersionMeta::version_lock(&*self.store, bucket, key, version)
+                .await
+                .map_err(Error::from)
+        }
+
+        /// The server's retention read and the GET/HEAD lock-header echo
+        /// (OL8, OL28): one store read, fail-closed rather than defaulting to
+        /// "unlocked".
+        async fn get_object_retention(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            version: Option<&Id>,
+        ) -> Result<Option<object_lock::Retention>, Error> {
+            VersionMeta::get_object_retention(&*self.store, bucket, key, version)
+                .await
+                .map_err(Error::from)
+        }
+
+        /// The server's legal-hold read (OL8, OL28), the same store call the
+        /// version plane's own read makes.
+        async fn get_object_legal_hold(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            version: Option<&Id>,
+        ) -> Result<object_lock::LegalHold, Error> {
+            VersionMeta::get_object_legal_hold(&*self.store, bucket, key, version)
+                .await
+                .map_err(Error::from)
+        }
     }
 
     /// The engine's marker-write port over this storage's store: a marker is a recorded slot
@@ -524,6 +642,10 @@ mod enabled {
         history_seq: Option<u64>,
         /// The slot this open found, before it superseded anything. `None` when the key had none.
         previous_slot: Option<PreviousSlot>,
+        /// Whether `close_put_write` stored a lock row for this write's identity.
+        /// The undo removes exactly the row this completion wrote; a lock the
+        /// advance would not store must not be deleted by the compensation.
+        lock_written: bool,
     }
 
     impl OpenedWrite {
@@ -593,6 +715,7 @@ mod enabled {
                     records: false,
                     history_seq: None,
                     previous_slot: None,
+                    lock_written: false,
                 });
             }
             // Read before the supersede. A failure after the slot moves puts this
@@ -627,6 +750,7 @@ mod enabled {
                 records: true,
                 history_seq,
                 previous_slot,
+                lock_written: false,
             })
         }
 
@@ -642,19 +766,39 @@ mod enabled {
             &self,
             bucket: &Name,
             key: &object::Key,
-            write: &OpenedWrite,
+            write: &mut OpenedWrite,
+            lock: Option<&object_lock::Lock>,
         ) -> Result<(), Error> {
             if let Some(plan) = &write.plan {
-                VersionMeta::advance_slot(&*self.store, bucket, key, write.id.clone(), plan.seq)
-                    .await
-                    .map_err(storage::Error::from)?;
+                // OL6, OL7: the create-time lock intent rides the slot
+                // advance — written with the completed version's identity and
+                // never clearing an existing row.
+                VersionMeta::advance_slot_with(
+                    &*self.store,
+                    bucket,
+                    key,
+                    write.id.clone(),
+                    plan.seq,
+                    lock,
+                )
+                .await
+                .map_err(storage::Error::from)?;
             }
+            // The compensation must remove only a row this close actually
+            // stored: the advance writes nothing for a plan-less write or an
+            // empty lock (OL5).
+            write.lock_written =
+                write.plan.is_some() && lock.is_some_and(object_lock::Lock::carries_fact);
             Ok(())
         }
 
         /// The version-creating put when this build has the plane. The engine
         /// reads the bucket's state and takes the version-free body when the
         /// bucket records none, so the caller does not spell the branch.
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "the write's field set — bucket, key, staged body, tags, owner, ACL and the effective lock — is forwarded unchanged into the version engine"
+        )]
         pub(crate) async fn commit_put(
             &self,
             bucket: &Name,
@@ -663,9 +807,20 @@ mod enabled {
             tags: object::Tags,
             owner: Option<&OwnerId>,
             acl: &Acl,
+            lock: Option<&object_lock::Lock>,
         ) -> Result<object::Info, Error> {
             self.objects()
-                .put_object_versioned(&self.plane, bucket, key, staged, tags, owner, acl, self)
+                .put_object_versioned(
+                    &self.plane,
+                    bucket,
+                    key,
+                    staged,
+                    tags,
+                    owner,
+                    acl,
+                    lock,
+                    self,
+                )
                 .await
                 .map_err(Error::from)
         }
@@ -784,6 +939,17 @@ mod enabled {
                         .await
                         .map_err(storage::Error::from)?;
                 }
+            }
+            // The slot restore does not touch lock rows, so the compensation
+            // removes the intent the advance stored beside it. A failed drain
+            // after `Landed::Slot` would otherwise leave a lock row naming a
+            // version this undo took back. A newer writer that owns the head
+            // (`!owned`) keeps the row: the version is still current for it.
+            if write.lock_written {
+                self.store
+                    .clear_version_lock(bucket, key, write.id.as_ref())
+                    .await
+                    .map_err(storage::Error::from)?;
             }
             Ok(())
         }
@@ -1010,7 +1176,15 @@ mod tests {
             .await
             .expect("the object is staged");
         let committed = storage
-            .commit_object(&bucket, &key, staged, object::Tags::empty(), None, &acl)
+            .commit_object(
+                &bucket,
+                &key,
+                staged,
+                object::Tags::empty(),
+                None,
+                &acl,
+                None,
+            )
             .await
             .expect("the versioned commit");
         let superseded = committed

@@ -40,7 +40,7 @@ use crate::{
 };
 use crate::{
     _core::{
-        acl, object,
+        acl, object, object_lock,
         storage::{ListBucketsParams, Storage},
     },
     backend::{
@@ -101,10 +101,30 @@ impl<S: Storage> S3Backend<S> {
             Some((owner, acl)) => (Some(owner), acl),
             None => (None, &default_acl),
         };
-        self.storage
-            .create_bucket(&name, owner, acl)
-            .await
-            .map_err(map_backend_error)?;
+        // Object Lock on create (OL1, OL13): `x-amz-bucket-object-lock-enabled`
+        // is s3s's parsed bool (its bool parser answers `400 InvalidArgument`
+        // on anything else before this handler runs). `true` creates the
+        // bucket with versioning `Enabled` and an enabled configuration in one
+        // step (the backend's atomic create, or the documented compensating
+        // one); the capability does not gate it — R13 honours the header with
+        // `[s3] object_lock` off, while the six surfaces stay refused.
+        let lock_enabled = req.input.object_lock_enabled_for_bucket.unwrap_or(false);
+        let created = if lock_enabled {
+            let config = object_lock::Config {
+                enabled: true,
+                rule: None,
+            };
+            self.storage
+                .create_bucket_with_lock(&name, owner, acl, &config)
+                .await
+        } else {
+            self.storage.create_bucket(&name, owner, acl).await
+        };
+        created.map_err(map_backend_error)?;
+        // OL18: a bucket recreated (or created) must not inherit a stale
+        // cache answer.
+        #[cfg(feature = "object-lock")]
+        self.object_lock_cache().insert(&name, lock_enabled);
         Ok(S3Response::new(CreateBucketOutput {
             // Directory-bucket only: plain buckets carry no ARN.
             bucket_arn: None,
@@ -121,6 +141,12 @@ impl<S: Storage> S3Backend<S> {
             .delete_bucket(&name)
             .await
             .map_err(map_backend_error)?;
+        // OL18: the deleted bucket stores no configuration now, so its entry
+        // is rewritten `false` — a reader that read `true` before the delete
+        // cannot resurrect it, and a bucket created again under the same name
+        // rewrites the entry with its own `lock_enabled`.
+        #[cfg(feature = "object-lock")]
+        self.object_lock_cache().insert(&name, false);
         Ok(S3Response::new(DeleteBucketOutput::default()))
     }
 

@@ -52,9 +52,9 @@ use crate::{
         meta::{
             BucketMeta, Metadata, ObjectMeta, UploadMeta, VersionMeta, bucket as bucket_row,
             object as object_row, upload as upload_row,
-            version::{Current as RowCurrent, Stored},
+            version::{Current as RowCurrent, ExpireReport, Expired, Stored},
         },
-        multipart, object, storage,
+        multipart, object, object_lock, storage,
         version::{self, State},
     },
     _store_redb::{RedbMetadata, bucket_versioning, object_meta},
@@ -437,6 +437,36 @@ impl BucketMeta for Rows {
             .await
             .map_err(Into::into)
     }
+
+    /// The bucket's Object Lock configuration, delegated to the shared row
+    /// (Task 3 owns the table and the fs current/marker enforcement).
+    async fn object_lock(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Option<object_lock::Config>, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::object_lock(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_object_lock(
+        &self,
+        bucket: &bucket::Name,
+        config: &object_lock::Config,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::set_object_lock(&self.engine, bucket, config)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn clear_object_lock(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        <RedbMetadata as BucketMeta>::clear_object_lock(&self.engine, bucket)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 #[async_trait]
@@ -797,6 +827,58 @@ impl UploadMeta for Rows {
             .await
             .map_err(Into::into)
     }
+
+    /// The upload's lock intent, delegated to the shared row (Task 3 owns the
+    /// table; the fs completion/abort apply it).
+    async fn create_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &upload_row::Row,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::create_with_lock(&self.engine, bucket, upload_id, row, lock)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn create_guarded_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &upload_row::Row,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::create_guarded_with_lock(
+            &self.engine,
+            bucket,
+            upload_id,
+            row,
+            lock,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn upload_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+    ) -> Result<Option<object_lock::Lock>, <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::upload_lock(&self.engine, bucket, upload_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn clear_upload_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        <RedbMetadata as UploadMeta>::clear_upload_lock(&self.engine, bucket, upload_id)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 #[async_trait]
@@ -945,6 +1027,162 @@ impl VersionMeta for Rows {
             .map_err(Into::into)
     }
 
+    /// The test-only raw writer, delegated under the contract's own gate.
+    #[cfg(any(test, feature = "testing"))]
+    async fn set_version_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), Self::Error> {
+        <RedbMetadata as VersionMeta>::set_version_lock(&self.engine, bucket, key, version, lock)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn version_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+    ) -> Result<Option<object_lock::Lock>, Self::Error> {
+        <RedbMetadata as VersionMeta>::version_lock(&self.engine, bucket, key, version)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_object_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+    ) -> Result<Option<object_lock::Retention>, Self::Error> {
+        <RedbMetadata as VersionMeta>::get_object_retention(&self.engine, bucket, key, version)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+    ) -> Result<object_lock::LegalHold, Self::Error> {
+        <RedbMetadata as VersionMeta>::get_object_legal_hold(&self.engine, bucket, key, version)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+        requested: Option<&object_lock::Retention>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, Self::Error> {
+        // Serialized with the delete path's pre-check and unlink: a lock
+        // granted between them could otherwise turn the store's authoritative
+        // re-check into a refusal after the protected bytes were removed
+        // (OL8/OL12). The mutation guard is this backend's one serialization
+        // point; the lock is not reentrant, so no fs write path calls this
+        // while holding it.
+        let _guard = self.storage.lock_bucket_mutations(bucket).await;
+        <RedbMetadata as VersionMeta>::set_retention(
+            &self.engine,
+            bucket,
+            key,
+            version,
+            requested,
+            bypass,
+            now,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn set_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+        hold: object_lock::LegalHold,
+    ) -> Result<object_lock::Lock, Self::Error> {
+        // The same serialization as `set_retention`: a hold granted between
+        // the delete arm's pre-check and its unlink must wait.
+        let _guard = self.storage.lock_bucket_mutations(bucket).await;
+        <RedbMetadata as VersionMeta>::set_legal_hold(&self.engine, bucket, key, version, hold)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The combined retention and legal-hold update, under the same bucket
+    /// mutation guard as the single-member writes: one engine transaction
+    /// decides and stores both members, and a refused retention leaves neither
+    /// applied (OL23).
+    async fn set_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+        retention: Option<Option<&object_lock::Retention>>,
+        legal_hold: Option<object_lock::LegalHold>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, Self::Error> {
+        let _guard = self.storage.lock_bucket_mutations(bucket).await;
+        <RedbMetadata as VersionMeta>::set_lock(
+            &self.engine,
+            bucket,
+            key,
+            version,
+            retention,
+            legal_hold,
+            bypass,
+            now,
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn expire_with(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seq: u64,
+        bypass: object_lock::Bypass,
+    ) -> Result<Expired, Self::Error> {
+        <RedbMetadata as VersionMeta>::expire_with(&self.engine, bucket, key, seq, bypass)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn expire_many_report(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seqs: &[u64],
+    ) -> Result<ExpireReport, Self::Error> {
+        <RedbMetadata as VersionMeta>::expire_many_report(&self.engine, bucket, key, seqs)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn advance_slot_with(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        id: Option<version::Id>,
+        seq: u64,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), Self::Error> {
+        <RedbMetadata as VersionMeta>::advance_slot_with(&self.engine, bucket, key, id, seq, lock)
+            .await
+            .map_err(Into::into)
+    }
+
     /// The one call the fs adds to the engine's own: the commit bumps the
     /// version-reference epoch the sweeper validates its live set against.
     async fn put_version(
@@ -1022,8 +1260,25 @@ mod tests {
             to_nanos, version,
         },
         _store_redb::{version as rows, version_index},
+        _util::testing::metadata::{
+            assert_object_lock_conformance, assert_object_lock_upload_conformance,
+        },
         testutil,
     };
+
+    /// The Object Lock legs over the **fs adapter**, not only the shared
+    /// engine: `Rows` forwards every lock method to the same `RedbMetadata`,
+    /// and this call proves the forwarding is the implementation's behavior
+    /// (OL21's fs `version_adapter` leg). The upload intent runs over the same
+    /// adapter.
+    #[tokio::test]
+    async fn the_object_lock_legs_hold_over_the_version_adapter() {
+        let (_root, storage) = testutil::storage();
+        let bucket = bucket::name("adapter-lock").unwrap();
+        let rows = storage.version_plane(&bucket).version_rows;
+        assert_object_lock_conformance(rows.as_ref()).await;
+        assert_object_lock_upload_conformance(rows.as_ref()).await;
+    }
 
     /// A storage with a `demo` bucket directory, its name and a key.
     async fn fixture() -> (tempfile::TempDir, FsStorage, Name, object::Key) {

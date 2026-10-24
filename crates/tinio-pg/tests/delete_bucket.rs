@@ -52,7 +52,15 @@ async fn delete_bucket_with_only_delete_markers_keeps_the_version_history() {
         .await
         .expect("the object is staged");
     let committed = storage
-        .commit_object(&bucket, &key, staged, object::Tags::empty(), None, &acl)
+        .commit_object(
+            &bucket,
+            &key,
+            staged,
+            object::Tags::empty(),
+            None,
+            &acl,
+            None,
+        )
         .await
         .expect("the versioned commit");
     let superseded = committed

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM version_object_lock\nWHERE bucket = $1 AND key = $2 AND version_id = ANY($3::text[])\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "11b97310f8ba7ca44079e00a14e5d98b97940abe03c251106fda702468742db0"
+}

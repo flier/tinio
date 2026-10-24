@@ -1,6 +1,6 @@
 //! Object read/write types and the [`ObjectOps`] contract category.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use derive_more::Debug;
@@ -12,8 +12,82 @@ use crate::{
     bucket, checksum,
     etag::ETag,
     multipart::ObjectPart,
-    object, version,
+    object, object_lock, version,
 };
+
+/// The effective Object Lock a write commits: the stored bucket configuration
+/// and the request's explicit retention and legal hold, resolved once here.
+///
+/// The rule is the model's ([`object_lock::write_lock`]): an explicit retention
+/// overrides the bucket default, and a write that carries only a legal hold
+/// still receives the default retention. A stored configuration that is not
+/// enabled contributes nothing, and a lock that ends up with neither a
+/// retention nor a hold is `None` (an unlocked write).
+///
+/// The caller resolves **once** and passes the answer to both the checksum
+/// decision and the write (OL16), so a concurrent configuration change cannot
+/// make the two disagree.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::time::{Duration, SystemTime};
+///
+/// use tinio_core::{
+///     object_lock::{Config, DefaultRetention, LegalHold, Mode, Period, Retention, Rule},
+///     storage::resolve_write_lock,
+/// };
+///
+/// let now = SystemTime::UNIX_EPOCH;
+/// let config = Config {
+///     enabled: true,
+///     rule: Some(Rule {
+///         default_retention: DefaultRetention {
+///             mode: Mode::Governance,
+///             period: Period::Days(7),
+///         },
+///     }),
+/// };
+///
+/// // No explicit retention: the bucket default applies.
+/// let default = resolve_write_lock(Some(&config), None, LegalHold::Off, now)
+///     .expect("the default retention is a lock");
+/// assert_eq!(
+///     default.retention.expect("the default").retain_until,
+///     now + Duration::from_secs(7 * 86_400)
+/// );
+///
+/// // An explicit retention overrides it.
+/// let explicit = Retention {
+///     mode: Mode::Compliance,
+///     retain_until: now + Duration::from_secs(60),
+/// };
+/// let resolved = resolve_write_lock(Some(&config), Some(&explicit), LegalHold::Off, now)
+///     .expect("the explicit retention is a lock");
+/// assert_eq!(resolved.retention, Some(explicit));
+///
+/// // A legal-hold-only write still receives the default retention.
+/// let held = resolve_write_lock(Some(&config), None, LegalHold::On, now)
+///     .expect("the hold alone is a lock");
+/// assert_eq!(held.legal_hold, LegalHold::On);
+/// assert!(held.retention.is_some());
+///
+/// // A bucket with no configuration resolves no lock.
+/// assert!(resolve_write_lock(None, None, LegalHold::Off, now).is_none());
+/// ```
+pub fn resolve_write_lock(
+    config: Option<&object_lock::Config>,
+    explicit: Option<&object_lock::Retention>,
+    legal_hold: object_lock::LegalHold,
+    now: SystemTime,
+) -> Option<object_lock::Lock> {
+    let rule = config
+        .filter(|config| config.enabled)
+        .and_then(|config| config.rule.as_ref());
+    let mut lock = object_lock::write_lock(explicit, rule, now);
+    lock.legal_hold = legal_hold;
+    lock.carries_fact().then_some(lock)
+}
 
 /// Result of a successful object write.
 ///
@@ -229,6 +303,14 @@ pub trait ObjectOps: Send + Sync + 'static {
     where
         Self: Storage,
     {
+        // The convenience write resolves the bucket's effective lock like any
+        // other write (OL16): a configuration's default retention applies, and
+        // the write may never silently skip a lock. It carries no explicit
+        // retention or legal hold, so a lock-enabled bucket's default is what
+        // it stores.
+        let lock = self
+            .resolve_write_lock(bucket, None, object_lock::LegalHold::Off, SystemTime::now())
+            .await?;
         let staged = self.stage_body(bucket, key, body, None, None).await?;
         let info = self
             .commit_object(
@@ -238,6 +320,7 @@ pub trait ObjectOps: Send + Sync + 'static {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                lock.as_ref(),
             )
             .await?;
         Ok(PutObjectResult { etag: info.etag })
@@ -272,6 +355,34 @@ pub trait ObjectOps: Send + Sync + 'static {
     where
         Self: Storage;
 
+    /// The effective Object Lock this write commits (OL7, OL16): the stored
+    /// bucket configuration combined with the request's explicit retention and
+    /// legal hold, resolved **once** in the backend where the configuration is
+    /// in hand.
+    ///
+    /// The caller uses the same answer for the checksum decision and for the
+    /// write: a resolved lock whose `retention` is `Some` requires a
+    /// `Content-MD5` or a checksum header/trailer on the request, and the same
+    /// value is passed to [`ObjectOps::commit_object`],
+    /// [`ObjectOps::copy_object`] or
+    /// [`MultipartOps::create_multipart_upload`](crate::storage::MultipartOps::create_multipart_upload).
+    /// Resolving twice would let a concurrent configuration change make the
+    /// checksum decision and the stored lock disagree.
+    ///
+    /// `explicit` is the request's own retention (already validated); a `None`
+    /// still consults the bucket default, and `legal_hold` is applied over the
+    /// result. The method is **required** (no default body): a security read
+    /// is never answered "unlocked" by a backend that cannot tell (OL2).
+    async fn resolve_write_lock(
+        &self,
+        bucket: &bucket::Name,
+        explicit: Option<&object_lock::Retention>,
+        legal_hold: object_lock::LegalHold,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
     /// The mutation phase of a write: atomically publish a staged body
     /// onto `key` (atomic on the backend side — last completed write
     /// wins, never a torn object, FR-011). Re-checks everything the
@@ -283,8 +394,15 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// with the write, with no post-commit tag window. `owner` is the recorded owner element —
     /// `None` = the empty owner wire (the lazy default owner at the auth
     /// layer; a no-identity path records empty, NOT the default owner,
-    /// review B4) — and `acl` the ACL row written with it. Returns the
+    /// review B4) — and `acl` the ACL row written with it. `lock` is the
+    /// effective Object Lock [`ObjectOps::resolve_write_lock`] answered: a
+    /// versioned commit stores it with the new version identity (OL7), and a
+    /// bucket that records no versions has no identity to lock. Returns the
     /// committed object metadata.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the commit's field set — bucket, key, staged body, tags, owner, ACL and the effective lock — is the request's own; every implementor must spell them the same way"
+    )]
     async fn commit_object(
         &self,
         bucket: &bucket::Name,
@@ -293,6 +411,7 @@ pub trait ObjectOps: Send + Sync + 'static {
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, <Self as Storage>::Error>
     where
         Self: Storage;
@@ -325,9 +444,14 @@ pub trait ObjectOps: Send + Sync + 'static {
     /// too and reusing the source's ETag for a single-form source (the
     /// content MD5 is unchanged by a copy). `NoSuchKey` when the source
     /// does not exist; `NoSuchBucket` when either bucket does not.
+    ///
+    /// `lock` is the **destination's** effective lock
+    /// ([`ObjectOps::resolve_write_lock`], resolved against the destination
+    /// bucket): a copy never inherits the source version's lock (OL12), so
+    /// only the destination's explicit headers or bucket default apply.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the trait method's own signature: source and destination bucket/key plus the carried tags, owner, ACL and checksum are the request's parts, and every implementor must spell them the same way"
+        reason = "the trait method's own signature: source and destination bucket/key plus the carried tags, owner, ACL, checksum and lock are the request's parts, and every implementor must spell them the same way"
     )]
     async fn copy_object(
         &self,
@@ -339,6 +463,7 @@ pub trait ObjectOps: Send + Sync + 'static {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
         _checksum: Option<checksum::Recorded>,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, <Self as Storage>::Error>
     where
         Self: Storage,
@@ -347,7 +472,7 @@ pub trait ObjectOps: Send + Sync + 'static {
         let staged = self
             .stage_body(dst_bucket, dst_key, get.body, None, None)
             .await?;
-        self.commit_object(dst_bucket, dst_key, staged, tags, owner, acl)
+        self.commit_object(dst_bucket, dst_key, staged, tags, owner, acl, lock)
             .await
     }
 

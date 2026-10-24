@@ -70,7 +70,7 @@ pub mod version;
 pub use bucket::BucketMeta;
 pub use object::ObjectMeta;
 pub use upload::UploadMeta;
-pub use version::VersionMeta;
+pub use version::{ExpireReport, VersionMeta};
 
 /// The metadata contract: the row error, and the three category traits that
 /// carry the operations.

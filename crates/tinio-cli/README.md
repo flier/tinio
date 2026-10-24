@@ -1,6 +1,6 @@
 # `tinio-cli` — the command-line interface
 
-`tinio-cli` is the CLI: the lifecycle verbs an operator types, the process sequence behind them, and the exit codes they answer with. It implements the CLI contract (`contracts/cli.md`) — a Minio-style invocation (a positional directory, default ports 9000/9001) and the exit-code mapping `0` success, `1` operational error, `2` usage error. It owns the **verb surface** — what each verb does at the operator's level — the `service` verbs that register the server with the platform's supervisor, and the **configuration composition root** (`src/config/`): the root document and its CLI-owned sections, discovery and auto-create, `.env`, credential generation and the `TINIO_STATE_DIR` parser, with the runtime crates' sections imported from their owners. It owns no control-plane mechanics (`tinio-api` owns the state file, the transports and the endpoints): what this crate does is reduce flags, environment and the config file to one resolution and hand each plane the inputs it expects.
+`tinio-cli` is the CLI: the lifecycle and Object Lock verbs an operator types, the process sequence behind them, and the exit codes they answer with. It implements the CLI contract (`contracts/cli.md`) — a Minio-style invocation (a positional directory, default ports 9000/9001) and the exit-code mapping `0` success, `1` operational error, `2` usage error. It owns the **verb surface** — what each verb does at the operator's level — the `service` verbs that register the server with the platform's supervisor, and the **configuration composition root** (`src/config/`): the root document and its CLI-owned sections, discovery and auto-create, `.env`, credential generation and the `TINIO_STATE_DIR` parser, with the runtime crates' sections imported from their owners. It owns no control-plane mechanics (`tinio-api` owns the state file, the transports and the endpoints): what this crate does is reduce flags, environment and the config file to one resolution and hand each plane the inputs it expects.
 
 ## The verbs
 
@@ -34,6 +34,7 @@ tinio service <install|uninstall|start|stop|query> [DIR] [--name NAME] [--user]
 | `mem` | the in-memory backend becomes selectable (default) |
 | `sandbox` | `--sandbox`: process confinement (default; implies `api`) |
 | `versioning` | the version plane (default) |
+| `object-lock` | the `object-lock`, `retention` and `legalhold` verbs, over the management plane (implies `api`) |
 | `pg` | the PostgreSQL backend becomes selectable |
 | `tls` | the management plane's HTTPS transport (implies `api`) |
 

@@ -40,22 +40,13 @@ use s3s::{S3Error, S3Request, S3Response, S3Result, dto, s3_error};
 use crate::{
     _core::{
         lifecycle::{
-            AbortIncompleteMultipartUpload, And, Config, Expiration, Filter, Invalid, InvalidKind,
+            AbortIncompleteMultipartUpload, And, Config, Expiration, Filter,
             NoncurrentVersionExpiration, Rule, Status, Tag,
         },
         storage::Storage,
     },
-    backend::{S3Backend, map_backend_error},
+    backend::{S3Backend, errors::invalid_error, map_backend_error},
 };
-
-/// `Content-MD5`: the legacy digest header (the `http` crate carries no
-/// constant for it).
-const CONTENT_MD5: &str = "content-md5";
-/// The `x-amz-trailer` header: a declared checksum trailer is a checksum
-/// promise without a value in the headers (LC8).
-const AMZ_TRAILER: &str = "x-amz-trailer";
-/// The prefix every checksum header shares, whatever its algorithm.
-const CHECKSUM_PREFIX: &str = "x-amz-checksum-";
 
 impl<S: Storage> S3Backend<S> {
     pub(crate) async fn op_get_bucket_lifecycle(
@@ -94,7 +85,9 @@ impl<S: Storage> S3Backend<S> {
         let bucket = self.bucket(bucket)?;
         require_checksum(&req.headers, req.trailing_headers.is_some())?;
         let config = config_from_dto(lifecycle_configuration)?;
-        config.validate().map_err(refusal)?;
+        config.validate().map_err(|invalid| {
+            invalid_error(invalid.kind, invalid.reason, invalid.rule.as_deref())
+        })?;
         self.storage
             .put_bucket_lifecycle(&bucket, &config)
             .await
@@ -128,31 +121,7 @@ impl<S: Storage> S3Backend<S> {
 /// algorithm's value is not compared either, for the same reason; a truncated
 /// or garbled body fails the XML parse before the digest could matter.
 fn require_checksum(headers: &HeaderMap, has_trailing_headers: bool) -> S3Result<()> {
-    if let Some(md5) = headers.get(CONTENT_MD5) {
-        let md5 = md5
-            .to_str()
-            .map_err(|_| super::checksum::invalid_digest())?;
-        return super::checksum::valid_content_md5(md5);
-    }
-    let declared = headers
-        .keys()
-        .any(|name| name.as_str().starts_with(CHECKSUM_PREFIX))
-        || headers.contains_key(AMZ_TRAILER)
-        || has_trailing_headers;
-    if declared {
-        Ok(())
-    } else {
-        Err(super::checksum::missing_content_md5())
-    }
-}
-
-/// The model's refusal as the wire's (LC8): its own class picks the code.
-fn refusal(invalid: Invalid) -> S3Error {
-    let id = invalid.rule.as_deref();
-    match invalid.kind {
-        InvalidKind::Shape => malformed(id, invalid.reason),
-        InvalidKind::Semantic => invalid_request(id, invalid.reason),
-    }
+    super::checksum::require_any_checksum(headers, has_trailing_headers)
 }
 
 /// A schema refusal, naming the rule when it has an id.
@@ -417,9 +386,9 @@ mod tests {
     use http::HeaderValue;
     use s3s::{S3, dto};
 
-    use super::CONTENT_MD5;
     use crate::backend::{
         Capabilities,
+        checksum::CONTENT_MD5,
         testutil::{s3_request, setup, setup_gated_with_caps},
     };
 

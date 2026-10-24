@@ -508,9 +508,18 @@ fn boto3_python() -> PathBuf {
 
 /// Run a boto3 scenario script against `endpoint` (best-effort client:
 /// needs the venv from [`boto3_python`]).
+///
+/// The harness's fixed server pair is exported to the script explicitly: the
+/// spawned server is forced to `ACCESS_KEY`/`SECRET_KEY`, so inheriting a
+/// shell's `TINIO_ACCESS_KEY`/`TINIO_SECRET_KEY` could sign with a different
+/// pair and fail every call with `SignatureDoesNotMatch`. A manual run of the
+/// script keeps its own env/fallback.
 fn boto3(endpoint: &str, script: &Path) -> AssertCmd {
     let mut c = AssertCmd::new(boto3_python());
-    c.arg(script).arg(endpoint);
+    c.arg(script)
+        .arg(endpoint)
+        .env("TINIO_ACCESS_KEY", ACCESS_KEY)
+        .env("TINIO_SECRET_KEY", SECRET_KEY);
     c
 }
 

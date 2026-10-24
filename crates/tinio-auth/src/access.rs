@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use http::Extensions;
 use parse_display::Display;
 use s3s::{
     S3Error, S3Result,
@@ -16,6 +17,7 @@ use s3s::{
 };
 use tracing::{Span, field, instrument};
 
+pub use crate::bypass::{MayBypass, may_bypass_authority};
 use crate::{
     _core::{
         acl::{
@@ -24,7 +26,9 @@ use crate::{
         },
         bucket, object, percent,
         storage::{self, Storage},
+        version,
     },
+    bypass::{bypass_requested, is_bypass_authority_op},
     error::{AccessDecision, classify},
     identity::Identity,
     matrix::{OpRule, Requirement, rule_for},
@@ -49,24 +53,31 @@ impl<S: Storage> AclAccess<S> {
 /// `S3AccessContext` (s3s keeps that type's fields `pub(crate)` with no
 /// public constructor, so the testable core takes the extracted values
 /// and [`AclAccess::check`] adapts the context into it).
-struct Request<'a> {
+///
+/// The fields are owned: `check` must release its immutable borrow of the
+/// context before it can hand the decision's extension bit back through
+/// `S3AccessContext::extensions_mut`.
+pub(crate) struct Request {
     /// The requester's canonical ID (resolved by
     /// [`Identity::principal`]).
-    principal: OwnerId,
+    pub(crate) principal: OwnerId,
     /// Whether the request carried verified credentials.
-    authenticated: bool,
+    pub(crate) authenticated: bool,
     /// The s3s operation name.
-    op: &'a str,
+    pub(crate) op: String,
     /// The route path (root/bucket/object).
-    path: &'a S3Path,
-    /// The raw request query (the `uploadId` parameter).
-    query: &'a str,
+    pub(crate) path: S3Path,
+    /// The raw request query (the `uploadId` and `versionId` parameters).
+    pub(crate) query: String,
     /// `x-amz-expected-bucket-owner`.
-    expected_bucket_owner: Option<&'a str>,
+    pub(crate) expected_bucket_owner: Option<String>,
     /// `x-amz-copy-source` (CopyObject, UploadPartCopy).
-    copy_source: Option<&'a str>,
+    pub(crate) copy_source: Option<String>,
     /// `x-amz-rename-source` (RenameObject).
-    rename_source: Option<&'a str>,
+    pub(crate) rename_source: Option<String>,
+    /// Whether the request asks for the governance bypass
+    /// (`x-amz-bypass-governance-retention`, s3s's bool parse).
+    pub(crate) bypass_requested: bool,
 }
 
 /// The bounded reason a decision span records — an enum, not a free string, so
@@ -82,6 +93,11 @@ enum Reason {
     OwnerMismatch,
     MalformedHeader,
     MalformedSource,
+    MalformedVersion,
+    /// The address names a delete marker: a real, addressable version
+    /// with no metadata of its own. The refusal is intentional (403),
+    /// never a backend failure.
+    DeleteMarker,
     NoResource,
     NoGrant,
     StorageError,
@@ -125,12 +141,12 @@ impl<S: Storage> S3Access for AclAccess<S> {
         let headers = cx.headers();
         // The decision span lives on `evaluate`: this async_trait trampoline
         // must not open a second span for the same decision.
-        self.evaluate(&Request {
+        let request = Request {
             principal,
             authenticated: cx.credentials().is_some(),
-            op: cx.s3_op().name(),
-            path: cx.s3_path(),
-            query: cx.uri().query().unwrap_or(""),
+            op: cx.s3_op().name().to_owned(),
+            path: owned_path(cx.s3_path()),
+            query: cx.uri().query().unwrap_or("").to_owned(),
             // A present-but-unreadable (non-UTF-8) expected-bucket-owner
             // header fails closed (403) — never a silent skip; the source
             // headers fail closed the same way (None → deny downstream).
@@ -138,18 +154,24 @@ impl<S: Storage> S3Access for AclAccess<S> {
                 Some(value) => Some(
                     value
                         .to_str()
-                        .map_err(|_| deny_with(Reason::MalformedHeader))?,
+                        .map_err(|_| deny_with(Reason::MalformedHeader))?
+                        .to_owned(),
                 ),
                 None => None,
             },
             copy_source: headers
                 .get("x-amz-copy-source")
-                .and_then(|v| v.to_str().ok()),
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
             rename_source: headers
                 .get("x-amz-rename-source")
-                .and_then(|v| v.to_str().ok()),
-        })
-        .await
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            bypass_requested: bypass_requested(headers),
+        };
+        // The owned request releases the context's immutable borrows, so the
+        // extensions can take the resolved authority bit.
+        self.evaluate(&request, cx.extensions_mut()).await
     }
 }
 
@@ -160,14 +182,87 @@ impl<S: Storage> AclAccess<S> {
         level = "info",
         target = "tinio::auth",
         skip_all,
-        fields(op = request.op, decision = field::Empty, reason = field::Empty)
+        fields(op = request.op.as_str(), decision = field::Empty, reason = field::Empty)
     )]
-    async fn evaluate(&self, request: &Request<'_>) -> S3Result<()> {
+    pub(crate) async fn evaluate(
+        &self,
+        request: &Request,
+        extensions: &mut Extensions,
+    ) -> S3Result<()> {
         let result = self.authorize(request).await;
         let decision = if result.is_ok() { "allowed" } else { "denied" };
         Span::current().record("decision", decision);
         metrics::record_authorization(result.is_ok());
+        // OL15: the governance-bypass authority of an ALLOWED request rides
+        // the extensions into the handler. An op with no bypass (and a
+        // denied request) gets no bit; the handler's `header && may_bypass`
+        // reads an absent bit as no authority.
+        if result.is_ok() && is_bypass_authority_op(&request.op) {
+            let granted = request.bypass_requested && self.may_bypass(request).await;
+            extensions.insert(MayBypass::new(granted));
+        }
         result
+    }
+
+    /// OL15's authority, resolved from the resource the request ADDRESSES
+    /// through the same [`Self::addressed_acl`] resolution the operation
+    /// gate uses (R23 closes the Task 7 duplicate): a `versionId` selects
+    /// that version's ACL (`version_acl`; the literal `null` selects the
+    /// null version), and only an unaddressed request reads the current
+    /// object's ACL. The bucket owner has parity over every version. Any
+    /// read failure — including a malformed address — answers `false`: the
+    /// handler owns the wire error, and no authority is ever inferred from
+    /// a resource the pipeline could not resolve.
+    async fn may_bypass(&self, request: &Request) -> bool {
+        let Some((bucket_name, key)) = request.path.as_object() else {
+            return false;
+        };
+        let (Ok(bucket_name), Ok(key)) = (bucket::name(bucket_name), object::key(key)) else {
+            return false;
+        };
+        let Ok(address) = addressed_version(request) else {
+            return false;
+        };
+        let Ok(bucket_acl) = self.storage.get_bucket_acl(&bucket_name).await else {
+            return false;
+        };
+        let bucket_owner = self.resolved_owner(&bucket_acl);
+        if request.principal == bucket_owner {
+            return true;
+        }
+        let Ok(acl) = self.addressed_acl(&bucket_name, &key, &address).await else {
+            return false;
+        };
+        may_bypass_authority(
+            &request.principal,
+            request.authenticated,
+            &acl,
+            &bucket_owner,
+            &self.identity.default_owner,
+        )
+    }
+
+    /// The ACL of the resource an address names — the shared "address → ACL"
+    /// resolution of the operation gate and [`Self::may_bypass`]: the
+    /// addressed version's ACL for a version-addressed request
+    /// (`version_acl`; the literal `null` address is the null version's
+    /// `None` identity), the current object's for
+    /// [`version::Address::Current`]. A backend read failure is returned
+    /// unchanged so each caller applies its own posture (the gate's
+    /// deny-first tiers, the authority's fail-closed `false`).
+    async fn addressed_acl(
+        &self,
+        bucket_name: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+    ) -> Result<Acl, <S as Storage>::Error> {
+        if address.is_addressed() {
+            self.storage
+                .version_acl(bucket_name, key, address.id())
+                .await
+        } else {
+            self.storage.get_object_acl(bucket_name, key).await
+        }
     }
 
     /// The authorization pipeline (spec §4 order): the
@@ -175,10 +270,10 @@ impl<S: Storage> AclAccess<S> {
     /// BEFORE `rule_for` (review B2), the operation mapping, the
     /// resource gates (owner bypass → grants), the B1 existence head,
     /// and the fail-closed / three-tier storage-error posture (B3).
-    async fn authorize(&self, request: &Request<'_>) -> S3Result<()> {
+    async fn authorize(&self, request: &Request) -> S3Result<()> {
         // (2) expected_bucket_owner: a mismatch on an existing bucket →
         // 403; a missing bucket skips (the handler answers NoSuchBucket).
-        if let Some(expected) = request.expected_bucket_owner
+        if let Some(expected) = &request.expected_bucket_owner
             && let Some(bucket_name) = request.path.get_bucket_name()
         {
             let name = bucket::name(bucket_name).map_err(|_| deny_with(Reason::NoResource))?;
@@ -190,7 +285,7 @@ impl<S: Storage> AclAccess<S> {
                 },
             };
             if let Some(acl) = bucket_acl
-                && self.resolved_owner(&acl).as_str() != expected
+                && self.resolved_owner(&acl).as_str() != expected.as_str()
             {
                 return deny(Reason::OwnerMismatch);
             }
@@ -200,8 +295,8 @@ impl<S: Storage> AclAccess<S> {
         if request.op == "DeleteObjects" {
             return self.delete_objects_gate(request).await;
         }
-        let rule = rule_for(request.op);
-        if is_upload_scoped(request.op) {
+        let rule = rule_for(&request.op);
+        if is_upload_scoped(&request.op) {
             return self.upload_gate(request, rule).await;
         }
         if rule.reads_source {
@@ -214,7 +309,7 @@ impl<S: Storage> AclAccess<S> {
     /// bucket-ACL grant to P (any permission — a WRITE-gated whole-op
     /// 403 would wrongly block per-key own-object deletes). The per-key
     /// checks are the handler's (Task 12).
-    async fn delete_objects_gate(&self, request: &Request<'_>) -> S3Result<()> {
+    async fn delete_objects_gate(&self, request: &Request) -> S3Result<()> {
         let Some(bucket_name) = request.path.get_bucket_name() else {
             return deny(Reason::NoResource);
         };
@@ -243,9 +338,9 @@ impl<S: Storage> AclAccess<S> {
     /// owner (the upload row's stored owner is "the creator"; no grant
     /// satisfies it). UploadPartCopy additionally needs source READ;
     /// Complete additionally applies the B1 destination head.
-    async fn upload_gate(&self, request: &Request<'_>, rule: OpRule) -> S3Result<()> {
+    async fn upload_gate(&self, request: &Request, rule: OpRule) -> S3Result<()> {
         let (bucket_name, key) = object_resource(request)?;
-        let upload_id = query_param(request.query, "uploadId").unwrap_or_default();
+        let upload_id = query_param(&request.query, "uploadId").unwrap_or_default();
         let upload = match self
             .storage
             .get_multipart_upload(&bucket_name, &key, &upload_id)
@@ -281,10 +376,11 @@ impl<S: Storage> AclAccess<S> {
         }
         if rule.reads_source {
             // UploadPartCopy: copy parity on the source (source READ).
-            let (src_bucket, src_key) = match request.copy_source.and_then(source::copy_source) {
-                Some(pair) => pair,
-                None => return deny(Reason::MalformedSource),
-            };
+            let (src_bucket, src_key) =
+                match request.copy_source.as_deref().and_then(source::copy_source) {
+                    Some(pair) => pair,
+                    None => return deny(Reason::MalformedSource),
+                };
             self.object_gate(&src_bucket, &src_key, Requirement::ObjectRead, request)
                 .await?;
         }
@@ -301,15 +397,16 @@ impl<S: Storage> AclAccess<S> {
     /// the destination-bucket WRITE overlay and the B1 destination head.
     /// A RenameObject source is the key of the request's own bucket
     /// (never a bucket split); a CopyObject source is `/bucket/key`.
-    async fn source_gate(&self, request: &Request<'_>, rule: OpRule) -> S3Result<()> {
+    async fn source_gate(&self, request: &Request, rule: OpRule) -> S3Result<()> {
         let (dst_bucket, dst_key) = object_resource(request)?;
         let (src_bucket, src_key) = match if request.op == "RenameObject" {
             request
                 .rename_source
+                .as_deref()
                 .and_then(source::rename_source)
                 .map(|key| (dst_bucket.clone(), key))
         } else {
-            request.copy_source.and_then(source::copy_source)
+            request.copy_source.as_deref().and_then(source::copy_source)
         } {
             Some(pair) => pair,
             // A missing/malformed source header fails closed — the check
@@ -345,8 +442,8 @@ impl<S: Storage> AclAccess<S> {
     /// PutObject existence dispatch (B1 — an existing destination key
     /// replaces the base with destination owner parity), the
     /// owner-only defaults, and the root-level Authenticated gate.
-    async fn resource_gate(&self, request: &Request<'_>, rule: OpRule) -> S3Result<()> {
-        match request.path {
+    async fn resource_gate(&self, request: &Request, rule: OpRule) -> S3Result<()> {
+        match &request.path {
             S3Path::Root => match rule.base {
                 // ListBuckets: any signed principal.
                 Requirement::Authenticated => {
@@ -412,8 +509,10 @@ impl<S: Storage> AclAccess<S> {
                                 .await
                         }
                     }
-                    // DeleteObject, object tagging, GetObjectAttributes:
-                    // object-owner-or-bucket-owner parity.
+                    // DeleteObject, object tagging, GetObjectAttributes and
+                    // Object Lock's four per-version operations: object-owner-
+                    // or-bucket-owner parity (version-addressed where the
+                    // request names a version).
                     Requirement::ObjectOrBucketOwner => {
                         self.object_or_bucket_owner(&name, &key, request).await
                     }
@@ -434,7 +533,7 @@ impl<S: Storage> AclAccess<S> {
         &self,
         bucket_name: &bucket::Name,
         key: &object::Key,
-        request: &Request<'_>,
+        request: &Request,
     ) -> S3Result<()> {
         match self.storage.get_object_acl(bucket_name, key).await {
             Ok(dst_acl) => {
@@ -458,7 +557,7 @@ impl<S: Storage> AclAccess<S> {
         &self,
         bucket_name: &bucket::Name,
         key: &object::Key,
-        request: &Request<'_>,
+        request: &Request,
     ) -> S3Result<()> {
         match self.storage.get_object_acl(bucket_name, key).await {
             Ok(acl) => {
@@ -480,7 +579,7 @@ impl<S: Storage> AclAccess<S> {
         &self,
         bucket_name: &bucket::Name,
         dst_acl: &Acl,
-        request: &Request<'_>,
+        request: &Request,
     ) -> S3Result<()> {
         if self.is_owner(dst_acl, &request.principal) {
             return allow(Reason::Owner);
@@ -507,7 +606,7 @@ impl<S: Storage> AclAccess<S> {
         &self,
         bucket_name: &bucket::Name,
         requirement: Requirement,
-        request: &Request<'_>,
+        request: &Request,
     ) -> S3Result<()> {
         let bucket_acl = match self.storage.get_bucket_acl(bucket_name).await {
             Ok(acl) => acl,
@@ -529,7 +628,7 @@ impl<S: Storage> AclAccess<S> {
         bucket_name: &bucket::Name,
         key: &object::Key,
         requirement: Requirement,
-        request: &Request<'_>,
+        request: &Request,
     ) -> S3Result<()> {
         let object_acl = match self.storage.get_object_acl(bucket_name, key).await {
             Ok(acl) => acl,
@@ -548,23 +647,62 @@ impl<S: Storage> AclAccess<S> {
     /// default-A class): no grant satisfies the gate. The single-key
     /// rule's ONE home is [`can_delete`] (`tinio_core::acl` — the
     /// handler-side per-key DeleteObjects check runs the same helper).
+    ///
+    /// R23: for the object operations the matrix marks
+    /// `version_addressed` the object leg is the ACL of the version the
+    /// request ADDRESSES (`version_acl` through [`Self::addressed_acl`]) —
+    /// the current object may be a different object entirely. An
+    /// unaddressed request keeps the current object's ACL. The bucket
+    /// owner has parity over every version and short-circuits before the
+    /// address is resolved; a malformed address fails closed.
     async fn object_or_bucket_owner(
         &self,
         bucket_name: &bucket::Name,
         key: &object::Key,
-        request: &Request<'_>,
+        request: &Request,
     ) -> S3Result<()> {
-        let object_acl = match self.storage.get_object_acl(bucket_name, key).await {
-            Ok(acl) => acl,
-            Err(err) => return self.missing_tiers(bucket_name, &err.into(), request).await,
-        };
         let bucket_acl = match self.storage.get_bucket_acl(bucket_name).await {
             Ok(acl) => acl,
             Err(err) => return self.missing_tiers(bucket_name, &err.into(), request).await,
         };
+        let bucket_owner = self.resolved_owner(&bucket_acl);
+        if request.principal == bucket_owner {
+            return allow(Reason::Owner);
+        }
+        let object_acl = if rule_for(&request.op).version_addressed {
+            let address = match addressed_version(request) {
+                Ok(address) => address,
+                // A malformed `versionId` names no resource to authorize:
+                // fail closed (a request the pipeline cannot resolve is
+                // never authorized the way the current object would be).
+                Err(()) => return deny(Reason::MalformedVersion),
+            };
+            match self.addressed_acl(bucket_name, key, &address).await {
+                Ok(acl) => acl,
+                Err(err) => {
+                    let err: storage::Error = err.into();
+                    // `version_acl` folds a delete marker and an unknown id
+                    // into `NoSuchVersion`; only the genuinely absent
+                    // version may ride the missing-version pass-through to
+                    // the handler's OL17 404. Everything else — the marker,
+                    // unreadable state — takes its own tier.
+                    if matches!(err, storage::Error::NoSuchVersion(_)) {
+                        return self
+                            .addressed_version_tiers(bucket_name, key, &address)
+                            .await;
+                    }
+                    return self.missing_tiers(bucket_name, &err, request).await;
+                }
+            }
+        } else {
+            match self.storage.get_object_acl(bucket_name, key).await {
+                Ok(acl) => acl,
+                Err(err) => return self.missing_tiers(bucket_name, &err.into(), request).await,
+            }
+        };
         if can_delete(
             &request.principal,
-            &self.resolved_owner(&bucket_acl),
+            &bucket_owner,
             &self.identity.default_owner,
             object_acl.owner.as_ref(),
         ) {
@@ -579,7 +717,7 @@ impl<S: Storage> AclAccess<S> {
     async fn bucket_owner_only(
         &self,
         bucket_name: &bucket::Name,
-        request: &Request<'_>,
+        request: &Request,
     ) -> S3Result<()> {
         let bucket_acl = match self.storage.get_bucket_acl(bucket_name).await {
             Ok(acl) => acl,
@@ -597,7 +735,7 @@ impl<S: Storage> AclAccess<S> {
         &self,
         bucket_name: &bucket::Name,
         key: &object::Key,
-        request: &Request<'_>,
+        request: &Request,
     ) -> S3Result<()> {
         let object_acl = match self.storage.get_object_acl(bucket_name, key).await {
             Ok(acl) => acl,
@@ -621,7 +759,7 @@ impl<S: Storage> AclAccess<S> {
         &self,
         bucket_name: &bucket::Name,
         err: &storage::Error,
-        request: &Request<'_>,
+        request: &Request,
     ) -> S3Result<()> {
         if !matches!(classify(err), AccessDecision::PassThroughMissing) {
             return deny(Reason::StorageError);
@@ -647,6 +785,38 @@ impl<S: Storage> AclAccess<S> {
         deny(Reason::NoGrant)
     }
 
+    /// Classify an addressed-ACL read that answered `NoSuchVersion`. The
+    /// stores report a **delete marker** and a genuinely unknown id with
+    /// the same class (`marker_has_no_metadata`), so the class alone cannot
+    /// decide: a marker is a real, addressable version, not a missing
+    /// resource, and a non-owner's marker delete is 403
+    /// (`Reason::DeleteMarker` — an intentional denial, never a backend
+    /// failure), while an id that names nothing is the handler's
+    /// `404 NoSuchVersion` (OL17). A content version that the ACL read
+    /// failed to resolve is unreadable state and also fails closed.
+    async fn addressed_version_tiers(
+        &self,
+        bucket_name: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+    ) -> S3Result<()> {
+        // The shared head split. This caller keeps its own statuses: a marker
+        // and an unresolved object fail closed (`403`), a miss is the
+        // handler's `404`, and any other storage error fails closed.
+        match version::split_head(
+            self.storage
+                .head_object_version(bucket_name, key, address.id())
+                .await,
+        ) {
+            version::HeadSplit::Marker { .. } => deny(Reason::DeleteMarker),
+            version::HeadSplit::Object(_) => deny(Reason::StorageError),
+            // The genuine miss: the handler answers `404 NoSuchVersion`
+            // (a missing key keeps its own `404 NoSuchKey`).
+            version::HeadSplit::Missing(_) => allow(Reason::Missing),
+            version::HeadSplit::Failed(_) => deny(Reason::StorageError),
+        }
+    }
+
     /// The resolved owner of a resource row: the stored owner element,
     /// or the identity's default (lazy) owner when the row has none.
     fn resolved_owner(&self, acl: &Acl) -> OwnerId {
@@ -665,10 +835,21 @@ impl<S: Storage> AclAccess<S> {
     }
 }
 
+/// The owned copy of a route path — [`S3Path`] is not `Clone`, and the
+/// request must release its borrow of the access context before the
+/// extension bit can be written.
+fn owned_path(path: &S3Path) -> S3Path {
+    match path {
+        S3Path::Root => S3Path::root(),
+        S3Path::Bucket { bucket } => S3Path::bucket(bucket),
+        S3Path::Object { bucket, key } => S3Path::object(bucket, key),
+    }
+}
+
 /// The (bucket, key) of an object-path request (upload-scoped and
 /// source-reading ops always resolve to S3Path::Object); anything else
 /// fails closed.
-fn object_resource(request: &Request<'_>) -> Result<(bucket::Name, object::Key), S3Error> {
+fn object_resource(request: &Request) -> Result<(bucket::Name, object::Key), S3Error> {
     let (b, k) = request
         .path
         .as_object()
@@ -683,6 +864,18 @@ fn object_resource(request: &Request<'_>) -> Result<(bucket::Name, object::Key),
 /// message).
 fn denied() -> S3Error {
     s3_error!(AccessDenied, "Access Denied")
+}
+
+/// The version address a request's `versionId` names — the ONE parse the
+/// operation gate and the bypass authority share. An absent parameter is
+/// [`version::Address::Current`]; a malformed value is an error, never a
+/// silent fall back to the current object's ACL. The literal `null` is
+/// [`version::Address::Null`] (the null version), never a version id.
+fn addressed_version(request: &Request) -> Result<version::Address, ()> {
+    match query_param(&request.query, "versionId") {
+        None => Ok(version::Address::Current),
+        Some(raw) => version::Address::from_wire(Some(&raw)).map_err(|_| ()),
+    }
 }
 
 /// The upload-scoped operations whose resource is the upload row (spec
@@ -718,7 +911,7 @@ fn form_decode(raw: &str) -> String {
 /// Grantee membership: canonical IDs compare to P; AllUsers covers any P
 /// (anonymous included); AuthenticatedUsers any signed P; LogDelivery
 /// (and any unknown URI) is never satisfiable — fail closed.
-fn grantee_matches(grantee: &Grantee, principal: &OwnerId, authenticated: bool) -> bool {
+pub(crate) fn grantee_matches(grantee: &Grantee, principal: &OwnerId, authenticated: bool) -> bool {
     match grantee {
         Grantee::Canonical(id) => id == principal,
         Grantee::Group(GroupUri(uri)) => match uri.as_str() {
@@ -754,7 +947,7 @@ fn permission_satisfies(requirement: Requirement, permission: Permission) -> boo
 }
 
 /// Grant evaluation: the ACL grants the requirement to P.
-fn grant_satisfies(acl: &Acl, requirement: Requirement, request: &Request<'_>) -> bool {
+fn grant_satisfies(acl: &Acl, requirement: Requirement, request: &Request) -> bool {
     acl.grants.iter().any(|grant| {
         grantee_matches(&grant.grantee, &request.principal, request.authenticated)
             && permission_satisfies(requirement, grant.permission)
@@ -762,720 +955,4 @@ fn grant_satisfies(acl: &Acl, requirement: Requirement, request: &Request<'_>) -
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{io, sync::Arc};
-
-    use bytes::Bytes;
-    use futures::stream;
-    use s3s::path::S3Path;
-    use tinio_mem::MemoryStorage;
-    use tinio_util::testing::{metrics::counter, spans};
-
-    use super::{AclAccess, OpRule, Reason, Request, Requirement, rule_for};
-    use crate::{
-        _core::{
-            acl::{
-                Acl, GROUP_ALL_USERS, GROUP_AUTHENTICATED_USERS, Grant, Grantee, GroupUri, OwnerId,
-                Permission, default_owner_id,
-            },
-            bucket, object,
-            storage::{BucketOps, MultipartOps, ObjectOps},
-        },
-        derive_canonical_id,
-        identity::{Identity, User},
-    };
-
-    // Fixture identities: two fixed canonical owners distinct from the
-    // configured users, and the anonymous principal.
-    fn uid() -> OwnerId {
-        OwnerId::new("aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899").unwrap()
-    }
-
-    fn other() -> OwnerId {
-        OwnerId::new("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100").unwrap()
-    }
-
-    fn anon() -> OwnerId {
-        OwnerId::anonymous()
-    }
-
-    fn alice() -> OwnerId {
-        derive_canonical_id("AKID")
-    }
-
-    fn bob() -> OwnerId {
-        derive_canonical_id("BKID")
-    }
-
-    fn identity() -> Arc<Identity> {
-        Arc::new(Identity::test(vec![
-            User::test("AKID", "secret", "alice"),
-            User::test("BKID", "secret", "bob"),
-        ]))
-    }
-
-    fn canonical(id: &OwnerId, permission: Permission) -> Grant {
-        Grant {
-            grantee: Grantee::Canonical(id.clone()),
-            permission,
-        }
-    }
-
-    fn group(uri: &str, permission: Permission) -> Grant {
-        Grant {
-            grantee: Grantee::Group(GroupUri(uri.into())),
-            permission,
-        }
-    }
-
-    fn private(owner: &OwnerId) -> Acl {
-        Acl::default_private(Some(owner.clone()))
-    }
-
-    async fn storage_with_bucket(owner: &OwnerId, grants: Vec<Grant>) -> Arc<MemoryStorage> {
-        let storage = MemoryStorage::new().unwrap();
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(
-                &b,
-                Some(owner),
-                &Acl {
-                    owner: Some(owner.clone()),
-                    grants,
-                },
-            )
-            .await
-            .unwrap();
-        Arc::new(storage)
-    }
-
-    async fn put_object(storage: &MemoryStorage, key: &str, owner: Option<&OwnerId>, acl: &Acl) {
-        let b = bucket::name("data").unwrap();
-        let k = object::key(key).unwrap();
-        let staged = storage
-            .stage_body(
-                &b,
-                &k,
-                Box::pin(stream::empty::<io::Result<Bytes>>()),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        storage
-            .commit_object(&b, &k, staged, object::Tags::empty(), owner, acl)
-            .await
-            .unwrap();
-    }
-
-    async fn upload(storage: &MemoryStorage, key: &str, owner: Option<&OwnerId>) -> String {
-        let b = bucket::name("data").unwrap();
-        let k = object::key(key).unwrap();
-        storage
-            .create_multipart_upload(
-                &b,
-                &k,
-                None,
-                object::Tags::empty(),
-                owner,
-                &Acl::default_private(owner.cloned()),
-            )
-            .await
-            .unwrap()
-            .upload_id
-    }
-
-    fn req<'a>(
-        principal: OwnerId,
-        authenticated: bool,
-        op: &'a str,
-        path: &'a S3Path,
-    ) -> Request<'a> {
-        Request {
-            principal,
-            authenticated,
-            op,
-            path,
-            query: "",
-            expected_bucket_owner: None,
-            copy_source: None,
-            rename_source: None,
-        }
-    }
-
-    async fn assert_allowed(access: &AclAccess<MemoryStorage>, request: &Request<'_>) {
-        access.evaluate(request).await.unwrap();
-    }
-
-    async fn assert_denied(access: &AclAccess<MemoryStorage>, request: &Request<'_>) {
-        let err = access
-            .evaluate(request)
-            .await
-            .expect_err("expected an AccessDenied rejection");
-        assert_eq!(err.code().as_str(), "AccessDenied");
-    }
-
-    #[tokio::test]
-    async fn anonymous_denied_on_private_bucket() {
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        put_object(&storage, "a.txt", Some(&owner), &private(&owner)).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "a.txt");
-        assert_denied(&access, &req(anon(), false, "GetObject", &path)).await;
-    }
-
-    #[tokio::test]
-    async fn public_read_allows_anonymous_get() {
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        let acl = Acl {
-            owner: Some(owner.clone()),
-            grants: vec![group(GROUP_ALL_USERS, Permission::Read)],
-        };
-        put_object(&storage, "a.txt", Some(&owner), &acl).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "a.txt");
-        assert_allowed(&access, &req(anon(), false, "GetObject", &path)).await;
-    }
-
-    #[tokio::test]
-    async fn owner_bypass_ignores_grants() {
-        // The implicit-owner rule: P == O passes without any grant —
-        // the ACL carries no owner FULL_CONTROL grant at all.
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        let acl = Acl {
-            owner: Some(alice().clone()),
-            grants: vec![],
-        };
-        put_object(&storage, "a.txt", Some(&alice()), &acl).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "a.txt");
-        assert_allowed(&access, &req(alice(), true, "GetObject", &path)).await;
-        assert_denied(&access, &req(bob(), true, "GetObject", &path)).await;
-    }
-
-    #[tokio::test]
-    async fn signed_user_without_grant_is_denied() {
-        // Signature verification itself is s3s's auth-provider layer
-        // (ConfigAuth) — out of scope here; the access-level counterpart
-        // is a valid signed user holding no grant.
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        put_object(&storage, "a.txt", Some(&owner), &private(&owner)).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "a.txt");
-        assert_denied(&access, &req(bob(), true, "GetObject", &path)).await;
-    }
-
-    #[tokio::test]
-    async fn expected_bucket_owner_mismatch_denies() {
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        put_object(&storage, "a.txt", Some(&owner), &private(&owner)).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "a.txt");
-        let mut r = req(owner.clone(), true, "GetObject", &path);
-        let stranger = other();
-        r.expected_bucket_owner = Some(stranger.as_str());
-        assert_denied(&access, &r).await;
-        r.expected_bucket_owner = Some(owner.as_str());
-        assert_allowed(&access, &r).await;
-    }
-
-    #[tokio::test]
-    async fn missing_object_tiers_pass_through_for_owner_and_reader() {
-        // The deny-first three tiers (review B3): the bucket owner and
-        // a bucket-READ grantee pass through (the handler's 404); anyone
-        // else gets 403 — no existence leak.
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![canonical(&bob(), Permission::Read)]).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "ghost");
-        assert_allowed(&access, &req(owner.clone(), true, "GetObject", &path)).await;
-        assert_allowed(&access, &req(bob(), true, "GetObject", &path)).await;
-        assert_denied(&access, &req(anon(), false, "GetObject", &path)).await;
-    }
-
-    #[tokio::test]
-    async fn missing_bucket_passes_through_for_any_principal() {
-        // The B3 tiers prove owner/grant over the bucket row; a genuinely
-        // missing bucket has none, so the access check passes through and
-        // the handler answers NoSuchBucket — AWS + contract FR-005, for
-        // every principal (there is no owner to prove).
-        let storage = MemoryStorage::new().unwrap();
-        let access = AclAccess::new(Arc::new(storage), identity());
-        let path = S3Path::bucket("ghost");
-        assert_allowed(&access, &req(uid(), true, "ListObjectsV2", &path)).await;
-        assert_allowed(&access, &req(anon(), false, "ListObjectsV2", &path)).await;
-        // DeleteBucket's owner-only gate on a missing bucket passes
-        // through too (the handler enforces existence → NoSuchBucket).
-        assert_allowed(&access, &req(uid(), true, "DeleteBucket", &path)).await;
-    }
-
-    #[tokio::test]
-    async fn overwrite_needs_object_or_bucket_owner() {
-        // Review B1: in a public-write bucket, an anonymous PUT onto an
-        // existing key is 403 (overwrite = delete parity); onto a
-        // missing key the bucket-WRITE grant suffices.
-        let owner = uid();
-        let storage =
-            storage_with_bucket(&owner, vec![group(GROUP_ALL_USERS, Permission::Write)]).await;
-        put_object(&storage, "a.txt", Some(&owner), &private(&owner)).await;
-        let access = AclAccess::new(storage, identity());
-        assert_denied(
-            &access,
-            &req(anon(), false, "PutObject", &S3Path::object("data", "a.txt")),
-        )
-        .await;
-        assert_allowed(
-            &access,
-            &req(
-                anon(),
-                false,
-                "PutObject",
-                &S3Path::object("data", "new.txt"),
-            ),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn copy_object_overwrite_checks_destination_owner() {
-        // Review B1: O is the DESTINATION object/bucket — an anonymous
-        // copy OVER an existing destination is 403 (source READ and
-        // destination WRITE grants notwithstanding); onto a missing key
-        // the source READ + destination bucket WRITE suffice.
-        let owner = uid();
-        let storage =
-            storage_with_bucket(&owner, vec![group(GROUP_ALL_USERS, Permission::Write)]).await;
-        let src_acl = Acl {
-            owner: Some(owner.clone()),
-            grants: vec![group(GROUP_ALL_USERS, Permission::Read)],
-        };
-        put_object(&storage, "src.txt", Some(&owner), &src_acl).await;
-        put_object(&storage, "dst.txt", Some(&owner), &private(&owner)).await;
-        let access = AclAccess::new(storage, identity());
-        let dst = S3Path::object("data", "dst.txt");
-        let mut r = req(anon(), false, "CopyObject", &dst);
-        r.copy_source = Some("/data/src.txt");
-        assert_denied(&access, &r).await;
-        let dst2 = S3Path::object("data", "dst2.txt");
-        let mut r = req(anon(), false, "CopyObject", &dst2);
-        r.copy_source = Some("/data/src.txt");
-        assert_allowed(&access, &r).await;
-    }
-
-    #[tokio::test]
-    async fn rename_object_overwrite_checks_destination_owner() {
-        // Review B1: rename source parity (the anonymous source owner)
-        // + destination bucket WRITE pass, but an existing destination
-        // still needs destination owner parity.
-        let owner = uid();
-        let storage =
-            storage_with_bucket(&owner, vec![group(GROUP_ALL_USERS, Permission::Write)]).await;
-        put_object(&storage, "src.txt", Some(&anon()), &private(&anon())).await;
-        put_object(&storage, "dst.txt", Some(&owner), &private(&owner)).await;
-        let access = AclAccess::new(storage, identity());
-        let dst = S3Path::object("data", "dst.txt");
-        let mut r = req(anon(), false, "RenameObject", &dst);
-        r.rename_source = Some("/src.txt");
-        assert_denied(&access, &r).await;
-        let dst2 = S3Path::object("data", "dst2.txt");
-        let mut r = req(anon(), false, "RenameObject", &dst2);
-        r.rename_source = Some("/src.txt");
-        assert_allowed(&access, &r).await;
-    }
-
-    #[tokio::test]
-    async fn upload_part_copy_requires_source_read_and_initiator() {
-        // UploadPartCopy: the upload creator gate (from the uploadId
-        // row) plus source READ (from the source ACL) — compound row.
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        put_object(&storage, "secret.txt", Some(&owner), &private(&owner)).await;
-        let src_acl = Acl {
-            owner: Some(owner.clone()),
-            grants: vec![group(GROUP_ALL_USERS, Permission::Read)],
-        };
-        put_object(&storage, "src.txt", Some(&owner), &src_acl).await;
-        let upload_id = upload(&storage, "dst.txt", Some(&alice())).await;
-        let query = format!("uploadId={upload_id}");
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "dst.txt");
-        // Creator, private source → 403 (source READ leg).
-        let mut r = req(alice(), true, "UploadPartCopy", &path);
-        r.query = &query;
-        r.copy_source = Some("/data/secret.txt");
-        assert_denied(&access, &r).await;
-        // Creator + source READ (AllUsers) → allowed.
-        r.copy_source = Some("/data/src.txt");
-        assert_allowed(&access, &r).await;
-        // Non-initiator with the source grant → 403 (upload-row leg).
-        let mut r = req(bob(), true, "UploadPartCopy", &path);
-        r.query = &query;
-        r.copy_source = Some("/data/src.txt");
-        assert_denied(&access, &r).await;
-    }
-
-    #[tokio::test]
-    async fn upload_scoped_ops_resolve_upload_row_via_upload_id() {
-        // ListParts/UploadPart/Abort read the upload creator from the
-        // uploadId-resolved row, not the S3Path object — the object at
-        // the key is owned by BOB, so an object-row gate would allow BOB
-        // and deny ALICE; the upload row does the reverse.
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        put_object(&storage, "dst.txt", Some(&bob()), &private(&bob())).await;
-        let upload_id = upload(&storage, "dst.txt", Some(&alice())).await;
-        let query = format!("uploadId={upload_id}");
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "dst.txt");
-        for op in ["ListParts", "UploadPart", "AbortMultipartUpload"] {
-            let mut r = req(alice(), true, op, &path);
-            r.query = &query;
-            assert_allowed(&access, &r).await;
-            let mut r = req(bob(), true, op, &path);
-            r.query = &query;
-            assert_denied(&access, &r).await;
-        }
-        // Complete applies the B1 destination head on top of the upload
-        // gate: the creator is not the existing destination's owner.
-        let mut r = req(alice(), true, "CompleteMultipartUpload", &path);
-        r.query = &query;
-        assert_denied(&access, &r).await;
-    }
-
-    #[tokio::test]
-    async fn delete_objects_coarse_gate_owner_or_any_grantee() {
-        // Review B2: the coarse gate is the bucket owner OR any
-        // bucket-ACL grant to P — a READ-only grantee passes (the
-        // per-key checks are the handler's); no grant at all → whole-op
-        // 403.
-        let owner = uid();
-        let storage =
-            storage_with_bucket(&owner, vec![canonical(&alice(), Permission::Read)]).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::bucket("data");
-        assert_allowed(&access, &req(owner.clone(), true, "DeleteObjects", &path)).await;
-        assert_allowed(&access, &req(alice(), true, "DeleteObjects", &path)).await;
-        assert_denied(&access, &req(bob(), true, "DeleteObjects", &path)).await;
-        assert_denied(&access, &req(anon(), false, "DeleteObjects", &path)).await;
-    }
-
-    #[tokio::test]
-    async fn unmapped_op_is_owner_only() {
-        // Default B: a resolved-but-unmapped op (GetBucketPolicy has no
-        // §4 row) is owner-only — a signed non-owner gets 403.
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::bucket("data");
-        assert_allowed(&access, &req(owner.clone(), true, "GetBucketPolicy", &path)).await;
-        assert_denied(&access, &req(alice(), true, "GetBucketPolicy", &path)).await;
-    }
-
-    #[tokio::test]
-    async fn authenticated_users_group_matches_any_signed_user() {
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        let acl = Acl {
-            owner: Some(owner.clone()),
-            grants: vec![group(GROUP_AUTHENTICATED_USERS, Permission::Read)],
-        };
-        put_object(&storage, "a.txt", Some(&owner), &acl).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "a.txt");
-        assert_allowed(&access, &req(alice(), true, "GetObject", &path)).await;
-        assert_denied(&access, &req(anon(), false, "GetObject", &path)).await;
-    }
-
-    #[tokio::test]
-    async fn root_ops_require_authentication() {
-        // ListBuckets / CreateBucket: the Authenticated requirement — any
-        // signed principal passes, anonymous 403 (a bucket needs a
-        // creator owner; no resource to grant against).
-        let storage = Arc::new(MemoryStorage::new().unwrap());
-        let access = AclAccess::new(storage, identity());
-        let root = S3Path::root();
-        assert_denied(&access, &req(anon(), false, "ListBuckets", &root)).await;
-        assert_allowed(&access, &req(alice(), true, "ListBuckets", &root)).await;
-        let bucket = S3Path::bucket("data");
-        assert_denied(&access, &req(anon(), false, "CreateBucket", &bucket)).await;
-        assert_allowed(&access, &req(alice(), true, "CreateBucket", &bucket)).await;
-    }
-
-    #[tokio::test]
-    async fn lazy_default_owner_gets_owner_bypass() {
-        // A row with no owner element (the empty wire, review B4)
-        // resolves to the identity's default owner — that principal
-        // passes the owner-parity gates.
-        let storage = Arc::new(MemoryStorage::new().unwrap());
-        let b = bucket::name("data").unwrap();
-        storage
-            .create_bucket(&b, None, &Acl::default_private(None))
-            .await
-            .unwrap();
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::bucket("data");
-        assert_allowed(
-            &access,
-            &req(default_owner_id(), true, "GetBucketLocation", &path),
-        )
-        .await;
-        assert_denied(&access, &req(alice(), true, "GetBucketLocation", &path)).await;
-    }
-
-    #[tokio::test]
-    async fn create_multipart_upload_denied_without_bucket_write() {
-        // CMU resolves to an object path (POST /bucket/key?uploads) but
-        // is NOT upload-scoped and carries no existence dispatch — the
-        // base bucket-WRITE gate applies (regression: the object-path
-        // BucketWrite branch once denied every CMU).
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "big.txt");
-        assert_denied(&access, &req(anon(), false, "CreateMultipartUpload", &path)).await;
-        assert_denied(&access, &req(bob(), true, "CreateMultipartUpload", &path)).await;
-        assert_allowed(
-            &access,
-            &req(owner.clone(), true, "CreateMultipartUpload", &path),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn create_multipart_upload_write_grantee_allowed() {
-        // CMU on a public-write bucket: the anonymous WRITE grantee is
-        // allowed (no existence head — there is no destination key yet).
-        let owner = uid();
-        let storage =
-            storage_with_bucket(&owner, vec![group(GROUP_ALL_USERS, Permission::Write)]).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "big.txt");
-        assert_allowed(&access, &req(anon(), false, "CreateMultipartUpload", &path)).await;
-    }
-
-    #[tokio::test]
-    async fn post_object_runs_the_base_only() {
-        // s3s routes POST to S3Path::Bucket — the form key is
-        // unavailable pre-deserialization, so the B1 destination head is
-        // not enforceable at the access layer; PostObject evaluates the
-        // base (bucket WRITE) only.
-        let owner = uid();
-        let storage =
-            storage_with_bucket(&owner, vec![group(GROUP_ALL_USERS, Permission::Write)]).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::bucket("data");
-        assert_allowed(&access, &req(anon(), false, "PostObject", &path)).await;
-    }
-
-    #[test]
-    fn delete_objects_rule_is_the_owner_only_default() {
-        // Task 8 carry: the coarse gate (bucket owner or any bucket-ACL
-        // grant) is a prose bullet the 10-requirement matrix cannot
-        // express, so `DeleteObjects` resolves to the default-B rule —
-        // the gate in `evaluate` must special-case the op BEFORE
-        // `rule_for`.
-        assert_eq!(
-            rule_for("DeleteObjects"),
-            OpRule {
-                base: Requirement::OwnerOnly,
-                reads_source: false,
-                writes_destination_bucket: false,
-                existence_dispatch: false,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn a_denial_books_the_denied_decision() {
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::object("data", "a.txt");
-        let before = counter("tinio_auth_authorizations_total", &[("decision", "denied")]);
-        assert_denied(&access, &req(bob(), true, "GetObject", &path)).await;
-        let after = counter("tinio_auth_authorizations_total", &[("decision", "denied")]);
-        assert!(
-            after > before,
-            "the denial must increment the family: {before} -> {after}"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_allowance_books_the_allowed_decision() {
-        let owner = uid();
-        let storage = storage_with_bucket(&owner, vec![]).await;
-        let access = AclAccess::new(storage, identity());
-        let path = S3Path::bucket("data");
-        let before = counter(
-            "tinio_auth_authorizations_total",
-            &[("decision", "allowed")],
-        );
-        assert_allowed(
-            &access,
-            &req(owner.clone(), true, "GetBucketLocation", &path),
-        )
-        .await;
-        let after = counter(
-            "tinio_auth_authorizations_total",
-            &[("decision", "allowed")],
-        );
-        assert!(
-            after > before,
-            "the allowance must increment the family: {before} -> {after}"
-        );
-    }
-
-    /// Evaluate one request under the process-wide span recorder and return
-    /// whether it was allowed plus the `reason` its decision span carried.
-    /// The recorder filters to this thread, so parallel tests cannot supply
-    /// the span; the `op` and `decision` fields are asserted with it.
-    async fn recorded_decision(
-        access: &AclAccess<MemoryStorage>,
-        request: &Request<'_>,
-    ) -> (bool, Option<String>) {
-        spans::install();
-        let capture = spans::capture();
-        let before = capture.spans_on_this_thread().len();
-        let allowed = access.evaluate(request).await.is_ok();
-        let recorded = capture.spans_on_this_thread();
-        let span = recorded[before..]
-            .iter()
-            .find(|span| span.name == "evaluate")
-            .unwrap_or_else(|| panic!("the decision span: {recorded:#?}"));
-        assert_eq!(span.field("op"), Some(request.op));
-        assert_eq!(
-            span.field("decision"),
-            Some(if allowed { "allowed" } else { "denied" })
-        );
-        (allowed, span.field("reason").map(str::to_string))
-    }
-
-    /// Every reachable decision branch records its bounded reason on the
-    /// decision span: owner bypass, a grant, the authenticated-only root and
-    /// bucket branches, the missing-resource tiers, the upload creator, the
-    /// expected-owner mismatch, a malformed source header, a missing grant,
-    /// and a missing resource path.
-    #[tokio::test]
-    async fn each_decision_records_its_bounded_reason() {
-        let owner = uid();
-        let storage = storage_with_bucket(
-            &owner,
-            vec![
-                canonical(&bob(), Permission::Read),
-                group(GROUP_ALL_USERS, Permission::Read),
-            ],
-        )
-        .await;
-        put_object(&storage, "a.txt", Some(&owner), &private(&owner)).await;
-        let access = AclAccess::new(Arc::clone(&storage), identity());
-
-        let (allowed, reason) = recorded_decision(
-            &access,
-            &req(
-                owner.clone(),
-                true,
-                "GetBucketLocation",
-                &S3Path::bucket("data"),
-            ),
-        )
-        .await;
-        assert!(allowed, "the owner bypasses the grant gate");
-        assert_eq!(reason.as_deref(), Some("owner"));
-
-        let (allowed, reason) = recorded_decision(
-            &access,
-            &req(anon(), false, "ListObjectsV2", &S3Path::bucket("data")),
-        )
-        .await;
-        assert!(allowed, "an AllUsers READ grant satisfies BucketRead");
-        assert_eq!(reason.as_deref(), Some("grant"));
-
-        let (allowed, reason) =
-            recorded_decision(&access, &req(alice(), true, "ListBuckets", &S3Path::root())).await;
-        assert!(allowed, "ListBuckets needs only a signed principal");
-        assert_eq!(reason.as_deref(), Some("authenticated"));
-
-        let (allowed, reason) = recorded_decision(
-            &access,
-            &req(bob(), true, "GetObject", &S3Path::object("data", "a.txt")),
-        )
-        .await;
-        assert!(!allowed, "a signed non-owner holds no object grant");
-        assert_eq!(reason.as_deref(), Some("no-grant"));
-
-        let bucket_path = S3Path::bucket("data");
-        let mut mismatch = req(owner.clone(), true, "GetBucketLocation", &bucket_path);
-        let stranger = other();
-        mismatch.expected_bucket_owner = Some(stranger.as_str());
-        let (allowed, reason) = recorded_decision(&access, &mismatch).await;
-        assert!(!allowed, "an expected-owner mismatch denies");
-        assert_eq!(reason.as_deref(), Some("owner-mismatch"));
-
-        let (allowed, reason) = recorded_decision(
-            &access,
-            &req(
-                anon(),
-                false,
-                "CopyObject",
-                &S3Path::object("data", "dst.txt"),
-            ),
-        )
-        .await;
-        assert!(!allowed, "a missing copy source fails closed");
-        assert_eq!(reason.as_deref(), Some("malformed-source"));
-
-        let (allowed, reason) = recorded_decision(
-            &access,
-            &req(owner.clone(), true, "DeleteObjects", &S3Path::root()),
-        )
-        .await;
-        assert!(!allowed, "the coarse gate needs a bucket path");
-        assert_eq!(reason.as_deref(), Some("no-resource"));
-
-        let upload_id = upload(&storage, "dst.txt", Some(&alice())).await;
-        let query = format!("uploadId={upload_id}");
-        let path = S3Path::object("data", "dst.txt");
-        let mut creator = req(alice(), true, "ListParts", &path);
-        creator.query = &query;
-        let (allowed, reason) = recorded_decision(&access, &creator).await;
-        assert!(allowed, "the upload's creator owns the upload row");
-        assert_eq!(reason.as_deref(), Some("upload-creator"));
-
-        let empty = Arc::new(MemoryStorage::new().unwrap());
-        let empty_access = AclAccess::new(empty, identity());
-        let (allowed, reason) = recorded_decision(
-            &empty_access,
-            &req(anon(), false, "ListObjectsV2", &S3Path::bucket("ghost")),
-        )
-        .await;
-        assert!(allowed, "a genuinely missing bucket passes through");
-        assert_eq!(reason.as_deref(), Some("missing"));
-    }
-
-    /// The reason vocabulary is closed and kebab-case: a new reason is a code
-    /// change, never a client-chosen series (`StorageError` is listed though
-    /// the mem backend cannot induce it, so the whole domain is pinned).
-    #[test]
-    fn every_reason_renders_its_bounded_label() {
-        for (reason, label) in [
-            (Reason::Owner, "owner"),
-            (Reason::Grant, "grant"),
-            (Reason::Authenticated, "authenticated"),
-            (Reason::Missing, "missing"),
-            (Reason::UploadCreator, "upload-creator"),
-            (Reason::OwnerMismatch, "owner-mismatch"),
-            (Reason::MalformedHeader, "malformed-header"),
-            (Reason::MalformedSource, "malformed-source"),
-            (Reason::NoResource, "no-resource"),
-            (Reason::NoGrant, "no-grant"),
-            (Reason::StorageError, "storage-error"),
-        ] {
-            assert_eq!(reason.to_string(), label);
-        }
-    }
-}
+pub(crate) mod tests;

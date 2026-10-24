@@ -11,6 +11,8 @@ use tracing::subscriber::set_global_default;
 
 #[cfg(feature = "lifecycle")]
 use crate::commands::lifecycle;
+#[cfg(feature = "object-lock")]
+use crate::commands::{legalhold, object_lock, retention};
 #[cfg(feature = "api")]
 use crate::commands::{status, stop};
 use crate::{
@@ -181,6 +183,12 @@ fn try_run() -> Result<ExitCode, Error> {
                 Command::Stop(args) => on_runtime(stop::run(args, located)),
                 #[cfg(feature = "lifecycle")]
                 Command::Lifecycle(args) => on_runtime(lifecycle::run(args, located)),
+                #[cfg(feature = "object-lock")]
+                Command::ObjectLock(args) => on_runtime(object_lock::run(args, located)),
+                #[cfg(feature = "object-lock")]
+                Command::Retention(args) => on_runtime(retention::run(args, located)),
+                #[cfg(feature = "object-lock")]
+                Command::LegalHold(args) => on_runtime(legalhold::run(args, located)),
                 // Not feature-gated, and `cli::Command`'s doc is why: `doctor` diagnoses the
                 // always-present layers, so only the parts of it that need the plane are.
                 Command::Doctor(args) => on_runtime(doctor::run(args, located)),

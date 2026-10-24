@@ -88,6 +88,17 @@
 -- The three are the review's, not a speculative set: a fourth belongs here only
 -- with a plan of its own in hand.
 --
+-- The three Object Lock tables (OL4, OL5). A bucket's configuration is a row
+-- of its own, never an element of the bucket row: the enabled bit survives a
+-- corrupt rule, and the rule wire's None is the empty string. A version's lock
+-- is keyed by the version-id wire, the literal `null` for the null version; an
+-- unlocked version has no row. A multipart upload's intent is keyed by
+-- (bucket, upload_id) and is written in the upload row's own transaction. Every
+-- lock row references buckets (name) ON DELETE CASCADE, so the rows die with
+-- the bucket in the statement that removes it. The three primary keys already
+-- lead with the bucket, so a bucket-wide read or drain scans its own range
+-- through the index and needs no second one.
+--
 -- parts.modified_at is the per-part write stamp, in unix **milliseconds**
 -- (the precision S3's ListParts LastModified carries), so a part reports the
 -- instant it was written rather than the upload's `initiated_at`. It is a
@@ -188,6 +199,16 @@ CREATE TABLE IF NOT EXISTS upload_checksums (
     PRIMARY KEY (bucket, upload_id)
 );
 
+CREATE TABLE IF NOT EXISTS upload_object_lock (
+    bucket text COLLATE "C" NOT NULL
+    REFERENCES buckets(name) ON DELETE CASCADE,
+    upload_id text COLLATE "C" NOT NULL,
+    mode text,
+    retain_until bigint,
+    legal_hold text,
+    PRIMARY KEY (bucket, upload_id)
+);
+
 -- The bucket's versioning state is a closed set of three, so PostgreSQL's own
 -- enum holds it. The labels are `tinio_core::version::State`'s Display wires,
 -- which that type's `sqlx` mapping binds directly (`PascalCase`).
@@ -200,9 +221,16 @@ CREATE TABLE IF NOT EXISTS bucket_versioning (
 
 CREATE TABLE IF NOT EXISTS bucket_lifecycle (
     bucket text COLLATE "C" PRIMARY KEY
-        REFERENCES buckets (name) ON DELETE CASCADE,
+    REFERENCES buckets(name) ON DELETE CASCADE,
     config text NOT NULL,
     updated_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bucket_object_lock (
+    bucket text COLLATE "C" PRIMARY KEY
+    REFERENCES buckets(name) ON DELETE CASCADE,
+    enabled boolean NOT NULL,
+    rule text NOT NULL
 );
 
 -- A version row is either an object version or a delete marker; the labels are
@@ -242,6 +270,17 @@ CREATE TABLE IF NOT EXISTS version_index (
     PRIMARY KEY (bucket, key, id)
 );
 
+CREATE TABLE IF NOT EXISTS version_object_lock (
+    bucket text COLLATE "C" NOT NULL
+    REFERENCES buckets(name) ON DELETE CASCADE,
+    key text COLLATE "C" NOT NULL,
+    version_id text COLLATE "C" NOT NULL,
+    mode text,
+    retain_until bigint,
+    legal_hold text,
+    PRIMARY KEY (bucket, key, version_id)
+);
+
 -- The key's current slot. It cannot ride object_meta: the contract's object row
 -- carries no version columns, and the suite advances a slot for a key that has
 -- no object row at all (the spike's finding F3).
@@ -253,6 +292,41 @@ CREATE TABLE IF NOT EXISTS current_slots (
     is_delete_marker boolean NOT NULL DEFAULT FALSE,
     PRIMARY KEY (bucket, key)
 );
+
+-- The one statement of the Object Lock ownership rule (OL8, OL31): a
+-- per-version lock row is owned when the version index names its identity at a
+-- `version_kind = 'object'` version row of the same key, or when the key's
+-- current slot is not a delete marker and carries the same identity wire. The
+-- drain's refusal and the doctor's orphan scan both select from this view, so
+-- the two answers cannot drift.
+CREATE OR REPLACE VIEW version_lock_owned AS
+SELECT
+    l.bucket,
+    l.key,
+    l.version_id
+FROM version_object_lock AS l
+WHERE
+    EXISTS (
+        SELECT 1
+        FROM version_index AS i
+        INNER JOIN version_rows AS r
+            ON r.bucket = i.bucket AND r.key = i.key AND r.seq = i.seq
+        WHERE
+            i.bucket = l.bucket
+            AND i.key = l.key
+            AND i.id = l.version_id
+            AND r.kind = 'object'
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM current_slots AS s
+        WHERE
+            s.bucket = l.bucket
+            AND s.key = l.key
+            AND NOT s.is_delete_marker
+            AND coalesce(s.version_id, 'null') = l.version_id
+    );
+
 
 -- The content plane (PG18, PG20, PG24). content holds the chunks of every
 -- generation; content_heads records which generation is live. publish writes

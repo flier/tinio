@@ -46,9 +46,11 @@ use utoipa::openapi::OpenApi as OpenApiSchema;
 
 #[cfg(feature = "lifecycle")]
 use crate::lifecycle::{self, LifecycleAdmin};
+#[cfg(feature = "object-lock")]
+use crate::object_lock::{self, ObjectLockAdmin};
 #[cfg(feature = "openapi")]
 use crate::openapi::document;
-use crate::{Error, metrics, state::State};
+use crate::{_core::mode::AccessMode, Error, metrics, state::State};
 
 /// The token rule that applies to this plane.
 ///
@@ -206,6 +208,10 @@ pub struct Context {
     pub port: Arc<OnceLock<u16>>,
     /// Require the control token for `/metrics` too (default `false`).
     pub metrics_requires_token: bool,
+    /// The run's access mode (default [`AccessMode::ReadWrite`]). A route group reads it for its
+    /// write admission instead of asking its admin: a read-only plane refuses a write before the
+    /// request body is looked at, so a new admin cannot silently accept one.
+    pub access: AccessMode,
     /// The lifecycle admin the three `/buckets/{bucket}/lifecycle` routes are served from,
     /// attached at construction ([`Context::with_lifecycle`]). **`None` means those routes do
     /// not exist**: a build without the `lifecycle` feature has no admin to inject (LC15) and a
@@ -214,6 +220,14 @@ pub struct Context {
     #[cfg(feature = "lifecycle")]
     #[debug("<injected>")]
     lifecycle: Option<Arc<dyn LifecycleAdmin>>,
+    /// The Object Lock admin the two `/buckets/{bucket}/object-lock` route pairs are served
+    /// from, attached at construction ([`Context::with_object_lock`]). **`None` means those
+    /// routes do not serve**: a build without the `object-lock` feature has no admin to inject
+    /// and a run whose `[s3] object_lock` is off injects none (OL23), so the handlers answer
+    /// `404` and no stored configuration can be replaced.
+    #[cfg(feature = "object-lock")]
+    #[debug("<injected>")]
+    object_lock: Option<Arc<dyn ObjectLockAdmin>>,
 }
 
 impl Context {
@@ -252,14 +266,25 @@ impl Context {
             stop,
             port: Arc::new(OnceLock::new()),
             metrics_requires_token: false,
+            access: AccessMode::ReadWrite,
             #[cfg(feature = "lifecycle")]
             lifecycle: None,
+            #[cfg(feature = "object-lock")]
+            object_lock: None,
         }
     }
 
     /// Require the control token for `/metrics` too.
     pub fn with_metrics_requires_token(mut self, required: bool) -> Self {
         self.metrics_requires_token = required;
+        self
+    }
+
+    /// Serve under `access`: a read-only plane answers every write route's admission `403` before
+    /// it reads the request body. The CLI passes the same [`AccessMode`] it built the storage's
+    /// options from, so the plane's admission and the store's own refusal cannot disagree.
+    pub fn with_access(mut self, access: AccessMode) -> Self {
+        self.access = access;
         self
     }
 
@@ -336,6 +361,120 @@ impl Context {
     #[cfg(feature = "lifecycle")]
     pub(crate) fn lifecycle(&self) -> Option<&Arc<dyn LifecycleAdmin>> {
         self.lifecycle.as_ref()
+    }
+
+    /// The same context with an Object Lock admin attached, or with none (OL23).
+    ///
+    /// **`None` is the whole feature-switch mechanism.** A build without the `object-lock`
+    /// feature does not register the four `/buckets/{bucket}/object-lock` routes at all, and a
+    /// run whose `[s3] object_lock` is `false` injects no admin — the handlers answer the
+    /// contract's plain `404` either way, so a capability that is off cannot have its stored
+    /// configurations replaced.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::{path::Path, sync::Arc};
+    ///
+    /// use async_trait::async_trait;
+    /// use tinio_api::{
+    ///     _core::{
+    ///         bucket, object,
+    ///         object_lock::{self, Config, LegalHold, Lock, Retention},
+    ///         storage, version,
+    ///     },
+    ///     object_lock::ObjectLockAdmin,
+    ///     router::{Auth, Context},
+    ///     state::State,
+    /// };
+    /// use tokio::sync::watch;
+    ///
+    /// struct Admin;
+    ///
+    /// #[async_trait]
+    /// impl ObjectLockAdmin for Admin {
+    ///     async fn bucket_config(
+    ///         &self,
+    ///         _bucket: &bucket::Name,
+    ///     ) -> Result<Option<Config>, storage::Error> {
+    ///         Ok(None)
+    ///     }
+    ///
+    ///     async fn put_bucket_config(
+    ///         &self,
+    ///         _bucket: &bucket::Name,
+    ///         _config: &Config,
+    ///     ) -> Result<(), storage::Error> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn object_lock(
+    ///         &self,
+    ///         _bucket: &bucket::Name,
+    ///         _key: &object::Key,
+    ///         _address: &version::Address,
+    ///     ) -> Result<Option<Lock>, storage::Error> {
+    ///         Ok(None)
+    ///     }
+    ///
+    ///     async fn put_retention(
+    ///         &self,
+    ///         _bucket: &bucket::Name,
+    ///         _key: &object::Key,
+    ///         _address: &version::Address,
+    ///         _retention: Option<&Retention>,
+    ///         _bypass: object_lock::Bypass,
+    ///     ) -> Result<(), storage::Error> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn put_legal_hold(
+    ///         &self,
+    ///         _bucket: &bucket::Name,
+    ///         _key: &object::Key,
+    ///         _address: &version::Address,
+    ///         _hold: LegalHold,
+    ///     ) -> Result<(), storage::Error> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     async fn update_lock(
+    ///         &self,
+    ///         _bucket: &bucket::Name,
+    ///         _key: &object::Key,
+    ///         _address: &version::Address,
+    ///         _retention: Option<Option<&Retention>>,
+    ///         _legal_hold: Option<LegalHold>,
+    ///         _bypass: object_lock::Bypass,
+    ///     ) -> Result<(), storage::Error> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let state =
+    ///     State::new("tinio-0123456789abcdef.sock", None, Path::new("/srv/data")).expect("state");
+    /// let (stop, _rx) = watch::channel(false);
+    /// // `Some(admin)` serves the four routes; `with_object_lock(None)`, or no call at all, is
+    /// // the capability-off context — the handlers answer `404`, the store untouched.
+    /// let context =
+    ///     Context::new(state, "127.0.0.1", Auth::Local, stop).with_object_lock(Some(Arc::new(Admin)));
+    /// assert!(
+    ///     format!("{context:?}").contains("<injected>"),
+    ///     "the admin is opaque in `Debug`"
+    /// );
+    /// ```
+    #[cfg(feature = "object-lock")]
+    pub fn with_object_lock(mut self, admin: Option<Arc<dyn ObjectLockAdmin>>) -> Self {
+        self.object_lock = admin;
+        self
+    }
+
+    /// The attached Object Lock admin, when there is one — the only door to a stored lock
+    /// configuration, and `None` for both causes the doc on the field names. Crate-private: the
+    /// admin is an input to construction, not something a caller patches in.
+    #[cfg(feature = "object-lock")]
+    pub(crate) fn object_lock(&self) -> Option<&Arc<dyn ObjectLockAdmin>> {
+        self.object_lock.as_ref()
     }
 }
 
@@ -450,6 +589,92 @@ pub struct InvalidBody {
     pub reason: String,
 }
 
+/// The admission, refusal and failure mapping the admin-backed route groups share.
+///
+/// The lifecycle and Object Lock groups differ only in what a storage refusal means beyond the
+/// common answer, so that part is here once and each module supplies only its extra mappings.
+/// The admin is taken **before anything else**, so a plane carrying none answers `404` whatever
+/// the request looks like; a read-only run's refusal and `AccessDenied` are `403`; a missing
+/// bucket is `404`; and everything else is a `500` whose detail stays in the log.
+#[cfg(any(feature = "lifecycle", feature = "object-lock"))]
+pub(crate) mod admin {
+    use std::sync::Arc;
+
+    use axum::{
+        Json,
+        http::StatusCode,
+        response::{IntoResponse, Response},
+    };
+
+    use crate::_core::{bucket, storage};
+
+    /// Why [`admit`] refused a request.
+    pub(crate) enum Admission {
+        /// No admin was injected; the message is the capability's own `404` sentence.
+        Absent(&'static str),
+        /// The route segment is not a bucket name.
+        InvalidName,
+    }
+
+    impl Admission {
+        /// The plane's answer for this refusal.
+        pub(crate) fn response(self) -> Response {
+            match self {
+                Self::Absent(message) => refusal(StatusCode::NOT_FOUND, message),
+                Self::InvalidName => refusal(StatusCode::NOT_FOUND, "no such bucket"),
+            }
+        }
+    }
+
+    /// The admin and the bucket every route's handler needs. **The admin is taken before
+    /// anything else**, so a plane carrying none answers `404` whatever the request looks like.
+    pub(crate) fn admit<A: ?Sized>(
+        admin: Option<&Arc<A>>,
+        wire: String,
+        absent: &'static str,
+    ) -> Result<(Arc<A>, bucket::Name), Admission> {
+        let Some(admin) = admin else {
+            return Err(Admission::Absent(absent));
+        };
+        let Ok(bucket) = bucket::name(wire) else {
+            return Err(Admission::InvalidName);
+        };
+        Ok((Arc::clone(admin), bucket))
+    }
+
+    /// This crate's error body with `status`: the shape every failure this plane answers carries.
+    pub(crate) fn refusal(status: StatusCode, message: &str) -> Response {
+        (
+            status,
+            Json(crate::ErrorBody {
+                error: message.to_string(),
+            }),
+        )
+            .into_response()
+    }
+
+    /// A storage failure as an admin route's status: the common read-only/404/500 mapping, with
+    /// `extra` consulted first for the module's own refusals (`Locked` and `InvalidBucketState`
+    /// for Object Lock, nothing for lifecycle).
+    pub(crate) fn failure(
+        context: &'static str,
+        err: storage::Error,
+        extra: impl FnOnce(&storage::Error) -> Option<Response>,
+    ) -> Response {
+        tracing::warn!(error = %err, "{context}");
+        if err.is_read_only() || matches!(&err, storage::Error::AccessDenied(_)) {
+            return refusal(StatusCode::FORBIDDEN, "access denied");
+        }
+        if let Some(response) = extra(&err) {
+            return response;
+        }
+        match err {
+            storage::Error::NoSuchBucket(_) => refusal(StatusCode::NOT_FOUND, "no such bucket"),
+            _ => refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
+        }
+    }
+}
+
 /// Builds the router for `shared`.
 ///
 /// **Every route goes before the `.route_layer(...)` lines** — why that ordering and that layer
@@ -489,6 +714,11 @@ pub fn router(shared: Shared) -> Router {
     // copy of it (LC14, LC15). A stripped build has no such path, and the fallback answers `404`.
     #[cfg(feature = "lifecycle")]
     let routes = lifecycle::mount(routes);
+    // The two Object Lock route pairs, likewise above the token layer and likewise only in a
+    // build that carries them (OL23). A stripped build has no such path, and the fallback
+    // answers `404`.
+    #[cfg(feature = "object-lock")]
+    let routes = object_lock::mount(routes);
     // And the schema, likewise above the layer: the local channel serves it openly, every other
     // transport has to present the token — a hidden route would be served unchecked.
     #[cfg(feature = "openapi")]

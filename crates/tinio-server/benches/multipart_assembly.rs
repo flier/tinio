@@ -72,6 +72,7 @@ fn multipart_assembly(c: &mut Criterion) {
                         object::Tags::empty(),
                         None,
                         &Acl::default_private(None),
+                        None,
                     )
                     .await
                     .unwrap();

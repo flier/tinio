@@ -115,6 +115,14 @@ pub struct Capabilities {
     #[default(_code = "DEFAULT_LIFECYCLE")]
     pub lifecycle: bool,
 
+    /// S3 Object Lock (Get/PutObjectLockConfiguration,
+    /// Get/PutObjectRetention, Get/PutObjectLegalHold). Default on; off
+    /// answers `NotImplemented` on the six operations, while the stored
+    /// configurations, default retention and delete protection stay in
+    /// force (OL2, OL20).
+    #[default(_code = "DEFAULT_OBJECT_LOCK")]
+    pub object_lock: bool,
+
     /// Cap on concurrently streaming SelectObjectContent responses
     /// (default 4): each job owns a body forwarder and a seat on the
     /// select rayon pool — without a cap, concurrent selects exhaust
@@ -169,6 +177,9 @@ const DEFAULT_VERSIONING: bool = true;
 
 /// Bucket lifecycle. Default on.
 const DEFAULT_LIFECYCLE: bool = true;
+
+/// S3 Object Lock. Default on.
+const DEFAULT_OBJECT_LOCK: bool = true;
 
 /// Concurrent SelectObjectContent responses. Default 4.
 const DEFAULT_SELECT_CONCURRENCY: u32 = 4;
@@ -314,6 +325,17 @@ mod schema_tests {
         let caps: Capabilities = toml::from_str("lifecycle = false").unwrap();
         caps.validate().unwrap();
         assert!(!caps.lifecycle);
+    }
+
+    #[test]
+    fn object_lock_defaults_on_and_can_be_disabled() {
+        assert!(
+            Capabilities::default().object_lock,
+            "a core-surface capability defaults on, like lifecycle"
+        );
+        let caps: Capabilities = toml::from_str("object_lock = false").unwrap();
+        caps.validate().unwrap();
+        assert!(!caps.object_lock);
     }
 
     #[test]

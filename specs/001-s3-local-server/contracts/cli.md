@@ -2,7 +2,7 @@
 
 **Branch**: `001-s3-local-server` | **Date**: 2026-08-21
 
-Systemd-style lifecycle commands (spec FR-007, design review) with Minio-compatible invocation. No data commands — bucket/object operations are performed directly on the filesystem; `tinio lifecycle` (below) is the one exception: it configures a server-side policy through the management plane and touches no bucket or object. Binary: `tinio` (thin `main` in the facade crate → `tinio_cli::run()`).
+Systemd-style lifecycle commands (spec FR-007, design review) with Minio-compatible invocation. No data commands — bucket/object operations are performed directly on the filesystem; `tinio lifecycle` (FR-007's first exception, below) and the object-lock groups (`object-lock`, `retention`, `legalhold` — the second) configure a server-side policy through the management plane and touch no bucket or object. Binary: `tinio` (thin `main` in the facade crate → `tinio_cli::run()`).
 
 ## Global
 
@@ -93,7 +93,7 @@ tinio lifecycle rm <BUCKET>
 tinio lifecycle put <BUCKET> FILE
 ```
 
-Bucket lifecycle configuration (FR-042) — **FR-007's one exception** to "no data commands": the verbs configure a server-side policy through the management plane's `GET`/`PUT`/`DELETE /buckets/{bucket}/lifecycle` routes, and never create, read, write or delete a bucket or an object. No S3 client is added to the CLI, and the CLI never opens a backend store — the running server owns it, so a root with no server answers the usual no-server refusal.
+Bucket lifecycle configuration (FR-042) — **FR-007's first exception** to "no data commands" (the object-lock groups are the second): the verbs configure a server-side policy through the management plane's `GET`/`PUT`/`DELETE /buckets/{bucket}/lifecycle` routes, and never create, read, write or delete a bucket or an object. No S3 client is added to the CLI, and the CLI never opens a backend store — the running server owns it, so a root with no server answers the usual no-server refusal.
 
 | Verb | Meaning |
 |---|---|
@@ -105,6 +105,38 @@ Bucket lifecycle configuration (FR-042) — **FR-007's one exception** to "no da
 Every verb also takes the root and the mode exactly as `status` and `stop` do — `[DIR]`, `--read-only`, and the `DirArgs` environment channels (`TINIO_STATE_DIR`, the credential pair) — so a verb asked about a root asks the server that serves it. `add` **replaces** the rule carrying that id — an action its flags do not name is dropped with it — and leaves every other rule untouched: the id is the merge key, and a field merge would silently keep an action the operator did not restate.
 
 `add`'s flags cover the Days-based actions only — a `Date`, an `ExpiredObjectDeleteMarker` or a `NewerNoncurrentVersions` is expressed by `put`, whose body is the whole stored model. The verbs speak the plane's JSON (the stored model, one spelling for both management surfaces); the S3 subresource speaks the framework's XML (`contracts/s3-surface.md` §Lifecycle). A server with `[s3] lifecycle = false` does not register the plane's routes, so every verb reports the capability as disabled (`contracts/config.md`). The verbs exist only in a build carrying the `lifecycle` cargo feature, like the plane's routes: a build without it does not expose this subcommand.
+
+### `tinio object-lock`
+
+```
+tinio object-lock enable <BUCKET>
+```
+
+Enable Object Lock on a bucket (FR-043) through the plane's `PUT /buckets/{bucket}/object-lock`; it touches no bucket or object. The command drives the plane's enable path, which enables the bucket's versioning first when the bucket is unversioned and then writes the configuration — the CLI convenience, because the S3 `PutObjectLockConfiguration` still requires versioning. The command writes the bucket configuration only; the default-retention rule is `tinio retention set --default`'s.
+
+### `tinio retention`
+
+```
+tinio retention set <BUCKET[/KEY]> [--version-id ID] [--bypass] [--default] MODE VALIDITY
+tinio retention info <BUCKET[/KEY]> [--version-id ID]
+tinio retention clear <BUCKET[/KEY]> [--version-id ID] [--default]
+```
+
+Sets, reads and clears a version's retention or the bucket's default rule (FR-043). `MODE` is `governance` or `compliance`; `VALIDITY` is `Nd` days or `Ny` years (`1d..=36500d`, `1y..=100y`). `BUCKET/KEY` names the object, and `--version-id` addresses one version; without it the current version is addressed. `--default` writes the bucket's default-retention rule, takes no key, no `--version-id` and no `--bypass`, and goes through the plane's enable path, which enables versioning first when the bucket is unversioned.
+
+`--bypass` is accepted on `set` only. `info <BUCKET>` without a key reads the bucket configuration; `info` with a key reads that version's retention. `--version-id` needs a key — `info <BUCKET> --version-id …` addresses no resource and is refused before any plane call, like the other key-required verbs. `clear` without `--default` carries the implicit governance bypass under the plane token; `clear --default` clears only the rule and keeps the bucket enabled, so on a bucket that is not enabled it reports "not enabled" and writes nothing.
+
+### `tinio legalhold`
+
+```
+tinio legalhold set <BUCKET[/KEY]> [--version-id ID]
+tinio legalhold info <BUCKET[/KEY]> [--version-id ID]
+tinio legalhold clear <BUCKET[/KEY]> [--version-id ID]
+```
+
+Sets a legal hold ON, reads it, or clears it to OFF (FR-043) — no positional `ON`/`OFF`. `--version-id` addresses one version; without it the current version is addressed. There is no `--bypass`, because a legal hold cannot be bypassed.
+
+All three groups take the root and the mode exactly as `status` and `stop` do (`[DIR]`, `--read-only`, the `DirArgs` environment channels), drive the management plane and never a store or an S3 client, so a root with no server answers the usual no-server refusal. `--json` is per subcommand and mirrors `mc`'s field names — `mode`/`until`/`urlpath`/`versionID`/`status`/`error` for retention, `op`/`enabled`/`mode`/`validity` for the bucket configuration (`30DAYS`/`3YEARS`), and `legalhold`/`urlpath`/`key`/`versionID` for a legal hold — while the plane's JSON stays the stored model. The groups exist only in a build carrying the `object-lock` cargo feature (which requires `api`), like the plane's routes; on a server that does not serve the capability every verb reports it as disabled (`contracts/config.md` owns the switch).
 
 ### `tinio doctor`
 

@@ -189,6 +189,7 @@ fn one_document_carries_capability_sweep_scanner_and_telemetry_keys() {
     acl = false
     versioning = false
     lifecycle = false
+    object_lock = false
     select_concurrency = 2
     select_stack_bytes = 33554432
     sig_v2 = true
@@ -235,6 +236,7 @@ fn one_document_carries_capability_sweep_scanner_and_telemetry_keys() {
         "the lifecycle capability's key is `[s3] lifecycle` — the one switch for the three \
          operations, the pass and the seed"
     );
+    assert!(!s3.capabilities.object_lock);
     assert_eq!(s3.capabilities.select_concurrency, 2);
     assert_eq!(s3.capabilities.select_stack_bytes, 33_554_432);
     assert!(s3.sig_v2);
@@ -782,6 +784,29 @@ fn capabilities_flatten_into_s3_section() {
     assert!(caps.delete_objects);
     assert!(caps.list_objects_v1);
     assert!(caps.list_objects_v2);
+}
+
+/// `[s3] object_lock` is the runtime capability Task 6 declared on `Capabilities`: default on
+/// (OL2, the core-surface posture), an explicit false reaches the field, and a non-boolean is
+/// refused through the same flattened-table parse as every other toggle.
+#[test]
+fn object_lock_defaults_on_and_maps_to_the_capability() {
+    assert!(
+        s3::Config::default().capabilities.object_lock,
+        "Object Lock is a core-surface capability, on by default like versioning and lifecycle"
+    );
+
+    // An empty `[s3]` section keeps the default; writing the key overrides it.
+    let config = Config::parse("version = 1\n[s3]").unwrap();
+    assert!(config.s3.as_ref().unwrap().capabilities.object_lock);
+
+    let config = Config::parse("version = 1\n[s3]\nobject_lock = false").unwrap();
+    assert!(!config.s3.unwrap().capabilities.object_lock);
+
+    // A string is not a boolean: the flattened table refuses it at parse, exactly as
+    // `[server] read_only = "yes"` is refused.
+    let err = Config::parse("version = 1\n[s3]\nobject_lock = \"off\"").unwrap_err();
+    assert!(matches!(err, Error::Parse { .. }), "{err}");
 }
 
 #[test]

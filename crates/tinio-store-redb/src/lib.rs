@@ -24,11 +24,13 @@ use crate::_core::meta::Metadata;
 mod acl;
 pub mod bucket;
 pub mod bucket_lifecycle;
+pub mod bucket_object_lock;
 pub mod bucket_versioning;
 pub mod compact;
 pub mod content;
 pub mod driver;
 pub mod error;
+pub mod lock_inspect;
 pub mod meta;
 pub mod object_meta;
 pub mod object_part;
@@ -51,8 +53,10 @@ pub mod store;
 pub mod table;
 pub mod upload;
 pub mod upload_checksum;
+pub mod upload_object_lock;
 pub mod version;
 pub mod version_index;
+pub mod version_object_lock;
 
 #[cfg(test)]
 mod contract;
@@ -144,7 +148,7 @@ impl Metadata for RedbMetadata {
     type Error = Error;
 }
 
-/// Create the twelve shared tables inside a write transaction
+/// Create the fifteen shared tables inside a write transaction
 /// (idempotent). Backends create their local tables in the same
 /// transaction alongside.
 pub fn ensure_all(txn: &mut redb::WriteTransaction) -> Result<(), Error> {
@@ -160,6 +164,9 @@ pub fn ensure_all(txn: &mut redb::WriteTransaction) -> Result<(), Error> {
     version_index::Table::ensure(txn)?;
     bucket_versioning::Table::ensure(txn)?;
     bucket_lifecycle::Table::ensure(txn)?;
+    bucket_object_lock::Table::ensure(txn)?;
+    version_object_lock::Table::ensure(txn)?;
+    upload_object_lock::Table::ensure(txn)?;
     Ok(())
 }
 
@@ -180,7 +187,7 @@ mod tests {
     fn assert_same<A: Same<B>, B>() {}
 
     #[test]
-    fn ensure_all_creates_exactly_the_twelve_tables_idempotently() {
+    fn ensure_all_creates_exactly_the_fifteen_tables_idempotently() {
         let db = Database::builder()
             .create_with_backend(InMemoryBackend::new())
             .unwrap();
@@ -206,6 +213,7 @@ mod tests {
             names,
             [
                 "bucket_lifecycle",
+                "bucket_object_lock",
                 "bucket_versioning",
                 "buckets",
                 "object_meta",
@@ -214,8 +222,10 @@ mod tests {
                 "part_stamps",
                 "parts",
                 "upload_checksums",
+                "upload_object_lock",
                 "uploads",
                 "version_index",
+                "version_object_lock",
                 "versions",
             ]
         );

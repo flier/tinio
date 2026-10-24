@@ -244,10 +244,10 @@ mod tests {
     }
 
     /// The on-disk byte-format contract: a freshly opened `meta.redb`
-    /// contains exactly the twelve shared store tables plus the fs-local
+    /// contains exactly the fifteen shared store tables plus the fs-local
     /// `state` table, and nothing else (shared-store-table-layer
     /// 2026-09-03 Goal 4 / spec §4 byte-format guard — this crate's own
-    /// `ensure_all` test pins the twelve shared names; this pins the full
+    /// `ensure_all` test pins the shared names; this pins the full
     /// schema the driver's open creates). Moved from tinio-fs's
     /// `database/open.rs`, 2026-10-01/2026-10-03.
     #[test]
@@ -265,6 +265,7 @@ mod tests {
             names,
             [
                 "bucket_lifecycle",
+                "bucket_object_lock",
                 "bucket_versioning",
                 "buckets",
                 "object_meta",
@@ -274,8 +275,10 @@ mod tests {
                 "parts",
                 "state",
                 "upload_checksums",
+                "upload_object_lock",
                 "uploads",
                 "version_index",
+                "version_object_lock",
                 "versions",
             ]
         );

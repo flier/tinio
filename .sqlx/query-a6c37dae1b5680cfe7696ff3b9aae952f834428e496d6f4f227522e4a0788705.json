@@ -1,0 +1,80 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO buckets (name, created, tags, acl, cors)\nVALUES ($1, $2, '{}', $3, '')\nON CONFLICT (\n    name) DO UPDATE SET acl.grants = ($3::acl).grants\nWHERE (buckets.acl).grants IS DISTINCT FROM ($3::acl).grants\nRETURNING (xmax = 0) AS inserted\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "inserted",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        {
+          "Custom": {
+            "name": "acl",
+            "kind": {
+              "Composite": [
+                [
+                  "owner",
+                  "Text"
+                ],
+                [
+                  "grants",
+                  {
+                    "Custom": {
+                      "name": "acl_grant[]",
+                      "kind": {
+                        "Array": {
+                          "Custom": {
+                            "name": "acl_grant",
+                            "kind": {
+                              "Composite": [
+                                [
+                                  "grantee",
+                                  {
+                                    "Custom": {
+                                      "name": "acl_grantee",
+                                      "kind": {
+                                        "Composite": [
+                                          [
+                                            "grantee_kind",
+                                            "Text"
+                                          ],
+                                          [
+                                            "grantee_value",
+                                            "Text"
+                                          ]
+                                        ]
+                                      }
+                                    }
+                                  }
+                                ],
+                                [
+                                  "permission",
+                                  "Text"
+                                ]
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a6c37dae1b5680cfe7696ff3b9aae952f834428e496d6f4f227522e4a0788705"
+}

@@ -23,12 +23,13 @@ pub trait TableDef {
     /// Whether a read-only handle may meet this table **missing** and
     /// answer it as empty. `false` for every base table: a state database
     /// without one is a database this build did not write, so its absence
-    /// is the redb error it is. `true` for the three version tables and
-    /// `bucket_lifecycle` — the four of the shared schema's twelve that a
-    /// root may legitimately predate (spec 2026-10-03 for the version
-    /// machinery, spec 2026-10-18 for the lifecycle row): "no history" and
-    /// "no configuration" must not read as "this root cannot be read"
-    /// (FR-023 amended, design 2026-10-03 **Read paths**).
+    /// is the redb error it is. `true` for the three version tables,
+    /// `bucket_lifecycle` and the three object-lock tables — the seven of
+    /// the shared schema's fifteen that a root may legitimately predate
+    /// (spec 2026-10-03 for the version machinery, spec 2026-10-18 for the
+    /// lifecycle row, design 2026-10-20 for Object Lock): "no history",
+    /// "no configuration" and "no lock" must not read as "this root cannot
+    /// be read" (FR-023 amended, design 2026-10-03 **Read paths**).
     const MAY_BE_ABSENT: bool = false;
 }
 
@@ -86,11 +87,13 @@ impl<'txn, D: TableDef> Table<'txn, D, redb::ReadOnlyTable<D::Key, D::Value>> {
     /// A read-only handle may meet a database that predates a table — a
     /// root written by a build without the version machinery has no
     /// version tables, one written before the lifecycle machinery has no
-    /// `bucket_lifecycle` — and "no history"/"no configuration" must not
-    /// read as "this root cannot be read". The tolerance is per table
-    /// ([`TableDef::MAY_BE_ABSENT`]): only the three version tables and
-    /// `bucket_lifecycle` allow it, and any other missing table propagates
-    /// redb's `TableDoesNotExist` as the error it is. The stand-in is a real,
+    /// `bucket_lifecycle`, one written before Object Lock has none of the
+    /// three lock tables — and "no history"/"no configuration"/"no lock"
+    /// must not read as "this root cannot be read". The tolerance is per
+    /// table ([`TableDef::MAY_BE_ABSENT`]): only the three version tables,
+    /// `bucket_lifecycle` and the three object-lock tables allow it, and any
+    /// other missing table propagates redb's `TableDoesNotExist` as the
+    /// error it is. The stand-in is a real,
     /// empty table: redb hands out no table that does not exist and its
     /// table types have no public constructor, so the missing table is
     /// answered from a process-wide in-memory database (`empty_table`,
@@ -164,8 +167,9 @@ mod tests {
     use redb::{Database, ReadableDatabase, backends::InMemoryBackend};
 
     use crate::{
-        _core::version::State, bucket_lifecycle, bucket_versioning, error::Error, objects, state,
-        version, version_index,
+        _core::version::State, bucket_lifecycle, bucket_object_lock, bucket_versioning,
+        error::Error, objects, state, upload_object_lock, version, version_index,
+        version_object_lock,
     };
 
     fn database() -> Database {
@@ -178,8 +182,10 @@ mod tests {
     /// tolerance is per table. A database predating the version machinery —
     /// no version table at all — answers every version table empty, and a
     /// database that has them still reads their own rows. `bucket_lifecycle`
-    /// is the fourth may-be-absent table (spec 2026-10-18, LC6), so a root
-    /// written before it reads "no configuration" rather than failing.
+    /// is the fourth may-be-absent table (spec 2026-10-18, LC6) and the three
+    /// Object Lock tables the fifth, sixth and seventh (design 2026-10-20,
+    /// OL4), so a root written before them reads "no configuration"/"no
+    /// lock" rather than failing.
     #[test]
     fn a_missing_may_be_absent_table_reads_as_empty_on_a_read_only_handle() {
         let db = database();
@@ -214,6 +220,30 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a root written before the lifecycle row has no bucket_lifecycle table"
+        );
+        assert!(
+            bucket_object_lock::Table::open_readonly(&txn)
+                .unwrap()
+                .get("data")
+                .unwrap()
+                .is_none(),
+            "a pre-feature root serves with no bucket lock configuration"
+        );
+        assert!(
+            version_object_lock::Table::open_readonly(&txn)
+                .unwrap()
+                .get("b", "k", "v1")
+                .unwrap()
+                .is_none(),
+            "a pre-feature root serves no version lock"
+        );
+        assert!(
+            upload_object_lock::Table::open_readonly(&txn)
+                .unwrap()
+                .get("b", "upload-1")
+                .unwrap()
+                .is_none(),
+            "a pre-feature root serves no upload intent"
         );
         drop(txn);
 

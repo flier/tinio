@@ -10,7 +10,7 @@ use crate::{
     acl::Acl,
     bucket, checksum,
     multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
-    object,
+    object, object_lock,
 };
 
 /// Parameters of a [`MultipartOps::list_parts`] call.
@@ -155,6 +155,16 @@ pub trait MultipartOps: Send + Sync + 'static {
     /// create-time owner element and ACL (persisted the same way —
     /// `None` owner = the empty owner wire, the lazy default owner) —
     /// applied by the completion, never re-ferried through the interface.
+    /// `lock` is the effective Object Lock [`ObjectOps::resolve_write_lock`]
+    /// resolved at create (OL6): it is fixed then, so a mid-upload
+    /// configuration change cannot alter it, and the completion applies the
+    /// stored intent.
+    ///
+    /// [`ObjectOps::resolve_write_lock`]: crate::storage::ObjectOps::resolve_write_lock
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the create's field set — bucket, key, checksum, tags, owner, ACL and the effective lock — is the request's own; Task 5b stores the lock atomically with the upload row"
+    )]
     async fn create_multipart_upload(
         &self,
         bucket: &bucket::Name,
@@ -163,6 +173,7 @@ pub trait MultipartOps: Send + Sync + 'static {
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<MultipartUpload, <Self as Storage>::Error>
     where
         Self: Storage;

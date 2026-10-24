@@ -40,7 +40,7 @@ use crate::{
         blob::BlobRef,
         bucket, checksum,
         content::{ContentEntry, ContentKey, ObjectContent, PublishId, StagedObject},
-        cors, lifecycle, meta, multipart, object,
+        cors, lifecycle, meta, multipart, object, object_lock,
         storage::{self, BodyStream},
         version::{Id, State},
     },
@@ -380,6 +380,9 @@ forward!(meta::BucketMeta {
     merge_lifecycle(bucket: &bucket::Name, rules: &[lifecycle::Rule]) -> Result<lifecycle::Merged, RowError>;
     merge_lifecycle_or_create(bucket: &bucket::Name, rules: &[lifecycle::Rule], now: SystemTime) -> Result<lifecycle::Merged, RowError>;
     clear_lifecycle(bucket: &bucket::Name) -> Result<bool, RowError>;
+    object_lock(bucket: &bucket::Name) -> Result<Option<object_lock::Config>, RowError>;
+    set_object_lock(bucket: &bucket::Name, config: &object_lock::Config) -> Result<bool, RowError>;
+    clear_object_lock(bucket: &bucket::Name) -> Result<bool, RowError>;
     remove(bucket: &bucket::Name) -> Result<(), RowError>;
     remove_if_empty(bucket: &bucket::Name) -> Result<(), RowError>;
 });
@@ -582,6 +585,60 @@ impl meta::UploadMeta for TestMeta {
     ) -> Result<(), RowError> {
         <RedbMetadata as meta::UploadMeta>::create_guarded(&self.inner, bucket, upload_id, row)
             .await
+    }
+
+    /// The lock intent is delegated like every other upload row: Task 3 owns
+    /// the table, and this double must not invent a second behaviour for it.
+    async fn create_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &meta::upload::Row,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), RowError> {
+        <RedbMetadata as meta::UploadMeta>::create_with_lock(
+            &self.inner,
+            bucket,
+            upload_id,
+            row,
+            lock,
+        )
+        .await
+    }
+
+    /// The guarded twin: the guard is the store's (its own bucket-row probe),
+    /// so the double delegates rather than forwarding to the unguarded body.
+    async fn create_guarded_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &meta::upload::Row,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), RowError> {
+        <RedbMetadata as meta::UploadMeta>::create_guarded_with_lock(
+            &self.inner,
+            bucket,
+            upload_id,
+            row,
+            lock,
+        )
+        .await
+    }
+
+    async fn upload_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+    ) -> Result<Option<object_lock::Lock>, RowError> {
+        <RedbMetadata as meta::UploadMeta>::upload_lock(&self.inner, bucket, upload_id).await
+    }
+
+    async fn clear_upload_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+    ) -> Result<(), RowError> {
+        <RedbMetadata as meta::UploadMeta>::clear_upload_lock(&self.inner, bucket, upload_id).await
     }
 
     async fn get(
@@ -884,6 +941,168 @@ impl meta::VersionMeta for TestMeta {
             return Ok(Some(seq));
         }
         <RedbMetadata as meta::VersionMeta>::version_seq_of(&self.inner, bucket, key, id).await
+    }
+
+    // The Object Lock contract methods delegate to the reference rows, exactly
+    // as every other call in this double does; Task 3's transactions are the
+    // one implementation the engine tests must exercise.
+    async fn set_version_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), RowError> {
+        <RedbMetadata as meta::VersionMeta>::set_version_lock(
+            &self.inner,
+            bucket,
+            key,
+            version,
+            lock,
+        )
+        .await
+    }
+
+    async fn version_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<Option<object_lock::Lock>, RowError> {
+        <RedbMetadata as meta::VersionMeta>::version_lock(&self.inner, bucket, key, version).await
+    }
+
+    async fn get_object_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<Option<object_lock::Retention>, RowError> {
+        <RedbMetadata as meta::VersionMeta>::get_object_retention(&self.inner, bucket, key, version)
+            .await
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<object_lock::LegalHold, RowError> {
+        <RedbMetadata as meta::VersionMeta>::get_object_legal_hold(
+            &self.inner,
+            bucket,
+            key,
+            version,
+        )
+        .await
+    }
+
+    async fn set_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+        requested: Option<&object_lock::Retention>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, RowError> {
+        <RedbMetadata as meta::VersionMeta>::set_retention(
+            &self.inner,
+            bucket,
+            key,
+            version,
+            requested,
+            bypass,
+            now,
+        )
+        .await
+    }
+
+    async fn set_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+        hold: object_lock::LegalHold,
+    ) -> Result<object_lock::Lock, RowError> {
+        <RedbMetadata as meta::VersionMeta>::set_legal_hold(&self.inner, bucket, key, version, hold)
+            .await
+    }
+
+    async fn set_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+        retention: Option<Option<&object_lock::Retention>>,
+        legal_hold: Option<object_lock::LegalHold>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, RowError> {
+        <RedbMetadata as meta::VersionMeta>::set_lock(
+            &self.inner,
+            bucket,
+            key,
+            version,
+            retention,
+            legal_hold,
+            bypass,
+            now,
+        )
+        .await
+    }
+
+    async fn expire_with(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seq: u64,
+        bypass: object_lock::Bypass,
+    ) -> Result<meta::version::Expired, RowError> {
+        <RedbMetadata as meta::VersionMeta>::expire_with(&self.inner, bucket, key, seq, bypass)
+            .await
+    }
+
+    async fn expire_many_report(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seqs: &[u64],
+    ) -> Result<meta::version::ExpireReport, RowError> {
+        <RedbMetadata as meta::VersionMeta>::expire_many_report(&self.inner, bucket, key, seqs)
+            .await
+    }
+
+    async fn advance_slot_with(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        id: Option<Id>,
+        seq: u64,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), RowError> {
+        if self
+            .refuse_next_advance_slot
+            .swap(false, AtomicOrdering::Relaxed)
+        {
+            return Err(io::Error::other("the slot plane refused this key's advance").into());
+        }
+        let advanced = <RedbMetadata as meta::VersionMeta>::advance_slot_with(
+            &self.inner,
+            bucket,
+            key,
+            id,
+            seq,
+            lock,
+        )
+        .await;
+        if advanced.is_ok() {
+            self.slots
+                .lock()
+                .expect("the slot log")
+                .insert((bucket.to_string(), key.to_string()), seq);
+        }
+        advanced
     }
 }
 

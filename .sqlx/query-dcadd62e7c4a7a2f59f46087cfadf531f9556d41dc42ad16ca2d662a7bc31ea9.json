@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM upload_object_lock WHERE bucket = $1 AND upload_id = $2\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dcadd62e7c4a7a2f59f46087cfadf531f9556d41dc42ad16ca2d662a7bc31ea9"
+}

@@ -53,6 +53,7 @@ async fn the_upload_lifecycle_records_and_serves_the_upload_row() {
             object::Tags::from_pairs([("team".to_owned(), "core".to_owned())]).unwrap(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -108,6 +109,7 @@ async fn a_guarded_store_refuses_the_create_of_a_bucket_it_does_not_hold() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap_err();
@@ -128,6 +130,7 @@ async fn the_part_pipeline_publishes_the_bytes_then_writes_the_row() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -201,6 +204,7 @@ async fn the_part_lock_spans_the_body_the_publish_and_the_row() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -251,6 +255,7 @@ async fn a_refused_part_row_write_takes_this_calls_publish_back() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -336,6 +341,7 @@ async fn a_body_failure_on_a_live_upload_answers_the_streams_error() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -382,6 +388,7 @@ async fn a_body_failure_that_raced_an_abort_answers_no_such_upload() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -417,6 +424,7 @@ async fn the_page_resumes_by_part_number_and_stops_at_the_marker() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -501,6 +509,7 @@ async fn a_truncated_page_whose_rows_all_self_healed_still_names_a_marker() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -576,6 +585,7 @@ async fn the_listing_pages_and_resumes_inside_a_same_key_group() {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -629,6 +639,7 @@ async fn a_lazy_store_records_the_upload_row_plainly() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();

@@ -65,6 +65,12 @@ impl PgStorage {
             .await
             .map_err(storage::Error::from)?
             .ok_or_else(|| storage::no_such_upload(upload_id))?;
+        // OL6: the create-time lock intent — fixed when the upload was created,
+        // so a mid-upload configuration change cannot alter it. It rides the
+        // slot advance; the drain below consumes it.
+        let lock = UploadMeta::upload_lock(&*self.store, bucket, upload_id)
+            .await
+            .map_err(storage::Error::from)?;
         let numbers: Vec<_> = parts.iter().map(|part| part.part_number).collect();
         let records = UploadMeta::part_records(&*self.store, bucket, key, upload_id, &numbers)
             .await
@@ -126,7 +132,7 @@ impl PgStorage {
 
         // Open before the copy. A supersede has to move the outgoing version
         // while its bytes are still the key's; the publish overwrites them.
-        let write = self.open_put_write(bucket, key).await?;
+        let mut write = self.open_put_write(bucket, key).await?;
         let before = ObjectMeta::get(&*self.store, bucket, key)
             .await
             .map_err(storage::Error::from)?;
@@ -186,7 +192,10 @@ impl PgStorage {
             .await?;
             return Err(err);
         }
-        if let Err(err) = self.close_put_write(bucket, key, &write).await {
+        if let Err(err) = self
+            .close_put_write(bucket, key, &mut write, lock.as_ref())
+            .await
+        {
             self.take_back(
                 bucket,
                 key,

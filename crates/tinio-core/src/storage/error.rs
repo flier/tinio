@@ -3,7 +3,7 @@
 use std::{io, num::ParseIntError};
 
 use super::range::ByteRange;
-use crate::{bucket, etag, object};
+use crate::{bucket, etag, object, object_lock};
 
 /// A backend-agnostic storage failure.
 ///
@@ -131,6 +131,23 @@ pub enum Error {
     /// bucket-scoped one.
     #[error("access denied: `{0}`")]
     AccessDenied(Denied),
+    /// An Object Lock refused a permanent delete or a lock write (OL8, OL11).
+    /// The payload is the non-bypassable class; the operator-facing detail
+    /// stays in the store's log, never on the wire.
+    #[error("object lock refused the operation: {0}")]
+    Locked(object_lock::RefusalReason),
+    /// The bucket's versioning state refuses the operation (OL13): a
+    /// lock-enabled bucket may not be suspended, and a per-object lock write
+    /// requires versioning `Enabled`. The payload is the bucket whose state
+    /// refused.
+    #[error("invalid bucket state: `{0}`")]
+    InvalidBucketState(bucket::Name),
+    /// A stored row violates an invariant this contract guarantees — the
+    /// undecodable lock row a fail-closed read or delete refuses rather than
+    /// guessing an unlocked version. The payload is the operator-facing
+    /// detail, never a wire value.
+    #[error("corrupt stored state: {0}")]
+    Corrupt(&'static str),
     /// A backend I/O failure; the underlying error is preserved.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
@@ -327,6 +344,59 @@ pub fn access_denied_bucket(name: &bucket::Name) -> Error {
     Error::AccessDenied(Denied::Bucket(name.clone()))
 }
 
+/// An Object Lock refusal, carrying the class the S3 surface maps.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::{object_lock::RefusalReason, storage};
+///
+/// let refused = storage::locked(RefusalReason::Compliance);
+/// assert!(matches!(
+///     refused,
+///     storage::Error::Locked(RefusalReason::Compliance)
+/// ));
+/// ```
+#[inline]
+pub fn locked(reason: object_lock::RefusalReason) -> Error {
+    Error::Locked(reason)
+}
+
+/// The versioning-state refusal, naming the bucket whose state refused.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::storage;
+///
+/// let bucket = tinio_util::testing::bucket_name("data");
+/// assert!(matches!(
+///     storage::invalid_bucket_state(&bucket),
+///     storage::Error::InvalidBucketState(_)
+/// ));
+/// ```
+#[inline]
+pub fn invalid_bucket_state(name: &bucket::Name) -> Error {
+    Error::InvalidBucketState(name.clone())
+}
+
+/// A stored row that violates a contract invariant (an undecodable lock row).
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::storage;
+///
+/// assert_eq!(
+///     storage::corrupt("the lock row has no legal hold").to_string(),
+///     "corrupt stored state: the lock row has no legal hold"
+/// );
+/// ```
+#[inline]
+pub fn corrupt(detail: &'static str) -> Error {
+    Error::Corrupt(detail)
+}
+
 /// A backend I/O failure; the underlying error is preserved.
 #[inline]
 pub fn io(err: io::Error) -> Error {
@@ -341,7 +411,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{_util::testing::assert_send_sync, etag::Error::*};
+    use crate::{_util::testing::assert_send_sync, etag::Error::*, object_lock::RefusalReason};
 
     #[test]
     fn displays_variants() {
@@ -405,6 +475,18 @@ mod tests {
                     object::key("a/.tinio/b").expect("a valid object key"),
                 )),
                 "access denied: `a/.tinio/b`",
+            ),
+            (
+                Error::Locked(RefusalReason::Governance),
+                "object lock refused the operation: governance",
+            ),
+            (
+                Error::InvalidBucketState(bucket::name("my-bucket").expect("a valid bucket name")),
+                "invalid bucket state: `my-bucket`",
+            ),
+            (
+                Error::Corrupt("the stored lock row has no legal hold"),
+                "corrupt stored state: the stored lock row has no legal hold",
             ),
             (
                 Error::Io(IoError::from(ErrorKind::NotFound)),

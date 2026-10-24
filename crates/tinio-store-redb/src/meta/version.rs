@@ -40,18 +40,23 @@ use crate::{
         meta::{
             VersionMeta,
             object::Row as CallerRow,
-            version::{Current, Kind as ContractKind, Stored, slot_move_rewinds},
+            version::{
+                Current, ExpireReport, Expired, Kind as ContractKind, Stored, slot_move_rewinds,
+            },
         },
-        object, storage, to_nanos,
+        object, object_lock, storage, to_nanos,
         version::{self as contract, Id, State},
     },
     Error, RedbMetadata,
     bucket::Table as BucketTable,
+    bucket_object_lock::Table as ConfigTable,
     bucket_versioning::Table as StateTable,
+    meta::version_lock::{self, LockOwned},
     object_meta::{Stored as ObjectRow, Table as ObjectTable},
     object_part::Table as PartTable,
     version::{Kind as RowKind, Row as VersionRow, Table as VersionTable},
     version_index::Table as IndexTable,
+    version_object_lock::{self, Table as LockTable},
 };
 
 /// The table kind of a contract row's kind: the two enumerations carry the same
@@ -183,18 +188,25 @@ impl VersionMeta for RedbMetadata {
 
     /// The guarded state write: the bucket row is read in the transaction that
     /// writes the state row, so a concurrent `remove_if_empty` cannot race it
-    /// (D22's refusal projection, the `put_guarded` shape).
+    /// (D22's refusal projection, the `put_guarded` shape). R21: the same
+    /// transaction refuses `Suspended` while an enabled Object Lock
+    /// configuration exists — a suspend could otherwise commit between a
+    /// retention write's configuration and state reads (OL13).
     async fn set_bucket_state_guarded(
         &self,
         bucket: &bucket::Name,
         state: State,
     ) -> Result<(), Error> {
         let refusal = storage::no_such_bucket(bucket);
+        let suspended = storage::invalid_bucket_state(bucket);
         let bucket = bucket.to_string();
         self.driver
             .write(move |txn| -> Result<(), Error> {
                 if !BucketTable::open(txn)?.exists(&bucket)? {
                     return Err(Error::Refused(refusal));
+                }
+                if state == State::Suspended && ConfigTable::open(txn)?.is_enabled(&bucket)? {
+                    return Err(Error::Refused(suspended));
                 }
                 StateTable::open(txn)?.set(&bucket, state)
             })
@@ -235,6 +247,7 @@ impl VersionMeta for RedbMetadata {
     }
 
     #[instrument(
+        name = "advance_slot",
         target = "tinio::storage",
         level = "info",
         skip(self),
@@ -244,16 +257,18 @@ impl VersionMeta for RedbMetadata {
             version = id.as_deref().map_or("null", String::as_str),
         )
     )]
-    async fn advance_slot(
+    async fn advance_slot_with(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         id: Option<Id>,
         seq: u64,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<(), Error> {
         let refusal = storage::no_such_bucket(bucket);
         let bucket = bucket.to_string();
         let key = key.to_string();
+        let lock = lock.cloned();
         self.driver
             .write(move |txn| {
                 // The bucket row is probed in this transaction, first, exactly
@@ -268,14 +283,40 @@ impl VersionMeta for RedbMetadata {
                 let marker = VersionTable::open(txn)?
                     .get(&bucket, &key, seq)?
                     .is_some_and(|row| row.kind == RowKind::Marker);
-                let mut table = ObjectTable::open(txn)?;
                 // A key with no `object_meta` row gets one here: the slot
                 // columns need a home, and the fabricated row's content-derived
                 // elements start empty (see `empty_object_row`). The effect is
                 // the deliberate rule the contract documents — an
                 // `ObjectMeta::get`/`walk` read then reports a recorded object
                 // for a key whose content side holds nothing.
-                let recorded = table.get(&bucket, &key)?;
+                let recorded = ObjectTable::open(txn)?.get(&bucket, &key)?;
+                // OL7: a null in-place replacement of an identity that already
+                // owns an active lock is a protected overwrite. The identity
+                // the slot records is the one this write would replace; a
+                // marker owns no lock (R19), and an ordinary overwrite creates
+                // a new identity, leaving the old lock intact.
+                if id.is_none()
+                    && let Some(slot) = recorded.as_ref().filter(|slot| !slot.is_delete_marker)
+                {
+                    let wire = contract::wire_of(slot.version_id.as_ref());
+                    if let Some(reason) = version_lock::locked_wire_reason(
+                        txn,
+                        &bucket,
+                        &key,
+                        &wire,
+                        object_lock::Bypass::None,
+                        SystemTime::now(),
+                    )? {
+                        tracing::warn!(
+                            bucket = %bucket,
+                            key = %key,
+                            version = %wire,
+                            reason = %reason,
+                            "refusing a protected in-place overwrite"
+                        );
+                        return Err(Error::Refused(storage::locked(reason)));
+                    }
+                }
                 // The sequence of the slot this advance moves off: the superseded
                 // version's own row. A key with no object row has no **recorded**
                 // slot — the fabricated row above is only a home for the columns
@@ -299,10 +340,14 @@ impl VersionMeta for RedbMetadata {
                         "a version slot never moves backwards",
                     ))));
                 }
+                let wire = contract::wire_of(id.as_ref());
                 row.version_id = id;
                 row.version_seq = seq;
                 row.is_delete_marker = marker;
-                table.put(&bucket, &key, &row)?;
+                ObjectTable::open(txn)?.put(&bucket, &key, &row)?;
+                // OL7: the lock commits with the current version; the lock
+                // writer owns the empty-lock and marker rules.
+                version_lock::put_advance_lock(txn, &bucket, &key, &wire, lock.as_ref(), marker)?;
                 // The stamp the move owes the row it moves off (the 2026-10-09
                 // ruling): the supersede commits the outgoing version's row with
                 // `became_noncurrent == 0` — the crash window's adopted row, not
@@ -321,7 +366,6 @@ impl VersionMeta for RedbMetadata {
                 // the current version's own, and stamping it would read as
                 // history without a slot to qualify it — and a sequence holding
                 // no row has nothing to stamp.
-                drop(table);
                 if let Some(moved_off) = moved_off.filter(|moved_off| *moved_off != seq) {
                     let mut versions = VersionTable::open(txn)?;
                     if versions
@@ -647,58 +691,65 @@ impl VersionMeta for RedbMetadata {
             .await
     }
 
-    async fn expire(
-        &self,
-        bucket: &bucket::Name,
-        key: &object::Key,
-        seq: u64,
-    ) -> Result<(), Error> {
-        // The single-row form is the batch of one: [`VersionMeta::expire_many`]
-        // runs the same body in the same one write transaction, so the
-        // atomicity rule is unchanged.
-        self.expire_many(bucket, key, &[seq]).await
-    }
-
-    async fn expire_many(
-        &self,
-        bucket: &bucket::Name,
-        key: &object::Key,
-        seqs: &[u64],
-    ) -> Result<(), Error> {
-        let bucket = bucket.to_string();
-        let key = key.to_string();
-        let seqs = seqs.to_vec();
-        self.driver
-            .write(move |txn| {
-                // One transaction for the whole listed history (the batch is
-                // the unit): a crash leaves every listed row or none of them.
-                for seq in seqs {
-                    let row = VersionTable::open(txn)?.get(&bucket, &key, seq)?;
-                    VersionTable::open(txn)?.remove(&bucket, &key, seq)?;
-                    if let Some(row) = row {
-                        // The entry goes only when it still points at this
-                        // row: two rows can share one identity wire (the null
-                        // version), and the index names only the newest of
-                        // them.
-                        IndexTable::open(txn)?.remove_pointing_at(&bucket, &key, &row.id, seq)?;
-                    }
-                }
-                Ok(())
-            })
-            .await
-    }
-
     async fn drain_bucket(&self, bucket: &bucket::Name) -> Result<(), Error> {
         let bucket = bucket.to_string();
         self.driver
             .write(move |txn| {
+                // OL8: the drain refuses, removing nothing, while any version
+                // row of the bucket is protected. The check runs before the
+                // first removal; an orphan lock row (one that resolves to no
+                // version) never refuses — the drain removes it. R19: a lock
+                // row a marker owns is exactly such an orphan — a marker is
+                // never a `may_delete` subject, so its row protects nothing
+                // here and leaves with the rest.
+                let now = SystemTime::now();
+                // The lock rows are collected first: redb hands out one
+                // writable table at a time from a transaction, and the check
+                // needs the version and index tables beside the lock rows.
+                let rows: Vec<(String, String, Option<String>, Option<i64>, Option<String>)> = {
+                    let locks = LockTable::open(txn)?;
+                    let mut rows = Vec::new();
+                    locks.for_bucket(&bucket, |key, wire, mode, until, hold| {
+                        rows.push((
+                            key.to_owned(),
+                            wire.to_owned(),
+                            mode.map(str::to_owned),
+                            until,
+                            hold.map(str::to_owned),
+                        ));
+                        Ok(())
+                    })?;
+                    rows
+                };
+                let mut protected = None;
+                for (key, wire, mode, until, hold) in rows {
+                    // [`LockOwned`] is the ownership rule's one home (OL7/
+                    // OL8, R19); only a lock that resolves to neither an
+                    // object version row nor the key's non-marker current
+                    // slot is an orphan the drain removes.
+                    if !txn.lock_owned(&bucket, &key, &wire)? {
+                        continue;
+                    }
+                    let lock =
+                        version_object_lock::decode(mode.as_deref(), until, hold.as_deref())?;
+                    if let Some(reason) =
+                        object_lock::delete_refusal(lock.as_ref(), now, object_lock::Bypass::None)
+                    {
+                        protected = Some(reason);
+                    }
+                }
+                if let Some(reason) = protected {
+                    return Err(Error::Refused(storage::locked(reason)));
+                }
                 // The rows and their index entries retire in **one** write
                 // transaction (the plan's Global Constraint): the index can
                 // never be left naming a row the drain removed. Both tables
                 // drain their own bucket range — the interval boundary is the
-                // table's, never hand-rolled here.
+                // table's, never hand-rolled here. The bucket's lock rows
+                // leave with them, an orphan included.
                 VersionTable::open(txn)?.drain_bucket(&bucket)?;
                 IndexTable::open(txn)?.drain_bucket(&bucket)?;
+                LockTable::open(txn)?.drain_bucket(&bucket)?;
                 Ok(())
             })
             .await
@@ -716,1096 +767,111 @@ impl VersionMeta for RedbMetadata {
         self.driver
             .read(move |txn| IndexTable::open_readonly(txn)?.seq_of(&bucket, &key, &id))
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        sync::Arc,
-        time::{Duration, SystemTime},
-    };
-
-    use redb::WriteTransaction;
-    use tinio_util::testing::{metadata::assert_version_conformance, spans::one_named};
-    use tracing::Level;
-
-    use crate::{
-        _core::{
-            ETag,
-            acl::Acl,
-            blob::{BlobRef, BlockHash},
-            bucket,
-            meta::{
-                BucketMeta, ObjectMeta, VersionMeta, bucket as bucket_row,
-                object::{PartRow, Row as CallerRow},
-                version::{Current, Stored},
-            },
-            object, storage, to_nanos,
-            version::Id,
-        },
-        Driver, Error, RedbMetadata,
-        object_meta::{Stored as ObjectStored, Table as ObjectTable},
-        testutil::capture_spans,
-        version::{Kind as RowKind, Row as VersionRow, Table as VersionTable, encode_blob},
-    };
-
-    /// Plant the bucket row the guarded writers probe. The bucket plane's own
-    /// conformance leg lives in `assert_bucket_meta_conformance`.
-    async fn bucket_with(store: &RedbMetadata, bucket: &bucket::Name) {
-        BucketMeta::create(store, bucket, &bucket_row::Row::at(SystemTime::UNIX_EPOCH))
-            .await
-            .unwrap();
-    }
-
-    /// The suite's version leg against a fresh in-memory implementation.
-    #[tokio::test]
-    async fn version_meta_conforms() {
-        let store = RedbMetadata::in_memory().unwrap();
-        assert_version_conformance(&store).await;
-    }
-
-    /// The slot columns are recorded **on the `object_meta` row** — the
-    /// landed table the scanner's orphan rule and the fs gate read — and
-    /// `advance_slot` derives the marker bit from the version row at the
-    /// slot's sequence.
-    #[tokio::test]
-    async fn advance_slot_records_the_slot_columns_on_the_object_row() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("slot-columns").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-
-        // A delete-marker version row at sequence 1, planted through the
-        // table layer: this leg reads the object row, not the index.
-        let (name, stored_key) = (bucket.to_string(), key.to_string());
-        let marker = VersionRow {
-            id: "v1".to_owned(),
-            blob: encode_blob(&BlobRef::empty()),
-            size: 0,
-            etag: String::new(),
-            created: 0,
-            became_noncurrent: 0,
-            kind: RowKind::Marker,
-            tags: String::new(),
-            checksum: String::new(),
-            owner: String::new(),
-            acl: String::new(),
-            seq: 1,
-        };
-        let driver = store.driver();
-        driver
-            .write(move |txn: &mut WriteTransaction| -> Result<(), Error> {
-                VersionTable::open(txn)?.put(&name, &stored_key, &marker)
-            })
-            .await
-            .unwrap();
-
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v1").unwrap()), 1)
-            .await
-            .unwrap();
-        let recorded = raw_row(&driver, &bucket, &key);
-        assert_eq!(
-            recorded.version_id.as_ref().map(|id| id.as_str()),
-            Some("v1"),
-            "the recorded identity is the slot's"
-        );
-        assert_eq!(recorded.version_seq, 1, "and so is the sequence");
-        assert!(
-            recorded.is_delete_marker,
-            "the version row's marker kind is recorded as the row's own flag"
-        );
-
-        // The dangling advance: no row at sequence 9, so the recorded flag
-        // is false while the identity is the recorded fact.
-        store.advance_slot(&bucket, &key, None, 9).await.unwrap();
-        let recorded = raw_row(&driver, &bucket, &key);
-        assert_eq!(recorded.version_id, None);
-        assert_eq!(recorded.version_seq, 9);
-        assert!(
-            !recorded.is_delete_marker,
-            "a sequence with no version row is not a marker"
-        );
-
-        // The contract's own read agrees with the recorded columns.
-        let slot: Option<Current> = store.current_slot(&bucket, &key).await.unwrap();
-        let slot = slot.expect("a recorded slot");
-        assert!(slot.exists && slot.version.is_none() && !slot.is_delete_marker);
-    }
-
-    /// The contract's two row reads inherit the table layer's corrupt-row
-    /// rules: the newest row's read **fails closed** — a corrupt newest row
-    /// answers `None`, never an older decodable version handed back as
-    /// current — and the bucket-wide walk **skips** the corrupt row instead of
-    /// failing. Only this side can plant one (D43).
-    #[tokio::test]
-    async fn the_contract_row_reads_heal_the_way_the_table_layer_rules() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("corrupt-reads").unwrap();
-        let key = object::key("a.txt").unwrap();
-        let (name, stored_key) = (bucket.to_string(), key.to_string());
-
-        let row = |seq: u64, blob: String| VersionRow {
-            id: format!("v{seq}"),
-            blob,
-            size: 5,
-            etag: String::new(),
-            created: 0,
-            became_noncurrent: 0,
-            kind: RowKind::Object,
-            tags: String::new(),
-            checksum: String::new(),
-            owner: String::new(),
-            acl: String::new(),
-            seq,
-        };
-        let good = encode_blob(&BlobRef::single(BlockHash::of(b"good"), 5));
-        let driver = store.driver();
-        driver
-            .write(move |txn: &mut WriteTransaction| -> Result<(), Error> {
-                let mut table = VersionTable::open(txn)?;
-                table.put(&name, &stored_key, &row(1, good))?;
-                // The newest row's shape is unreadable: no caller can repair it
-                // from the contract, and it must not read as absent history.
-                table.put(&name, &stored_key, &row(2, "garbage".to_owned()))
-            })
-            .await
-            .unwrap();
-
-        assert!(
-            store.latest(&bucket, &key).await.unwrap().is_none(),
-            "a corrupt newest row answers None, never the older version"
-        );
-        let rows = store.bucket_rows(&bucket).await.unwrap();
-        assert_eq!(
-            rows.iter().map(|stored| stored.seq).collect::<Vec<_>>(),
-            vec![1],
-            "the bucket walk skips the corrupt row"
-        );
-    }
-
-    /// A slot never moves backwards: a lower-sequence advance is refused (the
-    /// same shaped refusal `put_version` raises for a route it cannot honour),
-    /// the slot it would have rewound is left untouched, and a same-sequence
-    /// re-run still lands.
-    #[tokio::test]
-    async fn advance_slot_refuses_to_move_the_slot_backwards() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("monotonic").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v5").unwrap()), 5)
-            .await
-            .unwrap();
-        let err = store
-            .advance_slot(&bucket, &key, Some(Id::new("v2").unwrap()), 2)
-            .await
-            .unwrap_err();
-        // The backwards move is refused, not silently swallowed.
-        assert!(matches!(err, Error::Refused(_)), "refused: {err:?}");
-        let slot = store
-            .current_slot(&bucket, &key)
-            .await
-            .unwrap()
-            .expect("a recorded slot");
-        assert_eq!(slot.version.as_ref().map(|id| id.as_str()), Some("v5"));
-
-        // The crash window's own re-run sits at the same sequence: allowed.
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v5").unwrap()), 5)
-            .await
-            .unwrap();
-        // A higher sequence still moves forward.
-        store.advance_slot(&bucket, &key, None, 6).await.unwrap();
-        let after = store
-            .current_slot(&bucket, &key)
-            .await
-            .unwrap()
-            .expect("a recorded slot");
-        assert!(after.version.is_none() && !after.is_delete_marker);
-    }
-
-    /// A suspended bucket's in-place write to the **null** slot is not a
-    /// backward move (RC1, 2026-10-10): the null version's `seq = 0` is its own
-    /// numbering, so an advance from a recorded `(Some(id), 1)` slot onto the
-    /// null identity lands, records the null slot and stamps the version it
-    /// moved off. The plan for `(Put, Suspended)` over a real current version
-    /// answers exactly that pair (`identity = Null, seq = 0`), and before the
-    /// ruling the guard refused it — after the supersede, the publish and the
-    /// row write had committed, so the write took effect and then errored.
-    #[tokio::test]
-    async fn advance_slot_admits_the_null_identitys_in_place_move() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("null-in-place").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-        plant(&store, &bucket, &key, &[stamped_row(1, "v1", 0)]).await;
-
-        // The enabled write's slot, then the suspended bucket's in-place write:
-        // the same key, the null identity, the null version's own sequence.
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v1").unwrap()), 1)
-            .await
-            .unwrap();
-        store
-            .advance_slot(&bucket, &key, None, 0)
-            .await
-            .expect("the null version's in-place slot move is not a rewind");
-
-        let slot = store
-            .current_slot(&bucket, &key)
-            .await
-            .unwrap()
-            .expect("a recorded slot");
-        assert!(
-            slot.exists && slot.version.is_none() && !slot.is_delete_marker,
-            "the slot records the null identity: {slot:?}"
-        );
-        assert_ne!(
-            stamp_of(&store, &bucket, &key, 1).await,
-            0,
-            "the version the null write moved off stopped being current"
-        );
-    }
-
-    /// The companion of the null-identity rule: a move that keeps a **real**
-    /// identity and lowers the sequence is still the backward move the guard
-    /// exists to refuse — admitting the null write must not weaken it — and the
-    /// same-sequence re-run and the forward move behave as they always did.
-    #[tokio::test]
-    async fn advance_slot_still_refuses_a_lower_sequence_within_a_real_identity() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("real-identity-rewind").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-        plant(
-            &store,
-            &bucket,
-            &key,
-            &[stamped_row(5, "v5", 0), stamped_row(2, "v2", 0)],
-        )
-        .await;
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v5").unwrap()), 5)
-            .await
-            .unwrap();
-
-        let refused = store
-            .advance_slot(&bucket, &key, Some(Id::new("v2").unwrap()), 2)
-            .await;
-        assert!(matches!(refused, Err(Error::Refused(_))), "{refused:?}");
-        let slot = store
-            .current_slot(&bucket, &key)
-            .await
-            .unwrap()
-            .expect("a recorded slot");
-        assert_eq!(
-            slot.version.as_ref().map(|id| id.as_str()),
-            Some("v5"),
-            "the slot the refused move would have rewound is untouched"
-        );
-
-        // The crash window's own re-run still lands, and so does a forward move:
-        // the admission is the null identity's alone.
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v5").unwrap()), 5)
-            .await
-            .unwrap();
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v9").unwrap()), 9)
-            .await
-            .unwrap();
-    }
-
-    /// A slot advance stamps the row it moves off (the 2026-10-09 ruling): the
-    /// transaction that records the new current version records when the
-    /// superseded one stopped being current, in the same commit — so a row that
-    /// is history says so and its retention clock starts when the version
-    /// actually stopped being current, never earlier (the moment the supersede
-    /// committed it) and never at a re-run's later clock.
-    #[tokio::test]
-    async fn advance_slot_stamps_the_row_it_moves_off() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("advance-stamps").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-        // The current version's own row at sequence 1, written the way a
-        // supersede commits it (`became_noncurrent == 0` — the crash window's
-        // adopted row), and the incoming version's row at sequence 2.
-        plant(
-            &store,
-            &bucket,
-            &key,
-            &[stamped_row(1, "v1", 0), stamped_row(2, "v2", 0)],
-        )
-        .await;
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v1").unwrap()), 1)
-            .await
-            .unwrap();
-        assert_eq!(
-            stamp_of(&store, &bucket, &key, 1).await,
-            0,
-            "the row the slot records is the current version's: not history yet"
-        );
-
-        let before = to_nanos(SystemTime::now());
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v2").unwrap()), 2)
-            .await
-            .unwrap();
-
-        let stamped = stamp_of(&store, &bucket, &key, 1).await;
-        assert_ne!(
-            stamped, 0,
-            "the row the advance moved off records when it stopped being current"
-        );
-        assert!(
-            stamped >= before,
-            "the stamp is the advancing transaction's own clock, in unix nanos"
-        );
-        assert_eq!(
-            stamp_of(&store, &bucket, &key, 2).await,
-            0,
-            "the incoming version's own row is not history"
-        );
-
-        // A move off a sequence that holds no row is a no-op, not an error.
-        store.advance_slot(&bucket, &key, None, 9).await.unwrap();
-        assert!(
-            store.get_version(&bucket, &key, 9).await.unwrap().is_none(),
-            "an advance onto a free sequence writes no version row"
-        );
-
-        // The stamp rides the advancing transaction, so a refused advance
-        // commits neither half: the row it would have moved off keeps the stamp
-        // it had. One commit, or none — the atom the slot write and the stamp
-        // share, which is what makes a crash between them unobservable.
-        plant(&store, &bucket, &key, &[stamped_row(6, "v6", 0)]).await;
-        let refused = store
-            .advance_slot(&bucket, &key, Some(Id::new("v6").unwrap()), 6)
-            .await;
-        assert!(refused.is_err(), "a slot never moves backwards");
-        assert_eq!(
-            stamp_of(&store, &bucket, &key, 6).await,
-            0,
-            "a refused advance leaves the row it would have moved off unstamped"
-        );
-
-        // A key with no `object_meta` row has no **recorded** slot, so the
-        // advance moves off nothing: the version row (the null version) at the
-        // fabricated row's own default sequence is not stamped, because no
-        // writer ever recorded a slot naming it.
-        let fresh = object::key("b.txt").unwrap();
-        plant(&store, &bucket, &fresh, &[stamped_row(0, "null", 0)]).await;
-        store
-            .advance_slot(&bucket, &fresh, Some(Id::new("v7").unwrap()), 1)
-            .await
-            .unwrap();
-        assert_eq!(
-            stamp_of(&store, &bucket, &fresh, 0).await,
-            0,
-            "an advance that materializes the object row moves off no recorded slot"
-        );
-    }
-
-    /// The **first** stamp wins: a row that already says it is history keeps the
-    /// moment it stopped being current, so a re-run of the advance never moves
-    /// the retention clock — and a store that stamps the row when it creates it
-    /// (mem's supersede, the double stamp the contract allows) is not
-    /// contradicted by the advance that follows.
-    ///
-    /// A same-sequence advance is the crash window's own re-run, not a move off
-    /// anything: the row the slot still records is left unstamped, because the
-    /// stamp is what marks a row history to a reader that knows no slot.
-    #[tokio::test]
-    async fn advance_slot_never_moves_a_stamp_it_finds() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("advance-keeps-stamp").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-        plant(
-            &store,
-            &bucket,
-            &key,
-            &[stamped_row(1, "v1", 7), stamped_row(2, "v2", 0)],
-        )
-        .await;
-
-        // The slot records the stamped row — the shape mem's supersede leaves,
-        // where the outgoing row carries its own stamp before the slot moves off
-        // it — and the move away leaves that stamp exactly as it was.
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v1").unwrap()), 1)
-            .await
-            .unwrap();
-        assert_eq!(
-            stamp_of(&store, &bucket, &key, 1).await,
-            7,
-            "a row that already says it is history is not restamped"
-        );
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v2").unwrap()), 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            stamp_of(&store, &bucket, &key, 1).await,
-            7,
-            "the first stamp is when the version stopped being current"
-        );
-
-        // The crash window's own re-run sits at the sequence the slot already
-        // names: nothing moved off it, so the current version's row stays
-        // unstamped — a stamp here would read as a live version that is history.
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v2").unwrap()), 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            stamp_of(&store, &bucket, &key, 2).await,
-            0,
-            "a same-sequence re-run does not stamp the current version's row"
-        );
-    }
-
-    /// The deliberate divergence `advance_slot` documents: an advance onto a
-    /// key with no `object_meta` row materializes one, so an
-    /// [`ObjectMeta::get`] read reports a recorded object for a key whose
-    /// content side holds nothing.
-    #[tokio::test]
-    async fn advance_slot_materializes_the_object_row_for_a_key_with_no_content() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("fabricated").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-
-        let before = ObjectMeta::get(&store, &bucket, &key).await.unwrap();
-        assert!(before.is_none(), "no slot, no row");
-
-        store.advance_slot(&bucket, &key, None, 7).await.unwrap();
-
-        let row = ObjectMeta::get(&store, &bucket, &key).await.unwrap();
-        let row = row.expect("the slot's row is materialized");
-        assert_eq!((row.etag, row.size), (ETag::EMPTY, 0));
-        let recorded = raw_row(&store.driver(), &bucket, &key);
-        assert_eq!(recorded.version_seq, 7);
-    }
-
-    /// The slot writer probes the bucket row in its own transaction, exactly as
-    /// `put_guarded` and `set_bucket_state_guarded` do: a concurrent
-    /// `remove_if_empty` cannot be raced into having the advance materialize an
-    /// object row (and its slot columns) for a bucket that is gone.
-    #[tokio::test]
-    async fn advance_slot_refuses_a_bucket_with_no_row() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("slot-refusal").unwrap();
-        let key = object::key("a.txt").unwrap();
-
-        let refusal: storage::Error = store
-            .advance_slot(&bucket, &key, Some(Id::new("v1").unwrap()), 1)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(
-            matches!(refusal, storage::Error::NoSuchBucket(_)),
-            "{refusal:?}"
-        );
-        assert!(
-            ObjectMeta::get(&store, &bucket, &key)
-                .await
-                .unwrap()
-                .is_none(),
-            "a refused advance writes no object row"
-        );
-        assert!(
-            store.get_version(&bucket, &key, 1).await.unwrap().is_none(),
-            "and no version row"
-        );
-
-        bucket_with(&store, &bucket).await;
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v1").unwrap()), 1)
-            .await
-            .unwrap();
-        let recorded = raw_row(&store.driver(), &bucket, &key);
-        assert_eq!(
-            recorded.version_id.as_ref().map(|id| id.as_str()),
-            Some("v1")
-        );
-        assert_eq!(recorded.version_seq, 1);
-    }
-
-    /// The restore's commit, end to end: the slot's **backwards real-identity
-    /// move** lands — the one move `advance_slot` refuses — and every fact of
-    /// the commit rides the one transaction: the object row the caller hands in
-    /// and its slot columns, the cleared retained part list, the consumed row
-    /// with its index entry, and the stamp the move owes the row it moves off.
-    #[tokio::test]
-    async fn restore_slot_lands_the_backwards_move_with_every_fact_of_the_commit() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("restore-object").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-        let v1 = Id::new("v1").unwrap();
-        let v3 = Id::new("v3").unwrap();
-        // The successor's own row at the lower sequence and the removed
-        // current version's row above it, both with their index entries (the
-        // writer commits the two together, which is the state a restore
-        // consumes).
-        store
-            .put_version(&bucket, &key, &version_row_of(&stamped_row(1, "v1", 0)))
-            .await
-            .unwrap();
-        store
-            .put_version(&bucket, &key, &version_row_of(&stamped_row(3, "v3", 0)))
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .version_seq_of(&bucket, &key, Some(&v1))
-                .await
-                .unwrap(),
-            Some(1),
-            "the successor's index entry is planted"
-        );
-        // The object the removed version leaves behind: a retained part list
-        // (a completed multipart object) and the slot at the removed row.
-        ObjectMeta::put_with_parts(
-            &store,
-            &bucket,
-            &key,
-            &caller_row(9, 7),
-            &[part_row(1), part_row(2)],
-        )
-        .await
-        .unwrap();
-        store
-            .advance_slot(&bucket, &key, Some(v3.clone()), 3)
-            .await
-            .unwrap();
-        assert_eq!(store.parts(&bucket, &key).await.unwrap().len(), 2);
-
-        let restored = caller_row(5, 42);
-        store
-            .restore_slot(&bucket, &key, &restored, Some(v1.clone()), 1)
-            .await
-            .unwrap();
-
-        // S3: the object row is the caller's elements wholesale…
-        assert_eq!(
-            ObjectMeta::get(&store, &bucket, &key).await.unwrap(),
-            Some(restored.clone())
-        );
-        // …the recorded slot columns name the restored version…
-        let recorded = raw_row(&store.driver(), &bucket, &key);
-        assert_eq!(
-            recorded.version_id.as_ref().map(|id| id.as_str()),
-            Some("v1")
-        );
-        assert_eq!(
-            recorded.version_seq, 1,
-            "the slot moved backwards, to the restored version's own sequence"
-        );
-        // …and the contract's read answers the same pair (S6's move landed).
-        assert_eq!(
-            store.current_slot(&bucket, &key).await.unwrap(),
-            Some(Current {
-                exists: true,
-                version: Some(v1.clone()),
-                is_delete_marker: false,
-            })
-        );
-        // S3: the retained part list is cleared — a restore is a fresh object.
-        assert!(
-            store.parts(&bucket, &key).await.unwrap().is_empty(),
-            "the restored row carries no retained parts"
-        );
-        // S4: the consumed row and its index entry are gone, in this commit.
-        assert!(
-            store.get_version(&bucket, &key, 1).await.unwrap().is_none(),
-            "the restored version is current, so it has no history row"
-        );
-        assert_eq!(
-            store
-                .version_seq_of(&bucket, &key, Some(&v1))
-                .await
-                .unwrap(),
-            None,
-            "…and no index entry either"
-        );
-        assert_eq!(
-            store
-                .version_seq_of(&bucket, &key, Some(&v3))
-                .await
-                .unwrap(),
-            Some(3),
-            "the index entry of another version is untouched"
-        );
-        // S5: the row the slot moved off stopped being current, in the same
-        // commit.
-        assert_ne!(
-            stamp_of(&store, &bucket, &key, 3).await,
-            0,
-            "the row the slot moved off is stamped history"
-        );
-    }
-
-    /// S2/S7's marker arm: the marker bit is the **consumed row's** kind, never
-    /// the caller's, and it survives the row it came from — after the call
-    /// `current_slot` still answers a marker, with the row gone.
-    #[tokio::test]
-    async fn restore_slot_restores_a_delete_marker_whose_bit_survives_its_row() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("restore-marker").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-        let v1 = Id::new("v1").unwrap();
-        store
-            .put_version(&bucket, &key, &version_row_of(&marker_version_row(1, "v1")))
-            .await
-            .unwrap();
-        store
-            .put_version(&bucket, &key, &version_row_of(&stamped_row(3, "v3", 0)))
-            .await
-            .unwrap();
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v3").unwrap()), 3)
-            .await
-            .unwrap();
-
-        // The caller carries a marker-shaped row (empty content) and no kind:
-        // the kind is the version row's own fact.
-        store
-            .restore_slot(&bucket, &key, &caller_row(0, 0), Some(v1.clone()), 1)
-            .await
-            .unwrap();
-
-        let slot = store
-            .current_slot(&bucket, &key)
-            .await
-            .unwrap()
-            .expect("a recorded slot");
-        assert_eq!(slot.version.as_ref().map(|id| id.as_str()), Some("v1"));
-        assert!(
-            slot.is_delete_marker,
-            "the restored marker's bit survives the row it came from"
-        );
-        let recorded = raw_row(&store.driver(), &bucket, &key);
-        assert!(
-            recorded.is_delete_marker,
-            "…because the written row records the consumed row's marker kind"
-        );
-        assert!(
-            store.get_version(&bucket, &key, 1).await.unwrap().is_none(),
-            "the consumed marker row is gone"
-        );
-    }
-
-    /// R2's two arms: a sequence holding no row and a row naming another
-    /// identity are both refused, and the refusal commits neither half — the
-    /// version rows, the slot and the object row are exactly as they were.
-    #[tokio::test]
-    async fn restore_slot_refuses_an_absent_row_and_an_identity_mismatch() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("restore-refusal").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-        let v1 = Id::new("v1").unwrap();
-        let v2 = Id::new("v2").unwrap();
-        store
-            .put_version(&bucket, &key, &version_row_of(&stamped_row(1, "v1", 0)))
-            .await
-            .unwrap();
-        store
-            .put_version(&bucket, &key, &version_row_of(&stamped_row(2, "v2", 0)))
-            .await
-            .unwrap();
-        store
-            .advance_slot(&bucket, &key, Some(v2.clone()), 2)
-            .await
-            .unwrap();
-        let before = ObjectMeta::get(&store, &bucket, &key).await.unwrap();
-
-        // No version row at the sequence the caller names: a bug or a lost
-        // race, never a slot naming a version the store does not hold.
-        let absent = store
-            .restore_slot(&bucket, &key, &caller_row(5, 42), Some(v1.clone()), 9)
-            .await;
-        assert!(matches!(absent, Err(Error::Refused(_))), "{absent:?}");
-        // The row at that sequence exists, but it names another version.
-        let mismatched = store
-            .restore_slot(&bucket, &key, &caller_row(5, 42), Some(v1.clone()), 2)
-            .await;
-        assert!(
-            matches!(mismatched, Err(Error::Refused(_))),
-            "{mismatched:?}"
-        );
-
-        // Neither refusal committed anything: both rows are intact, the slot
-        // still names the current version, and no object row was written.
-        assert_eq!(
-            store
-                .get_version(&bucket, &key, 1)
-                .await
-                .unwrap()
-                .map(|row| row.id),
-            Some(Some(v1.clone())),
-            "the row an absent-row refusal named is untouched"
-        );
-        assert_eq!(
-            store
-                .get_version(&bucket, &key, 2)
-                .await
-                .unwrap()
-                .map(|row| row.id),
-            Some(Some(v2.clone())),
-            "the row an identity mismatch named is untouched"
-        );
-        assert_eq!(
-            store
-                .version_seq_of(&bucket, &key, Some(&v1))
-                .await
-                .unwrap(),
-            Some(1),
-            "…and its index entry"
-        );
-        let slot = store
-            .current_slot(&bucket, &key)
-            .await
-            .unwrap()
-            .expect("a recorded slot");
-        assert_eq!(slot.version.as_ref().map(|id| id.as_str()), Some("v2"));
-        assert_eq!(
-            ObjectMeta::get(&store, &bucket, &key).await.unwrap(),
-            before,
-            "a refused restore writes no object row"
-        );
-    }
-
-    /// The in-place re-run: a restore at the sequence the slot already names
-    /// lands, and moves off nothing — the same-sequence exemption S5 shares
-    /// with `advance_slot`, so no other row of the key is stamped either.
-    #[tokio::test]
-    async fn restore_slot_lands_in_place_and_stamps_nothing() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("restore-in-place").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-        let v2 = Id::new("v2").unwrap();
-        store
-            .put_version(&bucket, &key, &version_row_of(&stamped_row(1, "v1", 0)))
-            .await
-            .unwrap();
-        store
-            .put_version(&bucket, &key, &version_row_of(&stamped_row(2, "v2", 0)))
-            .await
-            .unwrap();
-        store
-            .advance_slot(&bucket, &key, Some(v2.clone()), 2)
-            .await
-            .unwrap();
-
-        store
-            .restore_slot(&bucket, &key, &caller_row(5, 42), Some(v2.clone()), 2)
-            .await
-            .unwrap();
-
-        assert!(
-            store.get_version(&bucket, &key, 2).await.unwrap().is_none(),
-            "the row is consumed like any other restore"
-        );
-        assert!(
-            store.get_version(&bucket, &key, 1).await.unwrap().is_some(),
-            "the untouched older row stays"
-        );
-        assert_eq!(
-            stamp_of(&store, &bucket, &key, 1).await,
-            0,
-            "a move at the slot's own sequence stamps no other row"
-        );
-        let slot = store
-            .current_slot(&bucket, &key)
-            .await
-            .unwrap()
-            .expect("a recorded slot");
-        assert_eq!(slot.version.as_ref().map(|id| id.as_str()), Some("v2"));
-        let recorded = raw_row(&store.driver(), &bucket, &key);
-        assert_eq!(recorded.version_seq, 2, "the slot stayed where it was");
-    }
-
-    /// A rewrite of the same version keeps the **stored** stamp and ignores the
-    /// caller's; a free sequence stores the caller's stamp. This is the stamp
-    /// source the engine no longer reads for itself.
-    #[tokio::test]
-    async fn put_version_preserves_the_stored_stamp_over_the_callers() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("stamp").unwrap();
-        let key = object::key("a.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-        let (name, stored_key) = (bucket.to_string(), key.to_string());
-
-        // The row already stored at sequence 4, stamped noncurrent.
-        let planted = VersionRow {
-            id: "v1".to_owned(),
-            blob: encode_blob(&BlobRef::single(BlockHash::of(b"x"), 1)),
-            size: 1,
-            etag: String::new(),
-            created: 0,
-            became_noncurrent: 777,
-            kind: RowKind::Object,
-            tags: String::new(),
-            checksum: String::new(),
-            owner: String::new(),
-            acl: String::new(),
-            seq: 4,
-        };
-        let driver = store.driver();
-        {
-            let planted = planted.clone();
-            driver
-                .write(move |txn: &mut WriteTransaction| -> Result<(), Error> {
-                    VersionTable::open(txn)?.put(&name, &stored_key, &planted)
-                })
-                .await
-                .unwrap();
-        }
-
-        // The caller's row names the same version but carries a different
-        // stamp: the stored one must win.
-        let mut caller = super::contract_row(&planted).expect("a decodable row");
-        caller.became_noncurrent = 999;
-        store.put_version(&bucket, &key, &caller).await.unwrap();
-        let stored = store.get_version(&bucket, &key, 4).await.unwrap();
-        let stored = stored.expect("the rewritten row");
-        assert_eq!(stored.became_noncurrent, 777);
-
-        // A sequence with no row stores the caller's stamp.
-        caller.seq = 5;
-        caller.became_noncurrent = 42;
-        store.put_version(&bucket, &key, &caller).await.unwrap();
-        let fresh = store.get_version(&bucket, &key, 5).await.unwrap();
-        let fresh = fresh.expect("the new row");
-        assert_eq!(fresh.became_noncurrent, 42);
-    }
-
-    /// The version-row write probes the bucket row in its own transaction,
-    /// exactly as the object-row guarded writers do: a version row is not less
-    /// of a row than the object row beside it.
-    #[tokio::test]
-    async fn put_version_refuses_a_bucket_with_no_row() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("version-refusal").unwrap();
-        let key = object::key("a.txt").unwrap();
-        let planted = VersionRow {
-            id: "v1".to_owned(),
-            blob: encode_blob(&BlobRef::single(BlockHash::of(b"x"), 1)),
-            size: 1,
-            etag: String::new(),
-            created: 0,
-            became_noncurrent: 0,
-            kind: RowKind::Object,
-            tags: String::new(),
-            checksum: String::new(),
-            owner: String::new(),
-            acl: String::new(),
-            seq: 1,
-        };
-        let row = super::contract_row(&planted).expect("a decodable row");
-
-        let refusal: storage::Error = store
-            .put_version(&bucket, &key, &row)
-            .await
-            .unwrap_err()
-            .into();
-        assert!(
-            matches!(refusal, storage::Error::NoSuchBucket(_)),
-            "{refusal:?}"
-        );
-        assert!(
-            store.get_version(&bucket, &key, 1).await.unwrap().is_none(),
-            "a refused version write leaves no row"
-        );
-
-        bucket_with(&store, &bucket).await;
-        store.put_version(&bucket, &key, &row).await.unwrap();
-        assert!(
-            store.get_version(&bucket, &key, 1).await.unwrap().is_some(),
-            "the version row lands once the bucket row exists"
-        );
-    }
-
-    /// One table-layer object version row for the stamp legs: one byte of
-    /// content, `became_noncurrent` as given.
-    fn stamped_row(seq: u64, id: &str, became_noncurrent: u64) -> VersionRow {
-        VersionRow {
-            id: id.to_owned(),
-            blob: encode_blob(&BlobRef::single(BlockHash::of(b"stamp"), 1)),
-            size: 1,
-            etag: String::new(),
-            created: 0,
-            became_noncurrent,
-            kind: RowKind::Object,
-            tags: String::new(),
-            checksum: String::new(),
-            owner: String::new(),
-            acl: String::new(),
-            seq,
-        }
-    }
-
-    /// One table-layer delete-marker row for the restore legs: no content, the
-    /// empty blob, no ETag — the shape a marker's row has.
-    fn marker_version_row(seq: u64, id: &str) -> VersionRow {
-        VersionRow {
-            id: id.to_owned(),
-            blob: encode_blob(&BlobRef::empty()),
-            size: 0,
-            etag: String::new(),
-            created: 0,
-            became_noncurrent: 0,
-            kind: RowKind::Marker,
-            tags: String::new(),
-            checksum: String::new(),
-            owner: String::new(),
-            acl: String::new(),
-            seq,
-        }
-    }
-
-    /// The contract row a table-layer row decodes to — the shape
-    /// [`VersionMeta::put_version`] takes, so the planted row carries its index
-    /// entry (the state a restore consumes).
-    fn version_row_of(row: &VersionRow) -> Stored {
-        super::contract_row(row).expect("a decodable version row")
-    }
-
-    /// The caller's object row for a restore: distinctive elements, so a leg
-    /// can tell the row the call wrote from anything the store fabricated.
-    fn caller_row(size: u64, identity: u64) -> CallerRow {
-        CallerRow {
-            etag: "0cc175b9c0f1b6a831c399e269772661".parse::<ETag>().unwrap(),
-            size,
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-            identity,
-            tags: object::Tags::empty(),
-            checksum: None,
-            owner: None,
-            acl: Acl::default_private(None),
-        }
-    }
-
-    /// One retained part of a completed multipart object.
-    fn part_row(number: u32) -> PartRow {
-        PartRow {
-            number,
-            size: 5,
-            checksum: None,
-        }
-    }
-
-    /// Plant version rows through the table layer: the contract has no
-    /// unguarded row writer, so only the store's own suite can stage a row that
-    /// the slot has not moved off yet.
-    async fn plant(
-        store: &RedbMetadata,
+    // The Object Lock contract methods: the lock row is keyed by the version
+    // identity, and every rule lives in [`version_lock`]; these are the
+    // contract's forwarding signatures (OL5, OL7, OL8).
+    #[cfg(any(test, feature = "testing"))]
+    async fn set_version_lock(
+        &self,
         bucket: &bucket::Name,
         key: &object::Key,
-        rows: &[VersionRow],
-    ) {
-        let (name, stored_key) = (bucket.to_string(), key.to_string());
-        let rows = rows.to_vec();
-        store
-            .driver()
-            .write(move |txn: &mut WriteTransaction| -> Result<(), Error> {
-                let mut table = VersionTable::open(txn)?;
-                for row in &rows {
-                    table.put(&name, &stored_key, row)?;
-                }
-                Ok(())
-            })
-            .await
-            .unwrap();
+        version: Option<&Id>,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), Error> {
+        version_lock::set_version_lock(self, bucket, key, version, lock).await
     }
 
-    /// The stamp a version row carries.
-    async fn stamp_of(
-        store: &RedbMetadata,
+    async fn version_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<Option<object_lock::Lock>, Error> {
+        version_lock::version_lock(self, bucket, key, version)
+    }
+
+    async fn get_object_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<Option<object_lock::Retention>, Error> {
+        Ok(version_lock::version_lock(self, bucket, key, version)?.and_then(|lock| lock.retention))
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+    ) -> Result<object_lock::LegalHold, Error> {
+        Ok(version_lock::version_lock(self, bucket, key, version)?
+            .map(|lock| lock.legal_hold)
+            .unwrap_or(object_lock::LegalHold::Off))
+    }
+
+    async fn set_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+        requested: Option<&object_lock::Retention>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, Error> {
+        version_lock::set_retention(self, bucket, key, version, requested, bypass, now).await
+    }
+
+    async fn set_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+        hold: object_lock::LegalHold,
+    ) -> Result<object_lock::Lock, Error> {
+        version_lock::set_legal_hold(self, bucket, key, version, hold).await
+    }
+
+    async fn set_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&Id>,
+        retention: Option<Option<&object_lock::Retention>>,
+        legal_hold: Option<object_lock::LegalHold>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, Error> {
+        version_lock::set_lock(
+            self, bucket, key, version, retention, legal_hold, bypass, now,
+        )
+        .await
+    }
+
+    /// The permanent delete, with the lock enforced inside the one transaction
+    /// that removes the row, its index entry and its lock row (OL8).
+    async fn expire_with(
+        &self,
         bucket: &bucket::Name,
         key: &object::Key,
         seq: u64,
-    ) -> u64 {
-        store
-            .get_version(bucket, key, seq)
-            .await
-            .unwrap()
-            .expect("the version row stays")
-            .became_noncurrent
+        bypass: object_lock::Bypass,
+    ) -> Result<Expired, Error> {
+        version_lock::expire_with(self, bucket, key, seq, bypass).await
     }
 
-    /// The `object_meta` row as the table layer sees it.
-    fn raw_row(driver: &Arc<Driver>, bucket: &bucket::Name, key: &object::Key) -> ObjectStored {
-        let (bucket, key) = (bucket.to_string(), key.to_string());
-        driver
-            .read(|txn| ObjectTable::open_readonly(txn)?.get(&bucket, &key))
-            .unwrap()
-            .expect("the slot's object row")
-    }
-
-    /// The three slot/version commits open one info span each on the storage
-    /// target: one span per contract call, not per row, and the identity the
-    /// commit moves is the recorded field.
-    #[tokio::test]
-    async fn version_commits_open_one_info_span_each() {
-        let capture = capture_spans();
-        let store = RedbMetadata::in_memory().unwrap();
-        let bucket = bucket::name("span-version").unwrap();
-        let key = object::key("slot.txt").unwrap();
-        bucket_with(&store, &bucket).await;
-        plant(&store, &bucket, &key, &[marker_version_row(1, "v1")]).await;
-
-        let watermark = capture.watermark();
-        store
-            .advance_slot(&bucket, &key, Some(Id::new("v1").unwrap()), 1)
-            .await
-            .unwrap();
-        store
-            .restore_slot(
-                &bucket,
-                &key,
-                &caller_row(5, 7),
-                Some(Id::new("v1").unwrap()),
-                1,
-            )
-            .await
-            .unwrap();
-        store
-            .put_version(&bucket, &key, &version_row_of(&stamped_row(2, "v2", 0)))
-            .await
-            .unwrap();
-
-        let spans = capture.spans_since(watermark);
-        let one = |name: &str| one_named(&spans, name);
-
-        let advance = one("advance_slot");
-        assert_eq!(advance.target, "tinio::storage");
-        assert_eq!(advance.level, Level::INFO);
-        assert_eq!(advance.field("bucket"), Some("span-version"));
-        assert_eq!(advance.field("key"), Some("slot.txt"));
-        assert_eq!(advance.field("version"), Some("v1"));
-
-        let restore = one("restore_slot");
-        assert_eq!(restore.target, "tinio::storage");
-        assert_eq!(restore.level, Level::INFO);
-        assert_eq!(restore.field("version"), Some("v1"));
-        assert_eq!(restore.field("bytes"), Some("5"));
-
-        let put = one("put_version");
-        assert_eq!(put.target, "tinio::storage");
-        assert_eq!(put.level, Level::INFO);
-        assert_eq!(put.field("version"), Some("v2"));
-        assert_eq!(put.field("kind"), Some("object"));
-        assert_eq!(put.field("bytes"), Some("1"));
+    /// The batched permanent delete: one transaction, protected sequences
+    /// skipped and reported, the rest removed with their lock rows (OL8).
+    async fn expire_many_report(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seqs: &[u64],
+    ) -> Result<ExpireReport, Error> {
+        version_lock::expire_many_report(self, bucket, key, seqs).await
     }
 }
+
+#[cfg(test)]
+mod tests;

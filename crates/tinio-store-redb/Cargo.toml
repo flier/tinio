@@ -18,8 +18,12 @@ tracing.workspace = true
 
 tinio-core.workspace = true
 
+[features]
+testing = ["tinio-core/testing"]
+
 [dev-dependencies]
 tempfile.workspace = true
+tinio-store-redb = { path = ".", features = ["testing"] }
 tracing-subscriber.workspace = true
 tinio-util = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = [

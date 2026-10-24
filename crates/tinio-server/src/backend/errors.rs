@@ -1,6 +1,23 @@
 use s3s::{S3Error, s3_error};
 
-use crate::_core::storage::Error as StorageError;
+use crate::_core::{lifecycle::InvalidKind, storage::Error as StorageError};
+
+/// A model refusal as the wire's (R14, LC8, OL17): the class picks the code
+/// (`Shape` → `MalformedXML`, `Semantic` → `InvalidRequest`) and the reason is
+/// the body. `rule_id` is the lifecycle rule the refusal belongs to; an
+/// object-lock refusal has none.
+pub(crate) fn invalid_error(kind: InvalidKind, reason: &str, rule_id: Option<&str>) -> S3Error {
+    match kind {
+        InvalidKind::Shape => match rule_id {
+            Some(id) => s3_error!(MalformedXML, "lifecycle rule {id}: {reason}"),
+            None => s3_error!(MalformedXML, "{reason}"),
+        },
+        InvalidKind::Semantic => match rule_id {
+            Some(id) => s3_error!(InvalidRequest, "lifecycle rule {id}: {reason}"),
+            None => s3_error!(InvalidRequest, "{reason}"),
+        },
+    }
+}
 
 /// A client-supplied value made safe to reflect into an XML error body
 /// (2026-10-06 review): the version-id rules are **length-only**, so a
@@ -76,6 +93,25 @@ pub(crate) fn map_backend_error<E: Into<StorageError>>(err: E) -> S3Error {
             );
             s3_error!(AccessDenied)
         }
+        // Object Lock (OL17): a protected permanent delete is the 403 the AWS
+        // surface answers; the reason is the log's, never the body's.
+        StorageError::Locked(reason) => {
+            tracing::debug!(reason = %reason, "object lock refused the operation");
+            s3_error!(AccessDenied)
+        }
+        // A lock-enabled bucket's versioning state refuses the operation
+        // (OL13): the 409 `InvalidBucketState` the design pins.
+        StorageError::InvalidBucketState(name) => s3_error!(
+            InvalidBucketState,
+            "invalid bucket state: `{}`",
+            printable(name.as_ref())
+        ),
+        // An invariant the contract guarantees was violated on disk — an
+        // undecodable lock row. A server fault, never a client error.
+        StorageError::Corrupt(detail) => {
+            tracing::error!(detail, "corrupt stored state");
+            s3_error!(InternalError)
+        }
         // D5: the detail is the log's, never the body's. A backend `Io` can
         // wrap tinio-fs's `Invariant` (that crate's `From<Error> for
         // storage::Error`), whose `Debug` names the broken invariant while its
@@ -100,6 +136,7 @@ mod tests {
     use super::*;
     use crate::_core::{
         ETag, bucket, object,
+        object_lock::RefusalReason,
         storage::{ByteRange, Denied, Error as StorageError},
     };
 
@@ -173,6 +210,18 @@ mod tests {
             (
                 StorageError::AccessDenied(Denied::Key(k)),
                 S3ErrorCode::AccessDenied,
+            ),
+            (
+                StorageError::Locked(RefusalReason::Governance),
+                S3ErrorCode::AccessDenied,
+            ),
+            (
+                StorageError::InvalidBucketState(b.clone()),
+                S3ErrorCode::InvalidBucketState,
+            ),
+            (
+                StorageError::Corrupt("bad lock row"),
+                S3ErrorCode::InternalError,
             ),
             (
                 StorageError::Io(IoError::other("boom")),

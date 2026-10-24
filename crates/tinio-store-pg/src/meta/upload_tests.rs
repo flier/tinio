@@ -14,8 +14,8 @@ use crate::{
         bucket, checksum,
         meta::{UploadMeta, upload::Row as UploadRow},
         multipart::PartNumber,
-        object,
-        storage::{group_and_paginate_unordered, uploads_order},
+        object, object_lock,
+        storage::{self, group_and_paginate_unordered, uploads_order},
     },
     Error, PgStore,
     tests::fixtures::{ETAG_A, bucket_row, key, name, scratch, tags},
@@ -908,6 +908,81 @@ async fn two_parts_of_one_upload_report_their_own_write_stamps() {
     assert!(
         second > first,
         "the second part's stamp is strictly later than the first's ({first:?} -> {second:?})"
+    );
+    db.drop_db().await;
+}
+
+/// The intent decode is fail-closed and the drain removes it with the rows
+/// (OL6): a corrupt stored row never reads as "no lock", a re-create replaces
+/// it, and complete/abort's drain takes it away.
+#[tokio::test]
+async fn a_corrupt_intent_fails_closed_and_the_drain_removes_it() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let data = name("plane-upload-lock-corrupt");
+    bucket_row(&store, &data).await;
+    let upload_id = "upload-lock-1";
+    sqlx::query(
+        "INSERT INTO upload_object_lock (bucket, upload_id, mode, retain_until, legal_hold) \
+         VALUES ($1, $2, 'BAD', NULL, 'OFF')",
+    )
+    .bind(data.as_ref())
+    .bind(upload_id)
+    .execute(store.as_driver())
+    .await
+    .unwrap();
+    assert!(matches!(
+        storage::Error::from(
+            UploadMeta::upload_lock(&store, &data, upload_id)
+                .await
+                .unwrap_err()
+        ),
+        storage::Error::Corrupt(_)
+    ));
+    // A re-create without an intent clears the stale row.
+    let row = state(upload_id, &key("big.bin"));
+    UploadMeta::create_with_lock(&store, &data, upload_id, &row, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        UploadMeta::upload_lock(&store, &data, upload_id)
+            .await
+            .unwrap(),
+        None
+    );
+    // A re-create with an intent stores it, and the drain removes it with the
+    // upload row (the completion/abort path).
+    UploadMeta::create_with_lock(
+        &store,
+        &data,
+        upload_id,
+        &row,
+        Some(&object_lock::Lock {
+            retention: Some(object_lock::Retention {
+                mode: object_lock::Mode::Governance,
+                retain_until: SystemTime::now() + Duration::from_secs(3_600),
+            }),
+            legal_hold: object_lock::LegalHold::Off,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        UploadMeta::upload_lock(&store, &data, upload_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    UploadMeta::drain_upload(&store, &data, upload_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        UploadMeta::upload_lock(&store, &data, upload_id)
+            .await
+            .unwrap(),
+        None,
+        "the drain removes the intent with the upload"
     );
     db.drop_db().await;
 }

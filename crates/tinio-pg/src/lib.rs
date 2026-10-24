@@ -41,6 +41,8 @@ pub extern crate tinio_util as _util;
 
 pub mod config;
 
+mod bucket;
+
 pub mod cleanup;
 pub mod doctor;
 mod error;

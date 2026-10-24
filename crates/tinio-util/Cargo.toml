@@ -64,6 +64,7 @@ testing = [
     "dep:serde_json",
     "dep:sha2",
     "dep:tracing-subscriber",
+    "tinio-core/testing",
 ]
 
 [lints.clippy]

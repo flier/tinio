@@ -1,0 +1,54 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT mode, retain_until, legal_hold\nFROM version_object_lock\nWHERE bucket = $1 AND key = $2 AND version_id = $3\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "mode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_object_lock",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "retain_until",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "version_object_lock",
+            "name": "retain_until"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "legal_hold",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_object_lock",
+            "name": "legal_hold"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "a6d30833f7e2dd4c014d18324645d41eba29b67f3ec7251cd430cd7c36395587"
+}

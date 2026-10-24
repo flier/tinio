@@ -43,6 +43,11 @@ pub mod s3;
 
 #[cfg(feature = "acl")]
 pub use self::_auth::{Identity, User};
+/// The process-local Object Lock cache handle the management plane's admin shares with the
+/// backend (OL18): the CLI creates it, injects the admin and hands the same handle to the data
+/// plane.
+#[cfg(feature = "object-lock")]
+pub use self::backend::ObjectLockCache;
 pub use self::{
     backend::{Capabilities, S3Backend},
     // `MetricsRefresh` lives in the private `mod data`, so it is re-exported here for the same

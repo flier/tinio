@@ -4,7 +4,10 @@
 //! simple delete inserts a marker), the rename refusal, and the shared
 //! conformance leg — the same oracle the memory backend runs.
 
-use std::{fs, time::SystemTime};
+use std::{
+    fs,
+    time::{Duration, SystemTime},
+};
 
 use bytes::Bytes;
 use futures::stream;
@@ -13,15 +16,17 @@ use crate::{
     _core::{
         BodyStream, ETag,
         acl::Acl,
-        bucket, collect_body, from_nanos, object,
+        bucket, collect_body, from_nanos,
+        meta::VersionMeta,
+        object, object_lock,
         storage::{self, BucketOps, ObjectOps, VersionOps},
         version::{self, ListParams},
     },
     _store_redb::{
         object_meta::{self, Stored},
-        version as rows,
+        version as rows, version_object_lock,
     },
-    _util::testing::conformance_versioning,
+    _util::testing::{conformance_versioning, metadata::reservation},
     FsStorage,
     database::Error as DatabaseError,
     meta::{Content, Verdict, gate},
@@ -56,6 +61,7 @@ async fn put(
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap()
@@ -265,7 +271,7 @@ async fn deleting_the_last_version_removes_the_key_from_the_tree() {
         .expect("an enabled write mints a version id");
 
     let removed = storage
-        .delete_object_version(&b, &key, Some(&only))
+        .delete_object_version(&b, &key, Some(&only), object_lock::Bypass::None)
         .await
         .unwrap();
     assert!(!removed.is_delete_marker);
@@ -370,7 +376,7 @@ async fn removing_a_marker_restores_the_version_it_hid() {
     let marker = storage.delete_object(&b, &key).await.unwrap().id.unwrap();
 
     let removed = storage
-        .delete_object_version(&b, &key, Some(&marker))
+        .delete_object_version(&b, &key, Some(&marker), object_lock::Bypass::None)
         .await
         .unwrap();
     assert!(removed.is_delete_marker);
@@ -437,7 +443,7 @@ async fn removing_a_version_restores_the_marker_it_superseded() {
 
     // Deleting the newest version makes the marker current again.
     let removed = storage
-        .delete_object_version(&b, &key, Some(&newest))
+        .delete_object_version(&b, &key, Some(&newest), object_lock::Bypass::None)
         .await
         .unwrap();
     assert!(!removed.is_delete_marker);
@@ -941,7 +947,7 @@ async fn deleting_a_noncurrent_version_leaves_the_current_one_alone() {
     let fresh = put(&storage, &b, &key, b"second").await.version_id.unwrap();
 
     let removed = storage
-        .delete_object_version(&b, &key, Some(&old))
+        .delete_object_version(&b, &key, Some(&old), object_lock::Bypass::None)
         .await
         .unwrap();
     assert!(!removed.is_delete_marker);
@@ -995,7 +1001,7 @@ async fn the_supersede_crash_window_lists_one_current_version_and_deletes_cleanl
     assert_eq!(current.info.version_id.as_ref(), Some(&only));
 
     let removed = storage
-        .delete_object_version(&b, &key, Some(&only))
+        .delete_object_version(&b, &key, Some(&only), object_lock::Bypass::None)
         .await
         .unwrap();
     assert_eq!(removed.id.as_ref(), Some(&only));
@@ -1417,7 +1423,7 @@ async fn deleting_the_last_version_of_a_prefixed_key_prunes_the_prefix_directory
     assert!(root.path().join("data").join("logs").is_dir());
 
     let removed = storage
-        .delete_object_version(&b, &key, Some(&only))
+        .delete_object_version(&b, &key, Some(&only), object_lock::Bypass::None)
         .await
         .unwrap();
     assert_eq!(removed.id.as_ref(), Some(&only));
@@ -1465,11 +1471,11 @@ async fn a_bucket_holding_only_a_delete_marker_is_not_empty() {
     // Every version and the marker removed: the rows go with the last one,
     // and the bucket deletes again.
     storage
-        .delete_object_version(&b, &key, Some(&marker))
+        .delete_object_version(&b, &key, Some(&marker), object_lock::Bypass::None)
         .await
         .unwrap();
     storage
-        .delete_object_version(&b, &key, Some(&only))
+        .delete_object_version(&b, &key, Some(&only), object_lock::Bypass::None)
         .await
         .unwrap();
     assert!(
@@ -1566,7 +1572,7 @@ async fn a_versioned_bucket_with_live_content_and_a_marker_is_not_empty() {
     // refusal left, and it must still answer it (the old directory-only gate
     // deleted the bucket here, which is the property this leg pins).
     storage
-        .delete_object_version(&b, &keep, Some(&live))
+        .delete_object_version(&b, &keep, Some(&live), object_lock::Bypass::None)
         .await
         .unwrap();
     assert!(
@@ -1806,7 +1812,7 @@ async fn the_whole_version_lifecycle_runs_over_the_real_state_dir() {
 
     // Delete a noncurrent version: only its own row goes.
     let removed = storage
-        .delete_object_version(&b, &key, Some(&ids[0]))
+        .delete_object_version(&b, &key, Some(&ids[0]), object_lock::Bypass::None)
         .await
         .unwrap();
     assert!(!removed.is_delete_marker);
@@ -1847,7 +1853,7 @@ async fn the_whole_version_lifecycle_runs_over_the_real_state_dir() {
 
     // Removing the marker shows the version it hid: current again.
     let unmarked = storage
-        .delete_object_version(&b, &key, Some(&marker_id))
+        .delete_object_version(&b, &key, Some(&marker_id), object_lock::Bypass::None)
         .await
         .unwrap();
     assert!(unmarked.is_delete_marker);
@@ -1930,7 +1936,7 @@ async fn the_whole_version_lifecycle_runs_over_the_real_state_dir() {
 
     for id in [&ids[3], &ids[2]] {
         let removed = storage
-            .delete_object_version(&b, &key, Some(id))
+            .delete_object_version(&b, &key, Some(id), object_lock::Bypass::None)
             .await
             .unwrap();
         assert_eq!(removed.id.as_ref(), Some(id));
@@ -1942,7 +1948,7 @@ async fn the_whole_version_lifecycle_runs_over_the_real_state_dir() {
     assert!(!file_exists(&root, "notes.txt"));
     for (flat, id) in [(&flat_a, &a_id), (&flat_b, &b_id)] {
         storage
-            .delete_object_version(&b, flat, Some(id))
+            .delete_object_version(&b, flat, Some(id), object_lock::Bypass::None)
             .await
             .unwrap();
     }
@@ -2032,7 +2038,7 @@ async fn a_superseded_version_carries_its_tags_checksum_owner_and_acl() {
         .await
         .unwrap();
     let first = storage
-        .commit_object(&b, &key, staged, tags.clone(), Some(&owner), &acl)
+        .commit_object(&b, &key, staged, tags.clone(), Some(&owner), &acl, None)
         .await
         .unwrap();
     let first_id = first
@@ -3243,3 +3249,6 @@ async fn a_null_address_of_a_gone_file_answers_one_nosuchkey_from_either_layer_w
         "and that arm leaves the row alone too"
     );
 }
+
+#[path = "tests/object_lock.rs"]
+mod object_lock_tests;

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use axum::{body::Body, http::Request};
 use tempfile::TempDir;
 use tinio_api::{
+    _core::mode::AccessMode,
     Options, Plane,
     router::{Auth, Context, Shared, router},
     state::State,
@@ -77,9 +78,12 @@ async fn the_management_plane_opens_its_request_state_and_shutdown_spans() {
         host: "127.0.0.1".to_string(),
         stop: plane_stop,
         metrics_requires_token: false,
+        access: AccessMode::ReadWrite,
         token: None,
         #[cfg(feature = "lifecycle")]
         lifecycle: None,
+        #[cfg(feature = "object-lock")]
+        object_lock: None,
     })
     .expect("bind");
     let serve = plane.serve(plane_rx);

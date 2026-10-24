@@ -57,10 +57,11 @@ use crate::{
     },
     _store_redb::{
         Driver, Error as StoreError, RedbContent, RedbMetadata, bucket as bucket_row,
-        bucket_lifecycle, ensure_all, object_meta, object_part, objects, part, part_checksum,
-        part_data, part_meta, part_stamp,
+        bucket_lifecycle, bucket_object_lock, ensure_all,
+        meta::bucket::bucket_occupied,
+        object_meta, object_part, objects, part, part_checksum, part_data, part_meta, part_stamp,
         scan::{drain_pair, drain_triple, for_each_pair},
-        store, upload, upload_checksum,
+        store, upload, upload_checksum, upload_object_lock,
     },
     Error,
     counting::CountingContent,
@@ -415,15 +416,14 @@ impl MemHooks {
             if bucket_row::Table::open(txn)?.row(&b)?.is_none() {
                 return Err(no_such_bucket(&name));
             }
-            // The two occupancy probes in the deleting transaction — one
+            // The five occupancy probes in the deleting transaction — one
             // key-range seek each, never a walk — so a concurrent write cannot
             // slip between the check and the removal. S3 answers BucketNotEmpty
-            // for object rows and in-progress uploads alike, and both halves
-            // are the shared table layer's own probes: the object-row one is
-            // exactly what `ObjectMeta::has_objects` answers from, so the
-            // in-transaction re-probe cannot drift from the contract's.
-            let objects = object_meta::Table::open(txn)?.has_bucket(&b)?;
-            if objects || upload::Table::open(txn)?.has_bucket(&b)? {
+            // for object rows, in-progress uploads, version history and the
+            // two Object Lock tables alike; the predicate is the shared redb
+            // store's own (`remove_if_empty`'s), so mem's teardown cannot
+            // drift from the contract's emptiness decision (OL8).
+            if bucket_occupied(txn, &b)? {
                 return Err(Error::from(not_empty(&name)));
             }
             bucket_row::Table::open(txn)?.remove(&b)?;
@@ -431,6 +431,11 @@ impl MemHooks {
             // teardown (the 2026-10-08 ruling elided `remove_if_empty` into
             // it), so the lifecycle row leaves in this same transaction.
             bucket_lifecycle::Table::open(txn)?.drain_bucket(&b)?;
+            // OL4/OL6: the bucket's Object Lock configuration and upload
+            // intents die with it; the per-version rows are the version
+            // plane's drain below.
+            bucket_object_lock::Table::open(txn)?.drain_bucket(&b)?;
+            upload_object_lock::Table::open(txn)?.drain_bucket(&b)?;
             // The bucket's stored state dies with it (spec 2026-10-03): the
             // object and upload planes' rows, mem's own part planes, and — under
             // the `versioning` feature — the version plane and the history
@@ -550,6 +555,7 @@ mod tests {
             BucketOps, CompletedPart, ListObjectsParams, MultipartOps, ObjectOps, acl::Acl,
             multipart::MIN_PART_BYTES, object, storage,
         },
+        _store_redb::version_object_lock,
         _util::testing::{assert_conformance, assert_send_sync, body},
     };
 
@@ -593,6 +599,88 @@ mod tests {
         assert_eq!(put.etag.as_str(), "d41d8cd98f00b204e9800998ecf8427e");
     }
 
+    /// OL8: mem's teardown counts both Object Lock tables in its emptiness
+    /// decision. A bucket whose only row is a per-version lock (with no
+    /// version row), and one whose only row is an upload intent (with no
+    /// upload row), each answer `NotEmpty`; removing the planted row is what
+    /// lets the deletion through, so the lock probe — never some other row —
+    /// is the blocker.
+    #[tokio::test]
+    async fn the_bucket_teardown_counts_both_lock_tables_as_occupancy() {
+        use crate::_core::object_lock::{LegalHold, Lock};
+
+        let storage = MemoryStorage::new().unwrap();
+        let lock = Lock {
+            retention: None,
+            legal_hold: LegalHold::On,
+        };
+
+        // A per-version lock row with no version row: an orphan the occupancy
+        // rule still counts (the drain would remove it, but a live bucket
+        // holding one is not empty).
+        let version_bucket = name("version-lock-probe").unwrap();
+        storage
+            .create_bucket(&version_bucket, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let key = object::key("k").unwrap();
+        let (bucket, wire, planted) = (version_bucket.to_string(), key.to_string(), lock.clone());
+        storage
+            .db
+            .write(move |txn| -> Result<(), Error> {
+                version_object_lock::Table::open(txn)?.put(&bucket, &wire, "v1", &planted)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                storage.delete_bucket(&version_bucket).await.unwrap_err(),
+                Error::Storage(storage::Error::NotEmpty(_))
+            ),
+            "a bucket holding only a version lock row is not empty"
+        );
+        let (bucket, wire) = (version_bucket.to_string(), key.to_string());
+        storage
+            .db
+            .write(move |txn| -> Result<(), Error> {
+                version_object_lock::Table::open(txn)?.remove(&bucket, &wire, "v1")?;
+                Ok(())
+            })
+            .unwrap();
+        storage.delete_bucket(&version_bucket).await.unwrap();
+
+        // An upload intent with no upload row: likewise occupancy.
+        let upload_bucket = name("upload-lock-probe").unwrap();
+        storage
+            .create_bucket(&upload_bucket, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let (bucket, planted) = (upload_bucket.to_string(), lock.clone());
+        storage
+            .db
+            .write(move |txn| -> Result<(), Error> {
+                upload_object_lock::Table::open(txn)?.put(&bucket, "upload-1", &planted)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                storage.delete_bucket(&upload_bucket).await.unwrap_err(),
+                Error::Storage(storage::Error::NotEmpty(_))
+            ),
+            "a bucket holding only an upload intent is not empty"
+        );
+        let bucket = upload_bucket.to_string();
+        storage
+            .db
+            .write(move |txn| -> Result<(), Error> {
+                upload_object_lock::Table::open(txn)?.remove(&bucket, "upload-1")?;
+                Ok(())
+            })
+            .unwrap();
+        storage.delete_bucket(&upload_bucket).await.unwrap();
+    }
+
     #[tokio::test]
     async fn multipart_etag_is_served_on_subsequent_reads() {
         let storage = MemoryStorage::new().unwrap();
@@ -610,6 +698,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();

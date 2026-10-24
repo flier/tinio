@@ -341,6 +341,22 @@ impl FsStorage {
             Publication::Versioned => self.plan_publish(bucket, key).await?,
             Publication::Bytes | Publication::BytesUnderLock => Plan::rowless(),
         };
+        // OL7/C1 (the 2026-10-21 review): the write paths' plan resolved the
+        // identity the row will record. When that identity is the null
+        // version, the write is an in-place replacement, and the outgoing
+        // identity's active lock must refuse it **before the rename** — after
+        // it, the bytes would already have replaced the protected content.
+        // The row transaction that records the write re-checks the same rule
+        // (`record_committed`), so this is the early refusal, not the
+        // authority. `plan.records_versions` is true for enabled **and**
+        // suspended buckets; the row-less arms (`Bytes`/`BytesUnderLock`)
+        // record their own rows and keep their own checks.
+        if matches!(publication, Publication::Versioned)
+            && plan.marker.id.is_none()
+            && plan.records_versions
+        {
+            self.refuse_protected_null(bucket, key).await?;
+        }
         // The unix dir hardening (spec 2026-09-05 §5a): a prefix dir
         // implicitly created by this write lands `0700` and chowned to the
         // bucket owner's mapped uid (the lookup runs once per publish).
@@ -394,7 +410,7 @@ mod enabled {
             from_nanos,
             meta::{VersionMeta, object as object_row},
             object::{self, Tags},
-            storage,
+            object_lock, storage,
             storage::VersionOps,
             to_nanos,
             version::{
@@ -636,6 +652,14 @@ mod enabled {
                     .supersede_with(bucket, key, &current)
                     .await
                     .map_err(projected)?;
+            }
+            // OL7: a suspended delete of a recorded null object removes the
+            // only copy. The same protected-null rule the publish applies
+            // refuses that before the marker row and the unlink. Replacing a
+            // current delete marker does not, and a supersede has already
+            // moved the bytes into history.
+            if !plan.supersede && current.is_null() && !current.degraded {
+                self.refuse_protected_null(bucket, key).await?;
             }
             let id = match plan.identity {
                 Identity::Fresh => Some(version::mint()),
@@ -1038,12 +1062,19 @@ mod enabled {
                 .map_err(Error::from)
         }
 
-        /// The engine's state write, under fs's bucket mutation lock: every
-        /// write path reads the state inside its own hold of this lock, so
-        /// the flip is serialized with them — without it a write that
+        /// The guarded engine state write, under fs's bucket mutation lock:
+        /// every write path reads the state inside its own hold of this lock,
+        /// so the flip is serialized with them — without it a write that
         /// overlapped the flip could act on the old state after the flip
         /// answered (orderable, but only by an argument; the lock makes the
         /// serialization the obvious reading).
+        ///
+        /// The write is the store's **guarded** one (R21/OL13), like pg's: a
+        /// suspend over an enabled Object Lock configuration refuses
+        /// `InvalidBucketState` inside the same transaction that reads the
+        /// configuration, so a lock-enabled bucket can never be suspended. A
+        /// lazily-created directory with no bucket row yet is the guarded
+        /// write's documented opt-out (see the arm below).
         #[instrument(
             level = "debug",
             target = "tinio::storage",
@@ -1053,10 +1084,24 @@ mod enabled {
         async fn set_bucket_versioning(&self, bucket: &Name, state: State) -> Result<(), Error> {
             self.ensure_bucket(bucket).await?;
             let _guard = self.lock_bucket_mutations(bucket).await;
-            self.objects()
-                .set_bucket_versioning(&self.version_plane(bucket), bucket, state)
-                .await
-                .map_err(Error::from)
+            let rows = self.version_plane(bucket).version_rows;
+            match VersionMeta::set_bucket_state_guarded(&*rows, bucket, state).await {
+                Ok(()) => Ok(()),
+                // A lazy plane's bucket row is materialized by its writers,
+                // not by a directory: a state write on a directory no writer
+                // has recorded yet is the plain state write (the contract
+                // leaves the guard opt-in for exactly this shape). Under this
+                // arm's mutation guard a concurrent bucket removal cannot
+                // interleave, and an enabled lock configuration implies a
+                // recorded bucket row (`put_bucket_object_lock` records it
+                // first), so the R21 cross-check is not lost here.
+                Err(storage::Error::NoSuchBucket(_)) => {
+                    VersionMeta::set_bucket_state(&*rows, bucket, state)
+                        .await
+                        .map_err(Error::from)
+                }
+                Err(err) => Err(err.into()),
+            }
         }
 
         async fn get_object_version(
@@ -1133,6 +1178,7 @@ mod enabled {
             bucket: &Name,
             key: &object::Key,
             version: Option<&Id>,
+            bypass: object_lock::Bypass,
         ) -> Result<Marker, Error> {
             self.ensure_bucket(bucket).await?;
             if key.is_reserved() || key.is_folder_marker() {
@@ -1146,14 +1192,26 @@ mod enabled {
             let path = self.resolve_key(&dir, key).await?;
             match self.locate(bucket, key, version).await? {
                 Found::Current { id, seq } => {
-                    // The current object version is permanently removed: the
-                    // newest remaining version becomes current again, or the
-                    // key disappears with it. The removal goes through the
-                    // delete path's own helper and PROPAGATES: a file that
-                    // could not be removed must not be reported as a
-                    // permanently deleted version (the surviving file would
-                    // self-heal into a fresh null version while the caller
-                    // believed it gone).
+                    // Object Lock (OL8, R11, R19): `expire_with` is the delete
+                    // policy and it answers before the content is touched. Its
+                    // no-row fallback judges the current slot even when the
+                    // addressed sequence differs from the slot's (the fs
+                    // degraded null), so a refusal precedes every removal and
+                    // the file is unlinked only after the store's verdict.
+                    let version_rows = self.version_plane(bucket).version_rows;
+                    version_rows.expire_with(bucket, key, seq, bypass).await?;
+                    // The verdict is deliberately not consulted: an `Err` (the
+                    // lock refusal) has already returned, so **any** success
+                    // means the addressed current version has no live row after
+                    // this call — a removed row or a row-less current slot that
+                    // `restore` clears below — and the key-path file is
+                    // unreferenced. Unlinking here is what reclaims the
+                    // degraded-null file the sweep does not see (it only
+                    // reclaims unreferenced blocks). The order is authoritative
+                    // answer first, file second; an I/O failure propagates
+                    // rather than hiding, and the row is already gone, so the
+                    // leftover file is unreferenced debris, never a protected
+                    // version's content.
                     remove_object_file(&path, *self.follow_symlinks()).await?;
                     let removed = (wire_of(id.as_ref()), seq);
                     self.restore(bucket, key, Some(&removed)).await?;
@@ -1183,8 +1241,9 @@ mod enabled {
                 Found::Row(row) => {
                     // No file is touched — the noncurrent version lives in the
                     // block store — so nothing can have been emptied here.
-                    self.versions(bucket)
-                        .expire(bucket, key, row.seq)
+                    self.version_plane(bucket)
+                        .version_rows
+                        .expire_with(bucket, key, row.seq, bypass)
                         .await
                         .map_err(projected)?;
                     Ok(Marker {
@@ -1287,6 +1346,132 @@ mod enabled {
             self.ensure_bucket(bucket).await?;
             self.objects()
                 .set_version_acl(&self.version_plane(bucket), bucket, key, version, acl)
+                .await
+                .map_err(Error::from)
+        }
+
+        /// The retention stored on a version — the server's read and the
+        /// GET/HEAD lock-header echo (OL8, OL28). One store read, fail closed.
+        async fn get_object_retention(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            version: Option<&Id>,
+        ) -> Result<Option<object_lock::Retention>, Error> {
+            self.ensure_bucket(bucket).await?;
+            VersionMeta::get_object_retention(
+                &Rows::new(self.storage_handle()),
+                bucket,
+                key,
+                version,
+            )
+            .await
+            .map_err(Error::from)
+        }
+
+        /// The legal hold stored on a version (OL8, OL28) — the same one
+        /// store read as the retention's.
+        async fn get_object_legal_hold(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            version: Option<&Id>,
+        ) -> Result<object_lock::LegalHold, Error> {
+            self.ensure_bucket(bucket).await?;
+            VersionMeta::get_object_legal_hold(
+                &Rows::new(self.storage_handle()),
+                bucket,
+                key,
+                version,
+            )
+            .await
+            .map_err(Error::from)
+        }
+
+        /// A version's whole lock in **one** store read — the GET/HEAD echo's
+        /// shape (OL8, OL28). The default composes the two single-value reads
+        /// above; the store's lock row answers both together, so this pays one.
+        async fn object_lock(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            version: Option<&Id>,
+        ) -> Result<Option<object_lock::Lock>, Error> {
+            self.ensure_bucket(bucket).await?;
+            VersionMeta::version_lock(&Rows::new(self.storage_handle()), bucket, key, version)
+                .await
+                .map_err(Error::from)
+        }
+
+        /// Set or clear a version's retention (R22) — the engine body's
+        /// address resolution and the store's one atomic write. The `Rows`
+        /// adapter takes the bucket mutation lock inside, so the write
+        /// serializes with the versioned write paths and the delete arms.
+        async fn set_retention(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            address: &version::Address,
+            requested: Option<&object_lock::Retention>,
+            bypass: object_lock::Bypass,
+            now: SystemTime,
+        ) -> Result<Option<object_lock::Lock>, Error> {
+            self.ensure_bucket(bucket).await?;
+            self.objects()
+                .set_retention(
+                    &self.version_plane(bucket),
+                    bucket,
+                    key,
+                    address,
+                    requested,
+                    bypass,
+                    now,
+                )
+                .await
+                .map_err(Error::from)
+        }
+
+        /// Set or clear a version's legal hold (R22) — the same delegation as
+        /// [`VersionOps::set_retention`].
+        async fn set_legal_hold(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            address: &version::Address,
+            hold: object_lock::LegalHold,
+        ) -> Result<object_lock::Lock, Error> {
+            self.ensure_bucket(bucket).await?;
+            self.objects()
+                .set_legal_hold(&self.version_plane(bucket), bucket, key, address, hold)
+                .await
+                .map_err(Error::from)
+        }
+
+        /// The combined retention and legal-hold update (OL23) — the engine
+        /// body's address resolution and the store's one atomic write, so a
+        /// refused retention leaves neither member applied.
+        async fn update_lock(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            address: &version::Address,
+            retention: Option<Option<&object_lock::Retention>>,
+            legal_hold: Option<object_lock::LegalHold>,
+            bypass: object_lock::Bypass,
+            now: SystemTime,
+        ) -> Result<Option<object_lock::Lock>, Error> {
+            self.ensure_bucket(bucket).await?;
+            self.objects()
+                .update_lock(
+                    &self.version_plane(bucket),
+                    bucket,
+                    key,
+                    address,
+                    retention,
+                    legal_hold,
+                    bypass,
+                    now,
+                )
                 .await
                 .map_err(Error::from)
         }

@@ -40,6 +40,13 @@ use crate::_core::storage::VersionOps;
 // `info_of`), and the **unix**-gated copy record tail
 // (`commit_staged`/`record_committed`) writes the table directly.
 use crate::_store_redb::object_meta;
+// The protected-null pre-check's lock table, and — unix only — the copy fast
+// path's record tail.
+use crate::_store_redb::version_object_lock;
+// The protected-null pre-check (`refuse_protected_null`) and the copy record
+// tail (`commit_staged`/`record_committed`) project their transactions'
+// refusals through the database module's own mapping.
+use crate::database;
 // The copy fast path's record tail (`commit_staged`/`record_committed`) is
 // unix-only — Windows has no kernel copy primitive, so its copy arm is the
 // engine-backed portable route — and these are its imports.
@@ -50,9 +57,10 @@ use crate::{
         BodyStream, ETag, acl,
         acl::{Acl, AclGrants},
         bucket, checksum,
+        meta::BucketMeta,
         multipart::ObjectPart,
         object::{self, Info, Tags},
-        storage,
+        object_lock, storage,
         storage::{
             ByteRange, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
             TagWriteResult, access_denied, no_such_bucket, no_such_key,
@@ -60,12 +68,40 @@ use crate::{
         version,
     },
     _ops::StagedBody as EngineStagedBody,
+    _store_redb::{Error as StoreError, RedbMetadata},
     backend::version::{Publication, Published},
     content::FsStaged,
+    database::map_contract_error,
     fsutil,
     meta::{Content, Verdict, gate},
     write::AtomicWriter,
 };
+
+/// The protected-null rule's one body over a transaction whose tables open the
+/// given way (`open` for a write transaction, `open_readonly` for a read one):
+/// the recorded identity, when it is not a marker, and its lock row — the wire
+/// and the refusal an in-place replacement must honour, or `None` when the
+/// write may proceed. The pre-rename check ([`FsStorage::refuse_protected_null`])
+/// and the authoritative re-check inside `record_committed` share it, so the two
+/// can never judge the rule differently.
+macro_rules! protected_null_refusal {
+    ($txn:expr, $open:ident, $bucket:expr, $key:expr) => {{
+        let recorded = object_meta::Table::$open($txn)?.get($bucket, $key)?;
+        match recorded.as_ref().filter(|slot| !slot.is_delete_marker) {
+            Some(slot) => {
+                let wire = version::wire_of(slot.version_id.as_ref());
+                let current = version_object_lock::Table::$open($txn)?.get($bucket, $key, &wire)?;
+                object_lock::delete_refusal(
+                    current.as_ref(),
+                    SystemTime::now(),
+                    object_lock::Bypass::None,
+                )
+                .map(|reason| (wire, reason))
+            }
+            None => None,
+        }
+    }};
+}
 
 /// The version facts a plane-free engine body cannot fill (G3), as fs's own
 /// rows answer them — with the file stamp the same resolution judged, kept
@@ -572,7 +608,7 @@ impl FsStorage {
     #[cfg(unix)]
     #[expect(
         clippy::too_many_arguments,
-        reason = "the contract's `copy_object` shape — source and destination bucket/key plus the carried tags, owner, ACL and checksum — which this unix fast path must match to override it"
+        reason = "the contract's `copy_object` shape — source and destination bucket/key plus the carried tags, owner, ACL, checksum and the destination's lock — which this unix fast path must match to override it"
     )]
     async fn copy_object_fast(
         &self,
@@ -584,6 +620,7 @@ impl FsStorage {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
         checksum: Option<checksum::Recorded>,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<Info, Error> {
         // Folder-marker destination: a marker is a directory, and its commit
         // is the marker branch's (`commit_marker`, the same one the ops
@@ -643,6 +680,7 @@ impl FsStorage {
             owner,
             acl,
             checksum,
+            lock,
         )
         .await
     }
@@ -1004,7 +1042,7 @@ impl FsStorage {
     #[cfg(unix)]
     #[expect(
         clippy::too_many_arguments,
-        reason = "the commit's own field set — bucket, key, staged bytes, tags, owner, ACL and checksum — one publish and one row write take them together"
+        reason = "the commit's own field set — bucket, key, staged bytes, tags, owner, ACL, checksum and the destination's lock — one publish and one row write take them together"
     )]
     async fn commit_staged(
         &self,
@@ -1015,6 +1053,7 @@ impl FsStorage {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
         checksum: Option<checksum::Recorded>,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<Info, Error> {
         // The bytes half: the publish's own stamp is what the row below
         // records.
@@ -1041,6 +1080,7 @@ impl FsStorage {
                 published.marker.id.as_ref(),
                 published.seq,
                 published.superseded,
+                lock,
             )
             .await
         {
@@ -1077,6 +1117,54 @@ impl FsStorage {
         })
     }
 
+    /// The protected-null pre-check, run by `publish_versioned` **before its
+    /// rename** on a publish whose resolved identity is the null version
+    /// (C1, the 2026-10-21 review): the write would replace the recorded
+    /// identity's content in place, and an identity that owns an active lock
+    /// must be refused while the old bytes are still the ones on disk. The
+    /// bytes-ahead-of-the-row ordering is the fs fast path's (a refusal after
+    /// the rename would replace content behind a 403 on a WORM path).
+    ///
+    /// This is not the authoritative guard: `record_committed` re-runs the
+    /// same rule inside the transaction that records the row, so a slot that
+    /// moved between this read and the rename is still refused, at the cost
+    /// of a rolled-back row (the pre-existing I7 shape). The read runs under
+    /// the publish's bucket mutation lock, so the intervening write it can
+    /// miss is one that does not take that lock.
+    pub(crate) async fn refuse_protected_null(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+    ) -> Result<(), Error> {
+        let refusal = self
+            .handle
+            .read(
+                |txn| -> Result<Option<object_lock::RefusalReason>, database::Error> {
+                    match protected_null_refusal!(txn, open_readonly, bucket, key) {
+                        Some((wire, reason)) => {
+                            tracing::warn!(
+                                bucket = %bucket,
+                                key = %key,
+                                version = %wire,
+                                reason = %reason,
+                                "refusing a protected in-place overwrite before the rename"
+                            );
+                            Ok(Some(reason))
+                        }
+                        None => Ok(None),
+                    }
+                },
+            )
+            .map_err(|err| match err {
+                database::Error::Redb(err) => map_contract_error(err),
+                err => Error::from(err),
+            })?;
+        if let Some(refusal) = refusal {
+            return Err(storage::locked(refusal).into());
+        }
+        Ok(())
+    }
+
     /// The committed object's row write: the `OBJECT_META` entry (tags +
     /// checksum + owner + ACL elements — the stored ACL holds the grant
     /// set only, the owner rides its own element — plus the current
@@ -1093,7 +1181,7 @@ impl FsStorage {
     #[cfg(unix)]
     #[expect(
         clippy::too_many_arguments,
-        reason = "one argument per element the row records — etag, size, mtime, identity, tags, checksum, owner, ACL and the version fields — the transaction writes them as one row"
+        reason = "one argument per element the row records — etag, size, mtime, identity, tags, checksum, owner, ACL, the version fields and the destination's lock — the transaction writes them as one row"
     )]
     async fn record_committed(
         &self,
@@ -1110,6 +1198,7 @@ impl FsStorage {
         version_id: Option<&version::Id>,
         version_seq: u64,
         superseded: Option<u64>,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<(), Error> {
         let bucket = bucket.clone();
         let key = key.clone();
@@ -1118,12 +1207,31 @@ impl FsStorage {
         let checksum = checksum.cloned();
         let owner = owner.cloned();
         let version_id = version_id.cloned();
+        let lock = lock.cloned();
         let acl = Acl {
             owner: None,
             grants: acl.grants.clone(),
         };
         self.handle
-            .write(move |txn| {
+            .write(move |txn| -> Result<(), database::Error> {
+                // OL7: the slot advance's rule, applied here because this tail
+                // writes the slot columns directly: a null in-place
+                // replacement of an identity that already owns an active lock
+                // is a protected overwrite and is refused **before** any
+                // write. An ordinary overwrite mints a new identity and
+                // leaves the old lock intact.
+                if version_id.is_none()
+                    && let Some((wire, reason)) = protected_null_refusal!(txn, open, &bucket, &key)
+                {
+                    tracing::warn!(
+                        bucket = %bucket,
+                        key = %key,
+                        version = %wire,
+                        reason = %reason,
+                        "refusing a protected in-place overwrite"
+                    );
+                    return Err(StoreError::Refused(storage::locked(reason)).into());
+                }
                 object_meta::Table::open(txn)?.put(
                     &bucket,
                     &key,
@@ -1141,12 +1249,27 @@ impl FsStorage {
                         acl: acl.clone(),
                     },
                 )?;
+                // OL7: the lock commits with the version's row, in the same
+                // transaction. A lock that carries neither a retention nor a
+                // hold is not stored, and the copy tail never writes a
+                // marker's row.
+                if let Some(lock) = lock.as_ref().filter(|lock| lock.carries_fact()) {
+                    let wire = version::wire_of(version_id.as_ref());
+                    version_object_lock::Table::open(txn)?.put(&bucket, &key, &wire, lock)?;
+                }
                 object_part::Table::open(txn)?.remove_key(&bucket, &key)?;
                 stamp_superseded(txn, &bucket, &key, superseded)?;
                 Ok(())
             })
             .await
-            .map_err(Error::from)
+            // The contract refusal this transaction can answer (the lock
+            // check) must keep its domain arm, exactly as the guarded row
+            // writers project it; a plain redb failure keeps the database
+            // lift.
+            .map_err(|err| match err {
+                database::Error::Redb(err) => map_contract_error(err),
+                err => Error::from(err),
+            })
     }
 }
 
@@ -1204,6 +1327,40 @@ impl ObjectOps for FsStorage {
             .map_err(Error::from)
     }
 
+    /// The effective Object Lock resolved once, where this backend's bucket
+    /// configuration is in hand (OL7, OL16). The configuration lives in the
+    /// shared bucket row; a row-less bucket (fs's lazy policy) can store none,
+    /// so its `NoSuchBucket` read answers "no configuration" — the write path
+    /// itself still fails an absent directory's publish with `NoSuchBucket`.
+    #[instrument(
+        level = "debug",
+        target = "tinio::storage",
+        skip(self, explicit, legal_hold),
+        fields(bucket = %bucket)
+    )]
+    async fn resolve_write_lock(
+        &self,
+        bucket: &bucket::Name,
+        explicit: Option<&object_lock::Retention>,
+        legal_hold: object_lock::LegalHold,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, Error> {
+        let config =
+            match <RedbMetadata as BucketMeta>::object_lock(&self.meta_store().engine(), bucket)
+                .await
+            {
+                Ok(config) => config,
+                Err(StoreError::Refused(storage::Error::NoSuchBucket(_))) => None,
+                Err(err) => return Err(map_contract_error(err)),
+            };
+        Ok(storage::resolve_write_lock(
+            config.as_ref(),
+            explicit,
+            legal_hold,
+            now,
+        ))
+    }
+
     /// The mutation phase: publish the staged bytes at `key` and record the
     /// row describing them.
     ///
@@ -1245,6 +1402,7 @@ impl ObjectOps for FsStorage {
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<Info, Error> {
         if key.is_folder_marker() {
             return self.commit_marker(bucket, key).await;
@@ -1262,14 +1420,14 @@ impl ObjectOps for FsStorage {
             {
                 let plane = self.version_plane(bucket);
                 self.objects()
-                    .put_object_versioned(&plane, bucket, key, staged, tags, owner, acl, self)
+                    .put_object_versioned(&plane, bucket, key, staged, tags, owner, acl, lock, self)
                     .await
                     .map_err(Error::from)?
             }
             #[cfg(not(feature = "versioning"))]
             {
                 self.objects()
-                    .commit_object(bucket, key, staged, tags, owner, acl)
+                    .commit_object(bucket, key, staged, tags, owner, acl, lock)
                     .await
                     .map_err(Error::from)?
             }
@@ -1312,11 +1470,12 @@ impl ObjectOps for FsStorage {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
         checksum: Option<checksum::Recorded>,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<Info, Error> {
         #[cfg(unix)]
         {
             self.copy_object_fast(
-                src_bucket, src_key, dst_bucket, dst_key, tags, owner, acl, checksum,
+                src_bucket, src_key, dst_bucket, dst_key, tags, owner, acl, checksum, lock,
             )
             .await
         }
@@ -1326,7 +1485,7 @@ impl ObjectOps for FsStorage {
             let staged = self
                 .stage_body(dst_bucket, dst_key, get.body, None, checksum)
                 .await?;
-            self.commit_object(dst_bucket, dst_key, staged, tags, owner, acl)
+            self.commit_object(dst_bucket, dst_key, staged, tags, owner, acl, lock)
                 .await
         }
     }

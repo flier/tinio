@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT version_id, seq, is_delete_marker\nFROM current_slots\nWHERE bucket = $1 AND key = $2\nFOR UPDATE\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "current_slots",
+            "name": "version_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "current_slots",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "is_delete_marker",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "current_slots",
+            "name": "is_delete_marker"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "af656b633e3e5a751ddcfe24257371cbebc44eda511c83dc9e47feb01dccf570"
+}

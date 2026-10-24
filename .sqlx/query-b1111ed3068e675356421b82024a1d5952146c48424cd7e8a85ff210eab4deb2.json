@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone_locks AS (\n    DELETE FROM upload_object_lock WHERE bucket = $1\n),\n\ngone_parts AS (\n    DELETE FROM parts WHERE bucket = $1\n),\n\ngone_part_checksums AS (\n    DELETE FROM part_checksums WHERE bucket = $1\n),\n\ngone_checksums AS (\n    DELETE FROM upload_checksums WHERE bucket = $1\n)\n\nDELETE FROM uploads WHERE bucket = $1\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b1111ed3068e675356421b82024a1d5952146c48424cd7e8a85ff210eab4deb2"
+}

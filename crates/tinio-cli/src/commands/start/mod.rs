@@ -12,6 +12,8 @@
 pub(crate) mod api;
 mod args;
 mod chown;
+#[cfg(feature = "object-lock")]
+mod object_lock_admin;
 #[cfg(feature = "api")]
 mod reader;
 mod run;
@@ -32,6 +34,8 @@ pub use self::{args::Args, run::run, serve::serve};
 use crate::_api::Plane;
 #[cfg(feature = "pg")]
 use crate::_pg;
+#[cfg(feature = "object-lock")]
+use crate::_server::ObjectLockCache;
 use crate::{
     _fs::FsStorage,
     _sandbox::Adopted,
@@ -55,6 +59,11 @@ pub(crate) struct Prepared<S> {
     /// (`api` builds only).
     #[cfg(feature = "api")]
     pub(crate) plane: Plane,
+    /// The Object Lock cache the management plane's admin and the data plane share (OL18). The
+    /// storage write the admin performs does not pass through the backend's own cache writers,
+    /// so the same handle must reach both. `None` when `[s3] object_lock` is off.
+    #[cfg(feature = "object-lock")]
+    pub(crate) object_lock_cache: Option<ObjectLockCache>,
 }
 
 /// The backend a running server serves — the **one seam** the serving half dispatches on.

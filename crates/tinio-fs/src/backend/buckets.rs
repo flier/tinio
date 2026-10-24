@@ -15,12 +15,17 @@ use tinio_util::testing::{object_key, part_number};
 use tokio::fs;
 
 use super::{Error, FsStorage};
+#[cfg(not(feature = "versioning"))]
+use crate::_core::storage::access_denied_bucket;
+// The create-with-lock override's versioning state (`versioning` only).
+#[cfg(feature = "versioning")]
+use crate::_core::version::State;
 use crate::{
     _core::{
         BucketsListing, ListBucketsParams, acl,
         acl::{Acl, AclGrants},
         bucket::{self, Bucket},
-        cors, lifecycle, object,
+        cors, lifecycle, object, object_lock,
         storage::{BucketOps, already_exists, no_such_bucket},
     },
     _ops::bucket::paginate_buckets,
@@ -298,6 +303,48 @@ impl BucketOps for FsStorage {
         self.harden_created_bucket(name, owner).await
     }
 
+    /// Create a bucket with Object Lock enabled (OL13): the directory, the
+    /// bucket row, the versioning state (`Enabled`) and the stored
+    /// configuration.
+    ///
+    /// fs has no single transaction across the content namespace and the three
+    /// row facts, so the engine composes them and compensates a failure by
+    /// deleting the bucket again. A crash between the steps leaves only the
+    /// versioning-first residue (`Enabled` with no configuration), which is
+    /// indistinguishable from a legitimate versioned bucket and is left alone;
+    /// the non-`Enabled` shape the startup repair completes comes from a
+    /// below-S3 configuration writer or external editing (R25), **never from
+    /// this order**. A returned error leaves nothing. redb and pg commit the
+    /// facts atomically instead.
+    ///
+    /// With the `versioning` feature off there is no versioning engine to
+    /// enable, so the stripped build refuses rather than creating an
+    /// unversioned bucket with a lock configuration.
+    async fn create_bucket_with_lock(
+        &self,
+        name: &bucket::Name,
+        owner: Option<&acl::OwnerId>,
+        acl: &Acl,
+        config: &object_lock::Config,
+    ) -> Result<(), Error> {
+        #[cfg(feature = "versioning")]
+        {
+            self.ops()
+                .create_bucket_with_lock(name, owner, acl, config, || async {
+                    self.objects()
+                        .set_bucket_versioning(&self.version_plane(name), name, State::Enabled)
+                        .await
+                })
+                .await
+                .map_err(Error::from)
+        }
+        #[cfg(not(feature = "versioning"))]
+        {
+            let _ = (owner, acl, config);
+            Err(access_denied_bucket(name).into())
+        }
+    }
+
     async fn delete_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
         // The engine's probes and its commit point, inside the bucket's
         // mutation guard: the guard must span the emptiness check and the
@@ -529,6 +576,36 @@ impl BucketOps for FsStorage {
         self.ensure_bucket(name).await?;
         self.ops()
             .delete_bucket_lifecycle(name)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn get_bucket_object_lock(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<Option<object_lock::Config>, Error> {
+        // Existence is the bucket directory (the lifecycle read's shape); the
+        // configuration is the engine's lazy-row read, None for a bucket that
+        // stores none and for a row-less bucket that can store none.
+        self.ensure_bucket(name).await?;
+        self.ops()
+            .get_bucket_object_lock(name)
+            .await
+            .map_err(Error::from)
+    }
+
+    async fn put_bucket_object_lock(
+        &self,
+        name: &bucket::Name,
+        config: &object_lock::Config,
+    ) -> Result<(), Error> {
+        // The mutation lock serializes the write against the bucket teardown
+        // and the sibling element writes; the versioning-state precondition
+        // (only an `Enabled` bucket is configured) is the S3 surface's (OL13).
+        let _guard = self.lock_bucket_mutations(name).await;
+        self.ensure_bucket(name).await?;
+        self.ops()
+            .put_bucket_object_lock(name, config)
             .await
             .map_err(Error::from)
     }
@@ -1117,6 +1194,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();

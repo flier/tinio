@@ -11,7 +11,9 @@ use std::path::PathBuf;
 
 // Reached directly rather than through the module's `pub use`: the row is `pub(crate)` and
 // re-exporting it would put a foreign `_sandbox::Error` in this crate's public API.
-use super::checks::{HOST_CONFINEMENT, HOST_CONFINEMENT_OK, host_confinement_finding};
+use super::checks::{
+    HOST_CONFINEMENT, HOST_CONFINEMENT_OK, OBJECT_LOCKS, host_confinement_finding,
+};
 use super::*;
 use crate::{
     _sandbox,
@@ -539,6 +541,294 @@ async fn a_clean_existing_store_still_reports_private_state_ok() {
     );
 }
 
+/// Plant the Object Lock rows the doctor reports through the **raw store** —
+/// the per-store fixture. No public writer can store a corrupt rule, a partial
+/// mode/date pair or an orphan lock row (the API and the plane validate and
+/// resolve first), so a public path would mask exactly the shapes the report
+/// exists for.
+///
+/// The planted bucket is also the partial lock-enabled shape the fs startup
+/// repair completes (`enabled = true` while versioning is not `Enabled`): the
+/// doctor's dry run must leave it exactly as planted and never run that
+/// repair (OL31).
+fn plant_object_lock_rows(root: &Path) {
+    use crate::{
+        _core::{
+            acl::Acl,
+            blob::{BlobRef, BlockHash},
+            etag::ETag,
+            object,
+            version::{self, State},
+        },
+        _fs::{
+            _store_redb::{
+                bucket_object_lock, bucket_versioning, object_meta, upload_object_lock,
+                version as version_rows, version_index, version_object_lock,
+            },
+            database,
+        },
+    };
+
+    let opened = database::open(&root.join(".tinio")).expect("open the state store");
+    {
+        let mut txn = opened.db.begin_write().expect("a write transaction");
+        // A corrupt bucket rule with its enabled bit set: the decoder discards
+        // the rule and keeps the bit, which is the fact the report must carry.
+        {
+            let mut configs = bucket_object_lock::Table::open(&mut txn).expect("table");
+            configs
+                .insert("locked", (true, "not a rule"))
+                .expect("insert");
+        }
+        // The partial bucket shape the startup repair completes.
+        {
+            let mut states = bucket_versioning::Table::open(&mut txn).expect("table");
+            states.set("locked", State::Suspended).expect("set");
+        }
+        // Two owned version rows (the index points at an object version row),
+        // so the corrupt rows below are reported as corrupt and not orphans.
+        let blob = version_rows::encode_blob(&BlobRef::single(BlockHash::of(b"x"), 1));
+        for (key, id, seq) in [("corrupt", "v-corrupt", 5_u64), ("partial", "v-partial", 6)] {
+            {
+                let mut rows = version_rows::Table::open(&mut txn).expect("table");
+                rows.put(
+                    "locked",
+                    key,
+                    &version_rows::Row {
+                        id: id.to_owned(),
+                        blob: blob.clone(),
+                        size: 1,
+                        etag: String::new(),
+                        created: 0,
+                        became_noncurrent: 0,
+                        kind: version_rows::Kind::Object,
+                        tags: String::new(),
+                        checksum: String::new(),
+                        owner: String::new(),
+                        acl: String::new(),
+                        seq,
+                    },
+                )
+                .expect("put");
+            }
+            {
+                let mut index = version_index::Table::open(&mut txn).expect("table");
+                index.put("locked", key, id, seq).expect("put");
+            }
+        }
+        // A corrupt mode, the date-only half of a mode/date pair, and an
+        // orphan (no version row and no current slot).
+        {
+            let mut locks = version_object_lock::Table::open(&mut txn).expect("table");
+            locks
+                .insert(
+                    ("locked", "corrupt", "v-corrupt"),
+                    (Some("NOT-A-MODE"), Some(1), Some("OFF")),
+                )
+                .expect("insert");
+            locks
+                .insert(
+                    ("locked", "partial", "v-partial"),
+                    (None, Some(1), Some("OFF")),
+                )
+                .expect("insert");
+            locks
+                .insert(
+                    ("locked", "orphan", "v-orphan"),
+                    (Some("GOVERNANCE"), Some(1), Some("OFF")),
+                )
+                .expect("insert");
+        }
+        // A row-less current version owns its lock through the key's current
+        // slot; a marker identity never does. The first is not an orphan, the
+        // second is (the drain's own rule).
+        for (key, id, marker) in [
+            ("current", "v-current", false),
+            ("marker", "v-marker", true),
+        ] {
+            {
+                let mut rows = object_meta::Table::open(&mut txn).expect("table");
+                rows.put(
+                    "locked",
+                    key,
+                    &object_meta::Stored {
+                        etag: ETag::EMPTY,
+                        size: 0,
+                        mtime: 0,
+                        file_identity: 0,
+                        tags: object::Tags::default(),
+                        checksum: None,
+                        owner: None,
+                        acl: Acl::default_private(None),
+                        version_id: Some(version::Id::new(id).expect("a valid version id")),
+                        version_seq: 1,
+                        is_delete_marker: marker,
+                    },
+                )
+                .expect("put");
+            }
+            {
+                let mut locks = version_object_lock::Table::open(&mut txn).expect("table");
+                locks
+                    .insert(
+                        ("locked", key, id),
+                        (Some("GOVERNANCE"), Some(1), Some("OFF")),
+                    )
+                    .expect("insert");
+            }
+        }
+        // A corrupt multipart intent: the third table the scan covers.
+        {
+            let mut intents = upload_object_lock::Table::open(&mut txn).expect("table");
+            intents
+                .insert(
+                    ("locked", "upload-1"),
+                    (Some("GOVERNANCE"), None, Some("OFF")),
+                )
+                .expect("insert");
+        }
+        txn.commit().expect("commit");
+    }
+}
+
+/// OL31: the dry run names the corrupt and orphan lock rows — the corrupt
+/// bucket rule keeps its enabled bit — and repairs nothing. The rows are
+/// report-only in every mode; the fs startup repair is the only writer, and
+/// the doctor's storage construction does not run it.
+#[tokio::test]
+async fn the_doctor_reports_the_lock_rows_and_a_dry_run_repairs_nothing() {
+    use redb::ReadableDatabase as _;
+
+    use crate::{
+        _core::{object_lock, version::State},
+        _fs::_store_redb::{
+            bucket_object_lock, bucket_versioning, upload_object_lock, version_object_lock,
+        },
+    };
+
+    let dir = tempfile::TempDir::new().expect("temp");
+    crate::test_support::seed_config(dir.path());
+    plant_object_lock_rows(dir.path());
+
+    // `Proposals::Findings` is the `--dry-run` mapping: it lists what a fix
+    // would change. The lock rows are not a fix's business, so the findings
+    // are the same and nothing is written.
+    let report = crate::test_support::run_checks(dir.path(), false, Proposals::Findings).await;
+    let rows: Vec<&Finding> = report
+        .findings()
+        .iter()
+        .filter(|finding| finding.check == OBJECT_LOCKS)
+        .collect();
+    assert!(!rows.is_empty(), "{:?}", report.findings());
+
+    // The corrupt bucket rule: the enabled bit survives in the report.
+    assert!(
+        rows.iter().any(|finding| {
+            finding.severity == Severity::Error
+                && finding.detail.contains("locked")
+                && finding.detail.contains("enabled")
+        }),
+        "the corrupt rule row keeps the enabled bit: {rows:?}"
+    );
+    // A corrupt per-version mode, owned by a version row.
+    assert!(
+        rows.iter().any(|finding| {
+            finding.severity == Severity::Error
+                && finding.detail.contains("v-corrupt")
+                && finding.detail.contains("mode")
+        }),
+        "the corrupt mode row is named: {rows:?}"
+    );
+    // A partial mode/date pair.
+    assert!(
+        rows.iter().any(|finding| {
+            finding.severity == Severity::Error
+                && finding.detail.contains("v-partial")
+                && finding.detail.contains("retain-until")
+        }),
+        "the partial pair row is named: {rows:?}"
+    );
+    // A corrupt multipart intent (the third table).
+    assert!(
+        rows.iter().any(|finding| {
+            finding.severity == Severity::Error && finding.detail.contains("upload-1")
+        }),
+        "the corrupt intent row is named: {rows:?}"
+    );
+    // An orphan lock row is a warn (it is residue the drain removes, not
+    // corruption).
+    assert!(
+        rows.iter().any(|finding| {
+            finding.severity == Severity::Warn
+                && finding.detail.contains("v-orphan")
+                && finding.detail.contains("orphan")
+        }),
+        "the orphan row is named as a warn: {rows:?}"
+    );
+    // A row-less current version owns its lock through the current slot: it
+    // is neither corrupt nor an orphan.
+    assert!(
+        !rows
+            .iter()
+            .any(|finding| finding.detail.contains("v-current")),
+        "a row-less current version owns its lock: {rows:?}"
+    );
+    // A marker identity owns no lock row: its lock is an orphan.
+    assert!(
+        rows.iter().any(|finding| {
+            finding.severity == Severity::Warn
+                && finding.detail.contains("v-marker")
+                && finding.detail.contains("orphan")
+        }),
+        "a marker identity owns no lock row: {rows:?}"
+    );
+
+    // Nothing repaired: every planted row is exactly as it was planted.
+    let opened = crate::_fs::database::open(&dir.path().join(".tinio")).expect("reopen");
+    {
+        let txn = opened.db.begin_read().expect("read transaction");
+        assert_eq!(
+            bucket_object_lock::Table::open_readonly(&txn)
+                .expect("table")
+                .get("locked")
+                .expect("get"),
+            Some(object_lock::Config {
+                enabled: true,
+                rule: None,
+            }),
+            "the corrupt rule is still stored with its enabled bit"
+        );
+        let locks = version_object_lock::Table::open_readonly(&txn).expect("table");
+        assert!(
+            locks.get("locked", "corrupt", "v-corrupt").is_err(),
+            "the corrupt row still fails closed"
+        );
+        assert!(
+            locks.get("locked", "partial", "v-partial").is_err(),
+            "the partial pair still fails closed"
+        );
+        assert!(
+            locks.get("locked", "orphan", "v-orphan").is_ok(),
+            "the orphan row is still there"
+        );
+        assert!(
+            upload_object_lock::Table::open_readonly(&txn)
+                .expect("table")
+                .get("locked", "upload-1")
+                .is_err(),
+            "the corrupt intent still fails closed"
+        );
+        assert_eq!(
+            bucket_versioning::Table::open_readonly(&txn)
+                .expect("table")
+                .get("locked")
+                .expect("get"),
+            Some(State::Suspended),
+            "the doctor must not run the startup repair"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_corrupt_meta_store_is_an_error() {
     // A file that is not a redb database: `check_integrity` cannot even open it, so the
@@ -561,6 +851,16 @@ async fn a_corrupt_meta_store_is_an_error() {
             .iter()
             .any(|f| f.check.contains("meta.redb") && f.severity == Severity::Error),
         "{:?}",
+        report.findings()
+    );
+    // The lock leg cannot run without the store, and it says so under its own name rather
+    // than vanishing from the check-name set.
+    assert!(
+        report
+            .findings()
+            .iter()
+            .any(|f| f.check == OBJECT_LOCKS && f.severity == Severity::Error),
+        "the lock leg is not silent on an unopenable store: {:?}",
         report.findings()
     );
 }
@@ -768,6 +1068,18 @@ async fn a_store_held_by_another_process_is_a_warn_not_an_error() {
         .expect("the leg reports");
     assert_eq!(meta.severity, Severity::Warn, "{:?}", report.findings());
     assert!(meta.detail.starts_with("not inspected:"), "{}", meta.detail);
+    // The lock leg rides the same "not inspected" arm, under its own name.
+    let locks = report
+        .findings()
+        .iter()
+        .find(|f| f.check == OBJECT_LOCKS)
+        .expect("the lock leg is not silent on a held store");
+    assert_eq!(locks.severity, Severity::Warn, "{:?}", report.findings());
+    assert!(
+        locks.detail.starts_with("not inspected:"),
+        "{}",
+        locks.detail
+    );
 }
 
 /// B15: the `Repaired` arm has no store a test can seed — `check_integrity` answers it only when
@@ -1067,12 +1379,28 @@ async fn the_pg_leg_stays_silent_for_a_filesystem_run() {
 async fn a_pg_configuration_without_a_dsn_is_reported_with_the_remedy() {
     let resolution = pg_resolution("version = 1\n[storage]\ntype = \"pg\"\n", false);
     let rows = super::checks::pg_findings(&resolution, None).await;
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!(rows[0].severity, Severity::Error, "{rows:?}");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let connection = rows
+        .iter()
+        .find(|row| row.check == "postgres connection")
+        .expect("the connection row is reported");
+    assert_eq!(connection.severity, Severity::Error, "{rows:?}");
     assert!(
-        rows[0].detail.contains("TINIO_PG_DSN"),
+        connection.detail.contains("TINIO_PG_DSN"),
         "the remedy names the addressing channel: {}",
-        rows[0].detail
+        connection.detail
+    );
+    // The Object Lock scan cannot run without a database either, and says so
+    // rather than dropping its check name from the report.
+    let locks = rows
+        .iter()
+        .find(|row| row.check == "object locks")
+        .expect("the lock leg is not silent when no dsn is addressed");
+    assert_eq!(locks.severity, Severity::Warn, "{rows:?}");
+    assert!(
+        locks.detail.starts_with("not inspected:"),
+        "{}",
+        locks.detail
     );
 }
 
@@ -1139,6 +1467,9 @@ async fn the_pg_leg_diagnoses_the_addressed_instance() {
         "postgres schema",
         "postgres access",
         "postgres ownership",
+        // OL31: the pg leg scans the three Object Lock tables and reports under
+        // the filesystem path's own check name.
+        "object locks",
     ] {
         assert!(row(name).is_some(), "the {name} row is missing: {rows:?}");
     }
@@ -1278,6 +1609,18 @@ async fn a_pg_run_skips_the_served_root_legs_and_is_green() {
             .expect("the row is kept for a pg run");
         assert!(row.detail.starts_with("skipped"), "{row:?}");
     }
+    // The Object Lock row is **not** a served-root skip: it is a fact about the
+    // database, and the pg leg (`checks::pg_findings`) scans the three tables and
+    // appends its rows after this check list. Answering a skipped row here would
+    // put two rows at one check name in the full report.
+    assert!(
+        !report
+            .findings()
+            .iter()
+            .any(|finding| finding.check == "object locks"),
+        "the Object Lock row belongs to the pg leg: {:?}",
+        report.findings()
+    );
     assert!(
         report
             .findings()

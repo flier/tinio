@@ -82,9 +82,12 @@ use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_NO_DATA};
 
 #[cfg(feature = "lifecycle")]
 use crate::lifecycle::LifecycleAdmin;
+#[cfg(feature = "object-lock")]
+use crate::object_lock::ObjectLockAdmin;
 #[cfg(windows)]
 use crate::pipe;
 use crate::{
+    _core::mode::AccessMode,
     Error,
     bind::{self, Channel},
     router::{Auth, Context, Shared, router},
@@ -1351,9 +1354,12 @@ impl Transport {
 ///     host: "127.0.0.1".to_string(),
 ///     stop,
 ///     metrics_requires_token: false,
+///     access: tinio_api::_core::mode::AccessMode::ReadWrite,
 ///     token: None,
 ///     #[cfg(feature = "lifecycle")]
 ///     lifecycle: None,
+///     #[cfg(feature = "object-lock")]
+///     object_lock: None,
 /// };
 /// let plane = Plane::bind(options)?;
 /// plane.publish(9000)?;
@@ -1378,6 +1384,10 @@ pub struct Options {
     pub stop: watch::Sender<bool>,
     /// Require the control token for `/metrics` too (default `false`).
     pub metrics_requires_token: bool,
+    /// The run's access mode, carried onto the plane's shared context so a write route's
+    /// admission can refuse it before the request body is read. The caller passes the same
+    /// [`AccessMode`](crate::_core::mode::AccessMode) it built its storage options from.
+    pub access: AccessMode,
     /// The token this plane serves with, when the caller supplies one instead of letting the
     /// plane generate it.
     ///
@@ -1400,6 +1410,16 @@ pub struct Options {
     #[cfg(feature = "lifecycle")]
     #[debug("<injected>")]
     pub lifecycle: Option<Arc<dyn LifecycleAdmin>>,
+    /// The Object Lock admin the plane's two `/buckets/{bucket}/object-lock` route pairs are
+    /// served from, or `None` for a plane that does not serve them (OL23). **An input because
+    /// only the caller holds the storage those routes read**, and `tinio-api` must not depend on
+    /// the crate that owns it (cargo's cycle rule). A build without the `object-lock` feature has
+    /// no field and no trait, and a run whose `[s3] object_lock` is off passes `None` — both
+    /// causes answer the four routes' `404`, so nothing can replace a stored configuration the
+    /// plane cannot serve.
+    #[cfg(feature = "object-lock")]
+    #[debug("<injected>")]
+    pub object_lock: Option<Arc<dyn ObjectLockAdmin>>,
 }
 
 /// The `state` this plane serves under: the control channel's identity, the served root, and
@@ -1515,9 +1535,12 @@ impl SocketFile {
 ///     host: "127.0.0.1".to_string(),
 ///     stop,
 ///     metrics_requires_token: false,
+///     access: tinio_api::_core::mode::AccessMode::ReadWrite,
 ///     token: None,
 ///     #[cfg(feature = "lifecycle")]
 ///     lifecycle: None,
+///     #[cfg(feature = "object-lock")]
+///     object_lock: None,
 /// })?;
 /// plane.publish(9000)?;
 /// plane.serve(rx).await?;
@@ -1609,9 +1632,12 @@ impl Plane {
     ///         stop,
     ///         // The launcher's token, when this plane is the child it confined.
     ///         metrics_requires_token: false,
+    ///         access: tinio_api::_core::mode::AccessMode::ReadWrite,
     ///         token: None,
     ///         #[cfg(feature = "lifecycle")]
     ///         lifecycle: None,
+    ///         #[cfg(feature = "object-lock")]
+    ///         object_lock: None,
     ///     },
     ///     &inherited,
     /// )?;
@@ -1745,9 +1771,12 @@ impl Plane {
     ///         stop,
     ///         // The launcher's token, when this plane is the child it confined.
     ///         metrics_requires_token: false,
+    ///         access: tinio_api::_core::mode::AccessMode::ReadWrite,
     ///         token: None,
     ///         #[cfg(feature = "lifecycle")]
     ///         lifecycle: None,
+    ///         #[cfg(feature = "object-lock")]
+    ///         object_lock: None,
     ///     },
     ///     listener,
     /// )?;
@@ -1824,9 +1853,12 @@ impl Plane {
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
     ///     metrics_requires_token: false,
+    ///     access: tinio_api::_core::mode::AccessMode::ReadWrite,
     ///     token: None,
     ///     #[cfg(feature = "lifecycle")]
     ///     lifecycle: None,
+    ///     #[cfg(feature = "object-lock")]
+    ///     object_lock: None,
     /// };
     /// // An empty list binds on every target, which is the arm this example can spell once — and
     /// // the argument macOS alone carries is spelled on the arm that has it.
@@ -1906,9 +1938,12 @@ impl Plane {
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
     ///     metrics_requires_token: false,
+    ///     access: tinio_api::_core::mode::AccessMode::ReadWrite,
     ///     token: None,
     ///     #[cfg(feature = "lifecycle")]
     ///     lifecycle: None,
+    ///     #[cfg(feature = "object-lock")]
+    ///     object_lock: None,
     /// })?;
     /// plane.publish(9000)?;
     /// # Ok(())
@@ -1960,9 +1995,12 @@ impl Plane {
             _ => None,
         };
         let context = Context::new(state, options.host, transport.auth(), options.stop)
-            .with_metrics_requires_token(options.metrics_requires_token);
+            .with_metrics_requires_token(options.metrics_requires_token)
+            .with_access(options.access);
         #[cfg(feature = "lifecycle")]
         let context = context.with_lifecycle(options.lifecycle);
+        #[cfg(feature = "object-lock")]
+        let context = context.with_object_lock(options.object_lock);
         let shared = Arc::new(context);
         Ok(Self {
             transport: Mutex::new(Some(transport)),
@@ -1999,9 +2037,12 @@ impl Plane {
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
     ///     metrics_requires_token: false,
+    ///     access: tinio_api::_core::mode::AccessMode::ReadWrite,
     ///     token: None,
     ///     #[cfg(feature = "lifecycle")]
     ///     lifecycle: None,
+    ///     #[cfg(feature = "object-lock")]
+    ///     object_lock: None,
     /// })?;
     /// // `/stop` sends on the very channel this awaits: the plane can end its own serve,
     /// // and the CLI's signal handlers flip the same one.
@@ -2043,9 +2084,12 @@ impl Plane {
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
     ///     metrics_requires_token: false,
+    ///     access: tinio_api::_core::mode::AccessMode::ReadWrite,
     ///     token: None,
     ///     #[cfg(feature = "lifecycle")]
     ///     lifecycle: None,
+    ///     #[cfg(feature = "object-lock")]
+    ///     object_lock: None,
     /// })?;
     /// // The data plane's port, and the moment `status` can find this server.
     /// plane.publish(9000)?;
@@ -2096,9 +2140,12 @@ impl Plane {
     ///     host: "127.0.0.1".to_string(),
     ///     stop,
     ///     metrics_requires_token: false,
+    ///     access: tinio_api::_core::mode::AccessMode::ReadWrite,
     ///     token: None,
     ///     #[cfg(feature = "lifecycle")]
     ///     lifecycle: None,
+    ///     #[cfg(feature = "object-lock")]
+    ///     object_lock: None,
     /// })?;
     /// plane.publish(9000)?;
     /// plane.serve(rx).await?;
@@ -2318,9 +2365,12 @@ mod tests {
             host: "127.0.0.1".to_string(),
             stop,
             metrics_requires_token: false,
+            access: AccessMode::ReadWrite,
             token: None,
             #[cfg(feature = "lifecycle")]
             lifecycle: None,
+            #[cfg(feature = "object-lock")]
+            object_lock: None,
         })
         .expect("a TCP bind needs no runtime")
     }
@@ -2569,9 +2619,12 @@ mod tests {
             host: "127.0.0.1".to_string(),
             stop,
             metrics_requires_token: false,
+            access: AccessMode::ReadWrite,
             token: None,
             #[cfg(feature = "lifecycle")]
             lifecycle: None,
+            #[cfg(feature = "object-lock")]
+            object_lock: None,
         })
         .expect("bind");
         assert!(path.exists(), "the bind created the socket file");
@@ -3027,9 +3080,12 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 stop,
                 metrics_requires_token: false,
+                access: AccessMode::ReadWrite,
                 token: None,
                 #[cfg(feature = "lifecycle")]
                 lifecycle: None,
+                #[cfg(feature = "object-lock")]
+                object_lock: None,
             })
             .expect("bind"),
         );
@@ -3210,9 +3266,12 @@ mod tests {
                     host: "127.0.0.1".to_string(),
                     stop: stop.clone(),
                     metrics_requires_token: false,
+                    access: AccessMode::ReadWrite,
                     token: None,
                     #[cfg(feature = "lifecycle")]
                     lifecycle: None,
+                    #[cfg(feature = "object-lock")]
+                    object_lock: None,
                 })
                 .expect("the plane is built"),
             );
@@ -3518,9 +3577,12 @@ mod tests {
             host: "127.0.0.1".to_string(),
             stop,
             metrics_requires_token: false,
+            access: AccessMode::ReadWrite,
             token: None,
             #[cfg(feature = "lifecycle")]
             lifecycle: None,
+            #[cfg(feature = "object-lock")]
+            object_lock: None,
         });
         let err = refused.expect_err("a second instance is refused");
         assert!(
@@ -3552,9 +3614,12 @@ mod tests {
             host: "127.0.0.1".to_string(),
             stop: stop.clone(),
             metrics_requires_token: false,
+            access: AccessMode::ReadWrite,
             token: None,
             #[cfg(feature = "lifecycle")]
             lifecycle: None,
+            #[cfg(feature = "object-lock")]
+            object_lock: None,
         };
 
         for short in [

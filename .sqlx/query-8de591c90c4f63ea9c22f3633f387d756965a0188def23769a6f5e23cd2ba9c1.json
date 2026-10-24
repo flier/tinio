@@ -1,0 +1,93 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- The doctor's Object Lock scan (OL31): every per-version lock row, with the\n-- ownership rule the drain uses, read from the schema's one view\n-- (`version_lock_owned`). A row that resolves to neither an object version row\n-- nor a non-marker current slot is an orphan.\nSELECT\n    l.bucket,\n    l.key,\n    l.version_id,\n    l.mode,\n    l.retain_until,\n    l.legal_hold,\n    (\n        EXISTS (\n            SELECT 1\n            FROM version_lock_owned AS o\n            WHERE\n                o.bucket = l.bucket\n                AND o.key = l.key\n                AND o.version_id = l.version_id\n        )\n    ) AS \"owned!\"\nFROM version_object_lock AS l\nORDER BY\n    l.bucket COLLATE \"C\",\n    l.key COLLATE \"C\",\n    l.version_id COLLATE \"C\"\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bucket",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_object_lock",
+            "name": "bucket"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_object_lock",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "version_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_object_lock",
+            "name": "version_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "mode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_object_lock",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "retain_until",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "version_object_lock",
+            "name": "retain_until"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "legal_hold",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "version_object_lock",
+            "name": "legal_hold"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "owned!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "8de591c90c4f63ea9c22f3633f387d756965a0188def23769a6f5e23cd2ba9c1"
+}

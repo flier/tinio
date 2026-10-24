@@ -7,7 +7,7 @@ use crate::{
     acl,
     acl::{Acl, AclGrants},
     bucket::{self, Bucket},
-    cors, lifecycle, object,
+    cors, lifecycle, object, object_lock,
 };
 
 /// Parameters of a [`BucketOps::list_buckets`] call — the S3 listing
@@ -95,6 +95,60 @@ pub trait BucketOps: Send + Sync + 'static {
         name: &bucket::Name,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Create a bucket with Object Lock enabled (OL13): the bucket row, its
+    /// versioning state (`Enabled`) and `config` commit as one step, so a
+    /// crash can leave no partial lock-enabled bucket.
+    ///
+    /// The caller supplies a request-validated configuration
+    /// ([`object_lock::Config::validate`]). `AlreadyExists` when the name is
+    /// taken. The default **fails closed**: a backend that has not implemented
+    /// the atomic create refuses rather than creating a partially configured
+    /// bucket. The compensating default that creates the bucket in steps is
+    /// the ops engine's (its transition, not this contract's).
+    async fn create_bucket_with_lock(
+        &self,
+        name: &bucket::Name,
+        owner: Option<&acl::OwnerId>,
+        acl: &Acl,
+        config: &object_lock::Config,
+    ) -> Result<(), <Self as Storage>::Error>
+    where
+        Self: Storage,
+    {
+        let _ = (owner, acl, config);
+        Err(super::access_denied_bucket(name).into())
+    }
+
+    /// The bucket's Object Lock configuration (S3
+    /// GetObjectLockConfiguration). `NoSuchBucket` when the bucket is missing;
+    /// `None` when it stores no configuration.
+    ///
+    /// The method is **required** (no default body): a security read is never
+    /// answered "unlocked" by a backend that cannot tell (OL2).
+    async fn get_bucket_object_lock(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<Option<object_lock::Config>, <Self as Storage>::Error>
+    where
+        Self: Storage;
+
+    /// Replace the bucket's Object Lock configuration (S3
+    /// PutObjectLockConfiguration — replace-all, no merge). `NoSuchBucket`
+    /// when the bucket is missing. The caller supplies a request-validated
+    /// configuration ([`object_lock::Config::validate`]); only an enabled
+    /// configuration is ever stored (OL13).
+    ///
+    /// The method is **required** (no default body): a backend that cannot
+    /// store the configuration refuses at compile time, never by answering
+    /// success.
+    async fn put_bucket_object_lock(
+        &self,
+        name: &bucket::Name,
+        config: &object_lock::Config,
     ) -> Result<(), <Self as Storage>::Error>
     where
         Self: Storage;

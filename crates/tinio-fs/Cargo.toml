@@ -44,6 +44,7 @@ tinio-version.workspace = true
 [features]
 default = []
 versioning = []
+testing = ["tinio-core/testing", "tinio-store-redb/testing"]
 
 [target.'cfg(unix)'.dependencies]
 moka = { workspace = true, features = ["sync", "atomic64"] }
@@ -63,7 +64,7 @@ tempfile.workspace = true
 
 tinio-bench.workspace = true
 tinio-util = { workspace = true, features = ["bench", "testing"] }
-tinio-fs = { path = ".", features = ["versioning"] }
+tinio-fs = { path = ".", features = ["versioning", "testing"] }
 
 [[bench]]
 name = "streaming"

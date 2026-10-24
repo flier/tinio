@@ -126,9 +126,11 @@ use tracing::{Level, callsite::rebuild_interest_cache};
 use tracing_subscriber::fmt::MakeWriter;
 
 pub mod blocks;
+mod fixtures;
 pub mod http;
 pub mod metadata;
 pub mod metrics;
+pub mod object_lock;
 pub mod sigv4;
 pub mod spans;
 
@@ -140,7 +142,9 @@ use crate::_core::{
     checksum::{self, Algorithm, Type},
     cors, multipart,
     multipart::MIN_PART_BYTES,
-    object, storage,
+    object,
+    object_lock::Bypass,
+    storage,
     storage::Error::*,
     version,
 };
@@ -324,6 +328,7 @@ where
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -379,6 +384,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
             None,
             &Acl::default_private(None),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -405,6 +411,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
                 None,
             )
             .await
@@ -447,6 +454,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
             src_tags,
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -460,6 +468,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
             None,
         )
         .await
@@ -484,6 +493,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
             None,
             &Acl::default_private(None),
             Some(src_checksum.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -531,6 +541,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
                 owner: Some(src_owner.clone()),
                 grants: src_grants.clone(),
             },
+            None,
         )
         .await
         .unwrap();
@@ -547,6 +558,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
                 owner: Some(requester.clone()),
                 grants: dst_grants.clone(),
             },
+            None,
             None,
         )
         .await
@@ -579,6 +591,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
             None,
             &Acl::default_private(None),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -599,6 +612,7 @@ async fn conformance_copy<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -1278,6 +1292,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -1373,6 +1388,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
             write_tags.clone(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -1414,6 +1430,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
                 owner: Some(acl_owner.clone()),
                 grants: acl_grants.clone(),
             },
+            None,
         )
         .await
         .unwrap();
@@ -1492,6 +1509,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -1521,6 +1539,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -1553,6 +1572,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -1580,6 +1600,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -1638,6 +1659,7 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
                 owner: Some(mv_owner.clone()),
                 grants: mv_grants.clone(),
             },
+            None,
         )
         .await
         .unwrap();
@@ -1893,6 +1915,7 @@ async fn conformance_listing<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             Some(&listed_owner),
             &Acl::default_private(Some(listed_owner.clone())),
+            None,
         )
         .await
         .unwrap();
@@ -1967,6 +1990,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap_err(),
@@ -1986,6 +2010,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2084,6 +2109,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2156,6 +2182,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2207,6 +2234,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2235,6 +2263,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2258,6 +2287,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2292,6 +2322,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2333,6 +2364,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2502,6 +2534,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             create_tags.clone(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2612,6 +2645,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2653,6 +2687,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
             None,
         )
         .await
@@ -2699,6 +2734,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2752,6 +2788,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
             commit_tags.clone(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -2797,6 +2834,7 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
                 owner: Some(cmu_owner.clone()),
                 grants: cmu_grants.clone(),
             },
+            None,
         )
         .await
         .unwrap();
@@ -2896,6 +2934,7 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap()
@@ -3168,7 +3207,7 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
     // Deleting the marker by its id removes it and restores the version it
     // hid as the current version.
     let removed = storage
-        .delete_object_version(b, &key, Some(&marker_id))
+        .delete_object_version(b, &key, Some(&marker_id), Bypass::None)
         .await
         .unwrap();
     check(
@@ -3356,7 +3395,7 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
     // Readable by its id: removing the current marker leaves the null
     // version's index entry as what `versionId=null` resolves to.
     let unmarked = storage
-        .delete_object_version(&parked_bucket, &parked, None)
+        .delete_object_version(&parked_bucket, &parked, None, Bypass::None)
         .await
         .unwrap();
     check(
@@ -3386,11 +3425,11 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
     // version materializes the null version back onto the key, and deleting
     // the null version removes the key.
     storage
-        .delete_object_version(&parked_bucket, &parked, Some(&parked_real))
+        .delete_object_version(&parked_bucket, &parked, Some(&parked_real), Bypass::None)
         .await
         .unwrap();
     storage
-        .delete_object_version(&parked_bucket, &parked, None)
+        .delete_object_version(&parked_bucket, &parked, None, Bypass::None)
         .await
         .unwrap();
     check(
@@ -3550,15 +3589,15 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
     // null delete removes the current null and materializes it back onto the
     // key, and the second removes it too.
     storage
-        .delete_object_version(&journey_bucket, &journey, Some(&journey_real))
+        .delete_object_version(&journey_bucket, &journey, Some(&journey_real), Bypass::None)
         .await
         .unwrap();
     storage
-        .delete_object_version(&journey_bucket, &journey, None)
+        .delete_object_version(&journey_bucket, &journey, None, Bypass::None)
         .await
         .unwrap();
     storage
-        .delete_object_version(&journey_bucket, &journey, None)
+        .delete_object_version(&journey_bucket, &journey, None, Bypass::None)
         .await
         .unwrap();
     check(
@@ -3674,15 +3713,25 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
     // delete materializes the older real version, whose delete removes the
     // key.
     storage
-        .delete_object_version(&converge_bucket, &converge, Some(&converge_next))
+        .delete_object_version(
+            &converge_bucket,
+            &converge,
+            Some(&converge_next),
+            Bypass::None,
+        )
         .await
         .unwrap();
     storage
-        .delete_object_version(&converge_bucket, &converge, None)
+        .delete_object_version(&converge_bucket, &converge, None, Bypass::None)
         .await
         .unwrap();
     storage
-        .delete_object_version(&converge_bucket, &converge, Some(&converge_real))
+        .delete_object_version(
+            &converge_bucket,
+            &converge,
+            Some(&converge_real),
+            Bypass::None,
+        )
         .await
         .unwrap();
     check(
@@ -3871,7 +3920,7 @@ pub async fn conformance_versioning<S: Storage>(storage: &S, b: &bucket::Name) {
     for (key, ids) in &seeds {
         for id in ids.iter().rev() {
             storage
-                .delete_object_version(&bounded_bucket, key, Some(id))
+                .delete_object_version(&bounded_bucket, key, Some(id), Bypass::None)
                 .await
                 .unwrap();
         }

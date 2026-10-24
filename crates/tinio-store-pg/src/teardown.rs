@@ -25,19 +25,22 @@
 //! redundant** for it: the engine's probes run outside any transaction here, so
 //! a writer that commits after them — or one that was waiting on the bucket-row
 //! lock taken below — is unseen by them and is exactly what the statement's own
-//! `object_meta` gate catches, atomically with the drains. Deleting that gate
-//! would reopen the probe→teardown window. So the store decides, inside one
-//! transaction:
+//! gate catches, atomically with the drains. Deleting that gate would reopen the
+//! probe→teardown window. So the store decides, inside one transaction:
 //!
 //! 1. the bucket row is locked (`FOR UPDATE`, the lock every guarded writer
 //!    takes through `assert_bucket_row`), so a stage or a guarded write
 //!    serializes with the teardown instead of interleaving it;
 //! 2. emptiness is probed **under that lock, in a later statement** — no
-//!    `object_meta` row, no `uploads` row, no live content generation — so a
-//!    writer that waited on the lock is seen;
-//! 3. the version rows, their index entries, the key slots, the versioning
-//!    state, the content chunks, the lifecycle row and the bucket row leave
-//!    together.
+//!    `object_meta` row, no `uploads` row, no live content generation, no
+//!    `version_rows` row, no `version_object_lock` row and no
+//!    `upload_object_lock` row — so a writer that waited on the lock is seen.
+//!    A bucket holding version history or a lock row is not empty (OL8);
+//! 3. the key slots, the versioning state, the content chunks, the lifecycle
+//!    row, the three Object Lock rows and the bucket row leave together. No
+//!    version row can remain at this point: step 2 refused a bucket holding
+//!    one, so the teardown never destroys version history or a lock
+//!    configuration it could not drain.
 //!
 //! A refusal rolls all of it back: the client gets `NotEmpty` and the bucket
 //! keeps every one of its rows, which is what makes a marker-only bucket
@@ -85,13 +88,15 @@ impl PgStore {
     /// The bucket row is locked first, and the emptiness check runs in the
     /// next statement so it sees everything committed while the lock waited.
     /// A bucket that still holds an object row (a delete marker included), an
-    /// upload or a live generation answers `NotEmpty` and commits nothing.
+    /// upload, a live generation, a version row, a version lock row or an
+    /// upload lock row answers `NotEmpty` and commits nothing.
     /// Blocks stay for the sweep, because liveness is derived from the rows.
     ///
     /// # Errors
     ///
     /// `NoSuchBucket` when the bucket row is already gone, `NotEmpty` when an
-    /// object row, an upload or a live generation still names the bucket.
+    /// object row, an upload, a live generation or an Object Lock row still
+    /// names the bucket.
     #[tracing::instrument(
         target = "tinio::storage",
         level = "info",

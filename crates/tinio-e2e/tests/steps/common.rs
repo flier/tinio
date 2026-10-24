@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use cucumber::{given, then};
+use cucumber::{gherkin::Step, given, then};
 use md5::{Digest, Md5};
 #[cfg(feature = "pg")]
 use sqlx::PgConnection;
@@ -49,6 +49,7 @@ use tokio::{
     time::sleep,
 };
 
+use super::cli::docstring;
 pub use crate::_fs::testing::fs_options;
 use crate::{
     _cli::config::Config,
@@ -69,6 +70,31 @@ pub fn deterministic_bytes(n: u64) -> Vec<u8> {
     (0..n).map(|i| ((i * 31 + 7) % 256) as u8).collect()
 }
 
+/// The standard-alphabet, padded base64 of `bytes` — what a `Content-MD5`
+/// header carries (RFC 4648 §4). Written out rather than adding `base64`
+/// to this crate for one header on the XML writes (the lifecycle and
+/// Object Lock documents share it).
+pub fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let tail = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = u32::from(tail[0]) << 16 | u32::from(tail[1]) << 8 | u32::from(tail[2]);
+        for i in 0..4u32 {
+            out.push(if (i as usize) < chunk.len() + 1 {
+                ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
 /// The lower-hex MD5 digest of `data` — an INDEPENDENT oracle of the
 /// server's ETag (computed straight from the md5 crate, not through
 /// `tinio_core::etag::ETag`: a test that verified the server's ETag
@@ -82,6 +108,22 @@ pub fn md5_hex(data: &[u8]) -> String {
         .into_iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// `PUT path` with the step's docstring as the XML body and its own
+/// `Content-MD5` — the one write shape the Object Lock and lifecycle XML
+/// documents share.
+pub async fn put_xml(world: &mut super::World, path: String, step: &Step) {
+    let body = docstring(step);
+    let digest = base64(&Md5::digest(body.as_bytes()));
+    let headers = [
+        ("Content-Type", "application/xml"),
+        ("Content-MD5", digest.as_str()),
+    ];
+    world.last = world
+        .client
+        .request("PUT", &path, &headers, body.as_bytes())
+        .await;
 }
 
 /// The @acl fixture users (grilling Q2 — the config-driven identity the

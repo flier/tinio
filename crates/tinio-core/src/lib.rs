@@ -30,6 +30,8 @@ pub mod meta;
 pub mod mode;
 pub mod multipart;
 pub mod object;
+pub mod object_lock;
+pub mod object_lock_inspect;
 pub mod percent;
 pub mod pipeline;
 pub mod severity;
@@ -47,6 +49,7 @@ pub use self::{
     blob::BlockHash,
     bucket::Bucket,
     etag::ETag,
+    meta::ExpireReport,
     mode::AccessMode,
     multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
     storage::{

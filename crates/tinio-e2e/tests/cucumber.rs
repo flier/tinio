@@ -2,10 +2,12 @@
 //! `tests/features/`; step definitions live in `tests/steps/`.
 //!
 //! Default tag filter: scenarios that cannot pass in this build are excluded
-//! unless the user passes an explicit `--tags` on the CLI. The five exclusion
+//! unless the user passes an explicit `--tags` on the CLI. The six exclusion
 //! axes are independent (`steps/tag_filter.rs` owns the composition): `@parquet`
 //! drops out unless the binary was compiled `--features parquet` (the parquet
 //! input reader lives behind `tinio-server/select-parquet`, off by default);
+//! `@object-lock` drops out unless the binary was compiled `--features
+//! object-lock` (the six-operation surface lives behind `tinio-server/object-lock`);
 //! a platform-bound scenario (`@linux`/`@macos`/`@windows`/`@unix`) drops out on
 //! every target its tags do not match — the step definitions exist only where
 //! it may run, and `fail_on_skipped()` would turn their absence into a failure —
@@ -124,6 +126,7 @@ fn main() {
         let filter = tag_filter::default_filter(
             env::consts::OS,
             cfg!(feature = "parquet"),
+            cfg!(feature = "object-lock"),
             env::var_os("TINIO_E2E_EXTERNAL").is_some(),
             confinement,
         );

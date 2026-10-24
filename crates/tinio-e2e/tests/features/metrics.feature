@@ -39,4 +39,8 @@ Feature: Metrics endpoint
     Given I sample the "tinio_s3_errors_total" counter for op "GetObject" and code "NoSuchBucket"
     When I send a "GET" request to "/ghost/key"
     Then the response status is 404
+    # The contract's code for a missing bucket (not a missing key): pinning it
+    # keeps a backend divergence — or a 404 whose code never reaches
+    # `MetricS3` — from hiding behind the status alone.
+    And the error code is "NoSuchBucket"
     And the "tinio_s3_errors_total" counter for op "GetObject" and code "NoSuchBucket" has increased

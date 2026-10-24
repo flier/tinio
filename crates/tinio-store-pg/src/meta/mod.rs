@@ -27,6 +27,7 @@ use crate::{
         acl::{Acl, AclGrants, OwnerId},
         bucket::Name as BucketName,
         meta::Metadata,
+        object_lock, storage,
     },
     Error, PgTx,
     store::PgStore,
@@ -38,6 +39,7 @@ pub mod bucket;
 pub mod object;
 pub mod upload;
 pub mod version;
+mod version_lock;
 
 impl Metadata for PgStore {
     type Error = Error;
@@ -133,4 +135,64 @@ pub(crate) async fn assert_bucket_row(tx: &mut PgTx, bucket: &BucketName) -> Res
         return Err(Error::NoSuchBucket(bucket.clone()));
     }
     Ok(())
+}
+
+/// Whether the bucket's Object Lock configuration is enabled, read inside
+/// `tx`.
+///
+/// One statement for the two places that need the bit: a lock write refuses
+/// unless it is set (`InvalidBucketState`, OL13), and a versioning suspend
+/// refuses while it is set (R21). An absent row is not enabled. The caller
+/// owns the refusal, because the two callers ask different questions of the
+/// same column; the statement is spelled once here.
+pub(crate) async fn bucket_lock_enabled(tx: &mut PgTx, bucket: &BucketName) -> Result<bool, Error> {
+    let enabled = sqlx::query_scalar!(
+        "SELECT enabled FROM bucket_object_lock WHERE bucket = $1",
+        bucket
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(enabled.unwrap_or(false))
+}
+
+/// Decode one `version_object_lock` or `upload_object_lock` row through the
+/// model's reader: a corrupt mode, date, legal hold or partial pair is the
+/// contract's `Corrupt` error, never an absent lock (OL5, OL10).
+///
+/// The caller's row struct supplies the three columns it selected; this is the
+/// one place both lock tables turn them into the contract type, so the two
+/// tables cannot decode differently.
+pub(crate) fn decode_lock(
+    mode: Option<&str>,
+    retain_until: Option<i64>,
+    legal_hold: Option<&str>,
+) -> Result<Option<object_lock::Lock>, Error> {
+    object_lock::Lock::from_columns(mode, retain_until, legal_hold).map_err(|refusal| {
+        tracing::warn!(
+            %refusal,
+            "a stored object lock row fails closed: corruption is not an absent lock"
+        );
+        Error::Storage(storage::corrupt(refusal.detail))
+    })
+}
+
+/// One stored lock row's three columns, in the order every lock statement
+/// selects them. The decode is [`decode_lock`]'s, so the version lock table,
+/// the drain and the upload intent cannot read a corrupt row differently.
+pub(crate) struct LockRow {
+    mode: Option<String>,
+    retain_until: Option<i64>,
+    legal_hold: Option<String>,
+}
+
+impl LockRow {
+    /// The contract may hold a lock with neither a retention nor a hold, which
+    /// the model reads as no lock; this is the same answer for a stored row.
+    pub(crate) fn decode(self) -> Result<Option<object_lock::Lock>, Error> {
+        decode_lock(
+            self.mode.as_deref(),
+            self.retain_until,
+            self.legal_hold.as_deref(),
+        )
+    }
 }

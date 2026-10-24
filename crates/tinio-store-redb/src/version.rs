@@ -882,6 +882,22 @@ where
         Ok(())
     }
 
+    /// Whether the bucket holds any version row at all — the bucket-emptiness
+    /// probe (OL8: a bucket's emptiness decision includes its version rows).
+    /// One range seek, never a walk: the rows of one bucket are contiguous
+    /// from `(bucket, "", u64::MIN)`, so the first row at or after that bound
+    /// is in the bucket iff any exists.
+    pub fn has_bucket(&self, bucket: &str) -> Result<bool, Error> {
+        let mut iter = self.0.range((bucket, "", u64::MIN)..)?;
+        match iter.next() {
+            Some(item) => {
+                let (key, _) = item?;
+                Ok(key.value().0 == bucket)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// [`Self::for_bucket_of`] from a **bound**, with an early stop: the same
     /// rows in the same `(key, seq)` order with the same self-healing decode,
     /// but the walk starts at `from` — `Included` names the first key (its

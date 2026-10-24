@@ -106,7 +106,7 @@ use crate::{
             object::{PartRow, Row},
             version::{Kind, Stored},
         },
-        object,
+        object, object_lock,
         storage::{self, Error, marker_has_no_metadata},
         version::{self, HeadResult, Id, Marker, ReadResult, State, wire_of},
     },
@@ -537,8 +537,14 @@ where
     ///   was ever recorded for, so a later write plans from zero rather than being refused
     ///   by a sequence nothing records any more;
     /// - **a noncurrent version** — its row and its index entry leave in one transaction
-    ///   ([`VersionMeta::expire`]). Its blocks stay: liveness is derived from the rows, and
+    ///   ([`VersionMeta::expire_with`]). Its blocks stay: liveness is derived from the rows, and
     ///   `Cleanup`'s sweep drops what no row names.
+    ///
+    /// `bypass` is forwarded to the store's atomic removal, which enforces the
+    /// identity's Object Lock (OL8, OL11): a COMPLIANCE retention or a legal
+    /// hold refuses in either mode, an unexpired GOVERNANCE retention refuses
+    /// unless the request's authority granted the bypass. A refusal removes
+    /// nothing; a delete marker is never protected (R19).
     ///
     /// The successor scan is [`VersionMeta::latest`]'s one row, never a walk of the history,
     /// and a row that is the current version's own — the sequence the slot records — is
@@ -547,13 +553,15 @@ where
     /// # Errors
     ///
     /// `NoSuchVersion` (the contract's not-found class, naming the wire the caller asked
-    /// for) when the identity names no version of the key.
+    /// for) when the identity names no version of the key, and `Locked` when the
+    /// identity's lock refuses the removal.
     pub async fn delete_object_version<R, B, G>(
         &self,
         plane: &Plane<R, C, B, G>,
         bucket: &bucket::Name,
         key: &object::Key,
         version: Option<&Id>,
+        bypass: object_lock::Bypass,
     ) -> Result<Marker, Error>
     where
         R: Metadata + VersionMeta,
@@ -571,9 +579,10 @@ where
                 is_delete_marker: current.is_delete_marker,
             };
             // The current version's own row: a marker's sits at the slot's sequence, a
-            // content version has none. `expire` is idempotent, so the content arm's call
-            // is the one that finds nothing.
-            VersionMeta::expire(&*plane.version_rows, bucket, key, current.seq)
+            // content version has none. `expire_with` is idempotent, so the content arm's
+            // call is the one that finds nothing; it enforces the identity's lock and
+            // removes it with the version (OL8).
+            VersionMeta::expire_with(&*plane.version_rows, bucket, key, current.seq, bypass)
                 .await
                 .map_err(projected)?;
             if let Some(row) = Self::successor(plane, bucket, key).await? {
@@ -609,13 +618,173 @@ where
         if row.id.as_ref() != version {
             return Err(storage::no_such_version(wire));
         }
-        VersionMeta::expire(&*plane.version_rows, bucket, key, seq)
+        VersionMeta::expire_with(&*plane.version_rows, bucket, key, seq, bypass)
             .await
             .map_err(projected)?;
         Ok(Marker {
             id: row.id.clone(),
             is_delete_marker: row.kind == Kind::Marker,
         })
+    }
+
+    /// Set, clear or leave a version's retention — S3 `PutObjectRetention` and
+    /// the management plane's `put_retention` (OL5, OL11, OL23, OL29).
+    ///
+    /// The address names the version: [`version::Address::Current`] resolves
+    /// the current slot's identity (a key with no current version is
+    /// `NoSuchVersion`), [`version::Address::Null`] the null version, and
+    /// [`version::Address::Id`] a specific id. The store's one-transaction
+    /// write asserts the identity exists and is not a marker, requires an
+    /// enabled bucket configuration and `Enabled` versioning, and applies the
+    /// model's `apply_retention`: `Some` sets the retention, `None` clears it
+    /// (the legal hold is preserved), and a COMPLIANCE retention cannot be
+    /// shortened or removed — the governance bypass applies only to an
+    /// unexpired GOVERNANCE retention.
+    ///
+    /// # Errors
+    ///
+    /// `NoSuchVersion` for a marker or an absent identity, `InvalidBucketState`
+    /// for a bucket without an enabled configuration (or without `Enabled`
+    /// versioning), `NoSuchBucket` for a missing bucket, and `Locked` for a
+    /// refused shortening or removal.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the retention write's field set — plane, bucket, key, address, requested retention, bypass and clock — is the request's own, forwarded to the store's atomic write"
+    )]
+    pub async fn set_retention<R, B, G>(
+        &self,
+        plane: &Plane<R, C, B, G>,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        requested: Option<&object_lock::Retention>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, Error>
+    where
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
+        B: BlockStore,
+    {
+        let identity = Self::lock_identity(plane, bucket, key, address).await?;
+        VersionMeta::set_retention(
+            &*plane.version_rows,
+            bucket,
+            key,
+            identity.as_ref(),
+            requested,
+            bypass,
+            now,
+        )
+        .await
+        .map_err(projected)
+    }
+
+    /// Set a version's legal hold — S3 `PutObjectLegalHold` and the plane's
+    /// `put_legal_hold` (OL5, OL11, OL23, OL29).
+    ///
+    /// The address resolution and the store's identity, configuration and
+    /// versioning assertions are [`ObjectOps::set_retention`]'s. The retention
+    /// is preserved and a legal hold has no bypass; [`object_lock::LegalHold::Off`]
+    /// clears it.
+    ///
+    /// # Errors
+    ///
+    /// The same classes as [`ObjectOps::set_retention`].
+    pub async fn set_legal_hold<R, B, G>(
+        &self,
+        plane: &Plane<R, C, B, G>,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        hold: object_lock::LegalHold,
+    ) -> Result<object_lock::Lock, Error>
+    where
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
+        B: BlockStore,
+    {
+        let identity = Self::lock_identity(plane, bucket, key, address).await?;
+        VersionMeta::set_legal_hold(&*plane.version_rows, bucket, key, identity.as_ref(), hold)
+            .await
+            .map_err(projected)
+    }
+
+    /// Apply the retention member and the legal-hold member in **one** store
+    /// transaction — the management plane's atomic object `PUT` (OL23).
+    ///
+    /// The address resolution is [`ObjectOps::set_retention`]'s. `retention`
+    /// is three-state (`None` leaves, `Some(None)` clears, `Some(Some(_))`
+    /// sets) and `legal_hold` is two-state (`None` leaves, a value sets). A
+    /// refused retention applies neither member, and the legal hold itself
+    /// never refuses.
+    ///
+    /// # Errors
+    ///
+    /// The same classes as [`ObjectOps::set_retention`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the combined write's field set — plane, bucket, key, address, both members, bypass and clock — is the request's own"
+    )]
+    pub async fn update_lock<R, B, G>(
+        &self,
+        plane: &Plane<R, C, B, G>,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+        retention: Option<Option<&object_lock::Retention>>,
+        legal_hold: Option<object_lock::LegalHold>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, Error>
+    where
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
+        B: BlockStore,
+    {
+        let identity = Self::lock_identity(plane, bucket, key, address).await?;
+        VersionMeta::set_lock(
+            &*plane.version_rows,
+            bucket,
+            key,
+            identity.as_ref(),
+            retention,
+            legal_hold,
+            bypass,
+            now,
+        )
+        .await
+        .map_err(projected)
+    }
+
+    /// Resolve a lock address to the store's identity spelling: `None` is the
+    /// null version, `Some(id)` a specific version. `Current` reads the slot —
+    /// the store then asserts the identity is a non-marker object version — and
+    /// a key with no current version is `NoSuchVersion`.
+    async fn lock_identity<R, B, G>(
+        plane: &Plane<R, C, B, G>,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        address: &version::Address,
+    ) -> Result<Option<Id>, Error>
+    where
+        R: Metadata + VersionMeta,
+        G: CurrentRows,
+        B: BlockStore,
+    {
+        match address {
+            version::Address::Current => {
+                let current = VersionMeta::current_slot(&*plane.version_rows, bucket, key)
+                    .await
+                    .map_err(projected)?;
+                match current {
+                    Some(current) if current.exists => Ok(current.version),
+                    _ => Err(storage::no_such_version(wire_of(None))),
+                }
+            }
+            version::Address::Null => Ok(None),
+            version::Address::Id(id) => Ok(Some(id.clone())),
+        }
     }
 
     /// The version that becomes current after the current one is removed.
@@ -1340,13 +1509,22 @@ where
     /// call is about to answer is real only once the row that records it is
     /// durable, and a read-heal cannot reconstruct a version identity.
     ///
+    /// `lock` is the effective Object Lock
+    /// [`ObjectOps::resolve_write_lock`](tinio_core::storage::ObjectOps::resolve_write_lock)
+    /// answered. It rides into the slot advance as
+    /// [`VersionMeta::advance_slot_with`]'s lock (OL7): the lock row commits
+    /// with the current version, `None` never clears an existing row, and a
+    /// null in-place replacement of an identity that owns an active lock is
+    /// refused by the store. A bucket that records no versions takes the
+    /// version-free body, which has no identity to lock.
+    ///
     /// # Errors
     ///
     /// The version engine's failures (a supersede race included), the row
     /// plane's, and the content plane's.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the versioned put's field set — plane, bucket, key, staged body, tags, owner, ACL and the marker port — is the operation's own, forwarded once into the version engine"
+        reason = "the versioned put's field set — plane, bucket, key, staged body, tags, owner, ACL, lock and the marker port — is the operation's own, forwarded once into the version engine"
     )]
     #[instrument(
         target = "tinio::storage",
@@ -1363,6 +1541,7 @@ where
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
         markers: &W,
     ) -> Result<object::Info, Error>
     where
@@ -1374,7 +1553,7 @@ where
         let state = plane.versions.state(bucket).await.map_err(projected)?;
         if !state.records_versions() {
             return self
-                .commit_object(bucket, key, staged, tags, owner, acl)
+                .commit_object(bucket, key, staged, tags, owner, acl, lock)
                 .await;
         }
         let (current, plan) = Self::load_plan(plane, bucket, key, Intent::Put, state).await?;
@@ -1469,7 +1648,7 @@ where
         }
         if let Err(err) = plane
             .version_rows
-            .advance_slot(bucket, key, id.clone(), plan.seq)
+            .advance_slot_with(bucket, key, id.clone(), plan.seq, lock)
             .await
             .map_err(projected)
         {

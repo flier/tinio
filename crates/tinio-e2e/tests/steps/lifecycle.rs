@@ -15,39 +15,14 @@
 //! honest against a future that does compare it.
 
 use cucumber::{gherkin::Step, then, when};
-use md5::{Digest as _, Md5};
 use tokio::time::{Duration, Instant, sleep};
 
-use super::cli::docstring;
+use super::common::put_xml;
 
 /// The poll's tick. A pass runs on the `[lifecycle]` cadence the scenario
 /// configures (tens of milliseconds), so a few ticks cover a full pass while
 /// the whole wait stays far below the step's bound.
 const POLL: Duration = Duration::from_millis(50);
-
-/// The standard-alphabet, padded base64 of `bytes` — what a `Content-MD5`
-/// header carries (RFC 4648 §4). Written out rather than adding `base64` to
-/// this crate for one header on one request.
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let tail = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = u32::from(tail[0]) << 16 | u32::from(tail[1]) << 8 | u32::from(tail[2]);
-        for i in 0..4u32 {
-            out.push(if (i as usize) < chunk.len() + 1 {
-                ALPHABET[((n >> (18 - 6 * i)) & 0x3f) as usize] as char
-            } else {
-                '='
-            });
-        }
-    }
-    out
-}
 
 /// `PUT /<bucket>?lifecycle` with the document the step carries as a
 /// docstring, replacing the bucket's whole configuration.
@@ -56,21 +31,7 @@ fn base64(bytes: &[u8]) -> String {
 /// which is why the corpus spells the wire shape and not the plane's JSON.
 #[when(expr = "I put this lifecycle configuration on bucket {string}")]
 async fn put_lifecycle_configuration(world: &mut super::World, bucket: String, step: &Step) {
-    let body = docstring(step);
-    let content_md5 = base64(&Md5::digest(body.as_bytes()));
-    let headers = [
-        ("Content-Type", "application/xml"),
-        ("Content-MD5", content_md5.as_str()),
-    ];
-    world.last = world
-        .client
-        .request(
-            "PUT",
-            &format!("/{bucket}?lifecycle"),
-            &headers,
-            body.as_bytes(),
-        )
-        .await;
+    put_xml(world, format!("/{bucket}?lifecycle"), step).await;
 }
 
 /// A bounded wait for the background pass: `{string}` is the request path of

@@ -44,7 +44,7 @@ use crate::{
         storage::{ListPartsParams, ListUploadsParams, Storage},
     },
     backend::{
-        S3Backend, check_complete_conditions, check_write_shape,
+        LockHeaders, S3Backend, check_complete_conditions, check_write_shape,
         checksum::{
             self, HasFields, VerifyState, VerifyStream, compose_composite, echo_validated,
             linearize_full_object, map_part_error, single_checksum_value,
@@ -55,6 +55,32 @@ use crate::{
         versioning::{query_version_id, require_versioning},
     },
 };
+
+/// The headers `CompleteMultipartUpload` may not carry (OL6): the create
+/// fixed the intent, so a lock or bypass header on the completion is a
+/// request-shape error (OL17). Compiled with the multipart surface always —
+/// the refusal is enforcement, not a gated Object Lock surface, so a stripped
+/// build answers the same `400`.
+const COMPLETE_REJECTED_HEADERS: [&str; 4] = [
+    "x-amz-object-lock-mode",
+    "x-amz-object-lock-retain-until-date",
+    "x-amz-object-lock-legal-hold",
+    "x-amz-bypass-governance-retention",
+];
+
+/// The `CompleteMultipartUpload` lock/bypass header refusal (OL6, OL17):
+/// `400 InvalidRequest`, before the parts are parsed.
+fn reject_complete_lock_headers(headers: &http::HeaderMap) -> S3Result<()> {
+    for header in COMPLETE_REJECTED_HEADERS {
+        if headers.contains_key(header) {
+            return Err(s3_error!(
+                InvalidRequest,
+                "{header} is not allowed on CompleteMultipartUpload"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// A request part number into the validated [`PartNumber`] (invalid →
 /// `InvalidPart`).
@@ -228,6 +254,33 @@ impl<S: Storage> S3Backend<S> {
         // parameter stays ignored (the create is the plain create; no
         // per-version behavior is invented).
         require_versioning(self, query_version_id(&req.uri))?;
+        // Object Lock (OL6, OL7, OL16): the create-time intent is resolved
+        // once here — the bucket default or the request's explicit pair,
+        // evaluated at the same clock reading the checksum decision uses —
+        // and the store writes it with the upload row, so a mid-upload
+        // configuration change cannot alter it. OL20: the strip owns the
+        // request headers, never the stored default — a stripped create
+        // yields empty headers, and the shared seam still applies the
+        // bucket's stored configuration so the upload cannot complete into
+        // an unprotected version, and gates the create on the checksum that
+        // lock requires (OL16).
+        let lock_headers = LockHeaders::from_request(
+            req.input.object_lock_mode.as_ref(),
+            req.input.object_lock_retain_until_date.as_ref(),
+            req.input.object_lock_legal_hold_status.as_ref(),
+        )?;
+        let write_lock = self
+            .write_lock(
+                &bucket,
+                &lock_headers,
+                super::LockChecksum {
+                    dto_md5: None,
+                    headers: &req.headers,
+                    trailing_headers: req.trailing_headers.is_some(),
+                    dto_checksum: req.input.checksum_algorithm.is_some(),
+                },
+            )
+            .await?;
         // The create-time checksum spec is persisted and drives the
         // per-part algorithm consistency + the compute-only tee (spec
         // 2026-08-31); the toggle off ⇒ today's accept-and-drop.
@@ -321,7 +374,15 @@ impl<S: Storage> S3Backend<S> {
         };
         let upload = self
             .storage
-            .create_multipart_upload(&bucket, &key, checksum, tags, owner, acl)
+            .create_multipart_upload(
+                &bucket,
+                &key,
+                checksum,
+                tags,
+                owner,
+                acl,
+                write_lock.as_ref(),
+            )
             .await
             .map_err(map_backend_error)?;
         // Seed the spec cache (F04): the spec is immutable after create
@@ -597,6 +658,11 @@ impl<S: Storage> S3Backend<S> {
         let key = self.key(req.input.key.clone())?;
         Self::record_operation_identity(&bucket, Some(&key));
         let upload_id = req.input.upload_id.clone();
+        // OL6/OL17: a completion may not carry a lock or bypass header — the
+        // create-time intent is fixed and applied by the store. Ungated: a
+        // stripped build carries no lock headers of its own, but a request
+        // that sends one is refused exactly the same way.
+        reject_complete_lock_headers(&req.headers)?;
         // The request-shape rejections go up front (before the parts
         // parse and the lock — a rejected request must not pay for
         // them): `If-Match` + `If-None-Match` together → 400
@@ -2012,6 +2078,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();

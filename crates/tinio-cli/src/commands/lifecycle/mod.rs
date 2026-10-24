@@ -171,26 +171,6 @@ pub async fn run(args: Args, located: Located) -> Result<ExitCode, Error> {
     }
 }
 
-/// The state of the server that answers for the root `args` names, or the refusal a root with
-/// nothing running gets.
-///
-/// **The pair `status` and `stop` probe and not a third search**: [`super::client_resolution`]
-/// resolves the root and decision 19's candidate pair, [`super::probe_pair`] asks the one a server
-/// is live in — so a lifecycle verb reaches the same server `tinio status` reports for that root.
-pub(crate) async fn server_state(args: DirArgs, located: Located) -> Result<State, Error> {
-    let (resolution, candidates) = super::client_resolution(args, located)?;
-    let super::Answer { report, .. } = super::probe_pair(&candidates).await?;
-    if report.running
-        && let Some(state) = report.state
-    {
-        return Ok(state);
-    }
-    Err(Error::Operational(format!(
-        "no running server for {}",
-        resolution.root.display()
-    )))
-}
-
 /// A connected management plane: one root resolution and one route target, so
 /// the four verbs cannot ask different servers or spell the route differently.
 ///
@@ -212,7 +192,7 @@ impl Plane {
         let Ok(bucket) = bucket::name(bucket.to_owned()) else {
             return Err(Error::Usage(format!("invalid bucket name: {bucket}")));
         };
-        let state = server_state(args, located).await?;
+        let state = super::server_state(args, located).await?;
         Ok(Self {
             state,
             target: format!("/buckets/{bucket}/lifecycle"),

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM version_index AS v\nUSING unnest($3::text[], $4::bigint[]) AS u (id, seq)\nWHERE v.bucket = $1 AND v.key = $2 AND v.id = u.id AND v.seq = u.seq\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "TextArray",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3d36a337f3eb7223142cf8e375fde2d332c36cb0d1ac61463c8e82f9a2d84a39"
+}

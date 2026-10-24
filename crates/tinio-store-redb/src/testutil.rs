@@ -3,13 +3,31 @@
 //! moved inline from `tests/rows.rs` (2026-10-01) — one home, so a fixture
 //! change lands once; and the process's span recorder, the shared harness's.
 
+use std::time::{Duration, SystemTime};
+
 use tinio_util::testing::spans;
 
 use crate::{
-    _core::etag::ETag,
+    _core::{
+        etag::ETag,
+        object_lock::{LegalHold, Lock, Mode, Retention},
+    },
     ensure_all,
     store::{Handle, open_in_memory},
 };
+
+/// A lock whose retention ends `secs` after the Unix epoch — the row tables'
+/// round-trip fixture. The instant is absolute, so a re-read row compares
+/// equal without depending on when the test ran.
+pub(crate) fn lock(mode: Mode, secs: u64, hold: LegalHold) -> Lock {
+    Lock {
+        retention: Some(Retention {
+            mode,
+            retain_until: SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+        }),
+        legal_hold: hold,
+    }
+}
 
 /// A ready store handle over a fresh in-memory redb database — the
 /// byte-format guard's home: no tempdir, no fs `Handle`, no tokio.

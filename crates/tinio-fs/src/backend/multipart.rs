@@ -53,6 +53,7 @@ use crate::{
         bucket, checksum,
         multipart::{CompletedPart, MultipartUpload, PartInfo, PartNumber},
         object::{self, Info},
+        object_lock,
         storage::{
             ByteRange, ListPartsParams, ListUploadsParams, MultipartOps, PartsListing,
             UploadsListing, access_denied, invalid_key, no_such_upload,
@@ -122,6 +123,7 @@ impl MultipartOps for FsStorage {
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<MultipartUpload, Error> {
         self.ensure_bucket(bucket).await?;
         // The multipart path must not be a backdoor for `.tinio` (FR-020).
@@ -140,7 +142,7 @@ impl MultipartOps for FsStorage {
         // lazy one: the bucket row is recorded by the bucket's own paths, and
         // an upload row needs none of it.
         self.multipart_ops()
-            .create_multipart_upload(bucket, key, checksum, tags, owner, acl)
+            .create_multipart_upload(bucket, key, checksum, tags, owner, acl, lock)
             .await
             .map_err(Error::from)
     }
@@ -550,9 +552,10 @@ mod tests {
             acl::Acl,
             multipart::{self, MIN_PART_BYTES},
             object,
-            storage::{BucketOps, Error as StorageError, ObjectOps},
+            storage::{BucketOps, Error as StorageError, ObjectOps, VersionOps},
+            version::Id,
         },
-        _util::testing::{body, read_body},
+        _util::testing::{body, object_lock::default_rule, read_body},
         testutil::{
             all_users_read_grant, bucket, checksum_tee, fs_options, md5_wire, owner_id, storage,
         },
@@ -573,6 +576,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -631,6 +635,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -718,6 +723,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -777,6 +783,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -788,6 +795,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -823,6 +831,7 @@ mod tests {
                     object::Tags::empty(),
                     None,
                     &Acl::default_private(None),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -878,6 +887,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -889,6 +899,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -920,6 +931,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -931,6 +943,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -995,6 +1008,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1062,6 +1076,7 @@ mod tests {
                 tags.clone(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1145,6 +1160,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1198,6 +1214,7 @@ mod tests {
                     owner: Some(owner.clone()),
                     grants: grants.clone(),
                 },
+                None,
             )
             .await
             .unwrap();
@@ -1277,6 +1294,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1428,7 +1446,7 @@ mod tests {
             .version_id
             .expect("the plain write minted an identity");
         storage
-            .delete_object_version(&b, &k, Some(&third))
+            .delete_object_version(&b, &k, Some(&third), object_lock::Bypass::None)
             .await
             .unwrap();
         match storage
@@ -1490,6 +1508,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1584,5 +1603,188 @@ mod tests {
         assert_eq!(info.size, 11);
         let get = storage.get_object(&b, &dst, None).await.unwrap();
         assert_eq!(read_body(get.body).await.unwrap(), b"hello world");
+    }
+
+    /// The upload's stored lock intent.
+    async fn upload_intent(
+        storage: &FsStorage,
+        b: &bucket::Name,
+        upload_id: &str,
+    ) -> Option<object_lock::Lock> {
+        use crate::_core::meta::UploadMeta;
+
+        storage
+            .version_plane(b)
+            .version_rows
+            .upload_lock(b, upload_id)
+            .await
+            .unwrap()
+    }
+
+    /// The identity's stored version lock.
+    async fn version_lock(
+        storage: &FsStorage,
+        b: &bucket::Name,
+        k: &object::Key,
+        id: Option<&Id>,
+    ) -> Option<object_lock::Lock> {
+        use crate::_core::meta::VersionMeta;
+
+        storage
+            .version_plane(b)
+            .version_rows
+            .version_lock(b, k, id)
+            .await
+            .unwrap()
+    }
+
+    /// OL6: the default evaluated at create is stored atomically with the
+    /// upload row, a mid-upload configuration change cannot alter it, and the
+    /// completion applies it to the final version and consumes it.
+    #[tokio::test]
+    async fn the_create_time_lock_intent_rides_the_completion() {
+        use std::time::SystemTime;
+
+        use crate::_core::version::State;
+
+        let (_root, storage) = storage();
+        let b = bucket(&storage).await;
+        storage
+            .set_bucket_versioning(&b, State::Enabled)
+            .await
+            .unwrap();
+        let k = object::key("locked.bin").unwrap();
+        storage
+            .put_bucket_object_lock(&b, &default_rule(object_lock::Mode::Governance, 7))
+            .await
+            .unwrap();
+        let intent = storage
+            .resolve_write_lock(&b, None, object_lock::LegalHold::Off, SystemTime::now())
+            .await
+            .unwrap()
+            .expect("the default resolves a governance lock");
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+                Some(&intent),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            upload_intent(&storage, &b, &upload.upload_id)
+                .await
+                .as_ref(),
+            Some(&intent),
+            "the create stores the intent with the upload row"
+        );
+
+        // A mid-upload configuration change must not alter the fixed intent.
+        storage
+            .put_bucket_object_lock(&b, &default_rule(object_lock::Mode::Compliance, 30))
+            .await
+            .unwrap();
+
+        let part = storage
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                part_number(1),
+                body(b"assembled"),
+                None,
+            )
+            .await
+            .unwrap();
+        let info = storage
+            .complete_multipart_upload(
+                &b,
+                &k,
+                &upload.upload_id,
+                &[CompletedPart {
+                    part_number: part.part_number,
+                    etag: part.etag,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let stored = version_lock(&storage, &b, &k, info.version_id.as_ref())
+            .await
+            .expect("the completed version carries the create-time lock");
+        assert_eq!(
+            stored, intent,
+            "the create-time intent, not the mid-upload config"
+        );
+        assert_eq!(
+            stored
+                .retention
+                .expect("the default carries a retention")
+                .mode,
+            object_lock::Mode::Governance
+        );
+        assert!(
+            upload_intent(&storage, &b, &upload.upload_id)
+                .await
+                .is_none(),
+            "the completion consumes the intent"
+        );
+    }
+
+    /// OL6: aborting an upload clears its stored intent.
+    #[tokio::test]
+    async fn aborting_an_upload_clears_its_lock_intent() {
+        use std::time::{Duration, SystemTime};
+
+        use crate::_core::version::State;
+
+        let (_root, storage) = storage();
+        let b = bucket(&storage).await;
+        storage
+            .set_bucket_versioning(&b, State::Enabled)
+            .await
+            .unwrap();
+        let k = object::key("aborted.bin").unwrap();
+        let lock = object_lock::Lock {
+            retention: Some(object_lock::Retention {
+                mode: object_lock::Mode::Compliance,
+                retain_until: SystemTime::now() + Duration::from_secs(3_600),
+            }),
+            legal_hold: object_lock::LegalHold::On,
+        };
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+                Some(&lock),
+            )
+            .await
+            .unwrap();
+        assert!(
+            upload_intent(&storage, &b, &upload.upload_id)
+                .await
+                .is_some(),
+            "the intent is stored"
+        );
+
+        storage
+            .abort_multipart_upload(&b, &k, &upload.upload_id)
+            .await
+            .unwrap();
+        assert!(
+            upload_intent(&storage, &b, &upload.upload_id)
+                .await
+                .is_none(),
+            "the abort's drain removes the intent"
+        );
     }
 }

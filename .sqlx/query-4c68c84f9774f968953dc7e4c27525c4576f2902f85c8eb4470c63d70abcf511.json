@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- The doctor's Object Lock scan (OL31) reads its three tables in one\n-- repeatable-read snapshot, so a concurrent write cannot make a lock row look\n-- orphaned between two statements of the same scan.\nSET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "4c68c84f9774f968953dc7e4c27525c4576f2902f85c8eb4470c63d70abcf511"
+}

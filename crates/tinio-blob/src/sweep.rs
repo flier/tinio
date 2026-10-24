@@ -61,6 +61,26 @@ impl LiveSet {
         }
     }
 
+    /// Build the set from an already-collected hash set, taking it as it
+    /// stands — a caller that owns the set avoids a second pass and rehash.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::collections::HashSet;
+    ///
+    /// use tinio_blob::LiveSet;
+    /// use tinio_core::blob::BlockHash;
+    ///
+    /// let hashes = HashSet::from([BlockHash::of(b"hello")]);
+    /// let live = LiveSet::from_set(hashes);
+    ///
+    /// assert!(live.contains(&BlockHash::of(b"hello")));
+    /// ```
+    pub fn from_set(hashes: HashSet<BlockHash>) -> Self {
+        Self { hashes }
+    }
+
     /// Build the set from a version history: the union of every row's blob
     /// block list. One home for the reduction the engine's `live_blocks`
     /// walk and the doctor's already-decoded rows both feed — the two can

@@ -54,6 +54,8 @@ use s3s::{auth::S3Auth, s3_error};
 use time::{OffsetDateTime, format_description, format_description::BorrowedFormatItem};
 use tokio::{net::TcpListener, sync::watch};
 use tower::Service as TowerService;
+#[cfg(not(any(feature = "acl", feature = "copy")))]
+use tracing::field;
 use tracing::{callsite::DefaultCallsite, dispatcher, instrument, metadata};
 
 #[cfg(feature = "acl")]
@@ -62,6 +64,8 @@ use crate::_auth::AclAccess;
 use crate::_auth::{ConfigAuth, Identity, User, derive_canonical_id};
 #[cfg(any(feature = "acl", feature = "copy"))]
 use crate::_core::acl::{DEFAULT_OWNER_DISPLAY_NAME, default_owner_id};
+#[cfg(feature = "object-lock")]
+use crate::backend::ObjectLockCache;
 #[cfg(feature = "cors")]
 use crate::backend::cors::{self, apply_cors_headers, bucket_from_uri};
 use crate::{
@@ -136,7 +140,7 @@ impl S3Auth for StaticAuth {
         level = "info",
         target = "tinio::auth",
         skip_all,
-        fields(result = tracing::field::Empty)
+        fields(result = field::Empty)
     )]
     async fn get_secret_key(&self, access_key: &str) -> s3s::S3Result<SecretKey> {
         let found = access_key == self.access_key;
@@ -165,12 +169,17 @@ fn static_auth(access_key: &str, secret_key: &str) -> StaticAuth {
 /// write policy. `From<Capabilities>` yields read-write, so existing call
 /// sites pass a bare `Capabilities` unchanged and a read-only caller opts in
 /// with [`PlaneConfig::read_only`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PlaneConfig {
     /// The `[s3]` capability toggles (FR-021).
     pub caps: Capabilities,
     /// The write policy (FR-023).
     pub access: AccessMode,
+    /// The Object Lock cache the backend shares with a writer outside the request paths — the
+    /// management plane's admin (OL18). `None` creates a fresh cache, which is every caller that
+    /// does not serve that plane.
+    #[cfg(feature = "object-lock")]
+    pub object_lock_cache: Option<ObjectLockCache>,
 }
 
 impl PlaneConfig {
@@ -179,6 +188,8 @@ impl PlaneConfig {
         Self {
             caps,
             access: AccessMode::ReadOnly,
+            #[cfg(feature = "object-lock")]
+            object_lock_cache: None,
         }
     }
 
@@ -193,8 +204,27 @@ impl From<Capabilities> for PlaneConfig {
         Self {
             caps,
             access: AccessMode::ReadWrite,
+            #[cfg(feature = "object-lock")]
+            object_lock_cache: None,
         }
     }
+}
+
+/// The mapping over `storage`, with the plane's Object Lock cache when one was supplied
+/// (OL18): the management plane's admin and the backend then share one cache handle.
+#[cfg(feature = "object-lock")]
+fn backend_for<S: Storage>(storage: Arc<S>, plane: &PlaneConfig) -> S3Backend<S> {
+    S3Backend::new_shared_with_object_lock_cache(
+        storage,
+        plane.caps,
+        plane.object_lock_cache.clone().unwrap_or_default(),
+    )
+}
+
+/// The mapping over `storage` in a build without the Object Lock surface.
+#[cfg(not(feature = "object-lock"))]
+fn backend_for<S: Storage>(storage: Arc<S>, plane: &PlaneConfig) -> S3Backend<S> {
+    S3Backend::new_shared(storage, plane.caps)
 }
 
 /// The data plane: the s3s service behind the metrics/access middleware.
@@ -216,7 +246,9 @@ impl DataPlane {
     /// `#[cfg(feature = "cors")]`.
     pub fn new_shared<S: Storage>(storage: Arc<S>, plane: impl Into<PlaneConfig>) -> Self {
         let plane = plane.into();
-        let backend = S3Backend::new_shared(Arc::clone(&storage), plane.caps);
+        let backend = backend_for(Arc::clone(&storage), &plane);
+        #[cfg(feature = "cors")]
+        let caps = plane.caps;
         #[cfg(feature = "cors")]
         {
             let mut builder = Self::service_builder(plane, backend);
@@ -224,7 +256,7 @@ impl DataPlane {
             // capability arm the preflight route; the erased lookup rides
             // on the service either way (None with the capability off — no
             // route, no decoration).
-            if let Some(lookup) = Self::cors_lookup(&storage, &plane.caps) {
+            if let Some(lookup) = Self::cors_lookup(&storage, &caps) {
                 builder.set_route(cors::PreflightRoute::new(Arc::clone(&lookup)));
                 return Self::from_service(builder.build(), Some(lookup));
             }
@@ -249,12 +281,14 @@ impl DataPlane {
     ) -> Self {
         let plane = plane.into();
         let storage = Arc::new(storage);
-        let backend = S3Backend::new_shared(Arc::clone(&storage), plane.caps);
+        let backend = backend_for(Arc::clone(&storage), &plane);
+        #[cfg(feature = "cors")]
+        let caps = plane.caps;
         let mut builder = Self::service_builder(plane, backend);
         builder.set_auth(static_auth(access_key, secret_key));
         #[cfg(feature = "cors")]
         {
-            if let Some(lookup) = Self::cors_lookup(&storage, &plane.caps) {
+            if let Some(lookup) = Self::cors_lookup(&storage, &caps) {
                 builder.set_route(cors::PreflightRoute::new(Arc::clone(&lookup)));
                 return Self::from_service(builder.build(), Some(lookup));
             }
@@ -293,14 +327,16 @@ impl DataPlane {
     ) -> Self {
         let plane = plane.into();
         let storage = Arc::new(storage);
-        let backend = S3Backend::new_shared(Arc::clone(&storage), plane.caps)
-            .with_identity(Arc::clone(&identity));
+        let backend =
+            backend_for(Arc::clone(&storage), &plane).with_identity(Arc::clone(&identity));
+        #[cfg(feature = "cors")]
+        let caps = plane.caps;
         let mut builder = Self::service_builder(plane, backend);
         builder.set_auth(ConfigAuth::new(Arc::clone(&identity)));
         builder.set_access(AclAccess::new(Arc::clone(&storage), identity));
         #[cfg(feature = "cors")]
         {
-            if let Some(lookup) = Self::cors_lookup(&storage, &plane.caps) {
+            if let Some(lookup) = Self::cors_lookup(&storage, &caps) {
                 builder.set_route(cors::PreflightRoute::new(Arc::clone(&lookup)));
                 return Self::from_service(builder.build(), Some(lookup));
             }
@@ -836,6 +872,8 @@ mod tests {
     use super::*;
     #[cfg(feature = "cors")]
     use crate::_core::cors;
+    #[cfg(feature = "object-lock")]
+    use crate::backend::ObjectLockCache;
     use crate::{
         _core::{
             acl::Acl,
@@ -947,6 +985,37 @@ mod tests {
         let plane: PlaneConfig = Capabilities::default().into();
         assert!(!plane.is_read_only());
         assert!(PlaneConfig::read_only(Capabilities::default()).is_read_only());
+    }
+
+    /// **The `PlaneConfig` handle reaches the backend as-is** (OL18): a regression that created
+    /// a fresh cache here would leave the management plane's admin invalidating a handle nobody
+    /// reads, and the S3 echo would keep a stale `false` while every test above still passed.
+    #[cfg(feature = "object-lock")]
+    #[test]
+    fn the_plane_config_cache_is_the_backends_cache() {
+        let cache = ObjectLockCache::new();
+        let plane = PlaneConfig {
+            caps: Capabilities::default(),
+            access: AccessMode::ReadWrite,
+            object_lock_cache: Some(cache.clone()),
+        };
+        let backend = backend_for(
+            Arc::new(MemoryStorage::new().expect("a memory storage")),
+            &plane,
+        );
+        assert!(
+            backend.object_lock_cache().shares_entries_with(&cache),
+            "the configured handle is the backend's, not a copy"
+        );
+
+        let fresh = backend_for(
+            Arc::new(MemoryStorage::new().expect("a memory storage")),
+            &PlaneConfig::from(Capabilities::default()),
+        );
+        assert!(
+            !fresh.object_lock_cache().shares_entries_with(&cache),
+            "an absent handle creates a fresh cache"
+        );
     }
 
     #[test]
@@ -1560,7 +1629,15 @@ mod tests {
                 .await
                 .unwrap();
             storage
-                .commit_object(&b, &k, staged, object::Tags::empty(), Some(owner), acl)
+                .commit_object(
+                    &b,
+                    &k,
+                    staged,
+                    object::Tags::empty(),
+                    Some(owner),
+                    acl,
+                    None,
+                )
                 .await
                 .unwrap();
         }

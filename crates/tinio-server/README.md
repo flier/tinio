@@ -15,6 +15,7 @@
 | `select-parquet` | `select` plus the Parquet input format |
 | `acl` | the four ACL operations and the identity-backed authn/authz stack (`ConfigAuth` + `AclAccess`) |
 | `versioning` | the version plane: Get/PutBucketVersioning, ListObjectVersions, the version-addressed object and delete surface, and the guard that refuses a version-addressed request outright |
+| `object-lock` | the Object Lock surface over the version plane (implies `versioning`): the bucket configuration and default retention, per-version retention and legal hold, the six `?object-lock`/`?retention`/`?legal-hold` operations, the write headers and the GET/HEAD echo |
 | `sandbox` | nothing in the library: it is the `required-features` gate of the confined-server end-to-end targets |
 | `api` | the `tinio-api` re-export — a name for the management plane, with no server code behind it |
 | `config` | the section types' serde + garde derives (the `[s3]` capability, identity, log and pipeline schemas the CLI composes) |
@@ -30,6 +31,7 @@
 | `src/backend/s3.rs` | the s3s `S3` dispatch, generated from that inventory |
 | `src/backend/buckets.rs`, `objects.rs`, `listing.rs`, `multipart.rs` | the operation groups as inherent methods |
 | `src/backend/versioning.rs` | the version operations, and the one guard every version-addressed request passes |
+| `src/backend/object_lock.rs` | the six Object Lock operations: the bucket configuration, per-version retention and legal hold, the write-header resolution and the GET/HEAD echo |
 | `src/backend/cors.rs` | the CORS trio, and the preflight route the browser asks anonymously |
 | `src/backend/acls.rs` | the ACL wire helpers and the write-path grant headers |
 | `src/backend/select.rs` | the S3 Select operation: the async bridge over the synchronous engine |
@@ -65,6 +67,7 @@ A disabled toggle answers `NotImplemented`, named by the **operation's** wire na
 | `select` | SelectObjectContent |
 | `acl` | the four ACL operations |
 | `versioning` | Get/PutBucketVersioning, ListObjectVersions — and every version-addressed request is refused outright rather than answered from the current object |
+| `object_lock` | the six Object Lock operations; the management plane's Object Lock routes are not registered and the GET/HEAD lock headers are skipped, while stored configurations, default retention and delete protection stay in force |
 
 The toggles above gate an **operation**, which is what lets them buy a refusal. The section's other keys gate nothing: they are limits and durations (`max_buckets`, `max_keys`, `select_concurrency`, `select_stack_bytes`, and the sweep and retention numbers the CLI hands to a backend), a relaxation (`allow_zero_page_size`), and further booleans — `checksum`, an opt-in that validates rather than refuses, and `sig_v2`, deprecated and off by default. None of them answers `NotImplemented`.
 

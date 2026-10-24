@@ -1747,8 +1747,15 @@ async fn pg_dsn_in_env_file(world: &mut World) {
 
 /// The operator's command line, run to whatever end it reaches: an exit, or a server that keeps
 /// serving.
+///
+/// **The command text takes the same substitutions the raw wire steps do** (`errors.rs`'s
+/// `subst`): a scenario may capture a value from the wire — a version id, an upload id — and
+/// name it on the operator's command line, which is the only way the process surface can address
+/// that identity. The two harness placeholders (`{root}`, `{state}`, `{missing}`) are `Cli::argv`'s
+/// and are left alone here.
 #[when(expr = "I run {string}")]
 async fn run_command(world: &mut World, command: String) {
+    let command = super::errors::subst(world, &command);
     cli(world).run(&command).await;
 }
 

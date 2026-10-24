@@ -21,7 +21,7 @@ use super::{Metadata, bucket as bucket_row};
 use crate::{
     ETag, MultipartUpload,
     acl::{Acl, OwnerId},
-    bucket, checksum, multipart, object,
+    bucket, checksum, multipart, object, object_lock,
     storage::{self, from_nanos, to_nanos},
 };
 
@@ -364,6 +364,61 @@ pub trait UploadMeta: Send + Sync + 'static {
     {
         UploadMeta::create(self, bucket, upload_id, row).await
     }
+
+    /// Upsert the upload state **and its lock intent** in one transaction
+    /// (OL6, OL27).
+    ///
+    /// The effective lock is resolved at create — the explicit header or the
+    /// bucket default evaluated then — and written with the upload row, so a
+    /// mid-upload configuration change cannot alter it. `None` stores no
+    /// intent. The completion applies the stored intent; abort, expiry and
+    /// teardown clear it.
+    async fn create_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &Row,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// [`UploadMeta::create_with_lock`] for a store that also answers the
+    /// bucket-row check inside the same write: the guarded twin of
+    /// [`UploadMeta::create_guarded`], with the same default.
+    async fn create_guarded_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &Row,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), <Self as Metadata>::Error>
+    where
+        Self: Metadata,
+    {
+        UploadMeta::create_with_lock(self, bucket, upload_id, row, lock).await
+    }
+
+    /// The lock intent stored with an upload, or `None` when it stores none
+    /// (OL6). A corrupt stored intent fails closed: the answer is
+    /// [`storage::Error::Corrupt`], never `Ok(None)`.
+    async fn upload_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+    ) -> Result<Option<object_lock::Lock>, <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// Clear the upload's lock intent (idempotent) — the completion's
+    /// consume, and the abort/expiry/teardown's removal.
+    async fn clear_upload_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+    ) -> Result<(), <Self as Metadata>::Error>
+    where
+        Self: Metadata;
 
     /// The upload state, present only when the upload exists **and** records
     /// `key`.

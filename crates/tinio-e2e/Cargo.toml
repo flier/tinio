@@ -32,7 +32,9 @@ hyper-util = { workspace = true, features = ["tokio"] }
 md-5 = { workspace = true }
 percent-encoding = { workspace = true }
 secrecy = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
+time = { workspace = true, features = ["parsing"] }
 toml = { workspace = true }
 
 tinio-api = { path = "../tinio-api", default-features = false }
@@ -51,6 +53,7 @@ rustix = { workspace = true, features = ["process"] }
 [features]
 default = ["lifecycle"]
 lifecycle = ["tinio-server/lifecycle"]
+object-lock = ["tinio-server/object-lock", "tinio-cli/object-lock"]
 parquet = ["tinio-server/select-parquet"]
 pg = ["dep:tinio-pg", "dep:sqlx", "tinio-pg/versioning", "tinio-pg/testing"]
 

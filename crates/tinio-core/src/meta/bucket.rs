@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use super::Metadata;
 use crate::{
     acl::{self, Acl, Grant, Grantee, GroupUri, OwnerId, Permission},
-    bucket, cors, lifecycle, object, percent,
+    bucket, cors, lifecycle, object, object_lock, percent,
     storage::{from_nanos, to_nanos},
 };
 
@@ -486,6 +486,46 @@ pub trait BucketMeta: Send + Sync + 'static {
     /// as [`BucketMeta::set_lifecycle`]: a bucket that stores no
     /// configuration answers `Ok(true)`.
     async fn clear_lifecycle(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<bool, <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// The bucket's Object Lock configuration, or `None` when it stores none
+    /// (OL4). A row that does not decode is no configuration — the enabled bit
+    /// survives a damaged rule ([`object_lock::Config::from_rule_wire`]), so
+    /// this answer is never "unlocked" for a bucket whose enabled bit is set.
+    ///
+    /// `NoSuchBucket` when the bucket row does not exist, the lifecycle read's
+    /// presence rule.
+    async fn object_lock(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Option<object_lock::Config>, <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// Replace the bucket's Object Lock configuration (OL13). Same presence
+    /// outcome as [`BucketMeta::set_lifecycle`]: a missing bucket writes
+    /// nothing and answers `Ok(false)`, and an identical write is not a change
+    /// signal. The request path validates the configuration
+    /// ([`object_lock::Config::validate`]).
+    async fn set_object_lock(
+        &self,
+        bucket: &bucket::Name,
+        config: &object_lock::Config,
+    ) -> Result<bool, <Self as Metadata>::Error>
+    where
+        Self: Metadata;
+
+    /// Clear the bucket's Object Lock configuration (idempotent, OL4). Same
+    /// presence outcome as [`BucketMeta::clear_lifecycle`]: a bucket that
+    /// stores no configuration answers `Ok(true)`.
+    ///
+    /// Every bucket-row writer clears this row in its own transaction, so a
+    /// configuration never outlives the bucket it was written for (LC19).
+    async fn clear_object_lock(
         &self,
         bucket: &bucket::Name,
     ) -> Result<bool, <Self as Metadata>::Error>

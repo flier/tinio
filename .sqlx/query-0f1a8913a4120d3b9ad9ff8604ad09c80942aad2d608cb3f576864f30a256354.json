@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM version_rows\nWHERE bucket = $1 AND key = $2 AND seq IN (SELECT unnest($3::int8[]))\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0f1a8913a4120d3b9ad9ff8604ad09c80942aad2d608cb3f576864f30a256354"
+}

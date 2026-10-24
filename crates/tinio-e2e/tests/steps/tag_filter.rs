@@ -103,17 +103,19 @@ fn platform_clause(target_os: &str) -> String {
 /// nothing is excluded (the caller then leaves `CUCUMBER_FILTER_TAGS` unset,
 /// which is cucumber's own default).
 ///
-/// Five independent axes, in composition order: `@parquet` unless the parquet
-/// cargo feature is on; the platform axis ([`platform_clause`]); the
-/// `@external` umbrella (`@interop`/`@boto3`/`@mc`) unless the external opt-in
-/// is set; `@confinement`, which follows the [`Confinement`] state — the
-/// target's own default (excluded off macOS) when the variable is unset, and
-/// the explicit states forcing it in or out on every target; and `@pg`,
-/// always excluded from the default run (PG17) — the `@pg` pass is its own run,
-/// driven by an explicit `--tags` (which is also what sets
+/// Six independent axes, in composition order: `@parquet` unless the parquet
+/// cargo feature is on; `@object-lock` unless the object-lock cargo feature is
+/// on (the corpus compiles against the server's gated surface, so a build
+/// without it can only answer NotImplemented); the platform axis
+/// ([`platform_clause`]); the `@external` umbrella (`@interop`/`@boto3`/`@mc`)
+/// unless the external opt-in is set; `@confinement`, which follows the
+/// [`Confinement`] state — the target's own default (excluded off macOS) when
+/// the variable is unset, and the explicit states forcing it in or out on every
+/// target; and `@pg`, always excluded from the default run (PG17) — the `@pg`
+/// pass is its own run, driven by an explicit `--tags` (which is also what sets
 /// `TINIO_E2E_BACKEND=pg`), and no other pass wants the DB-backed scenarios.
 ///
-/// The target, the two opt-in flags and the confinement state are parameters
+/// The target, the three opt-in flags and the confinement state are parameters
 /// rather than `cfg!`/env reads, so one function composes every host's filter
 /// and the composition is assertable without a host of each kind
 /// (`tests/traceability.rs` includes this file for exactly that). `@pg` is not
@@ -121,12 +123,16 @@ fn platform_clause(target_os: &str) -> String {
 pub fn default_filter(
     target_os: &str,
     parquet: bool,
+    object_lock: bool,
     external: bool,
     confinement: Confinement,
 ) -> String {
     let mut excluded: Vec<String> = Vec::new();
     if !parquet {
         excluded.push("not @parquet".to_owned());
+    }
+    if !object_lock {
+        excluded.push("not @object-lock".to_owned());
     }
     excluded.push(platform_clause(target_os));
     if !external {
@@ -175,9 +181,10 @@ mod tests {
         reason = "test support: no `#[test]` reaches this helper in the cucumber binary (harness disabled — never runs there), while the traceability binary's tests do — one attribute cannot be `expect` in both"
     )]
     fn selected(target_os: &str, tags: &[&str]) -> bool {
-        let filter: TagOperation = default_filter(target_os, true, true, Confinement::Include)
-            .parse()
-            .unwrap_or_else(|e| panic!("the filter for {target_os} parses: {e}"));
+        let filter: TagOperation =
+            default_filter(target_os, true, true, true, Confinement::Include)
+                .parse()
+                .unwrap_or_else(|e| panic!("the filter for {target_os} parses: {e}"));
         filter.eval(tags.iter().map(|tag| tag.trim_start_matches('@')))
     }
 
@@ -201,7 +208,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                default_filter(target, true, true, Confinement::Include),
+                default_filter(target, true, true, true, Confinement::Include),
                 expected,
                 "the composed filter for {target}"
             );
@@ -280,32 +287,34 @@ mod tests {
     #[test]
     fn the_other_axes_follow_their_inputs() {
         assert_eq!(
-            default_filter("linux", false, false, Confinement::Platform),
+            default_filter("linux", false, true, false, Confinement::Platform),
             "not @parquet and not ((@linux or @macos or @windows or @unix) and not (@linux or @unix)) and not @interop and not @boto3 and not @mc and not @confinement and not @pg"
         );
         // `@confinement` follows the state, not the host alone: on macOS the
         // platform default emits nothing for the family, and the `0` state
         // emits the exclusion — the two composed strings, whole.
         assert_eq!(
-            default_filter("macos", true, true, Confinement::Platform),
+            default_filter("macos", true, true, true, Confinement::Platform),
             "not ((@linux or @macos or @windows or @unix) and not (@macos or @unix)) and not @pg"
         );
         assert_eq!(
-            default_filter("macos", true, true, Confinement::Exclude),
+            default_filter("macos", true, true, true, Confinement::Exclude),
             "not ((@linux or @macos or @windows or @unix) and not (@macos or @unix)) and not @confinement and not @pg"
         );
         assert!(
-            !default_filter("macos", true, true, Confinement::Include).contains("@confinement")
+            !default_filter("macos", true, true, true, Confinement::Include)
+                .contains("@confinement")
         );
         assert!(
-            default_filter("windows", true, true, Confinement::Platform)
+            default_filter("windows", true, true, true, Confinement::Platform)
                 .contains("not @confinement")
         );
         assert!(
-            !default_filter("windows", true, true, Confinement::Include).contains("@confinement")
+            !default_filter("windows", true, true, true, Confinement::Include)
+                .contains("@confinement")
         );
         assert!(
-            default_filter("windows", true, true, Confinement::Exclude)
+            default_filter("windows", true, true, true, Confinement::Exclude)
                 .contains("not @confinement")
         );
     }
@@ -315,7 +324,7 @@ mod tests {
     #[test]
     fn the_confinement_axis_has_three_states() {
         fn excluded(target_os: &str, confinement: Confinement) -> bool {
-            default_filter(target_os, true, true, confinement).contains("not @confinement")
+            default_filter(target_os, true, true, true, confinement).contains("not @confinement")
         }
         for (target, platform_excludes) in [("linux", true), ("macos", false), ("windows", true)] {
             assert_eq!(
@@ -341,7 +350,7 @@ mod tests {
     #[test]
     fn the_pg_axis_is_excluded_from_every_default_run() {
         for target in ["linux", "macos", "windows"] {
-            let filter = default_filter(target, true, true, Confinement::Include);
+            let filter = default_filter(target, true, true, true, Confinement::Include);
             assert!(
                 filter.ends_with("not @pg"),
                 "the composed filter for {target}: {filter}"
@@ -361,11 +370,31 @@ mod tests {
     #[test]
     fn the_lifecycle_corpus_runs_by_default() {
         for target in ["linux", "macos", "windows"] {
-            let filter = default_filter(target, true, true, Confinement::Include);
+            let filter = default_filter(target, true, true, true, Confinement::Include);
             assert!(!filter.contains("@lifecycle"), "the filter for {target}");
             assert!(
                 selected(target, &["@lifecycle"]),
                 "a @lifecycle scenario on {target}"
+            );
+        }
+    }
+
+    /// The `@object-lock` corpus follows its cargo feature, the way `@parquet`
+    /// does: without `--features object-lock` the server's six-operation
+    /// surface is compiled out, so the default run excludes the corpus rather
+    /// than failing every scenario on a 501.
+    #[test]
+    fn the_object_lock_corpus_follows_its_cargo_feature() {
+        for target in ["linux", "macos", "windows"] {
+            let off = default_filter(target, true, false, true, Confinement::Include);
+            assert!(
+                off.contains("not @object-lock"),
+                "the filter for {target}: {off}"
+            );
+            let on = default_filter(target, true, true, true, Confinement::Include);
+            assert!(
+                !on.contains("@object-lock"),
+                "the filter for {target}: {on}"
             );
         }
     }

@@ -27,7 +27,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha1.workspace = true
 thiserror.workspace = true
-time = { workspace = true, features = ["formatting"] }
+time = { workspace = true, features = ["formatting", "parsing"] }
 tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros"] }
 tokio-rustls = { workspace = true, optional = true, features = [
     "ring",
@@ -44,8 +44,9 @@ tinio-core.workspace = true
 tinio-util.workspace = true
 
 [features]
-default = ["lifecycle", "openapi", "tls"]
+default = ["lifecycle", "object-lock", "openapi", "tls"]
 lifecycle = []
+object-lock = []
 openapi = ["dep:utoipa"]
 tls = ["dep:tokio-rustls"]
 

@@ -44,11 +44,11 @@ use std::error::Error as StdError;
 pub use body::{BodyStream, collect_body};
 pub use bucket::{BucketOps, BucketsListing, ListBucketsParams};
 pub use error::{
-    Denied, Error, access_denied, access_denied_bucket, already_exists, entity_too_large,
-    invalid_bucket_name, invalid_checksum, invalid_etag, invalid_key, invalid_part,
-    invalid_part_key, invalid_part_number, invalid_range, invalid_version, io, no_parts,
-    no_such_bucket, no_such_key, no_such_upload, no_such_version, not_empty, part_too_small,
-    too_many_uploads,
+    Denied, Error, access_denied, access_denied_bucket, already_exists, corrupt, entity_too_large,
+    invalid_bucket_name, invalid_bucket_state, invalid_checksum, invalid_etag, invalid_key,
+    invalid_part, invalid_part_key, invalid_part_number, invalid_range, invalid_version, io,
+    locked, no_parts, no_such_bucket, no_such_key, no_such_upload, no_such_version, not_empty,
+    part_too_small, too_many_uploads,
 };
 pub use listing::{
     RollupMirror, UnorderedPager, common_prefix, group_and_paginate, group_and_paginate_ordered,
@@ -60,6 +60,7 @@ pub use multipart::{
 };
 pub use object::{
     GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps, PutObjectResult, TagWriteResult,
+    resolve_write_lock,
 };
 pub use range::ByteRange;
 pub use time::{from_nanos, now_nanos, to_nanos};

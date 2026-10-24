@@ -28,11 +28,11 @@ use crate::{
             upload::{PartRecord, PartRow, PartsPage, Row as UploadRow, UploadsChunk},
         },
         multipart::PartNumber,
-        object,
+        object, object_lock,
         storage::{UnorderedPager, from_nanos, split_uploads_order, uploads_order},
     },
     Error, PgTx, begin,
-    meta::{acl_composite, assert_bucket_row, project},
+    meta::{LockRow, acl_composite, assert_bucket_row, project},
     store::PgStore,
     timestamp::{from_timestamp, to_timestamp},
 };
@@ -157,6 +157,61 @@ struct StoredWalked {
 /// through `require_upload`).
 struct StoredKey {
     key: object::Key,
+}
+
+/// Write the upload's lock intent inside the caller's transaction: the intent
+/// the create resolved, or the removal of a stale one an id being reused left
+/// behind (OL6).
+async fn set_intent(
+    tx: &mut PgTx,
+    bucket: &bucket::Name,
+    upload_id: &str,
+    lock: Option<&object_lock::Lock>,
+) -> Result<(), Error> {
+    match lock {
+        Some(lock) => {
+            let (mode, retain_until, hold) = lock.columns();
+            sqlx::query_file!(
+                "sql/meta/upload/lock_upsert.sql",
+                bucket,
+                upload_id,
+                mode.as_deref(),
+                retain_until,
+                hold.as_str()
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+        None => {
+            sqlx::query_file!("sql/meta/upload/lock_clear.sql", bucket, upload_id)
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The upload create and its lock intent in ONE transaction (OL6): the upload
+/// row, its checksum spec and the intent commit together, so a mid-upload
+/// configuration change cannot alter the intent a later complete applies.
+/// `guarded` adds the bucket-row check to the same transaction, so a
+/// concurrent `remove_if_empty` cannot race it.
+async fn create_in(
+    store: &PgStore,
+    guarded: bool,
+    bucket: &bucket::Name,
+    upload_id: &str,
+    row: &UploadRow,
+    lock: Option<&object_lock::Lock>,
+) -> Result<(), Error> {
+    let mut tx = begin(store.pool()).await?;
+    if guarded {
+        assert_bucket_row(&mut tx, bucket).await?;
+    }
+    upsert_upload(&mut tx, bucket, upload_id, row).await?;
+    set_intent(&mut tx, bucket, upload_id, lock).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// One part projection row: the part's number, its stored ETag, then the
@@ -806,6 +861,50 @@ impl UploadMeta for PgStore {
 
     async fn drain_bucket(&self, bucket: &bucket::Name) -> Result<(), Error> {
         sqlx::query_file!("sql/meta/upload/drain_bucket.sql", bucket)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// The create and its lock intent are ONE transaction (OL6): the upload
+    /// row, its checksum spec and the intent commit together, so a mid-upload
+    /// configuration change cannot alter the intent a later complete applies.
+    async fn create_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &UploadRow,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), Error> {
+        create_in(self, false, bucket, upload_id, row, lock).await
+    }
+
+    /// The guarded twin: the bucket-row check stays inside the transaction
+    /// that writes the upload row and its intent, so a concurrent
+    /// `remove_if_empty` cannot race it.
+    async fn create_guarded_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &UploadRow,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), Error> {
+        create_in(self, true, bucket, upload_id, row, lock).await
+    }
+
+    async fn upload_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+    ) -> Result<Option<object_lock::Lock>, Error> {
+        let row = query_file_as!(LockRow, "sql/meta/upload/lock_get.sql", bucket, upload_id)
+            .fetch_optional(self.pool())
+            .await?;
+        row.map_or(Ok(None), LockRow::decode)
+    }
+
+    async fn clear_upload_lock(&self, bucket: &bucket::Name, upload_id: &str) -> Result<(), Error> {
+        sqlx::query_file!("sql/meta/upload/lock_clear.sql", bucket, upload_id)
             .execute(self.pool())
             .await?;
         Ok(())

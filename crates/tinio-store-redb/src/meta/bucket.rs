@@ -17,13 +17,19 @@ use crate::{
     _core::{
         acl, bucket, cors, lifecycle,
         meta::{BucketMeta, bucket as row},
-        object, storage,
+        object, object_lock, storage,
+        version::State,
     },
     Error, RedbMetadata,
     bucket::{BucketRow, Table as BucketTable},
     bucket_lifecycle::Table as LifecycleTable,
+    bucket_object_lock::Table as ObjectLockTable,
+    bucket_versioning::Table as VersioningTable,
     object_meta::Table as MetaTable,
     upload::Table as UploadTable,
+    upload_object_lock::Table as UploadLockTable,
+    version::Table as VersionTable,
+    version_object_lock::Table as VersionLockTable,
 };
 
 /// The low-level row a contract row writes: the same five elements
@@ -36,6 +42,80 @@ fn stored_row(row: &row::Row) -> BucketRow {
         owner: wires.owner,
         acl: wires.grants,
         cors: wires.cors,
+    }
+}
+
+/// The shared body of a bucket-row write: refuse a taken name (writing
+/// nothing) and insert the row, then clear the lifecycle row a bucket that
+/// vanished out of band would otherwise leave behind (LC19). The caller's own
+/// transaction adds whatever else the write implies — the Object Lock clear
+/// for an ordinary create, the versioning state and the configuration for
+/// `create_bucket_with_lock`.
+fn insert_bucket_row(
+    txn: &mut WriteTransaction,
+    key: &str,
+    name: &bucket::Name,
+    stored: &BucketRow,
+) -> Result<(), Error> {
+    {
+        let mut table = BucketTable::open(txn)?;
+        if table.exists(key)? {
+            return Err(Error::Refused(storage::already_exists(name)));
+        }
+        table.put_full(key, stored)?;
+    }
+    // LC19: a table of its own does not inherit the bucket row's upsert, so a
+    // row left behind by a bucket that vanished out of band would otherwise
+    // expire the new bucket's objects.
+    LifecycleTable::open(txn)?.drain_bucket(key)
+}
+
+/// Whether `bucket` still holds any row whose presence refuses its teardown:
+/// the occupancy predicate `remove_if_empty` applies, in the caller's own
+/// transaction. One key-range seek per plane, never a walk — a consumer that
+/// elides the contract's two-transaction pair (tinio-mem) asks this so its
+/// emptiness decision cannot drift from the redb store's.
+pub fn bucket_occupied(txn: &mut WriteTransaction, bucket: &str) -> Result<bool, Error> {
+    let objects = MetaTable::open(txn)?.has_bucket(bucket)?;
+    let uploads = UploadTable::open(txn)?.has_bucket(bucket)?;
+    let versions = VersionTable::open(txn)?.has_bucket(bucket)?;
+    let version_locks = VersionLockTable::open(txn)?.has_bucket(bucket)?;
+    let upload_locks = UploadLockTable::open(txn)?.has_bucket(bucket)?;
+    Ok(objects || uploads || versions || version_locks || upload_locks)
+}
+
+impl RedbMetadata {
+    /// Create a bucket with Object Lock enabled (OL13) in ONE write
+    /// transaction: the bucket row, its `Enabled` versioning state and
+    /// `config`.
+    ///
+    /// The compensating composition (the ops engine's
+    /// `create_bucket_with_lock`) exists for a backend whose three facts are
+    /// three writes; a store whose rows share this database commits them
+    /// together, so no failure can leave a partial lock-enabled bucket. A
+    /// taken name is `AlreadyExists`, and the existence check and the three
+    /// inserts are the same transaction — the refusal writes nothing. The
+    /// same create-shape rule as [`BucketMeta::create`] applies to the
+    /// configuration tables: a stale lifecycle row of a name that vanished
+    /// out of band is cleared (LC19), and the lock row is overwritten by
+    /// `config` rather than inherited.
+    pub async fn create_bucket_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        row: &row::Row,
+        config: &object_lock::Config,
+    ) -> Result<(), Error> {
+        let name = bucket.clone();
+        let key = bucket.to_string();
+        let stored = stored_row(row);
+        let config = config.clone();
+        self.driver
+            .write(move |txn| {
+                insert_bucket_row(txn, &key, &name, &stored)?;
+                VersioningTable::open(txn)?.set(&key, State::Enabled)?;
+                ObjectLockTable::open(txn)?.set(&key, &config)
+            })
+            .await
     }
 }
 
@@ -80,6 +160,8 @@ fn merge_row(
     };
     if let Some(now) = create_at.filter(|_| !present) {
         BucketTable::open(txn)?.put_full(row, &BucketRow::at(now))?;
+        // OL4: the first-sight insert is a bucket-row write.
+        ObjectLockTable::open(txn)?.drain_bucket(row)?;
     }
     LifecycleTable::open(txn)?.set(row, &config)?;
     Ok(lifecycle::Merged::Stored)
@@ -166,7 +248,14 @@ impl BucketMeta for RedbMetadata {
     async fn record(&self, bucket: &bucket::Name, created: SystemTime) -> Result<(), Error> {
         let bucket = bucket.to_string();
         self.driver
-            .write(move |txn| BucketTable::open(txn)?.put(&bucket, created))
+            .write(move |txn| {
+                BucketTable::open(txn)?.put(&bucket, created)?;
+                // OL4: a bucket-row writer clears the Object Lock
+                // configuration in the same write. The row's other elements
+                // are cleared here too, so the configuration cannot describe a
+                // bucket state this write replaced.
+                ObjectLockTable::open(txn)?.drain_bucket(&bucket)
+            })
             .await
     }
 
@@ -176,19 +265,10 @@ impl BucketMeta for RedbMetadata {
         let stored = stored_row(row);
         self.driver
             .write(move |txn| {
-                {
-                    let mut table = BucketTable::open(txn)?;
-                    if table.exists(&key)? {
-                        return Err(Error::Refused(storage::already_exists(&name)));
-                    }
-                    table.put_full(&key, &stored)?;
-                }
-                // LC19: the configuration row is cleared in the same write as
-                // the bucket row. A table of its own does not inherit the
-                // bucket row's upsert, so a row left behind by a bucket that
-                // vanished out of band would otherwise expire the new bucket's
-                // objects.
-                LifecycleTable::open(txn)?.drain_bucket(&key)
+                insert_bucket_row(txn, &key, &name, &stored)?;
+                // OL4, the Object Lock twin of the LC19 rule: a stale
+                // configuration never protects the new bucket's writes.
+                ObjectLockTable::open(txn)?.drain_bucket(&key)
             })
             .await
     }
@@ -200,7 +280,15 @@ impl BucketMeta for RedbMetadata {
     ) -> Result<(SystemTime, bool), Error> {
         let bucket = bucket.to_string();
         self.driver
-            .write(move |txn| BucketTable::open(txn)?.get_or_insert(&bucket, now))
+            .write(move |txn| {
+                let (created, inserted) = BucketTable::open(txn)?.get_or_insert(&bucket, now)?;
+                // OL4: only a first-sight insert is a bucket-row write here;
+                // an existing row (and the configuration beside it) rides.
+                if inserted {
+                    ObjectLockTable::open(txn)?.drain_bucket(&bucket)?;
+                }
+                Ok((created, inserted))
+            })
             .await
     }
 
@@ -213,7 +301,10 @@ impl BucketMeta for RedbMetadata {
                 // LC19, the `create` drain's twin: this is the lazy policy's
                 // re-create (a store whose buckets outlive their rows adopts
                 // an existing record the same way).
-                LifecycleTable::open(txn)?.drain_bucket(&bucket)
+                LifecycleTable::open(txn)?.drain_bucket(&bucket)?;
+                // OL4: every bucket-row writer clears the Object Lock
+                // configuration beside the LC19 rule.
+                ObjectLockTable::open(txn)?.drain_bucket(&bucket)
             })
             .await
     }
@@ -243,9 +334,14 @@ impl BucketMeta for RedbMetadata {
         // write", so the `write_if` abort is the no-fsync arm.
         self.driver
             .write_if(move |txn| -> Result<Option<()>, Error> {
-                Ok(BucketTable::open(txn)?
-                    .put_tags_or_create(&row, &tags, now)?
-                    .then_some(()))
+                // OL4: a first-sight insert is a bucket-row writer and clears
+                // a stale Object Lock configuration; an existing row rides.
+                let present = BucketTable::open(txn)?.exists(&row)?;
+                let changed = BucketTable::open(txn)?.put_tags_or_create(&row, &tags, now)?;
+                if !present {
+                    ObjectLockTable::open(txn)?.drain_bucket(&row)?;
+                }
+                Ok(changed.then_some(()))
             })
             .await
             .map(|_| ())
@@ -314,7 +410,9 @@ impl BucketMeta for RedbMetadata {
                 let Some(mut stored) = table.row(&row)? else {
                     // First sight: the row is recorded WITH the grant set,
                     // so no reader sees it without them — and with no owner
-                    // (a bucket never sighted through the API has none).
+                    // (a bucket never sighted through the API has none). It
+                    // is a bucket-row write, so a stale Object Lock
+                    // configuration is cleared beside it (OL4).
                     table.put_full(
                         &row,
                         &BucketRow {
@@ -322,6 +420,11 @@ impl BucketMeta for RedbMetadata {
                             ..BucketRow::at(now)
                         },
                     )?;
+                    // OL4: drop the bucket-table handle before opening the
+                    // configuration table in the same transaction (redb
+                    // hands one transaction's tables out one at a time).
+                    drop(table);
+                    ObjectLockTable::open(txn)?.drain_bucket(&row)?;
                     return Ok(Some(()));
                 };
                 if stored.acl == grants_wire {
@@ -446,11 +549,19 @@ impl BucketMeta for RedbMetadata {
         // elements ride untouched.
         self.driver
             .write_if(move |txn| -> Result<Option<()>, Error> {
-                {
+                let present = {
                     let mut table = BucketTable::open(txn)?;
-                    if !table.exists(&row)? {
+                    let present = table.exists(&row)?;
+                    if !present {
                         table.put_full(&row, &BucketRow::at(now))?;
                     }
+                    present
+                };
+                if !present {
+                    // OL4: the first-sight insert is a bucket-row write, so
+                    // a stale Object Lock configuration is cleared in the
+                    // same transaction.
+                    ObjectLockTable::open(txn)?.drain_bucket(&row)?;
                 }
                 LifecycleTable::open(txn)?.set(&row, &config)?;
                 Ok(Some(()))
@@ -478,7 +589,9 @@ impl BucketMeta for RedbMetadata {
             .write(move |txn| {
                 BucketTable::open(txn)?.remove(&bucket)?;
                 // LC19: the rule dies with the bucket, in the same write.
-                LifecycleTable::open(txn)?.drain_bucket(&bucket)
+                LifecycleTable::open(txn)?.drain_bucket(&bucket)?;
+                // OL4: the Object Lock configuration dies with it too.
+                ObjectLockTable::open(txn)?.drain_bucket(&bucket)
             })
             .await
     }
@@ -491,372 +604,90 @@ impl BucketMeta for RedbMetadata {
                 if BucketTable::open(txn)?.row(&key)?.is_none() {
                     return Err(Error::Refused(storage::no_such_bucket(&name)));
                 }
-                // The two occupancy probes in the deleting transaction:
+                // The occupancy probes in the deleting transaction:
                 // one key-range seek each (never a walk), so a concurrent
                 // write cannot slip between the check and the removal. The
                 // object-row half is the table layer's own probe — the same
-                // one `ObjectMeta::has_objects` answers from.
-                let objects = MetaTable::open(txn)?.has_bucket(&key)?;
-                let uploads = UploadTable::open(txn)?.has_bucket(&key)?;
-                if objects || uploads {
+                // one `ObjectMeta::has_objects` answers from. OL8: a
+                // bucket's emptiness decision includes its version rows and
+                // its lock rows, so a teardown cannot strand either.
+                if bucket_occupied(txn, &key)? {
                     return Err(Error::Refused(storage::not_empty(&name)));
                 }
                 BucketTable::open(txn)?.remove(&key)?;
                 // LC19: the rule dies with the bucket, in the same write.
-                LifecycleTable::open(txn)?.drain_bucket(&key)
+                LifecycleTable::open(txn)?.drain_bucket(&key)?;
+                // OL4: the Object Lock configuration leaves with it.
+                ObjectLockTable::open(txn)?.drain_bucket(&key)
+            })
+            .await
+    }
+
+    async fn object_lock(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Option<object_lock::Config>, Error> {
+        let name = bucket.clone();
+        let bucket = bucket.to_string();
+        self.driver.read(move |txn| {
+            // The lifecycle read's presence rule: a missing bucket row is
+            // NoSuchBucket, never "no configuration" (OL4).
+            if !BucketTable::open_readonly(txn)?.exists(&bucket)? {
+                return Err(Error::Refused(storage::no_such_bucket(&name)));
+            }
+            ObjectLockTable::open_readonly(txn)?.get(&bucket)
+        })
+    }
+
+    async fn set_object_lock(
+        &self,
+        bucket: &bucket::Name,
+        config: &object_lock::Config,
+    ) -> Result<bool, Error> {
+        let name = bucket.clone();
+        let bucket = bucket.to_string();
+        let config = config.clone();
+        // The bucket row is the presence decision, taken inside the writing
+        // transaction: a missing bucket writes nothing and answers `false`
+        // (the `set_lifecycle` rule).
+        self.driver
+            .write(move |txn| -> Result<bool, Error> {
+                if !BucketTable::open(txn)?.exists(&bucket)? {
+                    return Ok(false);
+                }
+                // OL13: a configuration is only valid on an `Enabled` bucket.
+                // The check runs in the transaction that writes it, so a
+                // concurrent suspend — which takes the same write lock and
+                // reads the configuration — cannot interleave between the
+                // caller's read and this write and leave an enabled
+                // configuration on a `Suspended` bucket.
+                let state = VersioningTable::open(txn)?
+                    .get(&bucket)?
+                    .unwrap_or_default();
+                if state != State::Enabled {
+                    return Err(Error::Refused(storage::invalid_bucket_state(&name)));
+                }
+                ObjectLockTable::open(txn)?.set(&bucket, &config)?;
+                Ok(true)
+            })
+            .await
+    }
+
+    async fn clear_object_lock(&self, bucket: &bucket::Name) -> Result<bool, Error> {
+        let bucket = bucket.to_string();
+        // Same presence outcome as `clear_lifecycle`: a bucket that stores no
+        // configuration still answers `Ok(true)`.
+        self.driver
+            .write(move |txn| -> Result<bool, Error> {
+                if !BucketTable::open(txn)?.exists(&bucket)? {
+                    return Ok(false);
+                }
+                ObjectLockTable::open(txn)?.drain_bucket(&bucket)?;
+                Ok(true)
             })
             .await
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::{Duration, SystemTime};
-
-    use tinio_util::testing::metadata::{assert_bucket_meta_conformance, lifecycle_config};
-
-    use crate::{
-        _core::{
-            acl::{Acl, AclGrants, OwnerId},
-            bucket, cors,
-            etag::ETag,
-            lifecycle,
-            meta::{BucketMeta, bucket as row},
-            object, storage,
-        },
-        Error, RedbMetadata,
-        bucket_lifecycle::Table as LifecycleTable,
-        object_meta::{self, Stored},
-    };
-
-    fn t(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    }
-
-    /// A grant set (the owner's own default grants).
-    fn grants() -> AclGrants {
-        Acl::default_private(Some(owner())).grants
-    }
-
-    fn owner() -> OwnerId {
-        OwnerId::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap()
-    }
-
-    fn tags(pairs: &[(&str, &str)]) -> object::Tags {
-        object::Tags::from_pairs(
-            pairs
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
-        )
-        .unwrap()
-    }
-
-    /// The tag set as owned pairs — [`object::Tags::iter`] yields borrowed
-    /// `(&str, &str)` tuples, so a leg comparing against `Vec<(String,
-    /// String)>` needs this side (the shared suite's `pairs` helper).
-    fn pairs(tags: &object::Tags) -> Vec<(String, String)> {
-        tags.iter()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect()
-    }
-
-    /// Plant a lifecycle row through the raw table handle — the state a bucket
-    /// that vanished out of band leaves behind, which no contract call can
-    /// write (the setter refuses a bucket with no row).
-    async fn plant(store: &RedbMetadata, bucket: &str, config: lifecycle::Config) {
-        let bucket = bucket.to_owned();
-        store
-            .driver()
-            .write(move |txn| LifecycleTable::open(txn)?.set(&bucket, &config))
-            .await
-            .unwrap();
-    }
-
-    /// One valid object row to plant for the occupancy probe.
-    fn held_row() -> Stored {
-        Stored {
-            etag: "d41d8cd98f00b204e9800998ecf8427e".parse::<ETag>().unwrap(),
-            size: 0,
-            mtime: 0,
-            file_identity: 0,
-            tags: object::Tags::empty(),
-            checksum: None,
-            owner: None,
-            acl: Acl::default_private(None),
-            version_id: None,
-            version_seq: 0,
-            is_delete_marker: false,
-        }
-    }
-
-    /// The suite's bucket leg against a fresh in-memory implementation.
-    #[tokio::test]
-    async fn bucket_meta_conforms() {
-        let store = RedbMetadata::in_memory().unwrap();
-        assert_bucket_meta_conformance(&store).await;
-    }
-
-    /// The lifecycle setters answer bucket presence, never change: an
-    /// identical re-write and a clear on a bucket that stores none both
-    /// answer `true`, and only a missing bucket answers `false`.
-    #[tokio::test]
-    async fn the_lifecycle_setters_answer_bucket_presence() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let name = bucket::name("lifecycle").unwrap();
-        let config = lifecycle_config("expire-logs");
-
-        // No bucket row: nothing is written and both setters answer `false`.
-        assert!(!store.set_lifecycle(&name, &config).await.unwrap());
-        assert!(store.lifecycle(&name).await.unwrap().is_none());
-        assert!(!store.clear_lifecycle(&name).await.unwrap());
-        assert!(store.lifecycles().await.unwrap().is_empty());
-
-        store.create(&name, &row::Row::at(t(1))).await.unwrap();
-        assert!(store.set_lifecycle(&name, &config).await.unwrap());
-        assert_eq!(store.lifecycle(&name).await.unwrap(), Some(config.clone()));
-        assert!(
-            store.set_lifecycle(&name, &config).await.unwrap(),
-            "an identical configuration is still presence"
-        );
-        assert_eq!(
-            store.lifecycles().await.unwrap(),
-            vec![(name.clone(), config)]
-        );
-        assert!(store.clear_lifecycle(&name).await.unwrap());
-        assert!(store.lifecycle(&name).await.unwrap().is_none());
-        assert!(
-            store.clear_lifecycle(&name).await.unwrap(),
-            "a bucket that stores no configuration is still present"
-        );
-        assert!(store.lifecycles().await.unwrap().is_empty());
-    }
-
-    /// LC19's other half, which the shared suite cannot reach: once `remove`
-    /// drains the row no contract call leaves a stale one behind, so the plant
-    /// is raw. Both creation paths clear it in the write that lands the bucket
-    /// row, and `remove_if_empty` drains it exactly as `remove` does.
-    #[tokio::test]
-    async fn the_creation_paths_clear_a_stale_lifecycle_row() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let name = bucket::name("stale-lifecycle").unwrap();
-        let key = name.to_string();
-
-        plant(&store, &key, lifecycle_config("expire-logs")).await;
-        store.create(&name, &row::Row::at(t(1))).await.unwrap();
-        assert!(
-            store.lifecycle(&name).await.unwrap().is_none(),
-            "create clears the stale row in the write that lands the bucket row"
-        );
-
-        plant(&store, &key, lifecycle_config("expire-logs")).await;
-        store.record_full(&name, &row::Row::at(t(2))).await.unwrap();
-        assert!(
-            store.lifecycle(&name).await.unwrap().is_none(),
-            "record_full (the lazy policy's re-create) clears it too"
-        );
-
-        assert!(
-            store
-                .set_lifecycle(&name, &lifecycle_config("expire-logs"))
-                .await
-                .unwrap()
-        );
-        store.remove_if_empty(&name).await.unwrap();
-        assert!(
-            store.lifecycle(&name).await.unwrap().is_none(),
-            "remove_if_empty takes the rule with the bucket"
-        );
-        assert!(store.row(&name).await.unwrap().is_none());
-    }
-
-    /// The refusals D22 pins that the bucket leg alone cannot reach:
-    /// `create` answers `AlreadyExists` for a recorded name, and
-    /// `remove_if_empty` answers `NoSuchBucket` for a missing row and
-    /// `NotEmpty` while another category's row still names the bucket.
-    #[tokio::test]
-    async fn refusals_project_onto_the_contract_error() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let name = bucket::name("refusing").unwrap();
-        store.create(&name, &row::Row::at(t(1))).await.unwrap();
-        let refused: storage::Error = store
-            .create(&name, &row::Row::at(t(2)))
-            .await
-            .unwrap_err()
-            .into();
-        assert!(
-            matches!(refused, storage::Error::AlreadyExists(_)),
-            "{refused:?}"
-        );
-
-        let key = name.to_string();
-        let planted = key.clone();
-        store
-            .driver()
-            .write(move |txn| -> Result<(), Error> {
-                object_meta::Table::open(txn)?.put(&planted, "held.txt", &held_row())
-            })
-            .await
-            .unwrap();
-        let refused: storage::Error = store.remove_if_empty(&name).await.unwrap_err().into();
-        assert!(
-            matches!(refused, storage::Error::NotEmpty(_)),
-            "an object row keeps the bucket non-empty, got {refused:?}"
-        );
-        store
-            .driver()
-            .write(move |txn| -> Result<(), Error> {
-                object_meta::Table::open(txn)?.remove(&key, "held.txt")
-            })
-            .await
-            .unwrap();
-
-        store.remove_if_empty(&name).await.unwrap();
-        let refused: storage::Error = store.remove_if_empty(&name).await.unwrap_err().into();
-        assert!(
-            matches!(refused, storage::Error::NoSuchBucket(_)),
-            "a removed row refuses as NoSuchBucket, got {refused:?}"
-        );
-    }
-
-    /// The create-or-update tag write is ONE transaction in both arms: a
-    /// first-sight record and a replace are each one write transaction, and
-    /// the record lands WITH the tags (a reader never sees a bare row).
-    /// The write-transaction count is the driver's own (`write_lock_stats`,
-    /// one per `timed_write`, commit or abort).
-    #[tokio::test]
-    async fn set_tags_or_create_records_and_replaces_in_one_transaction() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let name = bucket::name("first-sight-tags").unwrap();
-        let writes = || store.driver().write_lock_stats().count;
-
-        // First sight: one write transaction, the row recorded with the
-        // tags at `now`.
-        let before = writes();
-        store
-            .set_tags_or_create(&name, &tags(&[("env", "prod")]), t(7))
-            .await
-            .unwrap();
-        assert_eq!(
-            writes() - before,
-            1,
-            "the first-sight tag record is one write"
-        );
-        let recorded = store.row(&name).await.unwrap().expect("the recorded row");
-        assert_eq!(recorded.created, t(7), "the first-sight row carries `now`");
-        assert_eq!(
-            pairs(&recorded.tags),
-            vec![("env".to_owned(), "prod".to_owned())]
-        );
-        assert!(recorded.cors.is_none(), "a fresh row has no other element");
-
-        // Replace: one write transaction, the creation time and the other
-        // elements ride.
-        let config = cors::Config {
-            rules: vec![cors::Rule {
-                id: Some("kept".to_owned()),
-                allowed_methods: vec!["GET".to_owned()],
-                allowed_origins: vec!["*".to_owned()],
-                allowed_headers: None,
-                expose_headers: None,
-                max_age_seconds: None,
-            }],
-        };
-        store.set_cors(&name, &config).await.unwrap();
-        let before = writes();
-        store
-            .set_tags_or_create(&name, &tags(&[("team", "core")]), t(9))
-            .await
-            .unwrap();
-        assert_eq!(writes() - before, 1, "the tag replace is one write");
-        let replaced = store.row(&name).await.unwrap().unwrap();
-        assert_eq!(replaced.created, t(7), "the recorded time is preserved");
-        assert_eq!(
-            pairs(&replaced.tags),
-            vec![("team".to_owned(), "core".to_owned())]
-        );
-        assert_eq!(
-            replaced.cors,
-            Some(config),
-            "the other elements are preserved"
-        );
-
-        // An identical set is a no-op body (the transaction still opens and
-        // aborts): the row is unchanged.
-        let before = writes();
-        store
-            .set_tags_or_create(&name, &tags(&[("team", "core")]), t(11))
-            .await
-            .unwrap();
-        assert_eq!(
-            writes() - before,
-            1,
-            "an identical set is still one transaction"
-        );
-        assert_eq!(store.row(&name).await.unwrap().unwrap(), replaced);
-    }
-
-    /// The grants create-or-update write is ONE transaction in both arms and
-    /// preserves the recorded owner element: the first-sight row carries the
-    /// grants and no owner, a later write replaces only the grants.
-    #[tokio::test]
-    async fn set_grants_or_create_preserves_the_owner_element() {
-        let store = RedbMetadata::in_memory().unwrap();
-        let name = bucket::name("first-sight-grants").unwrap();
-        let writes = || store.driver().write_lock_stats().count;
-        let held = owner();
-
-        // First sight: one write transaction, the grants recorded, no owner.
-        let before = writes();
-        store
-            .set_grants_or_create(&name, &grants(), t(3))
-            .await
-            .unwrap();
-        assert_eq!(
-            writes() - before,
-            1,
-            "the first-sight grant record is one write"
-        );
-        let recorded = store.row(&name).await.unwrap().expect("the recorded row");
-        assert_eq!(recorded.created, t(3));
-        assert_eq!(recorded.acl.grants, grants());
-        assert_eq!(
-            recorded.owner, None,
-            "a bucket never sighted through the API carries no owner"
-        );
-
-        // A recorded owner (the create-time ACL row) rides the later grants
-        // write: the row read and the write are the same transaction, so the
-        // owner's writer cannot slip between them.
-        let mut with_owner = recorded.clone();
-        with_owner.owner = Some(held.clone());
-        store.record_full(&name, &with_owner).await.unwrap();
-        let empty: AclGrants = Vec::new();
-        let before = writes();
-        store
-            .set_grants_or_create(&name, &empty, t(5))
-            .await
-            .unwrap();
-        assert_eq!(writes() - before, 1, "the grant replace is one write");
-        let replaced = store.row(&name).await.unwrap().unwrap();
-        assert_eq!(
-            replaced.owner,
-            Some(held),
-            "the recorded owner is carried over"
-        );
-        assert!(replaced.acl.grants.is_empty(), "the grants are replaced");
-        assert_eq!(replaced.created, t(3), "the recorded time is preserved");
-
-        // An identical set is a no-op body: the row is unchanged.
-        let before = writes();
-        store
-            .set_grants_or_create(&name, &empty, t(13))
-            .await
-            .unwrap();
-        assert_eq!(
-            writes() - before,
-            1,
-            "an identical set is still one transaction"
-        );
-        assert_eq!(store.row(&name).await.unwrap().unwrap(), replaced);
-    }
-}
+mod tests;

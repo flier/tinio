@@ -19,14 +19,17 @@ use crate::_api::state::State;
 #[cfg(feature = "api")]
 use crate::_api::{Error as ApiError, Options as ApiOptions, Plane};
 #[cfg(feature = "api")]
+use crate::_core::mode::AccessMode;
+#[cfg(feature = "api")]
 use crate::_core::storage::Storage;
+#[cfg(feature = "lifecycle")]
+use crate::_core::{bucket, storage::Error as StorageError};
+#[cfg(feature = "object-lock")]
+use crate::_server::ObjectLockCache;
 #[cfg(feature = "api")]
 use crate::daemon;
 #[cfg(feature = "lifecycle")]
-use crate::{
-    _api::lifecycle::LifecycleAdmin,
-    _core::{bucket, lifecycle, storage::Error as StorageError},
-};
+use crate::{_api::lifecycle::LifecycleAdmin, _core::lifecycle};
 use crate::{
     _fs::{Error as FsError, FsStorage},
     _sandbox::{Adopted, Attribution, Child, Refused, disarm_signal_relay, supervise},
@@ -491,13 +494,24 @@ pub fn run(
                 // authenticated client cannot accumulate an unbounded number of them.
                 storage.set_max_concurrent_uploads(s3.max_concurrent_uploads);
             }
+            #[cfg(feature = "object-lock")]
+            let object_lock_cache = object_lock_cache_for(&resolution);
             #[cfg(feature = "api")]
-            let plane =
-                open_management_plane(&storage, &resolution, &args, adopted.as_ref(), &handles)?;
+            let plane = open_management_plane(
+                &storage,
+                &resolution,
+                &args,
+                adopted.as_ref(),
+                &handles,
+                #[cfg(feature = "object-lock")]
+                object_lock_cache.clone(),
+            )?;
             Served::Fs(Box::new(super::Prepared {
                 storage,
                 #[cfg(feature = "api")]
                 plane,
+                #[cfg(feature = "object-lock")]
+                object_lock_cache,
             }))
         }
     };
@@ -574,6 +588,15 @@ fn lifecycle_admin<S: Storage + Clone + Send + Sync + 'static>(
         })
 }
 
+/// The run's Object Lock cache, or `None` when the capability is off (OL23). The handle is
+/// created here and travels to both consumers: the admin and the data plane's `PlaneConfig`.
+#[cfg(feature = "object-lock")]
+pub(super) fn object_lock_cache_for(resolution: &Resolution) -> Option<ObjectLockCache> {
+    super::serve::capabilities_for(resolution)
+        .object_lock
+        .then(ObjectLockCache::default)
+}
+
 /// The management plane over `storage` — the control channel that is the plane's
 /// single-instance gate, bound before the repair runs (design decision 12).
 ///
@@ -589,6 +612,7 @@ pub(super) fn open_management_plane<S>(
     args: &Args,
     adopted: Option<&Adopted>,
     handles: &signal::Handles,
+    #[cfg(feature = "object-lock")] object_lock_cache: Option<ObjectLockCache>,
 ) -> Result<Plane, Error>
 where
     S: Storage + Clone + 'static,
@@ -607,6 +631,11 @@ where
     let lifecycle = lifecycle_admin(storage, resolution);
     #[cfg(not(feature = "lifecycle"))]
     let lifecycle = None;
+    // The Object Lock admin carries the run's cache handle, the same one the data plane gets
+    // through its `PlaneConfig` (OL18, OL23). No capability, no admin and no route.
+    #[cfg(feature = "object-lock")]
+    let object_lock =
+        super::object_lock_admin::object_lock_admin(storage, object_lock_cache.as_ref());
     // `[server] host`/`port`, the flags folded in — what `/status` reports as the host.
     let bind = resolution.address()?;
     let options = ApiOptions {
@@ -619,6 +648,9 @@ where
             .api
             .as_ref()
             .is_some_and(|api| api.metrics_requires_token),
+        // The plane's write admission and the storage's own options read the same fact, so a
+        // read-only run refuses Object Lock writes in the plane before the body is parsed.
+        access: AccessMode::from(resolution.read_only),
         stop: handles.stopper.clone(), // `/stop` sends on the one shutdown channel
         // **The launcher's token, when this process was launched by one** (design decision 17's
         // private channel, extended to the one secret the two processes share). The launcher
@@ -635,6 +667,13 @@ where
         // ones, and the in-place platforms.
         token: adopted.and_then(|adopted| adopted.token().map(str::to_owned)),
         lifecycle,
+        // The API crate's `object-lock` surface rides its default features; this run's
+        // `object-lock` feature decides whether this build can inject the admin at all. A CLI
+        // without it passes `None`, and the plane's handlers answer `404`.
+        #[cfg(feature = "object-lock")]
+        object_lock,
+        #[cfg(not(feature = "object-lock"))]
+        object_lock: None,
     };
     // **A launcher already bound the control channel, and this process serves on what it
     // inherited** (`Adopted::controls`). Windows' reason is identity: the launcher's pipes carry
@@ -1023,9 +1062,18 @@ mod tests {
 
     use tempfile::TempDir;
 
+    #[cfg(feature = "object-lock")]
+    use super::super::object_lock_admin::object_lock_admin;
     use super::*;
+    #[cfg(feature = "object-lock")]
+    use crate::_core::{
+        acl::Acl,
+        bucket, object_lock,
+        storage::{self, BucketOps, VersionOps},
+        version::State as VersionState,
+    };
     use crate::_sandbox::{Attribution, Child, Terminal};
-    #[cfg(feature = "lifecycle")]
+    #[cfg(any(feature = "lifecycle", feature = "object-lock"))]
     use crate::{_fs::testing, _server::Capabilities};
 
     /// A confined child that exits with `code` and relays nothing.
@@ -1555,6 +1603,136 @@ mod tests {
             lifecycle_admin(&storage, &resolution(false)).is_none(),
             "a disabled capability injects no admin: rules editable but never run are the \
              surprise the ruling removes"
+        );
+    }
+
+    /// A resolution with the Object Lock capability and the run's write policy.
+    #[cfg(feature = "object-lock")]
+    fn object_lock_resolution(object_lock: bool, read_only: bool) -> Resolution {
+        Resolution {
+            pg_root: None,
+            root: PathBuf::from("/srv/data"),
+            config: Config {
+                s3: Some(config::s3::Config {
+                    capabilities: Capabilities {
+                        object_lock,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            identity: Default::default(),
+            config_text: String::new(),
+            config_path: PathBuf::from("/srv/data/.tinio/.tinio.toml"),
+            read_only,
+            state_dir: PathBuf::from("/srv/data/.tinio"),
+            state_dir_override: None,
+            config_error: None,
+        }
+    }
+
+    /// OL23's plane half: `[s3] object_lock = false` injects no admin, so the four routes answer
+    /// the `404` a stripped build's do and no stored configuration can be replaced. The same
+    /// document with the capability on injects one, and the cache handle is the one the data
+    /// plane will receive.
+    #[cfg(feature = "object-lock")]
+    #[tokio::test]
+    async fn a_disabled_capability_injects_no_object_lock_admin() {
+        let dir = TempDir::new().expect("a scratch root");
+        let storage = FsStorage::new(dir.path(), testing::fs_options()).expect("a storage");
+        let cache = object_lock_cache_for(&object_lock_resolution(true, false));
+        assert!(
+            cache.is_some(),
+            "the capability on creates the cache the data plane shares"
+        );
+        assert!(
+            object_lock_admin(&storage, cache.as_ref()).is_some(),
+            "the capability on injects the admin the plane's routes need"
+        );
+        assert!(
+            object_lock_cache_for(&object_lock_resolution(false, false)).is_none(),
+            "the capability off creates no cache"
+        );
+        assert!(
+            object_lock_admin(&storage, None).is_none(),
+            "a disabled capability injects no admin: routes editable but never enforced are \
+             the surprise the ruling removes"
+        );
+    }
+
+    /// OL24's convenience at the admin seam: enabling a bucket (with or without a rule) enables
+    /// versioning first when the bucket is unversioned, then stores the configuration.
+    #[cfg(feature = "object-lock")]
+    #[tokio::test]
+    async fn the_admin_enables_versioning_first_and_stores_the_configuration() {
+        let dir = TempDir::new().expect("a scratch root");
+        let storage = FsStorage::new(dir.path(), testing::fs_options()).expect("a storage");
+        let name = bucket::name("logs").expect("a bucket name");
+        storage
+            .create_bucket(&name, None, &Acl::default_private(None))
+            .await
+            .expect("a bucket");
+        assert_eq!(
+            storage.bucket_versioning(&name).await.expect("a read"),
+            VersionState::Unversioned,
+            "the fixture starts unversioned"
+        );
+
+        let cache = object_lock_cache_for(&object_lock_resolution(true, false));
+        let admin = object_lock_admin(&storage, cache.as_ref()).expect("an admin");
+        let config = object_lock::Config {
+            enabled: true,
+            rule: None,
+        };
+        admin
+            .put_bucket_config(&name, &config)
+            .await
+            .expect("the enable path");
+
+        assert_eq!(
+            storage.bucket_versioning(&name).await.expect("a read"),
+            VersionState::Enabled,
+            "versioning was enabled first"
+        );
+        assert_eq!(
+            storage.get_bucket_object_lock(&name).await.expect("a read"),
+            Some(config),
+            "the configuration was stored"
+        );
+    }
+
+    /// A suspended bucket cannot be lock-enabled: the admin refuses with the contract's
+    /// `InvalidBucketState`, which the plane answers `409`.
+    #[cfg(feature = "object-lock")]
+    #[tokio::test]
+    async fn a_suspended_bucket_is_refused_by_the_enable_path() {
+        let dir = TempDir::new().expect("a scratch root");
+        let storage = FsStorage::new(dir.path(), testing::fs_options()).expect("a storage");
+        let name = bucket::name("logs").expect("a bucket name");
+        storage
+            .create_bucket(&name, None, &Acl::default_private(None))
+            .await
+            .expect("a bucket");
+        storage
+            .set_bucket_versioning(&name, VersionState::Suspended)
+            .await
+            .expect("a suspended bucket");
+        let cache = object_lock_cache_for(&object_lock_resolution(true, false));
+        let admin = object_lock_admin(&storage, cache.as_ref()).expect("an admin");
+        let err = admin
+            .put_bucket_config(
+                &name,
+                &object_lock::Config {
+                    enabled: true,
+                    rule: None,
+                },
+            )
+            .await
+            .expect_err("a suspended bucket refuses the enable path");
+        assert!(
+            matches!(err, storage::Error::InvalidBucketState(_)),
+            "{err}"
         );
     }
 }

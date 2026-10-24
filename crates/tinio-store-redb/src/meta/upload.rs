@@ -36,7 +36,7 @@ use crate::{
             UploadMeta,
             upload::{PartRecord, PartRow, PartsPage, Row},
         },
-        multipart, object, storage,
+        multipart, object, object_lock, storage,
     },
     Error, RedbMetadata,
     bucket::Table as BucketTable,
@@ -45,6 +45,7 @@ use crate::{
     part_stamp::Table as PartStampTable,
     upload::Table as UploadTable,
     upload_checksum::Table as UploadChecksumTable,
+    upload_object_lock::Table as LockTable,
 };
 
 /// Decode one stored upload row plus its checksum spec.
@@ -155,6 +156,21 @@ fn put_upload_row(
     Ok(())
 }
 
+/// Write the upload's lock intent in the caller's transaction: the intent the
+/// create resolved, or the removal of a stale one an id being reused left
+/// behind (OL6).
+fn set_upload_lock(
+    txn: &mut WriteTransaction,
+    bucket: &str,
+    upload_id: &str,
+    lock: Option<&object_lock::Lock>,
+) -> Result<(), Error> {
+    match lock {
+        Some(lock) => LockTable::open(txn)?.put(bucket, upload_id, lock),
+        None => LockTable::open(txn)?.remove(bucket, upload_id),
+    }
+}
+
 #[async_trait::async_trait]
 impl UploadMeta for RedbMetadata {
     async fn create(&self, bucket: &bucket::Name, upload_id: &str, row: &Row) -> Result<(), Error> {
@@ -186,6 +202,73 @@ impl UploadMeta for RedbMetadata {
                 }
                 put_upload_row(txn, &bucket, &upload_id, &row)
             })
+            .await
+    }
+
+    /// The create and its lock intent are ONE transaction (OL6): the upload
+    /// row, its checksum spec and the intent commit together, so a mid-upload
+    /// configuration change cannot alter the intent a later complete applies.
+    async fn create_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &Row,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), Error> {
+        let bucket = bucket.to_string();
+        let upload_id = upload_id.to_string();
+        let row = row.clone();
+        let lock = lock.cloned();
+        self.driver
+            .write(move |txn| {
+                put_upload_row(txn, &bucket, &upload_id, &row)?;
+                set_upload_lock(txn, &bucket, &upload_id, lock.as_ref())
+            })
+            .await
+    }
+
+    /// The guarded twin: the bucket row is read in the transaction that writes
+    /// the upload row and its intent, so a concurrent `remove_if_empty` cannot
+    /// race it.
+    async fn create_guarded_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &Row,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), Error> {
+        let refusal = storage::no_such_bucket(bucket);
+        let bucket = bucket.to_string();
+        let upload_id = upload_id.to_string();
+        let row = row.clone();
+        let lock = lock.cloned();
+        self.driver
+            .write(move |txn| -> Result<(), Error> {
+                if BucketTable::open(txn)?.row(&bucket)?.is_none() {
+                    return Err(Error::Refused(refusal));
+                }
+                put_upload_row(txn, &bucket, &upload_id, &row)?;
+                set_upload_lock(txn, &bucket, &upload_id, lock.as_ref())
+            })
+            .await
+    }
+
+    async fn upload_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+    ) -> Result<Option<object_lock::Lock>, Error> {
+        let bucket = bucket.to_string();
+        let upload_id = upload_id.to_string();
+        self.driver
+            .read(move |txn| LockTable::open_readonly(txn)?.get(&bucket, &upload_id))
+    }
+
+    async fn clear_upload_lock(&self, bucket: &bucket::Name, upload_id: &str) -> Result<(), Error> {
+        let bucket = bucket.to_string();
+        let upload_id = upload_id.to_string();
+        self.driver
+            .write(move |txn| LockTable::open(txn)?.remove(&bucket, &upload_id))
             .await
     }
 
@@ -483,6 +566,8 @@ impl UploadMeta for RedbMetadata {
             .write(move |txn| {
                 UploadTable::open(txn)?.remove(&bucket, &upload_id)?;
                 UploadChecksumTable::open(txn)?.remove(&bucket, &upload_id)?;
+                // OL6: abort and expiry clear the lock intent with the rows.
+                LockTable::open(txn)?.remove(&bucket, &upload_id)?;
                 PartTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
                 PartChecksumTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
                 PartStampTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
@@ -514,6 +599,9 @@ impl UploadMeta for RedbMetadata {
                 uploads.remove(&bucket, &upload_id)?;
                 drop(uploads);
                 UploadChecksumTable::open(txn)?.remove(&bucket, &upload_id)?;
+                // OL6: the abort's consume clears the lock intent beside the
+                // upload row.
+                LockTable::open(txn)?.remove(&bucket, &upload_id)?;
                 PartTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
                 PartChecksumTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
                 PartStampTable::open(txn)?.drain_upload(&bucket, &upload_id)?;
@@ -528,6 +616,8 @@ impl UploadMeta for RedbMetadata {
             .write(move |txn| {
                 UploadTable::open(txn)?.drain_bucket(&bucket)?;
                 UploadChecksumTable::open(txn)?.drain_bucket(&bucket)?;
+                // OL6: the bucket teardown clears every lock intent too.
+                LockTable::open(txn)?.drain_bucket(&bucket)?;
                 PartTable::open(txn)?.drain_bucket(&bucket)?;
                 PartChecksumTable::open(txn)?.drain_bucket(&bucket)?;
                 PartStampTable::open(txn)?.drain_bucket(&bucket)?;
@@ -562,6 +652,7 @@ mod tests {
         part_checksum::Table as PartChecksumTable,
         part_stamp::Table as PartStampTable,
         upload_checksum::Table as UploadChecksumTable,
+        upload_object_lock::Table as LockTable,
     };
 
     /// The suite's upload leg against a fresh in-memory implementation —
@@ -574,6 +665,57 @@ mod tests {
     async fn upload_meta_conforms() {
         let store = RedbMetadata::in_memory().unwrap();
         assert_upload_meta_conformance(&store).await;
+    }
+
+    /// A corrupt intent fails **closed** on the contract read, and the next
+    /// create (with no intent) clears it: an unreadable intent never reads as
+    /// "no lock" and never survives a re-create (OL6).
+    #[tokio::test]
+    async fn a_corrupt_upload_intent_fails_closed_and_a_re_create_clears_it() {
+        let store = RedbMetadata::in_memory().unwrap();
+        let bucket = bucket::name("data").unwrap();
+        let key = object::key("big.bin").unwrap();
+        let row = Row::from_values(
+            "upload-1",
+            key.as_ref(),
+            SystemTime::UNIX_EPOCH,
+            object::Tags::empty(),
+            Acl::default_private(None),
+        )
+        .unwrap();
+        let (b, id) = (bucket.to_string(), "upload-1".to_owned());
+        store
+            .driver()
+            .write(move |txn| -> Result<(), Error> {
+                let mut table = LockTable::open(txn)?;
+                table
+                    .0
+                    .insert(
+                        (b.as_str(), id.as_str()),
+                        (Some("GOVERNANCE"), None, Some("OFF")),
+                    )
+                    .map_err(Error::from)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let refused: storage::Error = store
+            .upload_lock(&bucket, "upload-1")
+            .await
+            .unwrap_err()
+            .into();
+        assert!(
+            matches!(refused, storage::Error::Corrupt(_)),
+            "a partial intent is Corrupt, never \"no intent\""
+        );
+
+        // No bucket row is needed for the unguarded create; the re-create
+        // with no intent removes the corrupt row.
+        store
+            .create_with_lock(&bucket, "upload-1", &row, None)
+            .await
+            .unwrap();
+        assert_eq!(store.upload_lock(&bucket, "upload-1").await.unwrap(), None);
     }
 
     /// The suite's refusal leg pins `put_guarded` and `remove_if_empty`, not

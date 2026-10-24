@@ -6,7 +6,7 @@ description = "PostgreSQL implementation of the tinio persistence contracts: sch
 publish = false
 
 [features]
-testing = []
+testing = ["tinio-core/testing"]
 
 [dependencies]
 async-trait.workspace = true
@@ -36,6 +36,7 @@ tinio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tinio-store-pg = { path = ".", features = ["testing"] }
 tinio-util = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = [
     "macros",

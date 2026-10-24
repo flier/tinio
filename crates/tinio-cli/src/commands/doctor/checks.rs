@@ -26,6 +26,9 @@ use crate::_api::{
     state::socket_path,
     transport::{LocalForm, resolve_socket_path},
 };
+// The Object Lock scan (OL31) — the shared store's read-only inspection of its three lock
+// tables, imported for the same reason: the expression path would be four segments.
+use crate::_fs::_store_redb::lock_inspect::{self, InspectKind};
 // The crate-wide facade alias, imported rather than spelled `crate::_sandbox::...`: a
 // three-segment expression path is what this crate's `absolute_paths` lint refuses.
 use crate::_sandbox;
@@ -70,6 +73,10 @@ const FREE_SPACE: &str = "free space";
 
 /// The private state store's inspect row's name, owned here for the skip row and the store legs.
 const META_STORE: &str = "meta.redb";
+
+/// The Object Lock rows' check name (OL31), owned here so the scan's rows, the absent-store
+/// row and the tests cannot spell it differently.
+pub(crate) const OBJECT_LOCKS: &str = "object locks";
 
 /// Which pass is asking for the store — the one thing that decides whether it may be created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -552,6 +559,11 @@ pub async fn checks(run: &Run<'_>, proposals: Proposals) -> Report {
                     Severity::Ok,
                     "not present; nothing to check",
                 ));
+                report.push(Finding::check(
+                    OBJECT_LOCKS,
+                    Severity::Ok,
+                    "there is no store; nothing to check",
+                ));
             }
             Ok(Store::Opened { open, integrity }) => {
                 // `Stats` is `Copy` and the marker is a `bool`, so both are read **before**
@@ -559,6 +571,10 @@ pub async fn checks(run: &Run<'_>, proposals: Proposals) -> Report {
                 // owner, and the fragmentation leg still reads the values that open carried.
                 let stats = open.stats;
                 let compact_needed = open.compact_needed;
+                // The Object Lock rows are read before `open` moves: the scan takes a read
+                // transaction on the same database, and it is report-only, so it changes nothing
+                // the cleanup leg could observe.
+                report.extend(lock_findings(&open));
                 report.extend(cleanup_findings(run, open, options, proposals).await);
                 report.extend(store_findings(integrity, &stats, compact_needed, threshold));
             }
@@ -569,7 +585,10 @@ pub async fn checks(run: &Run<'_>, proposals: Proposals) -> Report {
                     Severity::Warn,
                     detail.clone(),
                 ));
-                report.push(Finding::check(META_STORE, Severity::Warn, detail));
+                report.push(Finding::check(META_STORE, Severity::Warn, detail.clone()));
+                // The lock leg cannot run without the store, and a leg that cannot run is never
+                // silent: the same "not inspected" warn, under the leg's own name.
+                report.push(Finding::check(OBJECT_LOCKS, Severity::Warn, detail));
             }
             Err(err) => {
                 report.push(Finding::check(
@@ -578,6 +597,11 @@ pub async fn checks(run: &Run<'_>, proposals: Proposals) -> Report {
                     err.to_string(),
                 ));
                 report.push(Finding::check(META_STORE, Severity::Error, err.to_string()));
+                report.push(Finding::check(
+                    OBJECT_LOCKS,
+                    Severity::Error,
+                    err.to_string(),
+                ));
             }
         }
 
@@ -606,13 +630,25 @@ pub async fn checks(run: &Run<'_>, proposals: Proposals) -> Report {
             Severity::Warn,
             "not inspected: this build carries no pg backend (the `pg` feature is off)",
         ));
+        // The scan is a leg like any other: a build that cannot run it says so under its own
+        // name rather than leaving a name in the report that nothing answered.
+        report.push(Finding::check(
+            OBJECT_LOCKS,
+            Severity::Warn,
+            "not inspected: this build carries no pg backend (the `pg` feature is off)",
+        ));
     }
     report
 }
 
-/// The private-state store's two rows for a pg run, each answered `ok` with the reason (ruling
+/// The private-state store's rows for a pg run, each answered `ok` with the reason (ruling
 /// R8): a pg run has no `meta.redb`, so these rows name the store's checks — the names the
 /// filesystem path's own store legs emit — and say why they did not run.
+///
+/// The Object Lock row is **not** in this set: it is a fact about the database, and the pg leg
+/// ([`pg_findings`]) scans the three tables for it, so a pg run's report carries the scan's
+/// rows at the same check name the filesystem path uses. Only the redb-file rows, which have no
+/// pg counterpart at all, are skipped here.
 fn store_skipped_findings() -> Vec<Finding> {
     [PRIVATE_STATE, META_STORE]
         .into_iter()
@@ -922,6 +958,42 @@ async fn collect_actions(
     Ok(findings)
 }
 
+/// The Object Lock rows (OL31): one finding per corrupt or orphan row, or one `ok` row when the
+/// three tables are clean. **Report-only in every mode** — `Proposals` is deliberately not a
+/// parameter, because neither the plain run nor `--dry-run` nor `--fix` repairs these rows: the
+/// fs startup repair is their only writer, and the doctor's storage construction
+/// ([`FsStorage::new_from_db`]) does not run it.
+///
+/// A corrupt bucket rule keeps its enabled bit in the row — the decoder discards only the rule —
+/// so the finding names that bit: it is the fact that still enforces, and an operator must not
+/// read "corrupt" as "the bucket stopped enforcing". A corrupt per-version row fails closed on
+/// every reader; an orphan resolves to no version row and no current slot and rides until the
+/// drain or a bucket teardown removes it.
+fn lock_findings(store: &database::Open) -> Vec<Finding> {
+    let scan = match lock_inspect::scan(&store.db) {
+        Ok(scan) => scan,
+        Err(err) => {
+            return vec![Finding::check(
+                OBJECT_LOCKS,
+                Severity::Error,
+                format!("not inspected: {err}"),
+            )];
+        }
+    };
+    let mut findings = Vec::new();
+    for (kind, detail) in scan.findings() {
+        let severity = match kind {
+            InspectKind::CorruptConfig | InspectKind::CorruptLock | InspectKind::CorruptIntent => {
+                Severity::Error
+            }
+            InspectKind::OrphanLock => Severity::Warn,
+            InspectKind::Clean => Severity::Ok,
+        };
+        findings.push(Finding::check(OBJECT_LOCKS, severity, detail));
+    }
+    findings
+}
+
 /// The store's two rows: the integrity verdict, and the fragmentation rule the module owns
 /// ([Needs compact](needs_compact)), evaluated on the `stats` the same `Open` carried — never
 /// against a byte count this leg compared itself.
@@ -1142,12 +1214,19 @@ pub(crate) async fn pg_findings(resolution: &Resolution, pg_dsn: Option<&Secret>
         // pg and nothing can be diagnosed, which is the operator's one fix. The decision is the
         // resolution's ([`Resolution::is_pg`]), the same one the check list's skip-set reads.
         if resolution.is_pg() {
-            return vec![Finding::check(
-                doctor::CONNECTION,
-                Severity::Error,
-                "a pg run names no dsn: set TINIO_PG_DSN (or `--pg-dsn`), or `[storage.pg] dsn` \
-                 in the configuration",
-            )];
+            let detail = "a pg run names no dsn: set TINIO_PG_DSN (or `--pg-dsn`), or \
+                          `[storage.pg] dsn` in the configuration";
+            // The scan is a leg like any other: a run that cannot address the
+            // database says so under the Object Lock row too, rather than
+            // dropping the name from the report.
+            return vec![
+                Finding::check(doctor::CONNECTION, Severity::Error, detail),
+                Finding::check(
+                    OBJECT_LOCKS,
+                    Severity::Warn,
+                    format!("not inspected: {detail}"),
+                ),
+            ];
         }
         return Vec::new();
     };

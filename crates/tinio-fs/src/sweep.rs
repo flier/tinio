@@ -29,6 +29,8 @@ use std::{
 };
 
 use smart_default::SmartDefault;
+#[cfg(all(test, feature = "versioning"))]
+use tinio_util::testing::metrics::test_lock;
 #[cfg(test)]
 use tinio_util::testing::{object_key, part_number};
 use tokio::{fs, sync::watch};
@@ -42,9 +44,10 @@ use crate::{
     _core::{
         blob::{BlobRef, BlockHash},
         cleanup::{retention_enabled, retires},
-        object,
+        object, object_lock,
     },
     _store_redb::{object_meta, version as rows},
+    _util::metrics::{LockOperation, record_protected_deletion},
     error::projected,
     metrics::{record_block_bytes, record_noncurrent_versions, record_sweep},
 };
@@ -271,9 +274,13 @@ type HistoryBuffer = Option<(String, Vec<BufferedRow>)>;
 /// single read transaction.
 #[cfg(feature = "versioning")]
 struct BucketPlan {
-    /// Every row's block addresses — the live set the block walk judges
-    /// against.
-    live: LiveSet,
+    /// Every surviving row's block hashes — the live set the block walk judges
+    /// against — plus, once a protected candidate is folded back, its blocks.
+    hashes: HashSet<BlockHash>,
+    /// The retiring sequences' identities: a sequence a lock protects is
+    /// re-read under the bucket mutation lock and its blocks folded back into
+    /// `hashes`.
+    candidates: HashSet<(object::Key, u64)>,
     /// The history rows the walk saw, before the expiry — the gauge's
     /// number.
     noncurrent: u64,
@@ -283,10 +290,21 @@ struct BucketPlan {
     retire: Vec<Retirement>,
 }
 
+#[cfg(feature = "versioning")]
+impl BucketPlan {
+    /// The live set the block walk judges against, taking the plan's own set
+    /// (the plan has nothing left to judge after this).
+    fn live(self) -> LiveSet {
+        LiveSet::from_set(self.hashes)
+    }
+}
+
 /// What `Sweeper::plan_retention`'s read transaction hands back.
 #[cfg(feature = "versioning")]
 struct RetentionScan {
     hashes: HashSet<BlockHash>,
+    /// The retiring sequences' identities, for the protected ones' fold-back.
+    candidates: HashSet<(object::Key, u64)>,
     noncurrent: u64,
     retire: Vec<Retirement>,
 }
@@ -317,6 +335,12 @@ fn flush_retirement(
     for (index, (seq, became, created, blob)) in history.iter().rev().enumerate() {
         if can_retire && retires(index, *became, *created, keep, expire, now) {
             seqs.push(*seq);
+            // Keep the retiring row's identity: if a lock protects the
+            // sequence, its blob is re-read under the bucket mutation lock
+            // and its blocks fold back into the live set.
+            if let Some(key) = key.as_ref() {
+                scan.candidates.insert((key.clone(), *seq));
+            }
             continue;
         }
         for block in blob.blocks() {
@@ -327,6 +351,19 @@ fn flush_retirement(
         && !seqs.is_empty()
     {
         scan.retire.push((key, seqs));
+    }
+}
+
+/// Record one retirement pass's protected skips under `operation = sweeper`.
+/// The writer gate is taken once for the whole pass (never once per skip): an
+/// exact-value test of this process-global family holds `test_lock::window()`
+/// on its thread, so a parallel test's skip cannot inflate that delta.
+#[cfg(feature = "versioning")]
+fn record_protected_deletions(reasons: Vec<object_lock::RefusalReason>) {
+    #[cfg(test)]
+    let _gate = test_lock::writer();
+    for reason in reasons {
+        record_protected_deletion(LockOperation::Sweeper, reason);
     }
 }
 
@@ -350,6 +387,7 @@ impl Sweeper {
                         temps = summary.temp_files,
                         uploads = summary.uploads,
                         expired_versions = summary.expired_versions,
+                        protected_versions = summary.protected_versions,
                         reclaimed_blocks = summary.reclaimed_blocks,
                         reclaimed_bytes = summary.reclaimed_bytes,
                         reclaimed_subtrees = summary.reclaimed_subtrees,
@@ -575,14 +613,15 @@ impl Sweeper {
         now: SystemTime,
         governed: &lifecycle::ActionOwners,
     ) -> Result<(), Error> {
-        let (plan, expired, epoch) = self.plan_bucket(bucket, now, governed).await?;
+        let (plan, expired, protected, epoch) = self.plan_bucket(bucket, now, governed).await?;
         summary.expired_versions += expired;
+        summary.protected_versions += protected;
         summary.noncurrent_versions += plan.noncurrent.saturating_sub(expired as u64);
         let candidates = self
             .storage
             .versions(bucket)
             .blobs()
-            .sweep_candidates(&plan.live, self.options.block_grace, now)
+            .sweep_candidates(&plan.live(), self.options.block_grace, now)
             .await
             .map_err(projected)?;
         // The walk measured every block's length on the way: the size gauge
@@ -613,24 +652,62 @@ impl Sweeper {
     /// retirements under the bucket's mutation lock, and the
     /// version-reference epoch read before the lock is released — the
     /// token [`Self::apply_bucket`] validates. A method of its own so the
-    /// tests can interleave a publish between the phases.
+    /// tests can interleave a publish between the phases. The two counts
+    /// [`Self::apply_retirement`] answers are returned beside the plan — the
+    /// plan itself is built exactly once, so no field is initialized to a
+    /// placeholder and overwritten.
     #[cfg(feature = "versioning")]
     async fn plan_bucket(
         &self,
         bucket: &Name,
         now: SystemTime,
         governed: &lifecycle::ActionOwners,
-    ) -> Result<(BucketPlan, usize, u64), Error> {
+    ) -> Result<(BucketPlan, usize, usize, u64), Error> {
         let guard = self.storage.lock_bucket_mutations(bucket).await;
-        let plan = self.plan_retention(bucket, now, governed).await?;
-        let expired = self.apply_retirement(bucket, &plan.retire).await?;
+        let mut plan = self.plan_retention(bucket, now, governed).await?;
+        let (expired, protected, protected_ids) =
+            self.apply_retirement(bucket, &plan.retire).await?;
+        // The planned live set excluded every candidate sequence, but a
+        // protected one survived the retirement: its row (and lock) is still
+        // there, and the blocks it names must stay live — otherwise the same
+        // pass would reclaim the bytes of a lock-protected version (OL19).
+        // The plan kept only the retired sequences' identities, so the
+        // protected ones' blobs are re-read here, still under this lock: no
+        // writer can move the bucket between the removal and this read (the
+        // pg sweeper's post-expiry read answered the same set).
+        let reread: Vec<(object::Key, u64)> = protected_ids
+            .into_iter()
+            .filter(|id| plan.candidates.remove(id))
+            .collect();
+        if !reread.is_empty() {
+            let scanned = bucket.clone();
+            let blobs = self
+                .storage
+                .handle()
+                .read(move |txn| {
+                    let table = rows::Table::open_readonly(txn)?;
+                    let mut blobs = Vec::with_capacity(reread.len());
+                    for (key, seq) in &reread {
+                        if let Some(row) = table.get(scanned.as_ref(), key.as_ref(), *seq)? {
+                            blobs.push(row.blob());
+                        }
+                    }
+                    Ok(blobs)
+                })
+                .map_err(Error::from)?;
+            for blob in blobs {
+                for block in blob.blocks() {
+                    plan.hashes.insert(block.hash);
+                }
+            }
+        }
         // Read last, still under the lock: every reference committed before
-        // this point is inside `plan.live`, and every one after it bumps the
-        // counter — during the walk, or while waiting on the lock this
+        // this point is inside the plan's hashes, and every one after it bumps
+        // the counter — during the walk, or while waiting on the lock this
         // phase is about to re-take.
         let epoch = self.storage.block_epoch();
         drop(guard);
-        Ok((plan, expired, epoch))
+        Ok((plan, expired, protected, epoch))
     }
 
     /// Phase 3 of [`Self::sweep_bucket`]: remove the walk's candidates
@@ -744,6 +821,7 @@ impl Sweeper {
                 let table = rows::Table::open_readonly(txn)?;
                 let mut scan = RetentionScan {
                     hashes: HashSet::new(),
+                    candidates: HashSet::new(),
                     noncurrent: 0,
                     retire: Vec::new(),
                 };
@@ -785,7 +863,8 @@ impl Sweeper {
             .await
             .map_err(Error::from)?;
         Ok(BucketPlan {
-            live: LiveSet::from_hashes(scan.hashes),
+            hashes: scan.hashes,
+            candidates: scan.candidates,
             noncurrent: scan.noncurrent,
             retire: scan.retire,
         })
@@ -794,18 +873,42 @@ impl Sweeper {
     /// Apply one plan's retirements — one port call per key, so a sweep
     /// over a long history pays one durable commit per key rather than one
     /// per version.
+    ///
+    /// The report is the lock-aware batched delete (OL8, OL19): a protected
+    /// sequence is a silent skip — counted for the summary, its identity
+    /// returned for the live-set fold-back, and recorded under
+    /// `operation = sweeper` — never a failure, and the answer's `removed` is
+    /// what actually went.
     #[cfg(feature = "versioning")]
-    async fn apply_retirement(&self, bucket: &Name, retire: &[Retirement]) -> Result<usize, Error> {
+    async fn apply_retirement(
+        &self,
+        bucket: &Name,
+        retire: &[Retirement],
+    ) -> Result<(usize, usize, Vec<(object::Key, u64)>), Error> {
         let versions = self.storage.versions(bucket);
         let mut expired = 0;
+        let mut protected = 0;
+        let mut protected_ids = Vec::new();
+        let mut recorded = Vec::new();
         for (key, seqs) in retire {
-            versions
-                .expire_many(bucket, key, seqs)
-                .await
-                .map_err(projected)?;
-            expired += seqs.len();
+            let report = match versions.expire_many_report(bucket, key, seqs).await {
+                Ok(report) => report,
+                Err(err) => {
+                    // The skips already observed keep their records, exactly
+                    // as the per-report write did.
+                    record_protected_deletions(recorded);
+                    return Err(projected(err));
+                }
+            };
+            for (seq, reason) in &report.protected {
+                recorded.push(*reason);
+                protected_ids.push((key.clone(), *seq));
+            }
+            protected += report.protected.len();
+            expired += usize::try_from(report.removed).unwrap_or(usize::MAX);
         }
-        Ok(expired)
+        record_protected_deletions(recorded);
+        Ok((expired, protected, protected_ids))
     }
 
     /// Reap the staged block temps of one bucket's block store older than
@@ -888,6 +991,7 @@ impl Sweeper {
 ///     temp_files: 1,
 ///     uploads: 0,
 ///     expired_versions: 2,
+///     protected_versions: 1,
 ///     reclaimed_blocks: 2,
 ///     reclaimed_bytes: 8,
 ///     reclaimed_subtrees: 0,
@@ -906,6 +1010,9 @@ pub struct Summary {
     pub uploads: usize,
     /// Noncurrent versions expired by the retention thresholds.
     pub expired_versions: usize,
+    /// Noncurrent versions the retention pass left in place because a stored
+    /// Object Lock protects them (OL19): a silent skip, never an error.
+    pub protected_versions: usize,
     /// Blocks reclaimed by the block-store pass.
     pub reclaimed_blocks: u64,
     /// Bytes reclaimed by the block-store pass.
@@ -931,6 +1038,8 @@ mod tests {
     use std::cmp::Reverse;
     use std::fs::{self, FileTimes, OpenOptions};
 
+    #[cfg(feature = "versioning")]
+    use tinio_util::testing::metrics::{protected_deletions, test_lock};
     use tokio::time;
 
     use super::*;
@@ -951,7 +1060,7 @@ mod tests {
     };
     #[cfg(feature = "versioning")]
     use crate::{
-        _core::{blob::BlockStore, collect_body, to_nanos},
+        _core::{blob::BlockStore, collect_body, object_lock, to_nanos},
         database::Error as DatabaseError,
         testutil::{wait_for_lock_waiter, wait_for_tmp},
     };
@@ -1083,6 +1192,221 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, b"two", "the surviving version's content still reads");
+    }
+
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_protected_noncurrent_version_is_skipped_and_recorded() {
+        use crate::_core::{storage::VersionOps, version::Address};
+
+        let (_root, storage, b, key) = versioned_fixture().await;
+        let versions = storage.versions(&b);
+        storage
+            .put_bucket_object_lock(
+                &b,
+                &object_lock::Config {
+                    enabled: true,
+                    rule: None,
+                },
+            )
+            .await
+            .unwrap();
+        let rows = history(&storage, &b, &key);
+        // Newest first: the last row is the one the keep budget retires.
+        let oldest = rows
+            .last()
+            .and_then(rows::Row::id)
+            .expect("a versioned write mints an id");
+        storage
+            .set_retention(
+                &b,
+                &key,
+                &Address::Id(oldest.clone()),
+                Some(&object_lock::Retention {
+                    mode: object_lock::Mode::Governance,
+                    retain_until: SystemTime::now() + Duration::from_secs(86_400),
+                }),
+                object_lock::Bypass::None,
+                SystemTime::now(),
+            )
+            .await
+            .unwrap();
+
+        // The family is process-global: serialize the delta against the other
+        // tests' writers (the mixed pass records the same label pair), and let
+        // this thread's own sweep writes through reentrantly.
+        let _window = test_lock::window();
+        let before = protected_deletions("sweeper", "governance");
+        let sweeper = Sweeper::new(
+            storage.clone(),
+            Options {
+                noncurrent_keep: 1,
+                block_grace: Duration::ZERO,
+                ..Options::default()
+            },
+        );
+        let protected_seq = rows.last().map(|row| row.seq).expect("an oldest row");
+        let summary = sweeper
+            .sweep_once(SystemTime::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.expired_versions, 0,
+            "the protected sequence is not expired"
+        );
+        assert_eq!(summary.protected_versions, 1, "the skip is counted");
+        let left = history(&storage, &b, &key);
+        assert_eq!(left.len(), 2, "the protected history row survives");
+        let protected = left
+            .iter()
+            .find(|row| row.seq == protected_seq)
+            .expect("the protected row is still there");
+        let bytes = collect_body(
+            versions
+                .blobs()
+                .open(&protected.blob(), None)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bytes, b"one",
+            "the protected version's body still reads after the sweep"
+        );
+        assert!(
+            versions
+                .blobs()
+                .blocks()
+                .contains(&BlockHash::of(b"one"))
+                .await
+                .unwrap(),
+            "the protected version's block survives the zero-grace sweep"
+        );
+        assert_eq!(
+            protected_deletions("sweeper", "governance") - before,
+            1.0,
+            "the refusal is recorded under operation=sweeper, reason=governance"
+        );
+    }
+
+    /// The same zero-grace pass over two keys: the unlocked key's oldest
+    /// noncurrent version is expired and its block reclaimed, while the
+    /// protected key's oldest version keeps its row and its bytes. The
+    /// planned live set excludes every candidate, so the pass must reconcile
+    /// it with the skip per key — a pass-wide exclusion would delete the
+    /// protected bytes (`OL19`).
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_mixed_pass_expires_one_keys_history_and_keeps_the_protected_ones() {
+        use crate::_core::{
+            storage::{ObjectOps, VersionOps},
+            version::Address,
+        };
+
+        let (_root, storage, b, key) = versioned_fixture().await;
+        let versions = storage.versions(&b);
+        storage
+            .put_bucket_object_lock(
+                &b,
+                &object_lock::Config {
+                    enabled: true,
+                    rule: None,
+                },
+            )
+            .await
+            .unwrap();
+        let rows = history(&storage, &b, &key);
+        let oldest = rows
+            .last()
+            .and_then(rows::Row::id)
+            .expect("a versioned write mints an id");
+        storage
+            .set_retention(
+                &b,
+                &key,
+                &Address::Id(oldest.clone()),
+                Some(&object_lock::Retention {
+                    mode: object_lock::Mode::Governance,
+                    retain_until: SystemTime::now() + Duration::from_secs(86_400),
+                }),
+                object_lock::Bypass::None,
+                SystemTime::now(),
+            )
+            .await
+            .unwrap();
+        // A second key with the same three-version history, left unlocked.
+        let other = object_key("other.txt");
+        let payloads: [&[u8]; 3] = [b"alpha", b"beta", b"gamma"];
+        for payload in payloads {
+            storage.put_object(&b, &other, body(payload)).await.unwrap();
+        }
+        let other_rows = history(&storage, &b, &other);
+        let other_oldest = other_rows.last().map(|row| row.seq).expect("an oldest row");
+
+        let sweeper = Sweeper::new(
+            storage.clone(),
+            Options {
+                noncurrent_keep: 1,
+                block_grace: Duration::ZERO,
+                ..Options::default()
+            },
+        );
+        let summary = sweeper
+            .sweep_once(SystemTime::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.expired_versions, 1,
+            "only the unlocked key's oldest version is expired"
+        );
+        assert_eq!(summary.protected_versions, 1, "one protected skip");
+        assert_eq!(
+            summary.reclaimed_blocks, 1,
+            "only the expired version's block is reclaimed"
+        );
+        // The protected key keeps its row and content.
+        let protected = history(&storage, &b, &key)
+            .into_iter()
+            .find(|row| row.seq == rows.last().map(|r| r.seq).unwrap())
+            .expect("the protected row survives");
+        let bytes = collect_body(
+            versions
+                .blobs()
+                .open(&protected.blob(), None)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, b"one", "the protected key's oldest body reads back");
+        // The unlocked key's oldest row is gone, its block reclaimed.
+        assert!(
+            !history(&storage, &b, &other)
+                .iter()
+                .any(|row| row.seq == other_oldest),
+            "the unlocked key's oldest version is expired"
+        );
+        assert!(
+            versions
+                .blobs()
+                .blocks()
+                .contains(&BlockHash::of(b"one"))
+                .await
+                .unwrap(),
+            "the protected key's block is kept"
+        );
+        assert!(
+            !versions
+                .blobs()
+                .blocks()
+                .contains(&BlockHash::of(b"alpha"))
+                .await
+                .unwrap(),
+            "the expired key's block is reclaimed"
+        );
     }
 
     #[cfg(feature = "versioning")]
@@ -1399,6 +1723,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1524,6 +1849,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1733,7 +2059,10 @@ mod tests {
     #[cfg(feature = "versioning")]
     #[tokio::test]
     async fn a_reference_committed_after_the_block_walk_keeps_its_block() {
-        use crate::_core::storage::{ObjectOps, VersionOps};
+        use crate::_core::{
+            object_lock::Bypass,
+            storage::{ObjectOps, VersionOps},
+        };
 
         let (_root, storage, b, key) = versioned_single_fixture().await;
         let sweeper = Sweeper::new(storage.clone(), Options::default());
@@ -1751,20 +2080,20 @@ mod tests {
             .expect("an enabled write mints a version id");
         storage.put_object(&b, &key, body(b"second")).await.unwrap();
         storage
-            .delete_object_version(&b, &key, Some(&previous))
+            .delete_object_version(&b, &key, Some(&previous), Bypass::None)
             .await
             .unwrap();
 
         // Phases 1 and 2 of a pass: the plan (with its epoch snapshot), then
         // the walk — which judges the block dead and past the grace.
-        let (plan, _, epoch) = sweeper
+        let (plan, _, _, epoch) = sweeper
             .plan_bucket(&b, now, &lifecycle::ActionOwners::default())
             .await
             .unwrap();
         let candidates = storage
             .versions(&b)
             .blobs()
-            .sweep_candidates(&plan.live, sweeper.options.block_grace, now)
+            .sweep_candidates(&plan.live(), sweeper.options.block_grace, now)
             .await
             .unwrap();
         assert!(
@@ -1850,6 +2179,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1902,6 +2232,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();

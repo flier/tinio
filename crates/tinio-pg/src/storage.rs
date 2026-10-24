@@ -2,9 +2,10 @@
 //!
 //! The operation bodies are the engine's (`tinio_ops`); this module holds what only this
 //! backend can do — the construction path with the access mode and the ownership lock, the
-//! receivers over one store, the error projection, and the three bodies the engine
-//! deliberately leaves to a backend (the multipart completion, the bucket teardown and the
-//! version facts a plane-free read cannot fill).
+//! receivers over one store, the error projection, and the two bodies the engine
+//! deliberately leaves to a backend (the multipart completion and the version facts a
+//! plane-free read cannot fill). The bucket group — the `BucketOps` impl, the lifecycle-rule
+//! read and the teardown — is [`crate::bucket`]; the object and multipart forwards stay here.
 //!
 //! # The two policies
 //!
@@ -24,23 +25,21 @@ use secrecy::ExposeSecret;
 use tinio_core::storage::VersionOps;
 use tinio_core::{
     acl::{Acl, AclGrants, OwnerId},
-    bucket::{self, Bucket},
-    checksum,
+    bucket, checksum,
     content::ContentKey,
-    cors, lifecycle,
-    meta::{BucketMeta, UploadMeta, VersionMeta, bucket::Row as MetaBucket},
+    meta::{BucketMeta, UploadMeta, VersionMeta},
     multipart::{self, CompletedPart, ObjectPart, PartNumber},
-    object,
+    object, object_lock,
     storage::{
-        self, BodyStream, BucketOps, BucketsListing, ByteRange, GetObjectResult, ListBucketsParams,
-        ListObjectsParams, ListPartsParams, ListUploadsParams, MultipartOps, ObjectListing,
-        ObjectOps, PartsListing, Storage, TagWriteResult, UploadsListing,
+        self, BodyStream, BucketOps, ByteRange, GetObjectResult, ListObjectsParams,
+        ListPartsParams, ListUploadsParams, MultipartOps, ObjectListing, ObjectOps, PartsListing,
+        Storage, TagWriteResult, UploadsListing,
     },
     version,
 };
 use tinio_ops::{
-    BucketOps as EngineBucketOps, BucketRow, MetadataFailure, MultipartOps as EngineMultipartOps,
-    ObjectOps as EngineObjectOps, StagedBody,
+    BucketRow, MetadataFailure, MultipartOps as EngineMultipartOps, ObjectOps as EngineObjectOps,
+    StagedBody,
 };
 
 #[cfg(feature = "versioning")]
@@ -247,25 +246,12 @@ impl PgStorage {
         &self.store
     }
 
-    /// The bucket-group receiver over this backend's handles.
-    ///
-    /// The two policies are pg's, declared and never inferred: a metadata-row write that fails
-    /// after the content is published is the **caller's** to compensate
-    /// ([`MetadataFailure::Fail`] — the row is the object), and the bucket's row **is** the
-    /// bucket ([`BucketRow::Guaranteed`]).
-    fn buckets(&self) -> EngineBucketOps<PgStore, PgStore, PgHooks> {
-        EngineBucketOps {
-            meta: Arc::clone(&self.store),
-            content: Arc::clone(&self.store),
-            hooks: self.hooks(),
-            metadata_failure: MetadataFailure::Fail,
-            bucket_row: BucketRow::Guaranteed,
-        }
-    }
-
     /// The engine's [`Hooks`](tinio_ops::Hooks) seam over this backend's store: the empty
     /// bucket-delete action and the store's per-upload part lock.
-    fn hooks(&self) -> PgHooks {
+    ///
+    /// `pub(crate)` because the bucket receiver ([`crate::bucket`]) is the other group that
+    /// carries it; the object and multipart receivers below are its callers in this module.
+    pub(crate) fn hooks(&self) -> PgHooks {
         PgHooks::new(Arc::clone(&self.store))
     }
 
@@ -304,6 +290,17 @@ impl PgStorage {
         Ok(state.records_versions())
     }
 
+    /// The namespace probe every per-object read opens with, matching fs and mem.
+    ///
+    /// The content plane's `stat` answers "no key" for an absent namespace (it swallows the
+    /// missing bucket so a bucket-scoped probe stays total), so without this probe a key in a
+    /// bucket with no row would be reported as `NoSuchKey` instead of the contract's
+    /// `NoSuchBucket`. `head_bucket` is the one-column existence read, and pg's
+    /// [`BucketRow::Guaranteed`] policy makes an absent row that refusal.
+    pub(crate) async fn ensure_bucket(&self, bucket: &bucket::Name) -> Result<(), Error> {
+        self.head_bucket(bucket).await.map(|_| ())
+    }
+
     /// The key rules an object operation opens with, before any plane is touched (FR-006/FR-020).
     ///
     /// The reserved segment is refused **at any depth**, and the class is the operation's: a
@@ -326,209 +323,10 @@ impl PgStorage {
         }
         Ok(())
     }
-
-    /// The bucket teardown: one transaction that refuses a non-empty bucket and
-    /// otherwise removes the whole namespace together (R3).
-    ///
-    /// The engine's `delete_bucket` runs its three probes (live content, upload
-    /// rows and object rows — a delete marker is one) and then the seam, which
-    /// is empty for pg ([`PgHooks`](crate::hooks)). Those probes refuse a
-    /// marker-only bucket up front, but they run before this teardown's
-    /// transaction and outside its lock, so the store re-probes the same rows
-    /// inside it: an object row, an upload or a live generation refuses the
-    /// delete before any version row is removed, and a refusal rolls everything
-    /// back. Blocks stay for the sweep, because liveness is derived from the
-    /// version rows.
-    ///
-    /// # Errors
-    ///
-    /// `NoSuchBucket` for a bucket with no row, `NotEmpty` when an object row,
-    /// an upload or a live generation still names it.
-    async fn teardown_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
-        // One transaction. A marker-only bucket is not empty, and a refusal
-        // must not already have committed the version deletes.
-        self.store
-            .teardown_bucket(name)
-            .await
-            .map_err(Error::from)?;
-        Ok(())
-    }
 }
 
 impl Storage for PgStorage {
     type Error = Error;
-}
-
-#[async_trait]
-impl storage::LifecycleRules for PgStorage {
-    async fn lifecycles(&self) -> Result<Vec<(bucket::Name, lifecycle::Config)>, storage::Error> {
-        BucketMeta::lifecycles(self.store())
-            .await
-            .map_err(Into::into)
-    }
-}
-
-#[async_trait]
-impl BucketOps for PgStorage {
-    async fn create_bucket(
-        &self,
-        name: &bucket::Name,
-        owner: Option<&OwnerId>,
-        acl: &Acl,
-    ) -> Result<(), Error> {
-        self.writable(Subject::Bucket(name))?;
-        // The row is the namespace [`ObjectContent::stage`] locks. The engine
-        // records it after the content plane's create, and that create inserts
-        // the same row, so the engine's following insert would answer
-        // `AlreadyExists` on the first create. Write the caller's row here.
-        let mut row = MetaBucket::at(SystemTime::now());
-        row.owner = owner.cloned();
-        row.acl = Acl {
-            owner: None,
-            grants: acl.grants.clone(),
-        };
-        BucketMeta::create(&*self.store, name, &row)
-            .await
-            .map_err(Error::from)?;
-        Ok(())
-    }
-
-    async fn delete_bucket(&self, name: &bucket::Name) -> Result<(), Error> {
-        self.writable(Subject::Bucket(name))?;
-        // The engine's three probes (live content, upload rows and object rows —
-        // a delete marker is one) run first and write nothing. The store's own
-        // statement then refuses a delete marker — an object row with no live
-        // bytes — and deletes the version rows only in the same statement that
-        // removes the bucket.
-        self.buckets()
-            .delete_bucket(name)
-            .await
-            .map_err(Error::from)?;
-        self.teardown_bucket(name).await
-    }
-
-    async fn head_bucket(&self, name: &bucket::Name) -> Result<Bucket, Error> {
-        self.buckets().head_bucket(name).await.map_err(Error::from)
-    }
-
-    async fn list_buckets(
-        &self,
-        params: ListBucketsParams,
-        owner: Option<&OwnerId>,
-        lazy_default: Option<&OwnerId>,
-    ) -> Result<BucketsListing, Error> {
-        self.buckets()
-            .list_buckets(params, owner, lazy_default)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn get_bucket_tags(&self, name: &bucket::Name) -> Result<object::Tags, Error> {
-        self.buckets()
-            .get_bucket_tags(name)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn put_bucket_tags(&self, name: &bucket::Name, tags: &object::Tags) -> Result<(), Error> {
-        self.writable(Subject::Bucket(name))?;
-        self.buckets()
-            .put_bucket_tags(name, tags)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn delete_bucket_tags(&self, name: &bucket::Name) -> Result<(), Error> {
-        self.writable(Subject::Bucket(name))?;
-        self.buckets()
-            .delete_bucket_tags(name)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn get_bucket_cors(&self, name: &bucket::Name) -> Result<Option<cors::Config>, Error> {
-        self.buckets()
-            .get_bucket_cors(name)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn put_bucket_cors(
-        &self,
-        name: &bucket::Name,
-        config: &cors::Config,
-    ) -> Result<(), Error> {
-        self.writable(Subject::Bucket(name))?;
-        self.buckets()
-            .put_bucket_cors(name, config)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn delete_bucket_cors(&self, name: &bucket::Name) -> Result<(), Error> {
-        self.writable(Subject::Bucket(name))?;
-        self.buckets()
-            .delete_bucket_cors(name)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn get_bucket_lifecycle(
-        &self,
-        name: &bucket::Name,
-    ) -> Result<Option<lifecycle::Config>, Error> {
-        self.buckets()
-            .get_bucket_lifecycle(name)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn put_bucket_lifecycle(
-        &self,
-        name: &bucket::Name,
-        config: &lifecycle::Config,
-    ) -> Result<(), Error> {
-        self.writable(Subject::Bucket(name))?;
-        self.buckets()
-            .put_bucket_lifecycle(name, config)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn merge_bucket_lifecycle(
-        &self,
-        name: &bucket::Name,
-        rules: &[lifecycle::Rule],
-    ) -> Result<lifecycle::Merged, Error> {
-        self.writable(Subject::Bucket(name))?;
-        self.buckets()
-            .merge_bucket_lifecycle(name, rules)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn delete_bucket_lifecycle(&self, name: &bucket::Name) -> Result<(), Error> {
-        self.writable(Subject::Bucket(name))?;
-        self.buckets()
-            .delete_bucket_lifecycle(name)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn get_bucket_acl(&self, name: &bucket::Name) -> Result<Acl, Error> {
-        self.buckets()
-            .get_bucket_acl(name)
-            .await
-            .map_err(Error::from)
-    }
-
-    async fn put_bucket_acl(&self, name: &bucket::Name, grants: &AclGrants) -> Result<(), Error> {
-        self.writable(Subject::Bucket(name))?;
-        self.buckets()
-            .put_bucket_acl(name, grants)
-            .await
-            .map_err(Error::from)
-    }
 }
 
 #[async_trait]
@@ -561,10 +359,33 @@ impl ObjectOps for PgStorage {
         tags: object::Tags,
         owner: Option<&OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, Error> {
         self.writable(Subject::Key(key))?;
         Self::refuse_reserved(key)?;
-        self.commit_put(bucket, key, staged, tags, owner, acl).await
+        self.commit_put(bucket, key, staged, tags, owner, acl, lock)
+            .await
+    }
+
+    /// The effective Object Lock resolved once from the stored bucket
+    /// configuration (OL7, OL16); the answer drives both the checksum
+    /// decision and the write.
+    async fn resolve_write_lock(
+        &self,
+        bucket: &bucket::Name,
+        explicit: Option<&object_lock::Retention>,
+        legal_hold: object_lock::LegalHold,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, Error> {
+        let config = BucketMeta::object_lock(&*self.store, bucket)
+            .await
+            .map_err(Error::from)?;
+        Ok(storage::resolve_write_lock(
+            config.as_ref(),
+            explicit,
+            legal_hold,
+            now,
+        ))
     }
 
     async fn get_object(
@@ -573,6 +394,7 @@ impl ObjectOps for PgStorage {
         key: &object::Key,
         range: Option<ByteRange>,
     ) -> Result<GetObjectResult, Error> {
+        self.ensure_bucket(bucket).await?;
         Self::refuse_non_object(key)?;
         let mut result = self
             .objects()
@@ -603,13 +425,14 @@ impl ObjectOps for PgStorage {
         owner: Option<&OwnerId>,
         acl: &Acl,
         checksum: Option<checksum::Recorded>,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, Error> {
         self.writable(Subject::Key(dst_key))?;
         let get = self.get_object(src_bucket, src_key, None).await?;
         let staged = self
             .stage_body(dst_bucket, dst_key, get.body, None, checksum)
             .await?;
-        self.commit_object(dst_bucket, dst_key, staged, tags, owner, acl)
+        self.commit_object(dst_bucket, dst_key, staged, tags, owner, acl, lock)
             .await
     }
 
@@ -661,6 +484,7 @@ impl ObjectOps for PgStorage {
         bucket: &bucket::Name,
         key: &object::Key,
     ) -> Result<object::Info, Error> {
+        self.ensure_bucket(bucket).await?;
         Self::refuse_non_object(key)?;
         let mut info = self
             .objects()
@@ -698,6 +522,7 @@ impl ObjectOps for PgStorage {
         bucket: &bucket::Name,
         key: &object::Key,
     ) -> Result<object::Tags, Error> {
+        self.ensure_bucket(bucket).await?;
         self.objects()
             .get_object_tags(bucket, key)
             .await
@@ -736,6 +561,7 @@ impl ObjectOps for PgStorage {
     }
 
     async fn get_object_acl(&self, bucket: &bucket::Name, key: &object::Key) -> Result<Acl, Error> {
+        self.ensure_bucket(bucket).await?;
         self.objects()
             .get_object_acl(bucket, key)
             .await
@@ -798,6 +624,7 @@ impl MultipartOps for PgStorage {
         tags: object::Tags,
         owner: Option<&OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<multipart::MultipartUpload, Error> {
         self.writable(Subject::Key(key))?;
         // The reserved segment refuses a multipart create too: the upload is the write path's
@@ -805,7 +632,7 @@ impl MultipartOps for PgStorage {
         // (FR-020).
         Self::refuse_reserved(key)?;
         self.parts()
-            .create_multipart_upload(bucket, key, checksum, tags, owner, acl)
+            .create_multipart_upload(bucket, key, checksum, tags, owner, acl, lock)
             .await
             .map_err(Error::from)
     }

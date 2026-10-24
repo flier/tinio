@@ -118,6 +118,7 @@
 //!         object::Tags::empty(),
 //!         None,
 //!         &Acl::default_private(None),
+//!         None,
 //!     )
 //!     .await
 //!     .unwrap();
@@ -168,7 +169,7 @@ use crate::{
             object::{Identity, Preserved, Row},
         },
         multipart::ObjectPart,
-        object,
+        object, object_lock,
         storage::{self, BodyStream, ByteRange, Error, GetObjectResult, TagWriteResult},
         version,
     },
@@ -750,6 +751,10 @@ where
         skip_all,
         fields(bucket = %bucket, key = %key)
     )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the commit's field set — bucket, key, staged body, tags, owner, ACL and the effective lock — is the request's own, forwarded once into the row write"
+    )]
     pub async fn commit_object(
         &self,
         bucket: &bucket::Name,
@@ -758,7 +763,15 @@ where
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, Error> {
+        // A bucket that records no versions has no version identity to lock:
+        // the resolver answers `Some` only for a bucket whose configuration is
+        // enabled, and an enabled configuration requires versioning `Enabled`
+        // (OL13), so this body never receives one in a reachable state. The
+        // parameter rides the seam unchanged so the versioned body
+        // (`put_object_versioned`) can store it.
+        let _ = lock;
         self.publish_and_record(bucket, key, staged, tags, owner, acl, false)
             .await
     }

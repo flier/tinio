@@ -1,4 +1,8 @@
-WITH gone_parts AS (
+WITH gone_locks AS (
+    DELETE FROM upload_object_lock WHERE bucket = $1
+),
+
+gone_parts AS (
     DELETE FROM parts WHERE bucket = $1
 ),
 

@@ -68,9 +68,23 @@ pub fn document() -> OpenApiSchema {
     ))]
     struct LifecycleApi;
 
+    // The two Object Lock route pairs exist only in a build that carries them (OL23), so the
+    // document lists them only there — the same merge, for the same reason.
+    #[cfg(feature = "object-lock")]
+    #[derive(OpenApi)]
+    #[openapi(paths(
+        crate::object_lock::object_lock_bucket_get_doc,
+        crate::object_lock::object_lock_bucket_put_doc,
+        crate::object_lock::object_lock_object_get_doc,
+        crate::object_lock::object_lock_object_put_doc
+    ))]
+    struct ObjectLockApi;
+
     let document = Api::openapi();
     #[cfg(feature = "lifecycle")]
     let document = document.merge_from(LifecycleApi::openapi());
+    #[cfg(feature = "object-lock")]
+    let document = document.merge_from(ObjectLockApi::openapi());
     document
 }
 
@@ -160,6 +174,26 @@ mod tests {
             .expect("the three routes are listed");
         for method in ["get", "put", "delete"] {
             assert!(lifecycle.get(method).is_some(), "{method} is listed");
+        }
+    }
+
+    /// OL23 mirrors the four Object Lock operations in the document, and only a build carrying
+    /// the routes lists them — the same gate as [`super::document`]'s merge.
+    #[cfg(feature = "object-lock")]
+    #[test]
+    fn the_openapi_document_lists_the_four_object_lock_operations() {
+        let schema = serde_json::to_value(super::document()).expect("the document is JSON");
+        for (path, methods) in [
+            ("/buckets/{bucket}/object-lock", ["get", "put"].as_slice()),
+            (
+                "/buckets/{bucket}/object-lock/objects",
+                ["get", "put"].as_slice(),
+            ),
+        ] {
+            let listed = schema["paths"].get(path).expect("the route is listed");
+            for method in methods {
+                assert!(listed.get(*method).is_some(), "{path} {method} is listed");
+            }
         }
     }
 }

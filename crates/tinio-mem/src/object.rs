@@ -30,7 +30,7 @@
 //! history bytes share one all-or-nothing admission decision (see
 //! `write_object`).
 
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -42,11 +42,12 @@ use futures::stream;
 #[cfg(feature = "versioning")]
 use crate::_core::{ETag, content::ContentKey, from_nanos, now_nanos};
 #[cfg(feature = "versioning")]
-use crate::_store_redb::{object_meta, object_part, objects};
+use crate::_store_redb::{object_meta, object_part, objects, version_object_lock};
 #[cfg(feature = "versioning")]
-use crate::version::check_bucket_write;
-#[cfg(feature = "versioning")]
-use crate::version::{insert_marker, prepare_publish, record_current_as_version};
+use crate::version::{
+    check_bucket_write, insert_marker, locked_wire_reason, prepare_publish,
+    record_current_as_version,
+};
 use crate::{
     _core::{
         BodyStream, ByteRange, GetObjectResult, ListObjectsParams, ObjectListing, ObjectOps,
@@ -54,10 +55,10 @@ use crate::{
         acl::{Acl, AclGrants},
         bucket::Name,
         checksum, collect_body,
-        meta::{ObjectMeta, VersionMeta},
+        meta::{BucketMeta, ObjectMeta, VersionMeta},
         multipart::ObjectPart,
-        object,
-        storage::VersionOps,
+        object, object_lock,
+        storage::{self, VersionOps},
         version,
     },
     _ops::{BucketRow, MetadataFailure, ObjectOps as EngineObjectOps},
@@ -187,6 +188,7 @@ impl MemoryStorage {
         mut checksum: Option<checksum::Recorded>,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, Error> {
         // Defensive: the staged-body path already rejects reserved keys —
         // a direct stage/commit must not create an invisible, undeletable
@@ -213,10 +215,12 @@ impl MemoryStorage {
         #[cfg(feature = "versioning")]
         if self.bucket_records_versions(bucket).await? {
             return self
-                .write_object_recording_versions(bucket, key, data, tags, checksum, owner, acl)
+                .write_object_recording_versions(
+                    bucket, key, data, tags, checksum, owner, acl, lock,
+                )
                 .await;
         }
-        self.write_object_plain(bucket, key, data, tags, checksum, owner, acl)
+        self.write_object_plain(bucket, key, data, tags, checksum, owner, acl, lock)
             .await
     }
 
@@ -237,7 +241,7 @@ impl MemoryStorage {
     /// compensation itself.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the plain write path's field set — bucket, key, body, tags, checksum, owner and ACL — kept positional because it is forwarded to the contract's `commit_object`"
+        reason = "the plain write path's field set — bucket, key, body, tags, checksum, owner, ACL and the effective lock — kept positional because it is forwarded to the contract's `commit_object`"
     )]
     async fn write_object_plain(
         &self,
@@ -248,6 +252,7 @@ impl MemoryStorage {
         checksum: Option<checksum::Recorded>,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, Error> {
         // The engine consumes its own staged value, and the one mem's
         // `stage_body` built cannot be handed to it (its bytes are
@@ -263,7 +268,7 @@ impl MemoryStorage {
             .await?;
         let info = self
             .object_ops()
-            .commit_object(bucket, key, staged, tags, owner, acl)
+            .commit_object(bucket, key, staged, tags, owner, acl, lock)
             .await
             .map_err(Error::from)?;
         // The bucket can begin recording versions between this write's dispatch
@@ -322,7 +327,7 @@ impl MemoryStorage {
     #[cfg(feature = "versioning")]
     #[expect(
         clippy::too_many_arguments,
-        reason = "the versioned write's field set — bucket, key, body, tags, checksum, owner and ACL — kept positional because the one raw transaction needs them all at once"
+        reason = "the versioned write's field set — bucket, key, body, tags, checksum, owner, ACL and the effective lock — kept positional because the one raw transaction needs them all at once"
     )]
     async fn write_object_recording_versions(
         &self,
@@ -333,6 +338,7 @@ impl MemoryStorage {
         checksum: Option<checksum::Recorded>,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, Error> {
         let marker = key.is_folder_marker();
         let size = data.len() as u64;
@@ -359,6 +365,10 @@ impl MemoryStorage {
                             .map(|guard| guard.value().len() as u64)
                             .unwrap_or(0)
                     };
+                    // The slot this write replaces, read before the state
+                    // machine moves it: OL7's protected in-place rule applies
+                    // when the incoming identity is the null version.
+                    let recorded = object_meta::Table::open(txn)?.get(b, k)?;
                     let delta = data.len() as i64 - old_len as i64;
                     let now = now_nanos();
                     // The current version's identity is the version state
@@ -370,6 +380,28 @@ impl MemoryStorage {
                     // metered).
                     let (version_id, version_seq, history_bytes, records_versions) =
                         prepare_publish(txn, bucket, key, now)?;
+                    // OL7: a null in-place replacement of an identity that
+                    // already owns an active lock is a protected overwrite.
+                    // The refusal returns before anything is committed, so
+                    // the transaction's writes (the supersede included) are
+                    // rolled back together.
+                    if version_id.is_none()
+                        && let Some(slot) = recorded.as_ref().filter(|slot| !slot.is_delete_marker)
+                    {
+                        let wire = version::wire_of(slot.version_id.as_ref());
+                        if let Some(reason) =
+                            locked_wire_reason(txn, b, k, &wire, object_lock::Bypass::None)?
+                        {
+                            tracing::warn!(
+                                bucket = %b,
+                                key = %k,
+                                version = %wire,
+                                reason = %reason,
+                                "refusing a protected in-place overwrite"
+                            );
+                            return Err(storage::locked(reason).into());
+                        }
+                    }
                     {
                         let mut objects = objects::Table::open(txn)?;
                         objects.put(b, k, &data)?;
@@ -390,6 +422,15 @@ impl MemoryStorage {
                     {
                         let mut table = object_meta::Table::open(txn)?;
                         table.put(b, k, &stored)?;
+                    }
+                    // OL7: the lock commits with the version's row in this
+                    // same transaction. A lock that carries neither a
+                    // retention nor a hold is not stored; an ordinary
+                    // overwrite mints a new identity and leaves the outgoing
+                    // version's lock row intact.
+                    if let Some(lock) = lock.filter(|lock| lock.carries_fact()) {
+                        let wire = version::wire_of(stored.version_id.as_ref());
+                        version_object_lock::Table::open(txn)?.put(b, k, &wire, lock)?;
                     }
                     {
                         let mut parts = object_part::Table::open(txn)?;
@@ -459,7 +500,9 @@ impl MemoryStorage {
                     };
                     // Before the rows below are removed: a versioned bucket
                     // moves the outgoing version into history and makes a
-                    // delete marker current in this same transaction. A folder
+                    // delete marker current in this same transaction.
+                    // `insert_marker` refuses a locked object the plan does
+                    // not supersede, so that removal never commits. A folder
                     // marker never reaches it — folder markers stay outside the
                     // version model, so their delete creates no marker.
                     let (marker, history_bytes) = if key.is_folder_marker() {
@@ -582,9 +625,40 @@ impl ObjectOps for MemoryStorage {
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, Error> {
-        self.write_object(bucket, key, staged.data, tags, staged.checksum, owner, acl)
+        self.write_object(
+            bucket,
+            key,
+            staged.data,
+            tags,
+            staged.checksum,
+            owner,
+            acl,
+            lock,
+        )
+        .await
+    }
+
+    /// The effective Object Lock resolved once, from mem's stored bucket
+    /// configuration (OL7, OL16). mem's buckets are rows, so a missing bucket
+    /// row is the contract's `NoSuchBucket` rather than "no configuration".
+    async fn resolve_write_lock(
+        &self,
+        bucket: &Name,
+        explicit: Option<&object_lock::Retention>,
+        legal_hold: object_lock::LegalHold,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, Error> {
+        let config = <RedbMetadata as BucketMeta>::object_lock(&*self.metadata, bucket)
             .await
+            .map_err(Error::from)?;
+        Ok(storage::resolve_write_lock(
+            config.as_ref(),
+            explicit,
+            legal_hold,
+            now,
+        ))
     }
 
     async fn copy_object(
@@ -597,6 +671,7 @@ impl ObjectOps for MemoryStorage {
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
         checksum: Option<checksum::Recorded>,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<object::Info, Error> {
         // The copy is the read-then-write primitive, not the engine's
         // same-bucket `ObjectContent::copy` fast path: the destination's bytes
@@ -614,7 +689,7 @@ impl ObjectOps for MemoryStorage {
         // key held.
         let get = self.get_object(src_bucket, src_key, None).await?;
         let data = collect_body(get.body).await?;
-        self.write_object(dst_bucket, dst_key, data, tags, checksum, owner, acl)
+        self.write_object(dst_bucket, dst_key, data, tags, checksum, owner, acl, lock)
             .await
     }
 
@@ -800,9 +875,7 @@ impl ObjectOps for MemoryStorage {
         // neither names an identity. The engine's lenient `delete_object_tags`
         // body deliberately discards that answer (it names no identity on
         // either row policy), so the write stays here and the pair follows it.
-        if !self
-            .metadata()
-            .set_tags(bucket, key, &object::Tags::empty())
+        if !ObjectMeta::set_tags(&**self.metadata(), bucket, key, &object::Tags::empty())
             .await
             .map_err(Error::from)?
         {
@@ -1402,6 +1475,7 @@ mod tests {
                 tags.clone(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1422,6 +1496,7 @@ mod tests {
                 copy_tags.clone(),
                 None,
                 &Acl::default_private(None),
+                None,
                 None,
             )
             .await
@@ -1455,6 +1530,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1499,6 +1575,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1535,6 +1612,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
                 None,
             )
             .await
@@ -1694,6 +1772,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap_err();
@@ -1753,6 +1832,7 @@ mod tests {
                     None,
                     None,
                     &Acl::default_private(None),
+                    None,
                 )
                 .await
                 .unwrap();

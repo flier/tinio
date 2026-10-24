@@ -8,7 +8,7 @@
 |---|---|
 | `tests/cucumber.rs` | The single cucumber binary (`harness = false`): installs the default tag filter and `fail_on_skipped()`. |
 | `tests/features/` | The `.feature` files, one per domain — the spec's executable form; `interop/` holds the external-client journeys. |
-| `tests/steps/` | The `World`, the `#[before]`/`#[after]` hooks, the domain step modules (`acl`, `buckets`, `cli`, `clients`, `common`, `conditions`, `doctor`, `errors`, `lifecycle`, `listing`, `multipart`, `objects`, `reserved_paths`, `select`, `versioning`) and `tag_filter.rs`, which composes the default filter. |
+| `tests/steps/` | The `World`, the `#[before]`/`#[after]` hooks, the domain step modules (`acl`, `buckets`, `cli`, `clients`, `common`, `conditions`, `doctor`, `errors`, `lifecycle`, `listing`, `multipart`, `object_lock`, `objects`, `reserved_paths`, `select`, `versioning`) and `tag_filter.rs`, which composes the default filter. |
 | `tests/traceability.rs` | The spec↔tag cross-check — a plain-harness target with no cucumber involvement. |
 | `scripts/wsl-interop.sh` | One-command `@interop` run inside WSL2 (Linux-side aws-cli/rclone). |
 
@@ -41,6 +41,8 @@ The vocabulary the table leans on — scenario-level vs feature-level tags, the 
 | `@acl-off` | `caps.acl = false` on the legacy no-identity plane — the four ACL ops answer `NotImplemented`; `config_from_tags` reads it, and it is not `@acl`'s branch. |
 | `@versioning-off` | `caps.versioning = false` — the three `?versioning` ops answer `NotImplemented`, and a version-addressed request is refused outright rather than answered from the current version (the fail-open guard, FR-039). |
 | `@cold-listing` | fs scanner interval 100 ms (cold-listing scenarios). |
+| `@object-lock` | The Object Lock corpus (`object_lock.feature`, where it is also the feature-level tag): the six `?object-lock`/`?retention`/`?legal-hold` operations, the write headers and the GET/HEAD echo (FR-043). The corpus runs only in a `--features object-lock` build; the default filter excludes it otherwise. |
+| `@object-lock-off` | `caps.object_lock = false` — the six operations answer `NotImplemented` while the stored locks, the default retention and delete protection stay in force (OL2/OL20). |
 | `@parquet` | Parquet input; needs `--features parquet` (the reader lives behind `tinio-server/select-parquet`) — excluded by the default filter when the feature is off. |
 | `@max-buckets-3` | `caps.max_buckets = 3` (ListBuckets pagination scenarios). |
 | `@cli` | The scenarios that spawn the real `tinio` binary and observe it from outside (`cli_lifecycle.feature`, `doctor.feature`, plus `confinement.feature`'s sandbox channels): the hook spawns nothing for them — no in-process server, no wire client. `{root}`/`{state}` in a step's command line expand to the scenario's scratch root and relocated state dir. |
@@ -49,7 +51,7 @@ The vocabulary the table leans on — scenario-level vs feature-level tags, the 
 
 ## The default filter
 
-With no `--tags`, the runner composes `CUCUMBER_FILTER_TAGS` (`tests/steps/tag_filter.rs`) from five independent axes: `@parquet` is excluded unless the binary was built `--features parquet`; a scenario carrying platform tags is excluded where the host's target matches none of them; the `@external` umbrella is excluded unless `TINIO_E2E_EXTERNAL` is set (any value, `0` included — the axis tests presence, not the value); `@confinement` follows `TINIO_E2E_CONFINEMENT`; and `@pg` is always excluded, whatever the host — the `@pg` pass is its own explicit-`--tags` run against a live database (PG17).
+With no `--tags`, the runner composes `CUCUMBER_FILTER_TAGS` (`tests/steps/tag_filter.rs`) from six independent axes: `@parquet` is excluded unless the binary was built `--features parquet`; `@object-lock` is excluded unless the binary was built `--features object-lock`; a scenario carrying platform tags is excluded where the host's target matches none of them; the `@external` umbrella is excluded unless `TINIO_E2E_EXTERNAL` is set (any value, `0` included — the axis tests presence, not the value); `@confinement` follows `TINIO_E2E_CONFINEMENT`; and `@pg` is always excluded, whatever the host — the `@pg` pass is its own explicit-`--tags` run against a live database (PG17).
 
 **An explicit `--tags` replaces the default filter rather than adding to it**, so a tagged run re-states every exclusion it wants. The platform axis needs care in a hand-written list: the runner's clause keeps a scenario carrying *any* matching platform tag, which a list of `not <tag>` clauses cannot express — so the backend-neutral lists below exclude every platform tag instead.
 

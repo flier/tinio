@@ -24,6 +24,8 @@ use smart_default::SmartDefault;
 
 #[cfg(feature = "lifecycle")]
 use crate::commands::lifecycle;
+#[cfg(feature = "object-lock")]
+use crate::commands::{legalhold, object_lock, retention};
 #[cfg(feature = "api")]
 use crate::commands::{status, stop};
 use crate::{
@@ -309,7 +311,9 @@ pub fn parse(argv: &[OsString]) -> Result<(Cli, ArgMatches), Error> {
 /// `#[cfg(feature = "api")]` and `#[cfg(feature = "lifecycle")]`, and without it a client
 /// command is an unknown subcommand — clap's own usage error, exit 2. **`Lifecycle` is `api`'s
 /// too**: the verbs speak the management plane's routes through `tinio-api`'s client, so a build
-/// with no plane has nothing for them to talk to.
+/// with no plane has nothing for them to talk to. **`ObjectLock`, `Retention` and `LegalHold`
+/// are `object-lock`'s** (which requires `api`), because they drive the plane's two object-lock
+/// routes and never a store.
 ///
 /// **`Doctor` deliberately does not**: it diagnoses the always-present layers (root, config,
 /// names, symlinks, free space, the `Cleanup` trait's private-state legs, the meta store), which
@@ -344,6 +348,16 @@ pub enum Command {
     /// Configure a bucket's lifecycle policy through a running server.
     #[cfg(feature = "lifecycle")]
     Lifecycle(lifecycle::Args),
+    /// Enable a bucket's Object Lock through a running server.
+    #[cfg(feature = "object-lock")]
+    ObjectLock(object_lock::Args),
+    /// Set, read or clear a version's retention through a running server.
+    #[cfg(feature = "object-lock")]
+    Retention(retention::Args),
+    /// Set, read or clear a version's legal hold through a running server.
+    #[cfg(feature = "object-lock")]
+    #[command(name = "legalhold")]
+    LegalHold(legalhold::Args),
     /// Diagnose a directory without a server.
     Doctor(doctor::Args),
     /// Manage the OS service that supervises a server.
@@ -448,6 +462,21 @@ impl Command {
             }
             #[cfg(feature = "lifecycle")]
             Self::Lifecycle(args) => {
+                let dir = args.dir_args();
+                client_discovery(dir.dir.clone(), dir.read_only, &dir.env)
+            }
+            #[cfg(feature = "object-lock")]
+            Self::ObjectLock(args) => {
+                let dir = args.dir_args();
+                client_discovery(dir.dir.clone(), dir.read_only, &dir.env)
+            }
+            #[cfg(feature = "object-lock")]
+            Self::Retention(args) => {
+                let dir = args.dir_args();
+                client_discovery(dir.dir.clone(), dir.read_only, &dir.env)
+            }
+            #[cfg(feature = "object-lock")]
+            Self::LegalHold(args) => {
                 let dir = args.dir_args();
                 client_discovery(dir.dir.clone(), dir.read_only, &dir.env)
             }

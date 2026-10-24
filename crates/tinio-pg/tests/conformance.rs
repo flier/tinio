@@ -38,7 +38,7 @@ use tinio_core::{
     acl::{Acl, AclGrants},
     cors,
     meta::{ObjectMeta, object::Row},
-    object,
+    object, object_lock,
     storage::{
         self, BucketOps, ListBucketsParams, ListObjectsParams, ListPartsParams, ListUploadsParams,
         MultipartOps, ObjectOps, VersionOps,
@@ -238,14 +238,30 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
         .await
         .expect("the writer stages the object");
     let committed = writer
-        .commit_object(&bucket, &key, staged, object::Tags::empty(), None, &acl)
+        .commit_object(
+            &bucket,
+            &key,
+            staged,
+            object::Tags::empty(),
+            None,
+            &acl,
+            None,
+        )
         .await
         .expect("the writer commits the object");
     // The versioned bucket's commit mints the current version's identity: the reads below
     // address it, because `None` names the *null* version and this bucket has none.
     let version = committed.version_id.clone();
     let upload = writer
-        .create_multipart_upload(&bucket, &part_key, None, object::Tags::empty(), None, &acl)
+        .create_multipart_upload(
+            &bucket,
+            &part_key,
+            None,
+            object::Tags::empty(),
+            None,
+            &acl,
+            None,
+        )
         .await
         .expect("the writer opens an upload");
     writer
@@ -408,7 +424,15 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
         .expect("the writer stages the argument");
     assert_denied(
         reader
-            .commit_object(&bucket, &key, staged, object::Tags::empty(), None, &acl)
+            .commit_object(
+                &bucket,
+                &key,
+                staged,
+                object::Tags::empty(),
+                None,
+                &acl,
+                None,
+            )
             .await
             .err(),
     );
@@ -422,6 +446,7 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
                 object::Tags::empty(),
                 None,
                 &acl,
+                None,
                 None,
             )
             .await
@@ -455,7 +480,7 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
     );
     assert_denied(
         reader
-            .create_multipart_upload(&bucket, &key, None, object::Tags::empty(), None, &acl)
+            .create_multipart_upload(&bucket, &key, None, object::Tags::empty(), None, &acl, None)
             .await
             .err(),
     );
@@ -510,7 +535,7 @@ async fn a_read_only_instance_refuses_every_write_and_serves_every_read() {
     );
     assert_denied(
         reader
-            .delete_object_version(&bucket, &key, None)
+            .delete_object_version(&bucket, &key, None, object_lock::Bypass::None)
             .await
             .err(),
     );
@@ -786,5 +811,56 @@ async fn a_read_only_instance_never_migrates_and_refuses_a_schema_it_does_not_ma
         .expect("the schema probe");
     assert!(!present, "a read-only instance never migrates");
     admin.close().await;
+    db.drop_db().await;
+}
+
+/// The namespace probe every per-object read opens with (fs and mem's `ensure_bucket` rule): a
+/// key in a bucket with no row answers the contract's `NoSuchBucket`, never the content plane's
+/// `NoSuchKey`. The plain and versioned reads, and the two row-backed object reads, are one
+/// class here — the pg row **is** the bucket.
+#[tokio::test]
+async fn a_missing_bucket_object_read_answers_no_such_bucket() {
+    if !require_dsn() {
+        return;
+    }
+    let db = TestDb::create().await.expect("a scratch database");
+    let store = PgStorage::connect(&scratch_config(&db), Access::ReadWrite)
+        .await
+        .expect("a writable store over the scratch database");
+    let bucket = bucket_name("missing-object-reads");
+    let key = object::key("probe.txt").expect("a valid key");
+
+    let refused =
+        |err: Option<Error>| matches!(err, Some(Error::Storage(storage::Error::NoSuchBucket(_))));
+    assert!(
+        refused(store.get_object(&bucket, &key, None).await.err()),
+        "GetObject on a missing bucket is NoSuchBucket, not NoSuchKey"
+    );
+    assert!(
+        refused(store.head_object(&bucket, &key).await.err()),
+        "HeadObject on a missing bucket is NoSuchBucket"
+    );
+    assert!(
+        refused(store.get_object_tags(&bucket, &key).await.err()),
+        "GetObjectTagging on a missing bucket is NoSuchBucket"
+    );
+    assert!(
+        refused(store.get_object_acl(&bucket, &key).await.err()),
+        "GetObjectAcl on a missing bucket is NoSuchBucket"
+    );
+    assert!(
+        refused(
+            store
+                .get_object_version(&bucket, &key, None, None)
+                .await
+                .err()
+        ),
+        "a version-addressed GetObject on a missing bucket is NoSuchBucket"
+    );
+    assert!(
+        refused(store.head_object_version(&bucket, &key, None).await.err()),
+        "a version-addressed HeadObject on a missing bucket is NoSuchBucket"
+    );
+
     db.drop_db().await;
 }

@@ -19,7 +19,7 @@
     reason = "test context: `unimplemented` has no in-tests key (docs/style.md §Panics)"
 )]
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -29,7 +29,10 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream;
-use tinio_util::testing::blocks::MemBlocks;
+use tinio_util::testing::{
+    blocks::MemBlocks,
+    metadata::{assert_object_lock_conformance, assert_object_lock_upload_conformance},
+};
 #[cfg(test)]
 use tinio_util::testing::{bucket_name, object_key};
 use tokio::fs;
@@ -45,9 +48,11 @@ use crate::{
         meta::{
             BucketMeta, Metadata, ObjectMeta, UploadMeta, VersionMeta, bucket as bucket_row,
             object as object_row, upload as upload_row,
-            version::{Current as RowCurrent, Stored},
+            version::{
+                Current as RowCurrent, ExpireReport, Expired as ExpireVerdict, Kind, Stored,
+            },
         },
-        multipart, object, storage,
+        multipart, object, object_lock, storage,
         version::{self, State},
     },
     Versions,
@@ -115,6 +120,20 @@ struct Inner {
     objects: Mutex<HashMap<(String, String), object_row::Row>>,
     /// The bucket lifecycle configurations, keyed by bucket name.
     lifecycle: Mutex<BTreeMap<String, lifecycle::Config>>,
+    /// The bucket names that have a row — the double keeps no elements, but
+    /// the lock configuration's presence outcome needs the row's existence.
+    buckets: Mutex<HashSet<String>>,
+    /// The bucket Object Lock configurations, keyed by bucket name.
+    configs: Mutex<BTreeMap<String, object_lock::Config>>,
+    /// The per-version locks, keyed as the lock table is:
+    /// `(bucket, key, version-id wire)` (`wire_of(None)` is the literal
+    /// `null`).
+    locks: Mutex<BTreeMap<(String, String, String), object_lock::Lock>>,
+    /// The multipart lock intents, keyed by `(bucket, upload_id)`.
+    upload_locks: Mutex<BTreeMap<(String, String), object_lock::Lock>>,
+    /// The upload rows written through `create_with_lock` — the row half the
+    /// lock intent is atomic with.
+    uploads: Mutex<BTreeMap<(String, String), upload_row::Row>>,
     /// The content root; the double keeps its bytes in real files under it, so
     /// a test can read back what a publish landed.
     root: PathBuf,
@@ -265,6 +284,98 @@ impl Fake {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// The identity a removal at `seq` addresses: the row's own, or — when no
+    /// row exists — the current slot's, provided the slot records this
+    /// sequence. `None` is nothing to remove.
+    fn identity_at(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        seq: u64,
+    ) -> Option<Option<version::Id>> {
+        if let Some(row) = self.row_at(bucket, key, seq) {
+            return Some(row.id);
+        }
+        let slot = self.content_slot(bucket, key);
+        (slot.exists && slot.seq == seq).then_some(slot.version)
+    }
+
+    /// The lock table's key for an identity: the version-id wire, whose `None`
+    /// spelling is the literal `null`.
+    fn lock_key(
+        bucket: &Name,
+        key: &object::Key,
+        id: Option<&version::Id>,
+    ) -> (String, String, String) {
+        (bucket.to_string(), key.to_string(), version::wire_of(id))
+    }
+
+    /// The stored lock for an identity, or `None` (the double's map holds the
+    /// decoded value, so there is no corrupt row to fail closed on).
+    fn stored_lock(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        id: Option<&version::Id>,
+    ) -> Option<object_lock::Lock> {
+        self.inner
+            .locks
+            .lock()
+            .unwrap()
+            .get(&Self::lock_key(bucket, key, id))
+            .cloned()
+    }
+
+    /// Whether the identity a lock write addresses exists: the key's current
+    /// slot names it and is not a marker, or a `Kind::Object` version row
+    /// carries it. A delete marker and an absent key are refused (OL5).
+    fn identity_exists(&self, bucket: &Name, key: &object::Key, id: Option<&version::Id>) -> bool {
+        let slot = self.content_slot(bucket, key);
+        if slot.exists && !slot.is_delete_marker && slot.version.as_ref() == id {
+            return true;
+        }
+        let (bucket, key) = (bucket.as_ref(), key.as_ref());
+        self.inner
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|((row_bucket, row_key, _), row)| {
+                row_bucket == bucket
+                    && row_key == key
+                    && row.kind == Kind::Object
+                    && row.id.as_ref() == id
+            })
+    }
+
+    /// The request path's two preconditions, in one place (OL5, OL13): the
+    /// bucket's configuration is enabled and its versioning state is
+    /// `Enabled`. Both refusals are [`storage::Error::InvalidBucketState`].
+    fn lock_writes_allowed(&self, bucket: &Name) -> Result<(), storage::Error> {
+        let enabled = self
+            .inner
+            .configs
+            .lock()
+            .unwrap()
+            .get(bucket.as_ref())
+            .is_some_and(|config| config.enabled);
+        if !enabled {
+            return Err(storage::invalid_bucket_state(bucket));
+        }
+        let state = self
+            .inner
+            .states
+            .lock()
+            .unwrap()
+            .get(bucket.as_ref())
+            .copied()
+            .unwrap_or_default();
+        if state != State::Enabled {
+            return Err(storage::invalid_bucket_state(bucket));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -318,7 +429,15 @@ impl BucketMeta for Fake {
         bucket: &bucket::Name,
         row: &bucket_row::Row,
     ) -> Result<(), <Self as Metadata>::Error> {
-        unimplemented!("the engine's double implements only the calls the engine makes")
+        // The double keeps only the row's existence: the lock configuration's
+        // presence outcome is the one element the contract suite reads.
+        let _ = row;
+        self.inner
+            .buckets
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string());
+        Ok(())
     }
 
     async fn record_if_absent(
@@ -483,6 +602,49 @@ impl BucketMeta for Fake {
         bucket: &bucket::Name,
     ) -> Result<bool, <Self as Metadata>::Error> {
         self.inner.lifecycle.lock().unwrap().remove(bucket.as_ref());
+        Ok(true)
+    }
+
+    async fn object_lock(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<Option<object_lock::Config>, <Self as Metadata>::Error> {
+        if !self.inner.buckets.lock().unwrap().contains(bucket.as_ref()) {
+            return Err(storage::no_such_bucket(bucket));
+        }
+        Ok(self
+            .inner
+            .configs
+            .lock()
+            .unwrap()
+            .get(bucket.as_ref())
+            .cloned())
+    }
+
+    async fn set_object_lock(
+        &self,
+        bucket: &bucket::Name,
+        config: &object_lock::Config,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        if !self.inner.buckets.lock().unwrap().contains(bucket.as_ref()) {
+            return Ok(false);
+        }
+        self.inner
+            .configs
+            .lock()
+            .unwrap()
+            .insert(bucket.to_string(), config.clone());
+        Ok(true)
+    }
+
+    async fn clear_object_lock(
+        &self,
+        bucket: &bucket::Name,
+    ) -> Result<bool, <Self as Metadata>::Error> {
+        if !self.inner.buckets.lock().unwrap().contains(bucket.as_ref()) {
+            return Ok(false);
+        }
+        self.inner.configs.lock().unwrap().remove(bucket.as_ref());
         Ok(true)
     }
 
@@ -695,13 +857,77 @@ impl UploadMeta for Fake {
         unimplemented!("the engine's double implements only the calls the engine makes")
     }
 
+    /// The multipart intent is real: Task 5b's engine tests assert that the
+    /// effective lock is fixed at create and that abort/complete clear it.
+    async fn create_with_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+        row: &upload_row::Row,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        let _ = row;
+        let at = (bucket.to_string(), upload_id.to_owned());
+        // The row and the intent land together (the double's one map write
+        // each: there is no transaction to lose one half of).
+        self.inner
+            .uploads
+            .lock()
+            .unwrap()
+            .insert(at.clone(), row.clone());
+        let mut locks = self.inner.upload_locks.lock().unwrap();
+        match lock {
+            Some(lock) => {
+                locks.insert(at, lock.clone());
+            }
+            None => {
+                locks.remove(&at);
+            }
+        }
+        Ok(())
+    }
+
+    async fn upload_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+    ) -> Result<Option<object_lock::Lock>, <Self as Metadata>::Error> {
+        Ok(self
+            .inner
+            .upload_locks
+            .lock()
+            .unwrap()
+            .get(&(bucket.to_string(), upload_id.to_owned()))
+            .cloned())
+    }
+
+    async fn clear_upload_lock(
+        &self,
+        bucket: &bucket::Name,
+        upload_id: &str,
+    ) -> Result<(), <Self as Metadata>::Error> {
+        self.inner
+            .upload_locks
+            .lock()
+            .unwrap()
+            .remove(&(bucket.to_string(), upload_id.to_owned()));
+        Ok(())
+    }
+
     async fn get(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         upload_id: &str,
     ) -> Result<Option<upload_row::Row>, <Self as Metadata>::Error> {
-        unimplemented!("the engine's double implements only the calls the engine makes")
+        Ok(self
+            .inner
+            .uploads
+            .lock()
+            .unwrap()
+            .get(&(bucket.to_string(), upload_id.to_owned()))
+            .filter(|row| row.key == *key)
+            .cloned())
     }
 
     async fn put_part(
@@ -980,12 +1206,13 @@ impl VersionMeta for Fake {
         }))
     }
 
-    async fn advance_slot(
+    async fn advance_slot_with(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         id: Option<version::Id>,
         seq: u64,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<(), storage::Error> {
         // The slot is a version-row fact: the marker bit comes from the row at
         // the slot's sequence, never from the caller.
@@ -997,12 +1224,21 @@ impl VersionMeta for Fake {
             key,
             Current {
                 exists: true,
-                version: id,
+                version: id.clone(),
                 is_delete_marker,
                 seq,
                 degraded: false,
             },
         );
+        // `Some` commits the lock with the slot move; `None` never clears one
+        // (OL7): only the removal primitives do.
+        if let Some(lock) = lock {
+            self.inner
+                .locks
+                .lock()
+                .unwrap()
+                .insert(Self::lock_key(bucket, key, id.as_ref()), lock.clone());
+        }
         Ok(())
     }
 
@@ -1169,38 +1405,295 @@ impl VersionMeta for Fake {
         Ok(rows)
     }
 
-    async fn expire(
+    async fn set_version_lock(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
-        seq: u64,
+        version: Option<&version::Id>,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<(), storage::Error> {
-        self.drop_row(bucket, key, seq);
-        Ok(())
-    }
-
-    /// The batch call, counted so a test can see that the engine's batched path
-    /// used it: the double has no transaction to save, so the override exists
-    /// to record the call, not to be cheaper.
-    async fn expire_many(
-        &self,
-        bucket: &bucket::Name,
-        key: &object::Key,
-        seqs: &[u64],
-    ) -> Result<(), storage::Error> {
-        *self.inner.batch_removals.lock().unwrap() += 1;
-        for seq in seqs {
-            self.drop_row(bucket, key, *seq);
+        let at = Self::lock_key(bucket, key, version);
+        let mut locks = self.inner.locks.lock().unwrap();
+        match lock {
+            Some(lock) => {
+                locks.insert(at, lock.clone());
+            }
+            None => {
+                locks.remove(&at);
+            }
         }
         Ok(())
     }
 
-    /// The engine never drains a bucket's rows (teardown is the backend's), so
-    /// the double refuses the call rather than pretending to have a bucket's
-    /// rows to remove.
+    async fn version_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+    ) -> Result<Option<object_lock::Lock>, storage::Error> {
+        Ok(self.stored_lock(bucket, key, version))
+    }
+
+    async fn get_object_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+    ) -> Result<Option<object_lock::Retention>, storage::Error> {
+        Ok(self
+            .stored_lock(bucket, key, version)
+            .and_then(|lock| lock.retention))
+    }
+
+    async fn get_object_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+    ) -> Result<object_lock::LegalHold, storage::Error> {
+        Ok(self
+            .stored_lock(bucket, key, version)
+            .map_or(object_lock::LegalHold::Off, |lock| lock.legal_hold))
+    }
+
+    async fn set_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+        requested: Option<&object_lock::Retention>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, storage::Error> {
+        if !self.identity_exists(bucket, key, version) {
+            return Err(storage::no_such_version(version::wire_of(version)));
+        }
+        self.lock_writes_allowed(bucket)?;
+        let current = self.stored_lock(bucket, key, version);
+        let updated = object_lock::apply_retention(current.as_ref(), requested, bypass, now)
+            .map_err(storage::locked)?;
+        let at = Self::lock_key(bucket, key, version);
+        let mut locks = self.inner.locks.lock().unwrap();
+        match &updated {
+            Some(lock) => {
+                locks.insert(at, lock.clone());
+            }
+            None => {
+                locks.remove(&at);
+            }
+        }
+        Ok(updated)
+    }
+
+    async fn set_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+        hold: object_lock::LegalHold,
+    ) -> Result<object_lock::Lock, storage::Error> {
+        if !self.identity_exists(bucket, key, version) {
+            return Err(storage::no_such_version(version::wire_of(version)));
+        }
+        self.lock_writes_allowed(bucket)?;
+        let current = self.stored_lock(bucket, key, version);
+        // The same rule the stores apply: the model decides whether a row
+        // remains, and "no row" is the empty lock this contract answers.
+        let updated = object_lock::apply_legal_hold(current.as_ref(), hold);
+        let at = Self::lock_key(bucket, key, version);
+        let mut locks = self.inner.locks.lock().unwrap();
+        let lock = match updated {
+            Some(lock) => {
+                locks.insert(at, lock.clone());
+                lock
+            }
+            None => {
+                locks.remove(&at);
+                object_lock::Lock::default()
+            }
+        };
+        Ok(lock)
+    }
+
+    /// The combined update: the same identity and write-path assertions as
+    /// the single-member writers, one model decision and one map write, so a
+    /// refused retention leaves neither member applied.
+    async fn set_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+        retention: Option<Option<&object_lock::Retention>>,
+        legal_hold: Option<object_lock::LegalHold>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, storage::Error> {
+        if !self.identity_exists(bucket, key, version) {
+            return Err(storage::no_such_version(version::wire_of(version)));
+        }
+        self.lock_writes_allowed(bucket)?;
+        let current = self.stored_lock(bucket, key, version);
+        let updated = object_lock::apply_lock(current.as_ref(), retention, legal_hold, bypass, now)
+            .map_err(storage::locked)?;
+        let at = Self::lock_key(bucket, key, version);
+        let mut locks = self.inner.locks.lock().unwrap();
+        match &updated {
+            Some(lock) => {
+                locks.insert(at, lock.clone());
+            }
+            None => {
+                locks.remove(&at);
+            }
+        }
+        Ok(updated)
+    }
+
+    async fn expire_with(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seq: u64,
+        bypass: object_lock::Bypass,
+    ) -> Result<ExpireVerdict, storage::Error> {
+        let Some(identity) = self.identity_at(bucket, key, seq) else {
+            return Ok(ExpireVerdict::Nothing);
+        };
+        let lock = self.stored_lock(bucket, key, identity.as_ref());
+        if let Some(reason) = object_lock::delete_refusal(lock.as_ref(), SystemTime::now(), bypass)
+        {
+            return Err(storage::locked(reason));
+        }
+        self.drop_row(bucket, key, seq);
+        self.inner
+            .locks
+            .lock()
+            .unwrap()
+            .remove(&Self::lock_key(bucket, key, identity.as_ref()));
+        Ok(ExpireVerdict::Removed)
+    }
+
+    /// The batched call, counted so a test can see that the engine's batched
+    /// path used it: the double has no transaction to save, so the override
+    /// exists to record the call, not to be cheaper. Protected sequences are
+    /// skipped and reported (OL8).
+    async fn expire_many_report(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seqs: &[u64],
+    ) -> Result<ExpireReport, storage::Error> {
+        *self.inner.batch_removals.lock().unwrap() += 1;
+        let mut report = ExpireReport::default();
+        for seq in seqs {
+            let had_row = self.row_at(bucket, key, *seq).is_some();
+            let Some(identity) = self.identity_at(bucket, key, *seq) else {
+                continue;
+            };
+            let lock = self.stored_lock(bucket, key, identity.as_ref());
+            if let Some(reason) = object_lock::delete_refusal(
+                lock.as_ref(),
+                SystemTime::now(),
+                object_lock::Bypass::None,
+            ) {
+                report.protected.push((*seq, reason));
+            } else {
+                self.drop_row(bucket, key, *seq);
+                self.inner.locks.lock().unwrap().remove(&Self::lock_key(
+                    bucket,
+                    key,
+                    identity.as_ref(),
+                ));
+                if had_row {
+                    report.removed += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// The bucket-wide drain (OL8): refuse, removing nothing, when any version
+    /// row is protected; otherwise remove every row, its index entry and every
+    /// lock row of the bucket — an orphan row included. Re-running is a no-op.
     async fn drain_bucket(&self, bucket: &bucket::Name) -> Result<(), storage::Error> {
-        let _ = bucket;
-        unimplemented!("the engine's double implements only the calls the engine makes")
+        let name = bucket.to_string();
+        let rows: Vec<(String, Stored)> = self
+            .inner
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((row_bucket, _, _), _)| row_bucket == &name)
+            .map(|((_, key, _), row)| (key.clone(), row.clone()))
+            .collect();
+        for (key, row) in &rows {
+            // R19: a marker owns no lock, so a marker-owned lock row is an
+            // orphan — the drain removes it, it never refuses the drain.
+            if row.kind.is_marker() {
+                continue;
+            }
+            let lock = self
+                .inner
+                .locks
+                .lock()
+                .unwrap()
+                .get(&(name.clone(), key.clone(), version::wire_of(row.id.as_ref())))
+                .cloned();
+            if let Some(reason) = object_lock::delete_refusal(
+                lock.as_ref(),
+                SystemTime::now(),
+                object_lock::Bypass::None,
+            ) {
+                return Err(storage::locked(reason));
+            }
+        }
+        // The row-less current version (OL7/OL8): a lock advanced with the
+        // slot and with no version row of its own is a protected version, not
+        // an orphan, so the drain refuses it too.
+        let slots: Vec<(String, Current)> = self
+            .inner
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((slot_bucket, _), _)| slot_bucket == &name)
+            .map(|((_, key), slot)| (key.clone(), slot.clone()))
+            .collect();
+        for (key, slot) in &slots {
+            if !slot.exists || slot.is_delete_marker {
+                continue;
+            }
+            let wire = version::wire_of(slot.version.as_ref());
+            let lock = self
+                .inner
+                .locks
+                .lock()
+                .unwrap()
+                .get(&(name.clone(), key.clone(), wire))
+                .cloned();
+            if let Some(reason) = object_lock::delete_refusal(
+                lock.as_ref(),
+                SystemTime::now(),
+                object_lock::Bypass::None,
+            ) {
+                return Err(storage::locked(reason));
+            }
+        }
+        self.inner
+            .rows
+            .lock()
+            .unwrap()
+            .retain(|(row_bucket, _, _), _| row_bucket != &name);
+        self.inner
+            .index
+            .lock()
+            .unwrap()
+            .retain(|(index_bucket, _, _), _| index_bucket != &name);
+        self.inner
+            .locks
+            .lock()
+            .unwrap()
+            .retain(|(lock_bucket, _, _), _| lock_bucket != &name);
+        Ok(())
     }
 
     async fn version_seq_of(
@@ -1236,4 +1729,15 @@ pub(crate) fn recorded(id: &str, seq: u64) -> Current {
         seq,
         degraded: false,
     }
+}
+
+/// The shared Object Lock legs over the double: the engine tests' store must
+/// satisfy the same contract the real stores do (Task 2's green witness while
+/// the redb/pg tables land in Tasks 3/4).
+#[tokio::test]
+async fn the_shared_object_lock_legs_hold_over_the_double() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Fake::new(dir.path());
+    assert_object_lock_conformance(&store).await;
+    assert_object_lock_upload_conformance(&store).await;
 }

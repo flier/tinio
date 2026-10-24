@@ -44,11 +44,17 @@ use prometheus::{
     register_int_gauge, register_int_gauge_vec,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, dto};
-use tinio_util::{metrics::RegisteredExt, status_label};
+use tinio_util::{
+    metrics::{
+        LockOperation, RegisteredExt, record_protected_deletion as record_util_protected_deletion,
+    },
+    status_label,
+};
 use tracing::{field, instrument};
 
 use crate::{
     _core::{
+        object_lock::RefusalReason,
         pipeline::Stats,
         storage::{WRITE_LOCK_BUCKET_BOUNDS_US, WRITE_LOCK_BUCKETS, WriteLockSnapshot},
     },
@@ -269,6 +275,20 @@ pub(crate) fn object_uploaded(op: &'static str) {
 /// Count one successful object deletion.
 pub(crate) fn object_deleted() {
     STORAGE_OBJECTS_DELETED.inc();
+}
+
+/// Record one permanent delete a stored Object Lock refused (OL25).
+///
+/// The family lives in `tinio-util` because the lifecycle pass and both
+/// backends' sweepers feed it too; this is the S3 surface's one call, made
+/// where the `Locked` error is still in hand so the operation names the wire
+/// call (`delete_object` / `delete_objects`). The test writer gate is the
+/// crate's, so an exact-value test's window excludes every other test's
+/// refusals of the same family.
+pub(crate) fn record_protected_deletion(operation: LockOperation, reason: RefusalReason) {
+    #[cfg(test)]
+    let _g = test_lock::writer();
+    record_util_protected_deletion(operation, reason);
 }
 
 /// Record a completed operation against a counter/histogram family pair.
@@ -515,8 +535,7 @@ mod tests {
         "tinio_storage_pass_failures_total",
         "tinio_storage_read_only",
         "tinio_storage_corrupt_rows_total",
-        // `tinio-auth` — a data test's ACL path registers the decision counter.
-        "tinio_auth_authorizations_total",
+        "tinio_object_lock_protected_deletions_total",
     ];
 
     /// Serializes the tests that mutate the shared, label-less
@@ -555,6 +574,12 @@ mod tests {
         util_metrics::record_fs_pass_failure(util_metrics::FsSection::Tmp);
         util_metrics::record_read_only(util_metrics::Backend::Fs, false);
         util_metrics::record_corrupt_rows(util_metrics::Backend::Fs, 0);
+        // The Object Lock refusal family: touch it so this gate sees it in
+        // isolation and in a full run alike.
+        util_metrics::record_protected_deletion(
+            util_metrics::LockOperation::Sweeper,
+            RefusalReason::Governance,
+        );
         // The pipeline families: the histograms need one sample each to be gathered.
         PIPELINE_TASK_DURATION
             .with_label_values(&["gate"])
@@ -602,8 +627,13 @@ mod tests {
         let mut expected: HashSet<&str> = SPEC_FAMILIES.iter().copied().collect();
         // Families another crate declares on this binary's path; the spec table
         // is their home, and this gate sees them only when the feature is on.
+        // `tinio-auth`'s two families: the crate is on this binary's path only
+        // with `acl` or `copy`, and the recorders above are gated the same way.
         #[cfg(any(feature = "acl", feature = "copy"))]
-        expected.insert("tinio_auth_credential_lookups_total");
+        {
+            expected.insert("tinio_auth_authorizations_total");
+            expected.insert("tinio_auth_credential_lookups_total");
+        }
         #[cfg(feature = "select")]
         {
             expected.insert("tinio_s3_select_scanned_bytes_total");

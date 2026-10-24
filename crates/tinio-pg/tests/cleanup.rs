@@ -8,7 +8,7 @@
     reason = "test support: a leg asserts its preconditions by panicking"
 )]
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::StreamExt;
 use tinio_core::{
@@ -18,7 +18,7 @@ use tinio_core::{
     lifecycle,
     meta::version::encode_blob,
     object,
-    storage::{ListObjectsParams, ObjectOps},
+    storage::{ListObjectsParams, ObjectOps, to_nanos},
 };
 use tinio_pg::{
     _store_pg::{
@@ -31,7 +31,7 @@ use tinio_pg::{
     Access, Error, PgStorage,
     cleanup::PgCleanup,
 };
-use tinio_util::testing::{bucket_name, hex};
+use tinio_util::testing::{bucket_name, hex, metrics::protected_deletions};
 
 /// Drain an action stream into the actions it reported.
 async fn collect(actions: ActionStream<Error>) -> Vec<RepairAction> {
@@ -997,6 +997,83 @@ async fn a_bucket_with_a_noncurrent_rule_keeps_its_versions_past_the_server_knob
             "{wire} retires by the knob in the same pass"
         );
     }
+
+    db.drop_db().await;
+}
+
+/// OL8/OL19/OL25: the retention pass consumes the lock-aware report — a
+/// protected noncurrent version is a silent skip, never an error, and it is
+/// recorded under `operation = sweeper` with its refusal reason.
+#[tokio::test]
+async fn a_protected_noncurrent_version_is_skipped_and_recorded() {
+    if !require_dsn() {
+        return;
+    }
+    let db = TestDb::create().await.expect("a scratch database");
+    let pool = Pool::open(&db.dsn, 4).expect("a pool over the scratch database");
+    let store = PgStore::connect_with_pool(pool.clone(), Access::ReadWrite)
+        .await
+        .expect("a writable store (migrating the scratch database)");
+
+    let wire = "cleanup-protected";
+    query(
+        "INSERT INTO buckets (name, created, tags, acl, cors) \
+         VALUES ($1, now(), '{}'::jsonb, ROW(NULL::text, ARRAY[]::acl_grant[])::acl, '')",
+    )
+    .bind(wire)
+    .execute(&pool)
+    .await
+    .expect("the bucket row");
+    let oldest = format!("{wire}-v1");
+    for (seq, id) in [(1_i64, oldest.as_str()), (2_i64, "cleanup-protected-v2")] {
+        query(
+            "INSERT INTO version_rows (bucket, key, seq, id, blob, size, etag, created, \
+             became_noncurrent, kind, tags, checksum, acl) \
+             VALUES ($1, 'v.txt', $2, $3, '', 0, 'planted', now(), 1, 'object', \
+             '{}'::jsonb, '', ROW(NULL::text, ARRAY[]::acl_grant[])::acl)",
+        )
+        .bind(wire)
+        .bind(seq)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("a planted version row");
+    }
+    // The older version's compliance retention: the retention rule retires it,
+    // the lock refuses, and the skip is not an error.
+    query(
+        "INSERT INTO version_object_lock (bucket, key, version_id, mode, retain_until, legal_hold) \
+         VALUES ($1, 'v.txt', $2, 'COMPLIANCE', $3, 'OFF')",
+    )
+    .bind(wire)
+    .bind(&oldest)
+    .bind(
+        i64::try_from(to_nanos(SystemTime::now() + Duration::from_secs(86_400)))
+            .expect("a representable retain-until"),
+    )
+    .execute(&pool)
+    .await
+    .expect("the lock row");
+
+    let before = protected_deletions("sweeper", "compliance");
+    let cleanup = PgCleanup::new(store.clone(), CleanupOptions::default()).with_retention(1, 0);
+    let actions = collect(cleanup.repair(RepairKind::Full).await.expect("a pass")).await;
+
+    assert_eq!(
+        count(
+            &pool,
+            wire,
+            "SELECT count(*) FROM version_rows WHERE bucket = $1"
+        )
+        .await,
+        2,
+        "the protected history row survives: {actions:?}"
+    );
+    assert_eq!(
+        protected_deletions("sweeper", "compliance") - before,
+        1.0,
+        "the refusal is recorded under operation=sweeper, reason=compliance"
+    );
 
     db.drop_db().await;
 }

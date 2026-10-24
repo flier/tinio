@@ -314,6 +314,52 @@ A `PUT` requires a checksum — `Content-MD5` or any `x-amz-checksum-*` header o
 
 The three operations are gated twice (`[s3] lifecycle`, default on; the `lifecycle` cargo feature), and a disabled capability answers `NotImplemented` on all three and runs no pass (`contracts/config.md` owns the switch). A read-only run refuses the two writes with `AccessDenied` — they are write rows of the operation table — and serves the `GET`.
 
+## Object Lock (FR-043)
+
+(spec FR-043; design `docs/superpowers/specs/2026-10-20-s3-object-lock-design.md` — the design owns the model, the pure rules, the enforcement and the storage transactions; this section is the protocol contract.) Object Lock is a per-bucket opt-in on the version model: the bucket configuration is an enabled bit plus at most one default-retention rule, and protection is per object **version** — a GOVERNANCE or COMPLIANCE retention with a fixed `RetainUntilDate`, and/or a legal hold with no expiry. A default rule applies to every new version placed in the bucket, an explicit per-version retention overrides it, and a legal-hold-only write still receives the default because the hold and the retention are independent.
+
+| Operation | Request | Success |
+|---|---|---|
+| `GetObjectLockConfiguration` | `GET /<bucket>?object-lock` | `200` with the stored `ObjectLockConfiguration` |
+| `PutObjectLockConfiguration` | `PUT /<bucket>?object-lock` | `200`, empty body; replaces the whole configuration |
+| `GetObjectRetention` | `GET /<bucket>/<key>?retention&versionId=` | `200` with the stored `Retention` |
+| `PutObjectRetention` | `PUT /<bucket>/<key>?retention&versionId=` | `200`, empty body |
+| `GetObjectLegalHold` | `GET /<bucket>/<key>?legal-hold&versionId=` | `200` with the stored `LegalHold` |
+| `PutObjectLegalHold` | `PUT /<bucket>/<key>?legal-hold&versionId=` | `200`, empty body |
+
+**The bucket configuration.** `ObjectLockConfiguration` carries `ObjectLockEnabled` and an optional `Rule/DefaultRetention`; `ObjectLockEnabled` accepts only the literal `Enabled`, and a rule carries a mode plus exactly one of `Days` or `Years` (the bounds are the model's, `docs/superpowers/specs/2026-10-20-s3-object-lock-design.md` §The model). The request path validates the document and a refused document stores nothing. The first configuration requires versioning `Enabled`; a lock-enabled bucket can never return to unversioned or be suspended; for an existing bucket, only one whose versioning is already enabled may be enabled through `PutObjectLockConfiguration` — AWS's support token has no local issuer, the request is accepted without it, and that deviation is recorded. `CreateBucket` reads `x-amz-bucket-object-lock-enabled` with s3s's bool parser (`true`/`True`/`false`/`False`) and writes the bucket, its versioning state and the configuration as one step; any other header value is the framework's `400 InvalidArgument`.
+
+**Write headers and multipart.** `PutObject`, `CopyObject` and `CreateMultipartUpload` accept `x-amz-object-lock-mode`, `x-amz-object-lock-retain-until-date` and `x-amz-object-lock-legal-hold`. `CopyObject` does not inherit the source's lock; the destination's explicit headers or default apply. `CreateMultipartUpload` resolves the effective lock at create and stores it with the upload, so a mid-upload configuration change cannot alter it; `CompleteMultipartUpload` applies the stored intent and rejects any lock or bypass header with `400 InvalidRequest`. `PostObject` maps its form fields into `PutObjectInput` and reaches the same write path.
+
+**The bypass.** `DeleteObject`, `DeleteObjects` and `PutObjectRetention` accept `x-amz-bypass-governance-retention`. The bit is honoured only for an unexpired GOVERNANCE retention and only when the caller holds the addressed version's owner/FullControl authority; with ACL off or no identity plane it is false, so a governance lock cannot be bypassed. COMPLIANCE refuses shortening, mode change, removal and deletion even with the header; a legal hold refuses deletion in either mode and has no bypass; bypassing governance never changes a legal hold.
+
+**GET/HEAD echo.** `GetObject` and `HeadObject` answer the three lock headers for the version they serve — keyed by the version identity wire, so a locked null version is not skipped — only when the capability is on and the bucket records versions. A bucket with no configuration skips the per-version read behind a process-local negative cache that `PutObjectLockConfiguration` and bucket create/delete invalidate.
+
+**Deletes and markers.** A plain DELETE is never blocked: it writes a delete marker, and markers are never protected. A permanent delete of a protected version is refused. Marker addressing follows the version model: an explicitly addressed marker, no version address whose current version is a marker, and a non-marker version without a lock are three distinct refusals — the status table is their one statement.
+
+**Status table** (FR-043's error surface; the design's OL17 owns the choices):
+
+| Case | Answer |
+|---|---|
+| A permanent delete of a protected version | `403 AccessDenied` |
+| A protected entry in `DeleteObjects` | per-key `AccessDenied`; the remaining entries proceed |
+| `GetObjectRetention`/`GetObjectLegalHold` on a non-marker version with no lock | `404 NoSuchObjectLockConfiguration` |
+| `GetObjectRetention`/`GetObjectLegalHold` on an explicitly addressed marker | `405 MethodNotAllowed` |
+| `GetObjectRetention`/`GetObjectLegalHold` with no version ID whose current version is a marker | `404 NoSuchKey` |
+| `GetObjectLockConfiguration` on a bucket with no configuration | `404 ObjectLockConfigurationNotFoundError` |
+| A lock header on a bucket with no configuration | `400 InvalidRequest` |
+| A `RetainUntilDate` in the past | `400 InvalidRequest` |
+| A retention XML present but carrying only one half of its mode/date pair | `400 MalformedXML` |
+| `PutObjectRetention` with **no** `Retention` element | `200`; the version's retention is cleared (a partial pair is the row above, not a clear) |
+| A lock or bypass header on `CompleteMultipartUpload` | `400 InvalidRequest` |
+| `PutBucketVersioning` to `Suspended` on a lock-enabled bucket; a first configuration on an unversioned bucket | `409 InvalidBucketState` |
+
+**Checksum.** A write whose effective lock carries a retention requires `Content-MD5` or a checksum header/trailer: missing is `400 InvalidRequest`, a malformed `Content-MD5` is `400 InvalidDigest`. `PutObject` and multipart verify it through their existing tee where `[s3] checksum` is on; `PutObjectRetention` and `PutObjectLegalHold` are presence-only (their XML body is consumed). The effective lock and the checksum decision are resolved once, so a concurrent configuration change cannot make them disagree; `PostObject` reads the mapped `PutObjectInput` fields, not only headers.
+
+**Gating.** The six operations are gated twice (the runtime switch `contracts/config.md` owns; the `object-lock` cargo feature), and a disabled capability answers `NotImplemented` on all six, does not register the plane's routes and skips the GET/HEAD lock headers (`contracts/config.md` owns the switch). Stored configurations, default retention and delete protection stay in force while the capability is off, because enforcement is not a write path. A read-only run serves the three reads and refuses the three writes with `AccessDenied`; both states are tested at runtime, and a stripped build is the capability-off shape at compile time.
+
+**The requirement this section is the contract for.** FR-043: the six operations, the create header, the three write headers, the bypass, the GET/HEAD echo, the status table, the marker mix, the versioning-state rules and the checksum requirement — the Object Lock journeys the plan `docs/superpowers/plans/2026-10-20-s3-object-lock.md` delivered in its Task 12.
+
 ## Object namespace
 
 ### Folder markers
@@ -353,6 +399,8 @@ Requirement mapping: bucket READ for ListObjects(V2)/ListMultipartUploads/HeadBu
 #### B1 existence head
 
 an overwrite on an existing destination requires P == O(destination object) or O(destination bucket); a missing key needs bucket WRITE only; the TOCTOU window between check and handler is accepted and documented); upload-scoped ops (ListParts/UploadPart/Complete/Abort) are upload-creator-or-bucket-owner (the upload row's stored creator; AWS initiator-only, Default-A class; Complete additionally runs the B1 head when the destination exists), UploadPartCopy = source object READ + creator-or-bucket-owner; CreateBucket authenticated (anonymous 403); ListBuckets any signed principal, filtered to the requester's buckets (anonymous 403 — the walk-time effective-owner compare: recorded element, or the identity's lazy default for an empty wire, uniform with `row_owner`; `lazy_default = None` = strict); resolved-but-unmapped operations are owner-only (Default B) — never anonymous; truly unknown paths never reach the check (s3s answers 501 first). **Deny-first `NoSuch*` three tiers** (B3): P == bucket owner → pass through to the handler's 404/204; P holds a bucket READ grant → pass through; otherwise 403 (no existence leak). A storage error while evaluating → fail-closed `AccessDenied`.
+
+**Version-addressed object operations.** For `DeleteObject`, each `DeleteObjects` entry, `Get/PutObjectRetention` and `Get/PutObjectLegalHold`, the object leg of the owner rule is the version the request addresses (`version_acl`), not the current object; bucket-owner parity is unchanged. Design `docs/superpowers/specs/2026-10-20-s3-object-lock-design.md` OL15 owns the rule, including the malformed-address (403), unknown-version (the handler's 404 `NoSuchVersion`) and delete-marker (the deny-first fail-closed posture, so a non-owner's marker delete is 403) cases.
 
 #### DeleteObjects
 

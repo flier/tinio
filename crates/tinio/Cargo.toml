@@ -40,6 +40,7 @@ full=[
     "list-v2",
     "mem",
     "multipart",
+    "object-lock",
     "openapi",
     "pg",
     "sandbox",
@@ -57,6 +58,7 @@ list-v1 = ["tinio-server/list-v1"]
 list-v2 = ["tinio-server/list-v2"]
 mem = ["tinio-cli/mem"]
 multipart = ["tinio-server/multipart"]
+object-lock = ["tinio-server/object-lock", "tinio-cli/object-lock"]
 openapi = ["tinio-api/openapi"]
 otel = ["tinio-server/otel"]
 pg = ["tinio-cli/pg"]

@@ -20,3 +20,4 @@ pub mod bucket;
 pub mod object;
 pub mod upload;
 pub mod version;
+pub(crate) mod version_lock;

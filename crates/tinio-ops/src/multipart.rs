@@ -127,6 +127,7 @@
 //!         object::Tags::empty(),
 //!         None,
 //!         &Acl::default_private(None),
+//!         None,
 //!     )
 //!     .await
 //!     .unwrap();
@@ -169,7 +170,7 @@ use crate::{
             upload::{PartRow, Row as UploadRow},
         },
         multipart::{MultipartUpload, PartInfo, PartNumber},
-        object,
+        object, object_lock,
         storage::{
             self, Error, ListUploadsParams, UploadsListing, key_marker_order, split_uploads_order,
         },
@@ -272,10 +273,21 @@ where
     /// records it guarded (a missing bucket row refuses with `NoSuchBucket`
     /// inside the contract's transaction) and `Lazy` records it plainly.
     ///
+    /// `lock` is the effective Object Lock the caller resolved at create
+    /// (OL6, OL16). It is stored **atomically with the upload row** through
+    /// [`UploadMeta::create_with_lock`]: the intent — the explicit header or
+    /// the bucket default evaluated now — is fixed at create, so a mid-upload
+    /// configuration change cannot alter it. The completion applies the stored
+    /// intent; abort, expiry and teardown clear it.
+    ///
     /// # Errors
     ///
     /// The contract's own failures — `NoSuchBucket` for the guarded policy's
     /// missing bucket row included.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the create's field set — bucket, key, checksum, tags, owner, ACL and the effective lock — is the request's own; the lock is written atomically with the upload row"
+    )]
     pub async fn create_multipart_upload(
         &self,
         bucket: &bucket::Name,
@@ -284,6 +296,7 @@ where
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<MultipartUpload, Error> {
         // The create time is read before the id is allocated, as this call has
         // always recorded it.
@@ -297,15 +310,23 @@ where
             owner: owner.cloned(),
             acl: acl.clone(),
         };
+        // The upload row and the lock intent commit in one transaction (OL6),
+        // so a mid-upload configuration change cannot alter the intent.
         match self.bucket_row {
-            BucketRow::Guaranteed => {
-                UploadMeta::create_guarded(&*self.meta, bucket, &row.upload_id, &row)
+            BucketRow::Guaranteed => UploadMeta::create_guarded_with_lock(
+                &*self.meta,
+                bucket,
+                &row.upload_id,
+                &row,
+                lock,
+            )
+            .await
+            .map_err(projected)?,
+            BucketRow::Lazy => {
+                UploadMeta::create_with_lock(&*self.meta, bucket, &row.upload_id, &row, lock)
                     .await
                     .map_err(projected)?
             }
-            BucketRow::Lazy => UploadMeta::create(&*self.meta, bucket, &row.upload_id, &row)
-                .await
-                .map_err(projected)?,
         }
         // The row is the recorded state and the answer is the same state: the
         // create borrows it, so its own values (never a second round of the

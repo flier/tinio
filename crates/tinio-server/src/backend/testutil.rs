@@ -122,11 +122,13 @@ pub(crate) fn acl_backend() -> S3Backend<MemoryStorage> {
 // --- the ACL request fixtures (one home for the three test modules'
 // copies: objects, buckets, versioning) ---
 
-/// A well-formed `Content-MD5` value (base64 of 16 zero bytes).
-#[cfg(feature = "acl")]
+/// A well-formed `Content-MD5`: base64 of 16 zero bytes (form-checked only —
+/// the body is consumed before the handler).
+pub(crate) const VALID_MD5: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
+
+/// [`VALID_MD5`] as the owned DTO field.
 pub(crate) fn valid_md5() -> String {
-    use base64::engine::general_purpose::STANDARD;
-    base64::Engine::encode(&STANDARD, [0u8; 16])
+    VALID_MD5.to_owned()
 }
 
 /// A canonical-user grantee.

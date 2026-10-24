@@ -67,6 +67,7 @@ use crate::{
     },
     _store_redb::{
         RedbMetadata, object_part, part, part_checksum, part_stamp, upload, upload_checksum,
+        upload_object_lock,
     },
     _util::lockmap::{Guard, Map},
     Error,
@@ -121,8 +122,10 @@ fn drain_upload_rest(
     upload_id: &str,
 ) -> Result<(), database::Error> {
     // The UPLOADS/checksum halves are one exact key each (idempotent
-    // remove — no range scan); only the PARTS half needs the range.
+    // remove — no range scan); only the PARTS half needs the range. OL6: the
+    // lock intent leaves with the upload row.
     upload_checksum::Table::open(txn)?.remove(bucket, upload_id)?;
+    upload_object_lock::Table::open(txn)?.remove(bucket, upload_id)?;
     part::Table::open(txn)?.drain_upload(bucket, upload_id)?;
     part_checksum::Table::open(txn)?.drain_upload(bucket, upload_id)?;
     part_stamp::Table::open(txn)?.drain_upload(bucket, upload_id)?;
@@ -139,6 +142,7 @@ pub(crate) fn drain_bucket_uploads(
 ) -> Result<(), database::Error> {
     upload::Table::open(txn)?.drain_bucket(bucket)?;
     upload_checksum::Table::open(txn)?.drain_bucket(bucket)?;
+    upload_object_lock::Table::open(txn)?.drain_bucket(bucket)?;
     part::Table::open(txn)?.drain_bucket(bucket)?;
     part_checksum::Table::open(txn)?.drain_bucket(bucket)?;
     part_stamp::Table::open(txn)?.drain_bucket(bucket)?;

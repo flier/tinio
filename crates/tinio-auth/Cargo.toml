@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+http.workspace = true
 parse-display.workspace = true
 prometheus.workspace = true
 s3s.workspace = true
@@ -22,7 +23,7 @@ bytes.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
-tinio-mem.workspace = true
+tinio-mem = { workspace = true, features = ["versioning"] }
 tinio-util = { workspace = true, features = ["testing"] }
 
 [lints.clippy]

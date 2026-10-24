@@ -23,7 +23,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use http::header::HeaderName;
+use http::{HeaderMap, header::HeaderName};
 use s3s::{
     S3Error, S3Result, TrailingHeaders,
     checksum::ChecksumHasher,
@@ -40,6 +40,7 @@ use super::map_backend_error;
 use crate::_core::{
     BodyStream,
     checksum::{self, Algorithm},
+    object_lock::Lock,
     storage::Error as StorageError,
 };
 
@@ -47,6 +48,10 @@ use crate::_core::{
 /// missing header is `InvalidRequest`, a value that is not the standard
 /// base64 of 16 bytes is `InvalidDigest`. Digest equality against the body is
 /// unverifiable here (s3s consumes it; the recorded deviation).
+///
+/// Every caller is a feature-gated surface (ACL, CORS, Object Lock), so a
+/// stripped build compiles the gate only for a build that can call it.
+#[cfg(any(feature = "acl", feature = "cors", feature = "object-lock"))]
 pub(crate) fn require_content_md5(md5: Option<&str>) -> S3Result<()> {
     let md5 = md5.ok_or_else(missing_content_md5)?;
     valid_content_md5(md5)
@@ -71,6 +76,130 @@ pub(crate) fn missing_content_md5() -> S3Error {
 /// The malformed-digest refusal.
 pub(crate) fn invalid_digest() -> S3Error {
     s3_error!(InvalidDigest, "The Content-MD5 you specified is not valid")
+}
+
+/// The legacy digest header's name (the `http` crate carries no constant).
+/// Compiled for every write gate that shares the checksum rule — the
+/// lifecycle/CORS/ACL PUTs (LC8), the Object Lock write gate (OL16) and a
+/// stripped build's stored-default gate (OL20).
+pub(crate) const CONTENT_MD5: &str = "content-md5";
+/// The `x-amz-trailer` header: a declared checksum trailer is a checksum
+/// promise without a value in the headers.
+const AMZ_TRAILER: &str = "x-amz-trailer";
+/// The prefix every checksum header shares, whatever its algorithm.
+const CHECKSUM_PREFIX: &str = "x-amz-checksum-";
+
+/// Whether the request carries a checksum promise: `Content-MD5`, any
+/// `x-amz-checksum-*` header, a declared checksum trailer, or parsed trailing
+/// headers. The one predicate behind the lifecycle/CORS/ACL `PUT` rule (LC8)
+/// and the Object Lock write gate (OL16).
+///
+/// A declared trailer counts only when it names a checksum algorithm: SigV4
+/// streaming declares `x-amz-chunk-signature` on the same header, and that is
+/// a signature promise, not a checksum (OL16 requires the checksum itself).
+pub(crate) fn has_request_checksum(headers: &HeaderMap, has_trailing_headers: bool) -> bool {
+    headers.contains_key(CONTENT_MD5)
+        || headers
+            .keys()
+            .any(|name| name.as_str().starts_with(CHECKSUM_PREFIX))
+        || declares_checksum_trailer(headers)
+        || has_trailing_headers
+}
+
+/// Whether `x-amz-trailer` names at least one checksum header — the same name
+/// matching [`declared_trailer`] applies, case-insensitively and across
+/// repeated header lines.
+fn declares_checksum_trailer(headers: &HeaderMap) -> bool {
+    let name = HeaderName::from_static(AMZ_TRAILER);
+    headers.get_all(&name).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.split(',').map(str::trim).any(|trailer| {
+                Algorithm::ALL
+                    .iter()
+                    .any(|algo| checksum_header_name(*algo).eq_ignore_ascii_case(trailer))
+            })
+        })
+    })
+}
+
+/// The request-shape checksum gate (LC8/OL16): a missing checksum is
+/// `InvalidRequest`, a malformed `Content-MD5` (or one not representable as
+/// text) is `InvalidDigest`. Digest equality against the body is unverifiable
+/// here (s3s consumes it; the recorded deviation).
+pub(crate) fn require_any_checksum(
+    headers: &HeaderMap,
+    has_trailing_headers: bool,
+) -> S3Result<()> {
+    if let Some(md5) = headers.get(CONTENT_MD5) {
+        let md5 = md5.to_str().map_err(|_| invalid_digest())?;
+        return valid_content_md5(md5);
+    }
+    if has_request_checksum(headers, has_trailing_headers) {
+        Ok(())
+    } else {
+        Err(missing_content_md5())
+    }
+}
+
+/// Whether one of the DTO's own checksum value fields is present — the
+/// `PostObject` shape, whose form fields are mapped into
+/// [`PutObjectInput`](dto::PutObjectInput) and never reach the headers (OL16).
+pub(crate) fn dto_has_checksum<T: ValueFields>(input: &T) -> bool {
+    Algorithm::ALL
+        .iter()
+        .any(|algo| input.checksum_value(*algo).is_some())
+}
+
+/// The OL16 checksum requirement: a write whose effective lock carries a
+/// retention must present `Content-MD5` or a checksum header/trailer.
+/// `dto_md5` is the request's `Content-MD5` wherever it arrived from (the DTO
+/// field or the raw header) and is form-checked here; `dto_checksum` says one
+/// of the DTO's own checksum fields is present (`PostObject`'s mapped form
+/// fields never reach the headers). Otherwise the header rule is
+/// [`require_any_checksum`]. A legal-hold-only lock carries no retention and
+/// requires nothing.
+///
+/// Always compiled: a stripped build has no lock headers, but the bucket's
+/// stored default still resolves to a lock and still requires the checksum
+/// (OL20) — the gate is enforcement, not a gated surface.
+pub(crate) fn require_lock_checksum(
+    lock: Option<&Lock>,
+    headers: &HeaderMap,
+    has_trailing_headers: bool,
+    dto_md5: Option<&str>,
+    dto_checksum: bool,
+) -> S3Result<()> {
+    if !lock.is_some_and(|lock| lock.retention.is_some()) {
+        return Ok(());
+    }
+    if let Some(md5) = dto_md5 {
+        valid_content_md5(md5)?;
+    }
+    if dto_md5.is_some() || dto_checksum {
+        return Ok(());
+    }
+    require_any_checksum(headers, has_trailing_headers)
+}
+
+/// The `Content-MD5` value of a request when it is representable as text
+/// (the DTO field first, the raw header otherwise): a header the framework
+/// could not read as text is the malformed digest, not an absent one.
+pub(crate) fn request_content_md5(
+    input: Option<&str>,
+    headers: &HeaderMap,
+) -> S3Result<Option<String>> {
+    if let Some(md5) = input {
+        return Ok(Some(md5.to_owned()));
+    }
+    headers
+        .get(CONTENT_MD5)
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| invalid_digest())
+        })
+        .transpose()
 }
 
 /// The tee error mapping of the staging paths (a part upload or a plain
@@ -176,7 +305,7 @@ impl Spec {
     #[cfg(feature = "multipart")]
     pub(crate) fn from_upload_part(
         input: &dto::UploadPartInput,
-        headers: &http::HeaderMap,
+        headers: &HeaderMap,
     ) -> S3Result<Option<Spec>> {
         Self::parse(
             single_checksum_value(input)?,
@@ -194,7 +323,7 @@ impl Spec {
     /// PUT has no persisted create algorithm to reconcile with.
     pub(crate) fn from_put_object(
         input: &dto::PutObjectInput,
-        headers: &http::HeaderMap,
+        headers: &HeaderMap,
     ) -> S3Result<Option<Spec>> {
         Self::parse(
             single_checksum_value(input)?,
@@ -972,7 +1101,7 @@ mod tests {
         // cases below drive.
         #[expect(
             clippy::unreachable,
-            reason = "test context: a nested helper in a test fn, asserted by the two-value-field case below (docs/style.md §Panics)"
+            reason = "argued: a nested helper inside a test fn — clippy's `allow-*-in-tests` keys do not reach it and `unreachable` has no in-tests key — and the arm is the single-value scan's own exclusion, which the two-value-field case below drives (docs/style.md §Panics)"
         )]
         fn found<'a>(
             crc32: Option<&'a str>,
@@ -1388,6 +1517,36 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // --- the declared-trailer predicate (the write gate's OL16 promise):
+    // a SigV4 streaming request declares `x-amz-chunk-signature`, which is a
+    // signature promise, not a checksum.
+
+    #[test]
+    fn a_signature_only_trailer_is_not_a_checksum() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-trailer", "x-amz-chunk-signature".parse().unwrap());
+        assert!(!has_request_checksum(&headers, false));
+        let err = require_any_checksum(&headers, false).unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidRequest");
+    }
+
+    #[test]
+    fn a_declared_checksum_trailer_is_a_checksum() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+        assert!(has_request_checksum(&headers, false));
+        assert!(require_any_checksum(&headers, false).is_ok());
+    }
+
+    #[test]
+    fn a_signature_and_checksum_trailer_are_a_checksum() {
+        let mut headers = http::HeaderMap::new();
+        headers.append("x-amz-trailer", "x-amz-chunk-signature".parse().unwrap());
+        headers.append("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+        assert!(has_request_checksum(&headers, false));
+        assert!(require_any_checksum(&headers, false).is_ok());
     }
 
     /// Drain a wrapped stream, returning the first error (a clean end

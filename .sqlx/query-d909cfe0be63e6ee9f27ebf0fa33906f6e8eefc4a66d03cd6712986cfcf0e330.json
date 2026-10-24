@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT mode, retain_until, legal_hold\nFROM upload_object_lock\nWHERE bucket = $1 AND upload_id = $2\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "mode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_object_lock",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "retain_until",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "upload_object_lock",
+            "name": "retain_until"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "legal_hold",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "upload_object_lock",
+            "name": "legal_hold"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "d909cfe0be63e6ee9f27ebf0fa33906f6e8eefc4a66d03cd6712986cfcf0e330"
+}

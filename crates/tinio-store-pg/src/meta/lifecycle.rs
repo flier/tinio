@@ -10,7 +10,7 @@ use sqlx::{query, query_file};
 use crate::{
     _core::{bucket, lifecycle},
     Error, PgTx, begin,
-    meta::bucket_row_present,
+    meta::{bucket::clear_config, bucket_row_present},
     store::PgStore,
     timestamp::to_timestamp,
 };
@@ -53,13 +53,18 @@ pub(in crate::meta) async fn merge_in_tx(
         Err(invalid) => return Ok(lifecycle::Merged::Refused(invalid)),
     };
     if let Some(now) = create_at.filter(|_| !present) {
-        query_file!(
+        let inserted = query_file!(
             "sql/meta/bucket/record_if_absent.sql",
             bucket,
             to_timestamp(now)
         )
         .execute(&mut **tx)
         .await?;
+        if inserted.rows_affected() > 0 {
+            // OL4: the first-sight insert is a bucket-row write, so a stale
+            // Object Lock configuration is cleared beside it.
+            clear_config(tx, bucket).await?;
+        }
     }
     upsert_row(tx, bucket, &config).await?;
     Ok(lifecycle::Merged::Stored)
@@ -178,13 +183,18 @@ pub(in crate::meta) async fn set_or_create(
     // row only when the directory-backed store has none, and does nothing
     // on an existing bucket. The configuration lands in the same
     // transaction, so no reader sees the row without it.
-    query_file!(
+    let inserted = query_file!(
         "sql/meta/bucket/record_if_absent.sql",
         bucket,
         to_timestamp(now)
     )
     .execute(&mut *tx)
     .await?;
+    if inserted.rows_affected() > 0 {
+        // OL4: the first-sight insert is a bucket-row write, so a stale
+        // Object Lock configuration is cleared beside it.
+        clear_config(&mut tx, bucket).await?;
+    }
     upsert_row(&mut tx, bucket, config).await?;
     tx.commit().await?;
     Ok(())

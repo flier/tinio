@@ -64,7 +64,7 @@ docker compose -f tools/pg/docker-compose.yml down
 - `Given`/`When`=act, `Then`=assert; 1st-person; one behavior/scenario.
 - Default filter owns platform / external / confinement (`TINIO_E2E_CONFINEMENT`) / pg; replacing it restates every exclusion.
 - Gate: fs, mem, pg (live postgres), parquet, spec-ID traceability; no spec ID → Rust; keep the shared util harness.
-- Clean target dir: build the binary first, else a large slice of scenarios fails spuriously.
+- Clean target dir: build the binary before the run, else a large slice of scenarios fails spuriously.
 
 ## Product surfaces
 

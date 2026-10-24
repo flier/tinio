@@ -64,7 +64,7 @@ use crate::{
         content::{ContentKey, ObjectContent, stage_body},
         meta::{
             Metadata, ObjectMeta, VersionMeta,
-            version::{Kind, Stored},
+            version::{ExpireReport, Kind, Stored},
         },
         object, storage,
         version::State,
@@ -689,6 +689,23 @@ where
     ) -> Result<(), Error> {
         self.rows
             .expire_many(bucket, key, seqs)
+            .await
+            .map_err(projected)
+    }
+
+    /// [`Self::expire_many`] with the lock-aware report (OL8, OL27): a
+    /// sequence a stored Object Lock protects is skipped and reported with its
+    /// refusal reason, never failed, and the answer counts only the rows the
+    /// call actually removed. The whole batch is the rows plane's one
+    /// transaction.
+    pub async fn expire_many_report(
+        &self,
+        bucket: &Name,
+        key: &object::Key,
+        seqs: &[u64],
+    ) -> Result<ExpireReport, Error> {
+        self.rows
+            .expire_many_report(bucket, key, seqs)
             .await
             .map_err(projected)
     }

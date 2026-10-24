@@ -18,6 +18,7 @@ use tinio_store_pg::{
 };
 use tinio_util::testing::metadata::{
     assert_content_conformance, assert_guarded_write_conformance, assert_metadata_conformance,
+    assert_object_lock_conformance, assert_object_lock_upload_conformance,
     assert_version_conformance,
 };
 
@@ -60,6 +61,106 @@ async fn content_conforms() {
     };
     assert_content_conformance(&store).await;
     db.drop_db().await;
+}
+
+/// The Object Lock contract's bucket, version, delete, batch and drain rules
+/// over real PostgreSQL (OL4–OL8, OL21).
+#[tokio::test]
+async fn object_lock_conforms() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    assert_object_lock_conformance(&store).await;
+    db.drop_db().await;
+}
+
+/// The multipart lock-intent contract: the intent is written atomically with
+/// the upload row, reads back, is replaced and clears (OL6, OL21).
+#[tokio::test]
+async fn object_lock_upload_conforms() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    assert_object_lock_upload_conformance(&store).await;
+    db.drop_db().await;
+}
+
+/// pg's Object Lock tables are part of the one initial migration, so a fresh
+/// database always holds all three: the redb MAY_BE_ABSENT / read-only
+/// pre-feature shape does not apply here. A database built before the feature
+/// is not served at all — the schema checksum gate refuses it (OL4, OL26).
+#[tokio::test]
+async fn a_fresh_database_holds_the_three_object_lock_tables() {
+    let Some((db, store)) = scratch().await else {
+        return;
+    };
+    let present: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT to_regclass(t)::text FROM unnest(ARRAY[$1, $2, $3]) AS t")
+            .bind("bucket_object_lock")
+            .bind("version_object_lock")
+            .bind("upload_object_lock")
+            .fetch_all(store.as_driver())
+            .await
+            .expect("the table probes");
+    assert_eq!(
+        present,
+        vec![
+            Some("bucket_object_lock".to_owned()),
+            Some("version_object_lock".to_owned()),
+            Some("upload_object_lock".to_owned()),
+        ],
+        "the initial migration creates the three tables, all-or-nothing"
+    );
+    db.drop_db().await;
+}
+
+/// The row-lock pieces the Object Lock write path depends on (OL13).
+///
+/// **This pin is shallow and claims no ordering.** It checks each statement
+/// that is expected to take a row lock names the row's table and carries
+/// `FOR UPDATE`; it does not observe blocking, so it cannot prove the order
+/// two statements run in. The ordering guarantee is the **Rust call
+/// sequence**: `advance_slot_with` (bucket row via `assert_bucket_row`, then
+/// the current slot, then the marker-bit read, then `lock_upsert`),
+/// `expire_with`/`expire_many_report` (bucket row, slot, then per sequence the
+/// version row and its lock row), `restore_slot` (bucket row, slot, version
+/// row) and `drain_bucket` (bucket row, then `drain_lock_owners`). Those call
+/// sites are the review surface; the behavioural legs
+/// (`a_config_write_and_a_suspend_serialize_on_the_bucket_row`, the drain
+/// refusal) are what exercise the contention.
+#[test]
+fn the_object_lock_statements_take_their_rows_for_update() {
+    for (name, table, sql) in [
+        (
+            "slot",
+            "current_slots",
+            include_str!("../../sql/meta/version/slot_for_update.sql"),
+        ),
+        (
+            "version row",
+            "version_rows",
+            include_str!("../../sql/meta/version/row_for_update.sql"),
+        ),
+        (
+            "lock row",
+            "version_object_lock",
+            include_str!("../../sql/meta/version/lock_get_for_update.sql"),
+        ),
+        (
+            "drain owners",
+            "version_object_lock",
+            include_str!("../../sql/meta/version/drain_lock_owners.sql"),
+        ),
+    ] {
+        assert!(
+            sql.contains(table),
+            "the {name} statement names its table ({table})"
+        );
+        assert!(
+            sql.contains("FOR UPDATE"),
+            "the {name} statement takes its rows' lock"
+        );
+    }
 }
 
 /// Review Focus 1: the order a listing answers is the key's UTF-8 byte

@@ -17,6 +17,7 @@ use crate::{
 ///
 /// let s3 = Config::default();
 /// assert!(s3.capabilities.multipart);
+/// assert!(s3.capabilities.object_lock);
 /// assert!(!s3.sig_v2); // deprecated, off by default
 /// assert_eq!(s3.temp_ttl_hours, 24);
 /// assert_eq!(s3.multipart_expire_days, None);

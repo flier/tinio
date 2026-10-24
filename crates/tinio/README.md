@@ -16,7 +16,7 @@
 | `sandbox` | process confinement (`docs/sandbox.md`) |
 | `versioning` | the version plane |
 | `select` | S3 Select, over the `tinio-select` engine |
-| `acl`, `cors`, `copy`, `multipart`, `list-v1`, `list-v2` | the S3 surface capabilities the `[s3]` configuration toggles |
+| `acl`, `cors`, `copy`, `multipart`, `list-v1`, `list-v2`, `object-lock` | the S3 surface capabilities the `[s3]` configuration toggles |
 | `otel` | the OpenTelemetry exporter |
 
 ## Layout

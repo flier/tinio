@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM buckets AS b\nWHERE\n    b.name = $1\n    AND NOT EXISTS (\n        SELECT 1 FROM object_meta AS o WHERE o.bucket = b.name\n    )\n    AND NOT EXISTS (SELECT 1 FROM uploads AS u WHERE u.bucket = b.name)\n    AND NOT EXISTS (\n        SELECT 1 FROM version_rows AS v WHERE v.bucket = b.name\n    )\n    AND NOT EXISTS (\n        SELECT 1 FROM version_object_lock AS l WHERE l.bucket = b.name\n    )\n    AND NOT EXISTS (\n        SELECT 1 FROM upload_object_lock AS u WHERE u.bucket = b.name\n    )\nRETURNING b.name\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "buckets",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8f64973dc646bc8de601a939cacc71105ae835b20c94e5766dac85226944d44f"
+}

@@ -28,7 +28,7 @@ use tinio_core::{
         self, AbortIncompleteMultipartUpload, Expiration, Filter, NoncurrentVersionExpiration,
         Rule, Status,
     },
-    object,
+    object, object_lock,
     storage::{BucketOps, MultipartOps, ObjectOps, VersionOps},
     version::{self, CurrentVersion, ListParams, State},
 };
@@ -593,7 +593,7 @@ async fn an_only_version_marker_is_removed() {
     // Remove the version behind the marker: now the marker is all that is left.
     let hidden = versions(&storage, &name).await[1].id.clone();
     storage
-        .delete_object_version(&name, &key, hidden.as_ref())
+        .delete_object_version(&name, &key, hidden.as_ref(), object_lock::Bypass::None)
         .await
         .unwrap();
 
@@ -639,6 +639,7 @@ async fn an_upload_one_raw_day_old_is_not_aborted() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -679,6 +680,7 @@ async fn an_upload_larger_than_the_size_bound_is_kept() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -722,6 +724,7 @@ async fn an_upload_past_the_clock_is_aborted() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();

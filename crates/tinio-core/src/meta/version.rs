@@ -35,7 +35,7 @@ use crate::{
     ETag,
     acl::{Acl, OwnerId},
     blob::{BlobRef, BlockHash, BlockRef},
-    bucket, checksum, object,
+    bucket, checksum, object, object_lock,
     storage::{self, from_nanos},
     version::{self, State},
 };
@@ -398,6 +398,56 @@ pub fn decode_blob(wire: &str) -> Option<BlobRef> {
     BlobRef::new(hash, len, blocks).ok()
 }
 
+/// What a batched permanent delete did (OL8, OL27).
+///
+/// The sweep and the lifecycle's protected-skip count consume it: the listed
+/// sequences that were removed, and the listed sequences a lock refused, each
+/// with the non-bypassable reason the refusal carries.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::{meta::version::ExpireReport, object_lock::RefusalReason};
+///
+/// let report = ExpireReport {
+///     removed: 2,
+///     protected: vec![(7, RefusalReason::Governance)],
+/// };
+/// assert_eq!(report.removed, 2);
+/// assert_eq!(report.protected.len(), 1);
+/// assert_eq!(
+///     ExpireReport::default(),
+///     ExpireReport {
+///         removed: 0,
+///         protected: Vec::new()
+///     }
+/// );
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExpireReport {
+    /// The number of version rows the call actually removed. A listed
+    /// sequence with no row is skipped, never counted.
+    pub removed: u64,
+    /// The listed sequences a lock refused, in the input's order, with the
+    /// reason the deletion may not proceed.
+    pub protected: Vec<(u64, object_lock::RefusalReason)>,
+}
+
+/// What one [`VersionMeta::expire_with`] call did — the store's verdict, for
+/// the caller that also owns bytes (the fs backend unlinks on `Removed`).
+///
+/// A refusal never reaches this type: a protected sequence is
+/// [`storage::Error::Locked`], which is what makes the refusal non-bypassable
+/// at the one place the lock is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expired {
+    /// The version row, its index entry and its lock row were removed.
+    Removed,
+    /// The sequence addressed nothing (no row at `seq` and no current slot to
+    /// judge): the call is a no-op.
+    Nothing,
+}
+
 /// The version rows, the bucket's versioning state and the key's current slot.
 ///
 /// # Examples
@@ -547,7 +597,9 @@ pub trait VersionMeta: Send + Sync + 'static {
         key: &object::Key,
         id: Option<version::Id>,
         seq: u64,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), Self::Error> {
+        self.advance_slot_with(bucket, key, id, seq, None).await
+    }
 
     /// Make a version current again — the **restore's commit**, in one
     /// transaction: the object row the restored version becomes, the slot moved
@@ -695,12 +747,21 @@ pub trait VersionMeta: Send + Sync + 'static {
 
     /// Remove the row at `seq` and its index entry in one transaction
     /// (idempotent).
+    ///
+    /// **The contract's no-bypass form**: it delegates to
+    /// [`VersionMeta::expire_with`] with [`object_lock::Bypass::None`], so a
+    /// protected version is refused (`Locked`) and the lock row is removed
+    /// with the version. It never clears a lock on its own.
     async fn expire(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         seq: u64,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), Self::Error> {
+        self.expire_with(bucket, key, seq, object_lock::Bypass::None)
+            .await
+            .map(|_| ())
+    }
 
     /// Remove the rows at `seqs` and their index entries in **one**
     /// transaction — the retention sweep's shape.
@@ -710,13 +771,19 @@ pub trait VersionMeta: Send + Sync + 'static {
     /// so a crash point — per version, leaving a half-retired history behind.
     /// Idempotent like [`Self::expire`], and with the same all-or-nothing
     /// unit: a crash leaves every listed row or none of them. A sequence with
-    /// no row is skipped, never an error.
+    /// no row is skipped, never an error. A **protected** sequence is skipped
+    /// silently as well: this compatibility method discards the report — use
+    /// [`Self::expire_many_report`] wherever a skip must be observed (the
+    /// sweeper does, and counts it).
     async fn expire_many(
         &self,
         bucket: &bucket::Name,
         key: &object::Key,
         seqs: &[u64],
-    ) -> Result<(), Self::Error>;
+    ) -> Result<(), Self::Error> {
+        let _ = self.expire_many_report(bucket, key, seqs).await?;
+        Ok(())
+    }
 
     /// Remove **every** version row the bucket holds, with its version-index
     /// entries, in one transaction — the whole-bucket drain a bucket teardown
@@ -735,6 +802,13 @@ pub trait VersionMeta: Send + Sync + 'static {
     /// bucket down retires separately — this call leaves `current_slots`
     /// recorded, as the fs and redb stores do (the 2026-10-13 ruling; pg's
     /// drain cleared slots and no longer does).
+    ///
+    /// **Object Lock (OL8).** The drain refuses, removing nothing, when any
+    /// version row of the bucket is protected (the check runs before the first
+    /// removal; a refusal is [`storage::Error::Locked`]). On success it removes
+    /// the bucket's per-version lock rows with the version rows, **an orphan
+    /// lock row with no version row included**. A bucket's emptiness decision
+    /// includes its lock rows; that probe is the caller's.
     async fn drain_bucket(&self, bucket: &bucket::Name) -> Result<(), Self::Error>;
 
     /// The sequence the version `id` names under `key` — the point-lookup
@@ -745,6 +819,197 @@ pub trait VersionMeta: Send + Sync + 'static {
         key: &object::Key,
         id: Option<&version::Id>,
     ) -> Result<Option<u64>, Self::Error>;
+
+    /// Write a version's lock directly — **the test-only raw writer**
+    /// (OL5, OL27). `None` removes the row. No identity, configuration or
+    /// versioning-state check runs: this is the one method that plants the
+    /// state the request path would have to earn, so it is compiled only for
+    /// tests and the shared harness and is never callable from the API or the
+    /// plane.
+    ///
+    /// **R18 — why this one lock method has a provided body.** It is gated on
+    /// `cfg(any(test, feature = "testing"))`, and a cfg-gated **required**
+    /// method cannot be demanded of every implementor's feature graph: a store
+    /// compiled without `tinio-core/testing` (an integration-test dependency
+    /// copy, a normal build) cannot provide a method its `tinio-core` does not
+    /// declare, so a required form would fail to compile instead of failing
+    /// closed. The provided body therefore returns
+    /// [`storage::Error::Corrupt`] — an error, never success and never
+    /// "unlocked". This is the **only** lock method with a default; every
+    /// security-relevant read and write ([`VersionMeta::version_lock`],
+    /// [`VersionMeta::get_object_retention`],
+    /// [`VersionMeta::get_object_legal_hold`], [`VersionMeta::set_retention`],
+    /// [`VersionMeta::set_legal_hold`], [`VersionMeta::expire_with`],
+    /// [`VersionMeta::expire_many_report`],
+    /// [`VersionMeta::advance_slot_with`]) is required with no default body.
+    #[cfg(any(test, feature = "testing"))]
+    async fn set_version_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), Self::Error>
+    where
+        Self::Error: From<storage::Error>,
+    {
+        let _ = (bucket, key, version, lock);
+        Err(storage::Error::Corrupt(
+            "the test-only object-lock writer is not compiled in this build",
+        )
+        .into())
+    }
+
+    /// A version's lock, or `None` when the version has no lock row (OL5).
+    /// The identity is the version-id wire: `None` is the null version.
+    ///
+    /// A corrupt or partial stored row **fails closed**: the answer is
+    /// [`storage::Error::Corrupt`], never `Ok(None)` — an unreadable lock may
+    /// hide one in force.
+    async fn version_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+    ) -> Result<Option<object_lock::Lock>, Self::Error>;
+
+    /// The retention in force on a version (OL5). `None` is no retention,
+    /// never "unlocked": the bucket's configuration decides whether the
+    /// feature is enabled, and a corrupt row fails closed.
+    async fn get_object_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+    ) -> Result<Option<object_lock::Retention>, Self::Error>;
+
+    /// The legal hold on a version (OL5). A version with no lock row answers
+    /// [`object_lock::LegalHold::Off`]; a corrupt row fails closed.
+    async fn get_object_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+    ) -> Result<object_lock::LegalHold, Self::Error>;
+
+    /// Set, clear or leave a version's retention in **one transaction**
+    /// (OL5, OL11, OL13).
+    ///
+    /// `requested` is `Some` to set and `None` to clear. Inside the
+    /// transaction the call asserts the identity (the current slot or a
+    /// `Kind::Object` version row; a marker or an absent key is refused), the
+    /// bucket's configuration is enabled, and versioning is `Enabled`.
+    /// [`object_lock::apply_retention`] applies the update; the current legal
+    /// hold is preserved in every arm. The answer is the resulting lock, or
+    /// `None` when the last fact was removed.
+    ///
+    /// A refusal is [`storage::Error::Locked`]; a bad identity is
+    /// [`storage::Error::NoSuchVersion`]; a bucket whose configuration or
+    /// versioning state refuses is [`storage::Error::InvalidBucketState`]; a
+    /// corrupt stored row is [`storage::Error::Corrupt`].
+    async fn set_retention(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+        requested: Option<&object_lock::Retention>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, Self::Error>;
+
+    /// Set a version's legal hold in one transaction (OL5, OL11, OL13). The
+    /// same identity, configuration and versioning assertions as
+    /// [`VersionMeta::set_retention`] run inside it; the retention is
+    /// preserved. A legal hold has no bypass.
+    async fn set_legal_hold(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+        hold: object_lock::LegalHold,
+    ) -> Result<object_lock::Lock, Self::Error>;
+
+    /// Set, clear or leave a version's retention **and** set or leave its
+    /// legal hold in **one transaction** (OL5, OL11, OL13, OL23).
+    ///
+    /// `retention` is the plane's three-state member — `None` leaves the
+    /// retention alone, `Some(None)` clears it and `Some(Some(retention))`
+    /// sets it — and `legal_hold` is its two-state member (`None` leaves the
+    /// hold alone, a value sets it). Both members are decided before the one
+    /// row is written: a refused retention (a COMPLIANCE shortening or
+    /// removal, or a GOVERNANCE change without [`object_lock::Bypass::Governance`])
+    /// answers [`storage::Error::Locked`] and applies **neither** member. The
+    /// legal hold itself never refuses and has no bypass.
+    ///
+    /// The identity, the bucket configuration and the versioning assertions
+    /// are [`VersionMeta::set_retention`]'s, run inside the same transaction,
+    /// and a corrupt stored row fails closed. The answer is the resulting
+    /// lock, or `None` when it carries no fact.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the combined write's field set — bucket, key, identity, both members, bypass and clock — is the request's own"
+    )]
+    async fn set_lock(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        version: Option<&version::Id>,
+        retention: Option<Option<&object_lock::Retention>>,
+        legal_hold: Option<object_lock::LegalHold>,
+        bypass: object_lock::Bypass,
+        now: SystemTime,
+    ) -> Result<Option<object_lock::Lock>, Self::Error>;
+
+    /// Permanently remove the version at `seq`, enforcing its lock, in one
+    /// transaction (OL8, OL27).
+    ///
+    /// The identity the row names — or, when no row exists at `seq`, the
+    /// current slot — is checked with [`object_lock::may_delete`] at the
+    /// store's own clock. A refusal is [`storage::Error::Locked`] and removes
+    /// nothing. On success the row, its index entry **and the lock row** are
+    /// removed together, and the answer says which of the two successes it
+    /// was (a listed sequence with no row is [`Expired::Nothing`]). A corrupt
+    /// lock row fails closed.
+    ///
+    /// The answer exists so a caller that also owns bytes — the fs backend —
+    /// unlinks only after the store's verdict ([`Expired::Removed`]) rather
+    /// than judging the lock a second time.
+    async fn expire_with(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seq: u64,
+        bypass: object_lock::Bypass,
+    ) -> Result<Expired, Self::Error>;
+
+    /// The batched permanent delete (OL8, OL27): protected sequences are
+    /// skipped and reported, the rest are removed, and the whole batch is one
+    /// transaction. A sequence with no row is skipped, never an error. This
+    /// is the sweep's shape; [`VersionMeta::expire_many`] keeps its signature
+    /// and discards this report.
+    async fn expire_many_report(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        seqs: &[u64],
+    ) -> Result<ExpireReport, Self::Error>;
+
+    /// Move the key's current slot to `(id, seq)` and, when `lock` is `Some`,
+    /// commit that lock **with the slot movement** (OL7, OL27).
+    ///
+    /// The slot rule is [`VersionMeta::advance_slot`]'s in full (the marker
+    /// bit comes from the row, the stamp goes on the row moved off, and the
+    /// null version is admitted in place). `lock: None` **never removes** an
+    /// existing lock row: only the removal primitives clear one. A backend
+    /// resolves the effective lock in its own write path and passes it here.
+    async fn advance_slot_with(
+        &self,
+        bucket: &bucket::Name,
+        key: &object::Key,
+        id: Option<version::Id>,
+        seq: u64,
+        lock: Option<&object_lock::Lock>,
+    ) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]

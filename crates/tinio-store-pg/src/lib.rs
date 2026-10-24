@@ -17,6 +17,7 @@
 //! - [`content`] — the `bytea`-chunked content plane (PG18/PG20/PG23/PG24).
 //! - [`blocks`] — the content-addressed block plane (PG14/PG19).
 //! - [`diagnostics`] — the read-only probes an operator's diagnosis asks for (PG4/PG6).
+//! - [`lock_inspect`] — the doctor's read-only Object Lock scan (OL31).
 //!
 //! # Ordering
 //!
@@ -49,6 +50,7 @@ pub mod blocks;
 pub mod cleanup;
 pub mod content;
 pub mod diagnostics;
+pub mod lock_inspect;
 pub mod meta;
 pub mod migrations;
 pub mod pool;

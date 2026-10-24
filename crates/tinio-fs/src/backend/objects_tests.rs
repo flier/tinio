@@ -22,6 +22,8 @@ use crate::_core::storage::MultipartOps;
 // The parts-table proof reads a table directly; the file-level import is
 // the copy fast path's, unix-gated, so the test module carries its own.
 use crate::_store_redb::object_part;
+#[cfg(any(unix, feature = "versioning"))]
+use crate::_store_redb::version_object_lock;
 // The ranged-stream tests assert the shared stream's chunking.
 use crate::_util::fsutil::CHUNK_SIZE;
 // The versioning leg is registered in the runner below, not inside
@@ -118,6 +120,7 @@ async fn copy_object_fast_path_preserves_content_and_etag() {
             None,
             &Acl::default_private(None),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -149,6 +152,7 @@ async fn copy_of_a_multipart_source_yields_the_content_md5() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -205,6 +209,7 @@ async fn copy_of_a_multipart_source_yields_the_content_md5() {
             None,
             &Acl::default_private(None),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -228,6 +233,7 @@ async fn copy_of_a_missing_source_is_no_such_key() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
             None,
         )
         .await
@@ -530,6 +536,7 @@ async fn commit_after_bucket_deleted_is_no_such_bucket() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap_err()
@@ -726,6 +733,7 @@ async fn commit_object_writes_to_bucket_target_at_rename() {
                     object::Tags::empty(),
                     None,
                     &Acl::default_private(None),
+                    None,
                 )
                 .await
                 .unwrap()
@@ -825,6 +833,7 @@ async fn fs_commit_and_copy_carry_tags() {
             tags.clone(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -845,6 +854,7 @@ async fn fs_commit_and_copy_carry_tags() {
             copy_tags.clone(),
             None,
             &Acl::default_private(None),
+            None,
             None,
         )
         .await
@@ -879,6 +889,7 @@ async fn fs_commit_records_the_stage_tee_checksum() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -927,6 +938,7 @@ async fn fs_content_recompute_preserves_tags_and_checksum() {
             tags.clone(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -980,6 +992,7 @@ async fn fs_object_parts_lifecycle() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -1024,6 +1037,7 @@ async fn fs_object_parts_lifecycle() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
             None,
         )
         .await
@@ -1127,6 +1141,7 @@ async fn fs_commit_records_owner_and_acl() {
             object::Tags::empty(),
             Some(&owner),
             &write_acl,
+            None,
         )
         .await
         .unwrap();
@@ -1173,6 +1188,7 @@ async fn fs_copy_records_the_callers_owner_and_acl() {
                 grants: grants.clone(),
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1210,6 +1226,7 @@ async fn fs_rename_moves_owner_and_acl() {
                 owner: Some(owner.clone()),
                 grants: grants.clone(),
             },
+            None,
         )
         .await
         .unwrap();
@@ -1290,6 +1307,7 @@ async fn fs_object_chowned_to_mapped_owner_uid() {
             object::Tags::empty(),
             Some(&owner),
             &Acl::default_private(Some(owner.clone())),
+            None,
         )
         .await
         .unwrap();
@@ -1326,6 +1344,7 @@ async fn fs_unmapped_owner_file_stays_server_user_owned() {
             object::Tags::empty(),
             Some(&owner),
             &Acl::default_private(Some(owner.clone())),
+            None,
         )
         .await
         .unwrap();
@@ -1376,6 +1395,7 @@ async fn fs_rename_preserves_ownership() {
             object::Tags::empty(),
             Some(&owner),
             &Acl::default_private(Some(owner.clone())),
+            None,
         )
         .await
         .unwrap();
@@ -1424,6 +1444,7 @@ async fn fs_copy_overwrite_rechown_to_new_owner() {
             object::Tags::empty(),
             Some(&owner_a),
             &Acl::default_private(Some(owner_a.clone())),
+            None,
         )
         .await
         .unwrap();
@@ -1437,6 +1458,7 @@ async fn fs_copy_overwrite_rechown_to_new_owner() {
             object::Tags::empty(),
             Some(&owner_b),
             &Acl::default_private(Some(owner_b.clone())),
+            None,
             None,
         )
         .await
@@ -1593,6 +1615,7 @@ async fn fs_chown_failure_after_rename_removes_file_and_errors() {
             object::Tags::empty(),
             Some(&owner),
             &Acl::default_private(Some(owner.clone())),
+            None,
         )
         .await
         .unwrap_err();
@@ -1649,6 +1672,7 @@ async fn fs_chown_failure_on_a_versioned_overwrite_keeps_the_current_version() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -1668,6 +1692,7 @@ async fn fs_chown_failure_on_a_versioned_overwrite_keeps_the_current_version() {
             object::Tags::empty(),
             Some(&owner),
             &Acl::default_private(Some(owner.clone())),
+            None,
         )
         .await
         .unwrap_err();
@@ -1683,4 +1708,160 @@ async fn fs_chown_failure_on_a_versioned_overwrite_keeps_the_current_version() {
             .is_ok(),
         "the current version stays addressable"
     );
+}
+
+/// OL7/OL12 on the unix fast-copy tail: the copy's slot write is
+/// `record_committed`'s (it writes the slot columns directly, not through
+/// `advance_slot_with`), so the protected-null refusal and the lock commit
+/// must live in **that** transaction. A copy over a null identity that owns an
+/// active lock is refused, and the lock row survives.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fast_copy_over_a_locked_null_version_is_refused() {
+    let (_root, storage) = storage();
+    let b = bucket(&storage).await;
+    storage
+        .set_bucket_versioning(&b, version::State::Suspended)
+        .await
+        .unwrap();
+    let src = object::key("src.bin").unwrap();
+    let dst = object::key("dst.bin").unwrap();
+    storage.put_object(&b, &src, body(b"source")).await.unwrap();
+    storage.put_object(&b, &dst, body(b"old")).await.unwrap();
+
+    let lock = object_lock::Lock {
+        retention: Some(object_lock::Retention {
+            mode: object_lock::Mode::Governance,
+            retain_until: std::time::SystemTime::now() + std::time::Duration::from_secs(3_600),
+        }),
+        legal_hold: object_lock::LegalHold::Off,
+    };
+    let (plant_bucket, plant_key) = (b.to_string(), dst.to_string());
+    let planted = lock.clone();
+    storage
+        .handle()
+        .write(move |txn| -> Result<(), database::Error> {
+            version_object_lock::Table::open(txn)?.put(
+                &plant_bucket,
+                &plant_key,
+                &crate::_core::version::wire_of(None),
+                &planted,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // C1 (the 2026-10-21 review): the refusal must land **before the
+    // rename**, so the destination keeps its protected bytes and ETag. The
+    // pre-check under the publish's mutation lock is what this proves; the
+    // row transaction's re-check stays the authority.
+    let before = storage.get_object(&b, &dst, None).await.unwrap();
+    let before_etag = before.info.etag.clone();
+    assert_eq!(read_body(before.body).await.unwrap(), b"old");
+
+    let err = storage
+        .copy_object(
+            &b,
+            &src,
+            &b,
+            &dst,
+            object::Tags::empty(),
+            None,
+            &Acl::default_private(None),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the locked null identity is a protected overwrite");
+    assert!(
+        matches!(err, Error::Storage(storage::Error::Locked(_))),
+        "the fast-copy tail refuses with Locked: {err:?}"
+    );
+    let after = storage.get_object(&b, &dst, None).await.unwrap();
+    assert_eq!(
+        read_body(after.body).await.unwrap(),
+        b"old",
+        "the refused copy leaves the protected content unchanged"
+    );
+    assert_eq!(
+        after.info.etag, before_etag,
+        "the refused copy leaves the destination's ETag unchanged"
+    );
+    let still_there = storage
+        .handle()
+        .read(move |txn| -> Result<bool, database::Error> {
+            Ok(version_object_lock::Table::open_readonly(txn)?
+                .get(
+                    &b.to_string(),
+                    &dst.to_string(),
+                    &crate::_core::version::wire_of(None),
+                )?
+                .is_some())
+        })
+        .unwrap();
+    assert!(still_there, "the refusal leaves the lock row in place");
+}
+
+/// A suspended delete of a locked null object must refuse before the marker
+/// row and the unlink. The bytes and the lock row are the only copy.
+#[cfg(feature = "versioning")]
+#[tokio::test]
+async fn a_suspended_delete_of_a_locked_null_version_is_refused() {
+    use std::time::SystemTime;
+
+    use crate::_core::{storage::VersionOps, version::wire_of};
+
+    let (_root, storage) = storage();
+    let b = bucket(&storage).await;
+    storage
+        .set_bucket_versioning(&b, version::State::Suspended)
+        .await
+        .unwrap();
+    let k = object::key("locked.txt").unwrap();
+    storage.put_object(&b, &k, body(b"keep")).await.unwrap();
+
+    let lock = object_lock::Lock {
+        retention: Some(object_lock::Retention {
+            mode: object_lock::Mode::Governance,
+            retain_until: SystemTime::now() + Duration::from_secs(3_600),
+        }),
+        legal_hold: object_lock::LegalHold::Off,
+    };
+    let (plant_bucket, plant_key) = (b.to_string(), k.to_string());
+    storage
+        .handle()
+        .write(move |txn| -> Result<(), database::Error> {
+            version_object_lock::Table::open(txn)?.put(
+                &plant_bucket,
+                &plant_key,
+                &wire_of(None),
+                &lock,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let err = storage.delete_object(&b, &k).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Storage(storage::Error::Locked(
+                object_lock::RefusalReason::Governance
+            ))
+        ),
+        "{err:?}"
+    );
+    let kept = storage.get_object(&b, &k, None).await.unwrap();
+    assert_eq!(read_body(kept.body).await.unwrap(), b"keep");
+    let still_there = storage
+        .handle()
+        .read(move |txn| -> Result<bool, database::Error> {
+            Ok(version_object_lock::Table::open_readonly(txn)?
+                .get(&b.to_string(), &k.to_string(), &wire_of(None))?
+                .is_some())
+        })
+        .unwrap();
+    assert!(still_there, "the refusal leaves the lock row in place");
 }

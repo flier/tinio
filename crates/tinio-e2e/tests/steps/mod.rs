@@ -16,6 +16,7 @@ use cucumber::{
 pub mod acl;
 pub mod buckets;
 pub mod cli;
+pub mod cli_object_lock;
 pub mod clients;
 pub mod common;
 pub mod conditions;
@@ -25,6 +26,7 @@ pub mod lifecycle;
 pub mod listing;
 pub mod metrics;
 pub mod multipart;
+pub mod object_lock;
 pub mod objects;
 pub mod reserved_paths;
 pub mod select;
@@ -175,6 +177,14 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
         // and a version-addressed request is refused outright — never
         // answered from the current version (the fail-open guard).
         caps.versioning = false;
+    }
+    if tagged("object-lock-off") {
+        // The Object Lock capability off (OL2, OL20): the six operations
+        // answer NotImplemented, while stored configurations, default
+        // retention and delete protection stay in force, and GET/HEAD
+        // skip the lock headers. The e2e build still compiles the
+        // surface (`--features object-lock`); this is the runtime switch.
+        caps.object_lock = false;
     }
     if tagged("max-buckets-3") {
         // The ListBuckets-pagination scenarios need a page cap below the

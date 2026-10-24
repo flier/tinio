@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO upload_object_lock (\n    bucket, upload_id, mode, retain_until, legal_hold\n)\nVALUES ($1, $2, $3, $4, $5)\nON CONFLICT (bucket, upload_id) DO UPDATE SET\n    mode = excluded.mode,\n    retain_until = excluded.retain_until,\n    legal_hold = excluded.legal_hold\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "016b8f00b50964763261a69cdba182718574ab0c9e853b4e556cb9327b759bd1"
+}

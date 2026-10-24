@@ -4,7 +4,10 @@ use std::{
 };
 
 use futures::stream;
-use tinio_util::testing::{metrics::test_lock, spans};
+use tinio_util::testing::{
+    metrics::{protected_deletions, test_lock},
+    spans,
+};
 use tokio::{runtime, sync::watch, time::sleep};
 use tracing::{Level, subscriber::with_default};
 use tracing_subscriber::prelude::*;
@@ -12,12 +15,286 @@ use tracing_subscriber::prelude::*;
 use super::*;
 use crate::{
     _core::{
-        BucketOps, MultipartOps, ObjectOps, acl::Acl, object, storage::VersionOps, version::State,
+        BucketOps, MultipartOps, ObjectOps, acl::Acl, object, object_lock, storage::VersionOps,
+        version::State,
     },
     _mem::MemoryStorage,
     clock::FixedClock,
     metrics::action_count,
 };
+
+/// A noncurrent rule by version count rather than age: deterministic
+/// regardless of the wall clock (a `Days` rule counts to the next midnight).
+fn noncurrent_budget(keep: i32) -> lifecycle::Rule {
+    lifecycle::Rule {
+        noncurrent_version_expiration: Some(lifecycle::NoncurrentVersionExpiration {
+            noncurrent_days: None,
+            newer_noncurrent_versions: Some(keep),
+        }),
+        // `NewerNoncurrentVersions` requires its own filter.
+        filter: lifecycle::Filter {
+            prefix: Some("a".into()),
+            ..lifecycle::Filter::default()
+        },
+        ..rule()
+    }
+}
+
+/// A lock-enabled versioned bucket holding three versions of one key: the two
+/// older ones are history, the newest is current. Answers the oldest version's
+/// id.
+async fn locked_history(
+    mode: object_lock::Mode,
+) -> (Arc<MemoryStorage>, bucket::Name, object::Key, version::Id) {
+    let storage = Arc::new(MemoryStorage::new().unwrap());
+    let bucket = bucket::name("locked").unwrap();
+    let key = object::key("a.txt").unwrap();
+    storage
+        .create_bucket(&bucket, None, &Acl::default_private(None))
+        .await
+        .unwrap();
+    storage
+        .set_bucket_versioning(&bucket, State::Enabled)
+        .await
+        .unwrap();
+    storage
+        .put_bucket_object_lock(
+            &bucket,
+            &object_lock::Config {
+                enabled: true,
+                rule: None,
+            },
+        )
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        storage
+            .put_object(&bucket, &key, Box::pin(stream::empty()))
+            .await
+            .unwrap();
+    }
+    let entries = storage
+        .list_object_versions(
+            &bucket,
+            ListParams {
+                max_keys: PAGE,
+                ..ListParams::default()
+            },
+        )
+        .await
+        .unwrap()
+        .entries;
+    assert_eq!(entries.len(), 3, "three versions of one key");
+    let old = entries[2]
+        .id
+        .clone()
+        .expect("a versioned write mints an id");
+    storage
+        .set_retention(
+            &bucket,
+            &key,
+            &version::Address::Id(old.clone()),
+            Some(&object_lock::Retention {
+                mode,
+                retain_until: SystemTime::now() + Duration::from_secs(86_400),
+            }),
+            object_lock::Bypass::None,
+            SystemTime::now(),
+        )
+        .await
+        .unwrap();
+    (storage, bucket, key, old)
+}
+
+/// A clock a minute on, so a zero-day noncurrent threshold is already due.
+fn due_runner(storage: &Arc<MemoryStorage>) -> Runner<MemoryStorage> {
+    let (_stop, stopped) = watch::channel(false);
+    Runner::new(
+        Arc::clone(storage),
+        Options {
+            delay: Duration::ZERO,
+            ..Options::default()
+        },
+        Arc::new(FixedClock(
+            SystemTime::now() + Duration::from_secs(100 * 86_400),
+        )),
+        stopped,
+    )
+}
+
+/// OL19: a `Locked` noncurrent expiration is a counted skip, not an error. The
+/// version stays, nothing is counted as expired or failed, and the metric
+/// records the lifecycle operation with the refusal reason.
+#[tokio::test]
+async fn a_locked_noncurrent_version_is_a_counted_skip() {
+    let (storage, bucket, _key, _old) = locked_history(object_lock::Mode::Governance).await;
+    let before = protected_deletions("lifecycle", "governance");
+    let runner = due_runner(&storage);
+    let seeded = runner
+        .seed(&[Seed {
+            bucket: bucket.clone(),
+            rule: noncurrent_budget(1),
+        }])
+        .await;
+    let summary = runner.pass().await;
+
+    assert_eq!(seeded.buckets_with_rules, 1, "the rule was stored");
+    assert_eq!(summary.protected_versions, 1, "the skip is counted");
+    assert_eq!(summary.expired_versions, 0, "nothing was removed");
+    assert_eq!(summary.errors, 0, "a protected version is not an error");
+    assert_eq!(
+        storage
+            .list_object_versions(
+                &bucket,
+                ListParams {
+                    max_keys: PAGE,
+                    ..ListParams::default()
+                },
+            )
+            .await
+            .unwrap()
+            .entries
+            .len(),
+        3,
+        "the protected history row survives"
+    );
+    assert_eq!(
+        protected_deletions("lifecycle", "governance") - before,
+        1.0,
+        "the refusal is recorded under operation=lifecycle, reason=governance"
+    );
+}
+
+/// OL19: current-version expiration is not lock-protected — a DELETE without a
+/// version id writes a marker even on a lock-enabled bucket.
+#[tokio::test]
+async fn the_current_version_still_expires_to_a_marker_on_a_locked_bucket() {
+    let storage = Arc::new(MemoryStorage::new().unwrap());
+    let bucket = bucket::name("locked").unwrap();
+    let key = object::key("a.txt").unwrap();
+    storage
+        .create_bucket(&bucket, None, &Acl::default_private(None))
+        .await
+        .unwrap();
+    storage
+        .set_bucket_versioning(&bucket, State::Enabled)
+        .await
+        .unwrap();
+    storage
+        .put_bucket_object_lock(
+            &bucket,
+            &object_lock::Config {
+                enabled: true,
+                rule: None,
+            },
+        )
+        .await
+        .unwrap();
+    storage
+        .put_object(&bucket, &key, Box::pin(stream::empty()))
+        .await
+        .unwrap();
+
+    let runner = due_runner(&storage);
+    runner
+        .seed(&[Seed {
+            bucket: bucket.clone(),
+            rule: expires(1),
+        }])
+        .await;
+    let summary = runner.pass().await;
+
+    assert_eq!(summary.expired_objects, 1, "the current version expires");
+    assert_eq!(summary.protected_versions, 0, "no lock refuses a marker");
+    assert_eq!(
+        storage.current_version(&bucket, &key).await.unwrap(),
+        CurrentVersion::Marker,
+        "a versioned bucket's expiration writes a marker"
+    );
+}
+
+/// OL19: `ExpiredObjectDeleteMarker` removes a marker (not protected), even on
+/// a lock-enabled bucket.
+#[tokio::test]
+async fn an_expired_object_delete_marker_is_removed_on_a_locked_bucket() {
+    let storage = Arc::new(MemoryStorage::new().unwrap());
+    let bucket = bucket::name("locked").unwrap();
+    let key = object::key("a.txt").unwrap();
+    storage
+        .create_bucket(&bucket, None, &Acl::default_private(None))
+        .await
+        .unwrap();
+    storage
+        .set_bucket_versioning(&bucket, State::Enabled)
+        .await
+        .unwrap();
+    storage
+        .put_bucket_object_lock(
+            &bucket,
+            &object_lock::Config {
+                enabled: true,
+                rule: None,
+            },
+        )
+        .await
+        .unwrap();
+    storage
+        .put_object(&bucket, &key, Box::pin(stream::empty()))
+        .await
+        .unwrap();
+    let content = storage
+        .list_object_versions(
+            &bucket,
+            ListParams {
+                max_keys: PAGE,
+                ..ListParams::default()
+            },
+        )
+        .await
+        .unwrap()
+        .entries[0]
+        .id
+        .clone();
+    storage.delete_object(&bucket, &key).await.unwrap();
+    storage
+        .delete_object_version(&bucket, &key, content.as_ref(), object_lock::Bypass::None)
+        .await
+        .unwrap();
+
+    let runner = due_runner(&storage);
+    runner
+        .seed(&[Seed {
+            bucket: bucket.clone(),
+            rule: lifecycle::Rule {
+                expiration: Some(lifecycle::Expiration {
+                    days: None,
+                    date: None,
+                    expired_object_delete_marker: Some(true),
+                }),
+                ..rule()
+            },
+        }])
+        .await;
+    let summary = runner.pass().await;
+
+    assert_eq!(summary.expired_versions, 1, "the marker is removed");
+    assert_eq!(summary.protected_versions, 0, "a marker is never protected");
+    assert!(
+        storage
+            .list_object_versions(
+                &bucket,
+                ListParams {
+                    max_keys: PAGE,
+                    ..ListParams::default()
+                },
+            )
+            .await
+            .unwrap()
+            .entries
+            .is_empty(),
+        "the key's only version (the marker) is gone"
+    );
+}
 
 /// A versioned bucket holding one key.
 async fn marked() -> (Arc<MemoryStorage>, bucket::Name, object::Key) {
@@ -166,7 +443,7 @@ async fn a_stopping_chain_is_left_whole() {
         .id
         .clone();
     storage
-        .delete_object_version(&bucket, &key, hidden.as_ref())
+        .delete_object_version(&bucket, &key, hidden.as_ref(), object_lock::Bypass::None)
         .await
         .unwrap();
     let (stop, stopped) = watch::channel(false);
@@ -346,6 +623,7 @@ fn a_pass_spans_its_cycle_and_its_actions() {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -417,6 +695,7 @@ fn a_pass_spans_its_cycle_and_its_actions() {
         "buckets_with_rules",
         "expired_objects",
         "expired_versions",
+        "protected_versions",
         "aborted_uploads",
         "errors",
     ] {

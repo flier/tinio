@@ -108,6 +108,7 @@ async fn the_stage_streams_the_body_and_fixes_its_etag_and_checksum() {
             tags(),
             Some(&owner()),
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -158,6 +159,7 @@ async fn a_carried_checksum_wins_over_the_stages_streamed_digest() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -187,6 +189,7 @@ async fn the_commit_writes_the_row_under_the_receivers_bucket_row_policy() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -212,6 +215,7 @@ async fn the_commit_writes_the_row_under_the_receivers_bucket_row_policy() {
         object::Tags::empty(),
         None,
         &Acl::default_private(None),
+        None,
     )
     .await
     .unwrap();
@@ -243,6 +247,7 @@ async fn a_failed_row_write_is_read_through_the_metadata_failure_policy() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap_err();
@@ -273,6 +278,7 @@ async fn a_failed_row_write_is_read_through_the_metadata_failure_policy() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap();
@@ -306,6 +312,7 @@ async fn the_fail_policys_compensation_leaves_a_newer_writers_bytes_alone() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .unwrap_err();
@@ -449,6 +456,7 @@ async fn a_stale_row_is_recomputed_and_rewritten() {
         tags(),
         Some(&owner()),
         &Acl::default_private(None),
+        None,
     )
     .await
     .unwrap();
@@ -609,6 +617,7 @@ async fn ranges_resolve_against_the_served_length() {
         object::Tags::empty(),
         None,
         &Acl::default_private(None),
+        None,
     )
     .await
     .unwrap();
@@ -657,6 +666,7 @@ async fn a_rename_moves_the_bytes_and_the_record_in_one_call_each() {
         tags(),
         Some(&owner()),
         &Acl::default_private(None),
+        None,
     )
     .await
     .unwrap();
@@ -730,6 +740,7 @@ async fn the_tag_pairs_replace_clear_and_follow_the_row_policy() {
         object::Tags::empty(),
         None,
         &Acl::default_private(None),
+        None,
     )
     .await
     .unwrap();
@@ -795,6 +806,7 @@ async fn the_acl_pair_replaces_the_grants_and_preserves_the_owner() {
         tags(),
         Some(&owner()),
         &Acl::default_private(Some(owner())),
+        None,
     )
     .await
     .unwrap();
@@ -835,6 +847,7 @@ async fn the_retained_part_list_is_served_and_projected() {
         object::Tags::empty(),
         None,
         &Acl::default_private(None),
+        None,
     )
     .await
     .unwrap();
@@ -893,6 +906,7 @@ async fn put_versioned<C: ObjectContent>(
         object::Tags::empty(),
         None,
         &Acl::default_private(None),
+        None,
         plane.version_rows.as_ref(),
     )
     .await
@@ -926,6 +940,7 @@ async fn a_versioned_put_supersedes_before_it_publishes() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
             plane.version_rows.as_ref(),
         )
         .await
@@ -1079,6 +1094,7 @@ async fn a_refused_versioned_row_write_leaves_the_current_version_in_place() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
             plane.version_rows.as_ref(),
         )
         .await
@@ -1147,6 +1163,7 @@ async fn a_refused_versioned_row_write_keeps_the_retained_parts() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
             plane.version_rows.as_ref(),
         )
         .await
@@ -1203,6 +1220,7 @@ async fn a_refused_versioned_slot_advance_leaves_the_current_version_in_place() 
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
             plane.version_rows.as_ref(),
         )
         .await

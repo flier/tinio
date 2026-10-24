@@ -29,7 +29,7 @@ futures.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
-tinio-store-redb.workspace = true
+tinio-store-redb = { workspace = true, features = ["testing"] }
 tinio-util = { workspace = true, features = ["testing"] }
 
 [[bench]]

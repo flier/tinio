@@ -26,13 +26,14 @@ sqlx = { workspace = true, optional = true, default-features = false, features =
     "postgres",
 ] }
 thiserror.workspace = true
-time.workspace = true
+time = { workspace = true, features = ["formatting", "parsing"] }
 tracing.workspace = true
 unicode-properties = { workspace = true, features = ["general-category"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [features]
 sqlx = ["dep:sqlx"]
+testing = []
 
 [dev-dependencies]
 proptest.workspace = true

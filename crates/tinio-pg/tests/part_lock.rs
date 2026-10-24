@@ -49,7 +49,7 @@ async fn upload(storage: &PgStorage, bucket: &bucket::Name) -> Result<String, St
         .map_err(|err| err.to_string())?;
     let key = object::key("locked.bin").map_err(|err| err.to_string())?;
     Ok(storage
-        .create_multipart_upload(bucket, &key, None, object::Tags::empty(), None, &acl)
+        .create_multipart_upload(bucket, &key, None, object::Tags::empty(), None, &acl, None)
         .await
         .map_err(|err| err.to_string())?
         .upload_id)

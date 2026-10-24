@@ -17,7 +17,7 @@ use cucumber::{gherkin::Step, given, then, when};
 /// (matched case-insensitively against the stored names, so a stored
 /// `ETag` substitutes `{etag}`). Applied to the raw steps' paths, bodies,
 /// and header-table values.
-fn subst(world: &super::World, text: &str) -> String {
+pub(super) fn subst(world: &super::World, text: &str) -> String {
     let mut out = text.to_string();
     if out.contains("{upload_id}") {
         out = out.replace("{upload_id}", &world.mp.upload_id);

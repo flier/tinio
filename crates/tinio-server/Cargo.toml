@@ -95,11 +95,12 @@ tokio = { workspace = true, features = ["full"] }
 toml.workspace = true
 
 tinio-api.workspace = true
-tinio-fs.workspace = true
+tinio-fs = { workspace = true, features = ["testing"] }
 tinio-mem.workspace = true
 tinio-sandbox.workspace = true
 tinio-sandbox-linux = { workspace = true, features = ["testing"] }
 tinio-sandbox-windows = { workspace = true, features = ["testing"] }
+tinio-store-redb = { workspace = true, features = ["testing"] }
 tinio-util = { workspace = true, features = ["bench", "state", "testing"] }
 
 [[test]]
@@ -149,6 +150,7 @@ list-v1 = []
 list-v2 = []
 cors = []
 lifecycle = []
+object-lock = ["versioning"]
 select = ["dep:tinio-select", "dep:cfg-if", "dep:rayon"]
 select-parquet = ["select", "tinio-select/parquet"]
 acl = ["dep:tinio-auth"]

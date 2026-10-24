@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM bucket_object_lock WHERE bucket = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "23a92f3f73f7d91257c0151c06464949503164d6e7d92e26a422cb663b8abc71"
+}

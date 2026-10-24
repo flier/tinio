@@ -221,6 +221,10 @@ async fn prepare_pg(
     let storage = PgStorage::connect(&config, access)
         .await
         .map_err(StorageError::from)?;
+    // The Object Lock cache is created before the plane, because the admin needs the same
+    // handle the data plane later receives (OL18). It is `None` when the capability is off.
+    #[cfg(feature = "object-lock")]
+    let object_lock_cache = super::run::object_lock_cache_for(&serving.resolution);
     #[cfg(feature = "api")]
     let plane = super::run::open_management_plane(
         &storage,
@@ -228,9 +232,16 @@ async fn prepare_pg(
         &serving.args,
         serving.adopted.as_ref(),
         &serving.handles,
+        #[cfg(feature = "object-lock")]
+        object_lock_cache.clone(),
     )?;
     #[cfg(feature = "api")]
-    let prepared = Prepared { storage, plane };
+    let prepared = Prepared {
+        storage,
+        plane,
+        #[cfg(feature = "object-lock")]
+        object_lock_cache,
+    };
     #[cfg(not(feature = "api"))]
     let prepared = Prepared { storage };
     Ok((prepared, serving))
@@ -264,6 +275,8 @@ where
     let storage = prepared.storage;
     #[cfg(feature = "api")]
     let plane = prepared.plane;
+    #[cfg(feature = "object-lock")]
+    let object_lock_cache = prepared.object_lock_cache;
     let Serving {
         resolution,
         args,
@@ -391,7 +404,12 @@ where
     // same process registry the reader below fills, so nothing about the data plane is unobserved.
     let data = plane_for(
         storage.metrics_storage(),
-        PlaneConfig { caps, access },
+        PlaneConfig {
+            caps,
+            access,
+            #[cfg(feature = "object-lock")]
+            object_lock_cache,
+        },
         &resolution,
     );
 

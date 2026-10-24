@@ -143,7 +143,6 @@ use crate::{_core::storage::VersionOps, storage::MemoryStorage};
 /// The feature-off `VersionOps`: the trait's default bodies own every answer
 /// (the refusal class for the nine, `Unversioned` for `bucket_versioning`),
 /// so there is nothing to write here and nothing to forget.
-
 #[cfg(not(feature = "versioning"))]
 impl VersionOps for MemoryStorage {}
 
@@ -277,6 +276,9 @@ pub(crate) fn check_bucket_write(txn: &mut WriteTransaction, bucket: &Name) -> R
     Ok(())
 }
 
+#[cfg(feature = "versioning")]
+pub(crate) use enabled::locked_wire_reason;
+
 /// The versioned implementation, compiled with the `versioning` feature.
 #[cfg(feature = "versioning")]
 mod enabled {
@@ -285,6 +287,7 @@ mod enabled {
         collections::{BTreeMap, HashSet},
         mem,
         ops::Bound,
+        time::SystemTime,
     };
 
     use async_trait::async_trait;
@@ -300,8 +303,8 @@ mod enabled {
             content::ContentKey,
             from_nanos,
             meta::{VersionMeta, object as object_row},
-            object,
-            storage::{VersionOps, common_prefix, marker_has_no_metadata},
+            object, object_lock,
+            storage::{self, VersionOps, common_prefix, marker_has_no_metadata},
             version::{
                 self, CurrentVersion, HeadResult, Id, ListParams, Listing, Marker, ReadResult,
                 State, wire_of,
@@ -310,7 +313,7 @@ mod enabled {
         _store_redb::{
             bucket_versioning, object_meta, object_part, objects,
             scan::{drain_pair, for_each_pair},
-            version as stored, version_index,
+            version as stored, version_index, version_object_lock,
         },
         _version::{Current as Slot, Identity, Intent, Seqs, plan_write},
         DatabaseError, Error,
@@ -823,17 +826,51 @@ mod enabled {
         Ok(())
     }
 
+    /// The refusal `wire`'s lock would give a delete, loaded inside this
+    /// transaction (OL7, OL8). `Ok(None)` means the caller may remove or
+    /// replace that identity. Every mem delete and the null in-place
+    /// overwrite call this rather than spelling [`object_lock::may_delete`].
+    ///
+    /// `pub(crate)` because the module re-exports it at the same visibility
+    /// (`crate::version::locked_wire_reason`, the object path's call site).
+    pub(crate) fn locked_wire_reason(
+        txn: &mut WriteTransaction,
+        bucket: &str,
+        key: &str,
+        wire: &str,
+        bypass: object_lock::Bypass,
+    ) -> Result<Option<object_lock::RefusalReason>, Error> {
+        let lock = version_object_lock::Table::open(txn)?.get(bucket, key, wire)?;
+        Ok(object_lock::delete_refusal(
+            lock.as_ref(),
+            SystemTime::now(),
+            bypass,
+        ))
+    }
+
     /// Remove the current object version's rows (its content, metadata and
     /// retained part list) — the materialize's first half. A current delete
     /// marker has no such rows. Answers the byte delta: the content row's
     /// bytes leave the tracked total (negated).
+    ///
+    /// **Object Lock (OL8, R19).** The current version's identity is checked
+    /// before anything is removed: a lock that refuses the delete refuses the
+    /// whole transaction, removing nothing, and on success the identity's
+    /// lock row leaves in the same commit as the rows it protected. A marker
+    /// never reaches this function (the caller resolves it as a `Row`).
     fn drop_current(
         txn: &mut WriteTransaction,
         bucket: &Name,
         key: &object::Key,
+        id: Option<&Id>,
+        bypass: object_lock::Bypass,
     ) -> Result<i64, Error> {
         let b = bucket.as_ref().as_str();
         let k = key.as_ref().as_str();
+        let wire = wire_of(id);
+        if let Some(reason) = locked_wire_reason(txn, b, k, &wire, bypass)? {
+            return Err(Error::Storage(storage::locked(reason)));
+        }
         let removed = {
             let mut objects = objects::Table::open(txn)?;
             let removed = objects
@@ -845,6 +882,9 @@ mod enabled {
         };
         object_meta::Table::open(txn)?.remove(b, k)?;
         crate::_store_redb::object_part::Table::open(txn)?.remove_key(b, k)?;
+        // The lock row leaves with the version it protected, in this same
+        // transaction.
+        version_object_lock::Table::open(txn)?.remove(b, k, &wire)?;
         Ok(-(removed as i64))
     }
 
@@ -982,7 +1022,7 @@ mod enabled {
     /// twice, and `row.size` must be `data.len()`, the length the meter bills.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the completion's inputs — storage, transaction, bucket/key, clock, bytes, row, parts and the release credit — are one transaction's field set, taken together because the caller holds the accounting lock across the call"
+        reason = "the completion's inputs — storage, transaction, bucket/key, clock, bytes, row, parts, the release credit and the create-time lock intent — are one transaction's field set, taken together because the caller holds the accounting lock across the call"
     )]
     pub(crate) fn complete_versioned(
         storage: &MemoryStorage,
@@ -994,6 +1034,7 @@ mod enabled {
         row: &object_row::Row,
         parts: &[object_row::PartRow],
         credit: u64,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<CompletedWrite, Error> {
         check_bucket_write(txn, bucket)?;
         let b = bucket.as_ref().as_str();
@@ -1006,11 +1047,36 @@ mod enabled {
                 .unwrap_or(0)
         };
         let delta = data.len() as i64 - old_len as i64;
+        // The slot this completion replaces, read before the publish moves
+        // it: OL7's protected in-place rule applies when the incoming
+        // identity is the null version. The same read the single-object put
+        // takes.
+        let recorded = object_meta::Table::open(txn)?.get(b, k)?;
         // The publish hook runs BEFORE the bytes below become visible: what it
         // moves into history is the outgoing content, so the object row must
         // still hold it.
         let (version_id, version_seq, history_bytes, records_versions) =
             prepare_publish(txn, bucket, key, now)?;
+        // OL7: a null in-place replacement of an identity that already owns
+        // an active lock is a protected overwrite. The refusal returns before
+        // the bytes are published, so the transaction's writes roll back and
+        // an empty completion intent cannot leave the old lock row on new
+        // bytes. A current delete marker is not this slot.
+        if version_id.is_none()
+            && let Some(slot) = recorded.as_ref().filter(|slot| !slot.is_delete_marker)
+        {
+            let wire = wire_of(slot.version_id.as_ref());
+            if let Some(reason) = locked_wire_reason(txn, b, k, &wire, object_lock::Bypass::None)? {
+                tracing::warn!(
+                    bucket = %b,
+                    key = %k,
+                    version = %wire,
+                    reason = %reason,
+                    "refusing a protected in-place overwrite"
+                );
+                return Err(Error::Storage(storage::locked(reason)));
+            }
+        }
         {
             let mut objects = objects::Table::open(txn)?;
             objects.put(b, k, data)?;
@@ -1031,6 +1097,13 @@ mod enabled {
         {
             let mut table = object_meta::Table::open(txn)?;
             table.put(b, k, &stored)?;
+        }
+        // OL6, OL7: the create-time lock intent commits with the completed
+        // version's row, in the same transaction. A lock that carries neither
+        // a retention nor a hold is not stored.
+        if let Some(lock) = lock.filter(|lock| lock.carries_fact()) {
+            let wire = version::wire_of(version_id.as_ref());
+            version_object_lock::Table::open(txn)?.put(b, k, &wire, lock)?;
         }
         {
             let mut table = object_part::Table::open(txn)?;
@@ -1164,6 +1237,26 @@ mod enabled {
         }
         let peek = peek_mut(txn, bucket, key)?;
         let plan = plan_write(Intent::Delete, state, &peek.slot(), &peek.seqs());
+        // OL7: a delete the plan does not supersede removes the current
+        // object in place — on a suspended bucket that is the null version,
+        // and its bytes exist only in the object row. An active lock refuses
+        // before any row is written, so the caller's removal commits nothing.
+        // A current delete marker is not an object and is still replaced.
+        if !plan.supersede
+            && let Some(Current::Object(meta)) = peek.current()
+        {
+            let wire = wire_of(meta.version_id.as_ref());
+            if let Some(reason) = locked_wire_reason(txn, b, k, &wire, object_lock::Bypass::None)? {
+                tracing::warn!(
+                    bucket = %b,
+                    key = %k,
+                    version = %wire,
+                    reason = %reason,
+                    "refusing a protected in-place delete"
+                );
+                return Err(Error::Storage(storage::locked(reason)));
+            }
+        }
         let mut delta = 0i64;
         if plan.supersede {
             delta = supersede(txn, bucket, key, &peek, now, plan.converge_null)?;
@@ -1230,6 +1323,9 @@ mod enabled {
         stored::Table::open(txn)?.drain_bucket(b)?;
         version_index::Table::open(txn)?.drain_bucket(b)?;
         bucket_versioning::Table::open(txn)?.drain_bucket(b)?;
+        // OL8: the bucket's per-version lock rows leave with the version
+        // plane, an orphan included.
+        version_object_lock::Table::open(txn)?.drain_bucket(b)?;
         drain_blobs(txn, b)
     }
 
@@ -1590,6 +1686,35 @@ mod enabled {
         storage.ensure_bucket(bucket).await
     }
 
+    /// Resolve an S3 version address to the store's identity spelling for the
+    /// lock writes (R22, OL29): `Current` reads the current slot (a key with no
+    /// current version is `NoSuchVersion`), `Null` is the absence of an id and
+    /// `Id` the named version. Mirrors the engine's `lock_identity`; the store
+    /// then asserts the identity is a non-marker object version.
+    async fn lock_identity(
+        storage: &MemoryStorage,
+        bucket: &Name,
+        key: &object::Key,
+        address: &version::Address,
+    ) -> Result<Option<Id>, Error> {
+        match address {
+            version::Address::Current => {
+                let current = VersionMeta::current_slot(storage.metadata().as_ref(), bucket, key)
+                    .await
+                    .map_err(Error::from)?;
+                match current {
+                    Some(current) if current.exists => Ok(current.version),
+                    // The address names the key's current slot, not the null
+                    // version: with no current version there is no identity to
+                    // name, so the message names the key it could not resolve.
+                    _ => Err(no_such_version(format!("current of {}", key.as_ref()))),
+                }
+            }
+            version::Address::Null => Ok(None),
+            version::Address::Id(id) => Ok(Some(id.clone())),
+        }
+    }
+
     #[async_trait]
     impl VersionOps for MemoryStorage {
         async fn bucket_versioning(&self, bucket: &Name) -> Result<State, Error> {
@@ -1727,6 +1852,7 @@ mod enabled {
             bucket: &Name,
             key: &object::Key,
             version: Option<&Id>,
+            bypass: object_lock::Bypass,
         ) -> Result<Marker, Error> {
             ensure_bucket(self, bucket).await?;
             // The accounting lock is taken BEFORE the transaction and held
@@ -1748,8 +1874,12 @@ mod enabled {
                     Found::Current(stored) => {
                         // The current object version is permanently removed:
                         // the newest remaining version becomes current again,
-                        // or the key disappears with it.
-                        let mut delta = drop_current(txn, bucket, key)?;
+                        // or the key disappears with it. `drop_current`
+                        // enforces and removes the version's lock in this
+                        // same transaction (OL8), honouring the request's
+                        // governance bypass.
+                        let mut delta =
+                            drop_current(txn, bucket, key, stored.version_id.as_ref(), bypass)?;
                         delta += materialize(txn, bucket, key)?;
                         (
                             Marker {
@@ -1763,7 +1893,8 @@ mod enabled {
                         // The current delete marker: removing it shows the
                         // version it hid. Its row is the only record it has —
                         // a current version carries no index entry — so the
-                        // row goes without the index.
+                        // row goes without the index. A marker never observes
+                        // a lock row (R19).
                         remove_current_row(txn, bucket, key, row.seq)?;
                         let delta = materialize(txn, bucket, key)?;
                         (
@@ -1775,7 +1906,28 @@ mod enabled {
                         )
                     }
                     Found::Row(row) => {
+                        // OL8/R19: a noncurrent object version is protected
+                        // by its identity's lock, and the lock row leaves
+                        // with it. A marker is never protected.
+                        if row.kind == stored::Kind::Object
+                            && let Some(reason) = locked_wire_reason(
+                                txn,
+                                bucket.as_ref().as_str(),
+                                key.as_ref().as_str(),
+                                &row.id,
+                                bypass,
+                            )?
+                        {
+                            return Err(Error::Storage(storage::locked(reason)));
+                        }
                         let delta = drop_row(txn, bucket, key, &row)?;
+                        if row.kind == stored::Kind::Object {
+                            version_object_lock::Table::open(txn)?.remove(
+                                bucket.as_ref().as_str(),
+                                key.as_ref().as_str(),
+                                &row.id,
+                            )?;
+                        }
                         (
                             Marker {
                                 id: row.id(),
@@ -2051,6 +2203,125 @@ mod enabled {
                 }
             })
         }
+
+        /// The retention stored on a version — the server's read and the
+        /// GET/HEAD lock-header echo (OL8, OL28). One store read, fail closed.
+        async fn get_object_retention(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            version: Option<&Id>,
+        ) -> Result<Option<object_lock::Retention>, Error> {
+            ensure_bucket(self, bucket).await?;
+            VersionMeta::get_object_retention(self.metadata().as_ref(), bucket, key, version)
+                .await
+                .map_err(Error::from)
+        }
+
+        /// The legal hold stored on a version (OL8, OL28) — the same one
+        /// store read as the retention's.
+        async fn get_object_legal_hold(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            version: Option<&Id>,
+        ) -> Result<object_lock::LegalHold, Error> {
+            ensure_bucket(self, bucket).await?;
+            VersionMeta::get_object_legal_hold(self.metadata().as_ref(), bucket, key, version)
+                .await
+                .map_err(Error::from)
+        }
+
+        /// A version's whole lock in **one** store read — the GET/HEAD echo's
+        /// shape (OL8, OL28). The default composes the two single-value reads
+        /// above; the store's row answers both together, so this pays one.
+        async fn object_lock(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            version: Option<&Id>,
+        ) -> Result<Option<object_lock::Lock>, Error> {
+            ensure_bucket(self, bucket).await?;
+            VersionMeta::version_lock(self.metadata().as_ref(), bucket, key, version)
+                .await
+                .map_err(Error::from)
+        }
+
+        /// Set or clear a version's retention (R22): the engine body's
+        /// address resolution, then the store's one atomic read-modify-write
+        /// (which also asserts the identity, the configuration and the
+        /// versioning state).
+        async fn set_retention(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            address: &version::Address,
+            requested: Option<&object_lock::Retention>,
+            bypass: object_lock::Bypass,
+            now: SystemTime,
+        ) -> Result<Option<object_lock::Lock>, Error> {
+            let identity = lock_identity(self, bucket, key, address).await?;
+            VersionMeta::set_retention(
+                self.metadata().as_ref(),
+                bucket,
+                key,
+                identity.as_ref(),
+                requested,
+                bypass,
+                now,
+            )
+            .await
+            .map_err(Error::from)
+        }
+
+        /// Set or clear a version's legal hold (R22) — the same address
+        /// resolution and one atomic store write, the retention preserved.
+        async fn set_legal_hold(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            address: &version::Address,
+            hold: object_lock::LegalHold,
+        ) -> Result<object_lock::Lock, Error> {
+            let identity = lock_identity(self, bucket, key, address).await?;
+            VersionMeta::set_legal_hold(
+                self.metadata().as_ref(),
+                bucket,
+                key,
+                identity.as_ref(),
+                hold,
+            )
+            .await
+            .map_err(Error::from)
+        }
+
+        /// The combined retention and legal-hold update (OL23) — the same
+        /// address resolution and one atomic store write, so a refused
+        /// retention leaves neither member applied.
+        async fn update_lock(
+            &self,
+            bucket: &Name,
+            key: &object::Key,
+            address: &version::Address,
+            retention: Option<Option<&object_lock::Retention>>,
+            legal_hold: Option<object_lock::LegalHold>,
+            bypass: object_lock::Bypass,
+            now: SystemTime,
+        ) -> Result<Option<object_lock::Lock>, Error> {
+            let identity = lock_identity(self, bucket, key, address).await?;
+            VersionMeta::set_lock(
+                self.metadata().as_ref(),
+                bucket,
+                key,
+                identity.as_ref(),
+                retention,
+                legal_hold,
+                bypass,
+                now,
+            )
+            .await
+            .map_err(Error::from)
+        }
     }
 }
 
@@ -2081,12 +2352,13 @@ mod tests {
                 acl::Acl,
                 bucket, from_nanos,
                 meta::object as object_row,
-                multipart, now_nanos, object,
+                multipart, now_nanos, object, object_lock,
                 storage::{self, VersionOps},
                 version::{self, HeadResult, ListParams, ReadResult, State},
             },
             _store_redb::{
                 bucket as redb_bucket, bucket_versioning, scan::for_each_pair, version as stored,
+                version_object_lock,
             },
             _util::testing::{body, read_body},
             Error, MemoryOptions, MemoryStorage,
@@ -2274,7 +2546,7 @@ mod tests {
             // that blob — the blob itself: both its bytes and the capacity
             // they held go.
             storage
-                .delete_object_version(&b, &key, Some(&one))
+                .delete_object_version(&b, &key, Some(&one), object_lock::Bypass::None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2352,7 +2624,7 @@ mod tests {
             // The first key's version row goes, but the second key's row
             // still names the blob: nothing is released.
             storage
-                .delete_object_version(&b, &a, Some(&a_old))
+                .delete_object_version(&b, &a, Some(&a_old), object_lock::Bypass::None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2364,7 +2636,7 @@ mod tests {
 
             // The last naming row goes: the blob and its bytes follow.
             storage
-                .delete_object_version(&b, &c, Some(&c_old))
+                .delete_object_version(&b, &c, Some(&c_old), object_lock::Bypass::None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -2447,6 +2719,7 @@ mod tests {
                     object::Tags::empty(),
                     None,
                     &Acl::default_private(None),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2533,7 +2806,7 @@ mod tests {
                 .version_id
                 .expect("the overwrite minted an identity");
             storage
-                .delete_object_version(&b, &key, Some(&fresh_id))
+                .delete_object_version(&b, &key, Some(&fresh_id), object_lock::Bypass::None)
                 .await
                 .unwrap();
             let restored = storage.get_object(&b, &key, None).await.unwrap();
@@ -2846,7 +3119,7 @@ mod tests {
                 .expect("an enabled write mints an identity");
 
             let removed = storage
-                .delete_object_version(&b, &key, Some(&id))
+                .delete_object_version(&b, &key, Some(&id), object_lock::Bypass::None)
                 .await
                 .unwrap();
             assert_eq!(removed.id.as_ref(), Some(&id));
@@ -2888,8 +3161,31 @@ mod tests {
             storage.delete_object(&b, &key).await.unwrap();
 
             // The key's current version is a marker and its history holds the
-            // superseded versions: the bucket is empty of objects, and its
-            // version state dies with the bucket row.
+            // superseded versions: the bucket holds no object row, but OL8's
+            // emptiness decision includes the version rows, so the teardown
+            // refuses it.
+            assert!(
+                matches!(
+                    storage.delete_bucket(&b).await.unwrap_err(),
+                    Error::Storage(storage::Error::NotEmpty(_))
+                ),
+                "a bucket holding version history is not empty"
+            );
+            // Emptying the history through the version primitive lets the
+            // bucket go; its state row dies with the bucket row.
+            let entries = storage
+                .list_object_versions(&b, params())
+                .await
+                .unwrap()
+                .entries;
+            for entry in entries {
+                if let Some(id) = entry.id {
+                    storage
+                        .delete_object_version(&b, &key, Some(&id), object_lock::Bypass::None)
+                        .await
+                        .unwrap();
+                }
+            }
             storage.delete_bucket(&b).await.unwrap();
             assert!(
                 storage.bucket_versioning(&b).await.is_err(),
@@ -3029,7 +3325,7 @@ mod tests {
             );
             missing(
                 storage
-                    .delete_object_version(&ghost, &key, None)
+                    .delete_object_version(&ghost, &key, None, object_lock::Bypass::None)
                     .await
                     .unwrap_err(),
             );
@@ -3236,8 +3532,10 @@ mod tests {
             // path holds it across the core.
             let guard = storage.content().lock_accounting().await;
             let refused = storage.db.write(|txn| {
-                complete_versioned(&storage, txn, &b, &key, now, &data, &row, &retained, 10)
-                    .map(|_| ())
+                complete_versioned(
+                    &storage, txn, &b, &key, now, &data, &row, &retained, 10, None,
+                )
+                .map(|_| ())
             });
             drop(guard);
             let err = refused.unwrap_err();
@@ -3436,7 +3734,9 @@ mod tests {
             let done: CompletedWrite = storage
                 .db
                 .write(|txn| {
-                    complete_versioned(&storage, txn, &b, &key, now, &data, &row, &retained, 0)
+                    complete_versioned(
+                        &storage, txn, &b, &key, now, &data, &row, &retained, 0, None,
+                    )
                 })
                 .unwrap();
             drop(guard);
@@ -3624,5 +3924,163 @@ mod tests {
                 "the current version is the object row: the repair writes no version row"
             );
         }
+
+        /// A governance retention on the null wire, planted beside a suspended
+        /// write. The S3 suspend guard never reaches this state; the row is
+        /// what the unguarded state write can leave behind.
+        fn plant_null_governance(
+            storage: &MemoryStorage,
+            bucket: &bucket::Name,
+            key: &object::Key,
+        ) {
+            use std::time::SystemTime;
+
+            let bucket_name = bucket.as_ref().as_str().to_owned();
+            let key_name = key.as_ref().as_str().to_owned();
+            let planted = object_lock::Lock {
+                retention: Some(object_lock::Retention {
+                    mode: object_lock::Mode::Governance,
+                    retain_until: SystemTime::now() + Duration::from_secs(3_600),
+                }),
+                legal_hold: object_lock::LegalHold::Off,
+            };
+            storage
+                .db
+                .write(move |txn| -> Result<(), Error> {
+                    version_object_lock::Table::open(txn)?.put(
+                        &bucket_name,
+                        &key_name,
+                        &version::wire_of(None),
+                        &planted,
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        fn null_lock_held(
+            storage: &MemoryStorage,
+            bucket: &bucket::Name,
+            key: &object::Key,
+        ) -> bool {
+            let bucket_name = bucket.as_ref().as_str().to_owned();
+            let key_name = key.as_ref().as_str().to_owned();
+            storage
+                .db
+                .read(move |txn| -> Result<bool, Error> {
+                    Ok(version_object_lock::Table::open_readonly(txn)?
+                        .get(&bucket_name, &key_name, &version::wire_of(None))?
+                        .is_some())
+                })
+                .unwrap()
+        }
+
+        /// A suspended delete of a locked null object must refuse and commit
+        /// nothing: the bytes and the lock row are the only copy.
+        #[tokio::test]
+        async fn a_suspended_delete_of_a_locked_null_version_is_refused() {
+            let (storage, b) = with_bucket().await;
+            storage
+                .set_bucket_versioning(&b, State::Suspended)
+                .await
+                .unwrap();
+            let key = object::key("locked.txt").unwrap();
+            storage
+                .put_object(&b, &key, body(b"keep".to_vec()))
+                .await
+                .unwrap();
+            plant_null_governance(&storage, &b, &key);
+
+            let err = storage.delete_object(&b, &key).await.unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::Storage(storage::Error::Locked(
+                        object_lock::RefusalReason::Governance
+                    ))
+                ),
+                "{err}"
+            );
+            assert_eq!(
+                read_body(storage.get_object(&b, &key, None).await.unwrap().body)
+                    .await
+                    .unwrap(),
+                b"keep"
+            );
+            assert!(
+                null_lock_held(&storage, &b, &key),
+                "the refusal leaves the lock row on the old bytes"
+            );
+        }
+
+        /// A suspended completion over a locked null object must refuse before
+        /// the new bytes land, including when the completion carries no lock
+        /// intent of its own. The old lock row stays with the old bytes.
+        #[tokio::test]
+        async fn a_suspended_completion_over_a_locked_null_version_is_refused() {
+            let (storage, b) = with_bucket().await;
+            storage
+                .set_bucket_versioning(&b, State::Suspended)
+                .await
+                .unwrap();
+            let key = object::key("locked.bin").unwrap();
+            storage
+                .put_object(&b, &key, body(b"old-bytes".to_vec()))
+                .await
+                .unwrap();
+            plant_null_governance(&storage, &b, &key);
+
+            let data = b"new-bytes".to_vec();
+            let now = now_nanos();
+            let row = object_row::Row {
+                etag: ETag::from_content(&data),
+                size: data.len() as u64,
+                mtime: from_nanos(now),
+                identity: 0,
+                tags: object::Tags::empty(),
+                checksum: None,
+                owner: None,
+                acl: Acl::default_private(None),
+            };
+            let retained = [object_row::PartRow {
+                number: 1,
+                size: data.len() as u64,
+                checksum: None,
+            }];
+            let guard = storage.content().lock_accounting().await;
+            let refused = storage.db.write(|txn| {
+                complete_versioned(
+                    &storage, txn, &b, &key, now, &data, &row, &retained, 0, None,
+                )
+            });
+            drop(guard);
+            let Err(err) = refused else {
+                panic!("a locked null completion must refuse");
+            };
+            assert!(
+                matches!(
+                    err,
+                    Error::Storage(storage::Error::Locked(
+                        object_lock::RefusalReason::Governance
+                    ))
+                ),
+                "{err}"
+            );
+            assert_eq!(
+                read_body(storage.get_object(&b, &key, None).await.unwrap().body)
+                    .await
+                    .unwrap(),
+                b"old-bytes"
+            );
+            assert!(
+                null_lock_held(&storage, &b, &key),
+                "the refusal leaves the lock row on the old bytes"
+            );
+        }
     }
+
+    /// Object Lock's Storage journeys: one call into the shared suite, plus the
+    /// memory backend's lock-row fixture.
+    #[cfg(feature = "versioning")]
+    mod object_lock_tests;
 }

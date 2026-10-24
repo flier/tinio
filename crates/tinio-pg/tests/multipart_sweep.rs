@@ -70,6 +70,7 @@ async fn upload(storage: &PgStorage, bucket: &bucket::Name, key: &str) -> String
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
         )
         .await
         .expect("the upload is created")

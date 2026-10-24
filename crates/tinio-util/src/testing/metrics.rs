@@ -65,6 +65,21 @@ pub fn histogram_count(family: &str, labels: &[(&str, &str)]) -> f64 {
     })
 }
 
+/// The `tinio_object_lock_protected_deletions_total` value for one
+/// operation/reason pair — the family's delta fixture.
+///
+/// A test reads it before and after the code under test and asserts the
+/// difference, so a parallel writer of another label pair cannot skew the
+/// answer. The label values are the family's closed domains
+/// (`delete_object`, `delete_objects`, `lifecycle`, `sweeper`; `legal_hold`,
+/// `compliance`, `governance`).
+pub fn protected_deletions(operation: &str, reason: &str) -> f64 {
+    counter(
+        "tinio_object_lock_protected_deletions_total",
+        &[("operation", operation), ("reason", reason)],
+    )
+}
+
 /// The whole default registry rendered in the text exposition format.
 pub fn exposition() -> String {
     let mut buffer = Vec::new();

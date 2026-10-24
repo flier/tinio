@@ -71,7 +71,7 @@
 //! # }
 //! ```
 
-use std::time::SystemTime;
+use std::{future::Future, time::SystemTime};
 
 use tracing::instrument;
 
@@ -83,7 +83,7 @@ use crate::{
         content::ObjectContent,
         cors, lifecycle,
         meta::{BucketMeta, Metadata, bucket as row},
-        object,
+        object, object_lock,
         storage::{self, Error, UnorderedPager},
     },
     hooks::Hooks,
@@ -96,6 +96,171 @@ where
     C: ObjectContent,
     H: Hooks,
 {
+    /// The bucket's Object Lock configuration (S3
+    /// GetObjectLockConfiguration). `NoSuchBucket` when a guaranteed store has
+    /// no bucket row; `None` when it stores no configuration.
+    ///
+    /// A lazy store's bucket is its directory: a row-less bucket has never
+    /// been sighted through the API, so it can store no configuration and the
+    /// read answers `None` without asking the row plane (which would answer
+    /// `NoSuchBucket` for the absent row).
+    ///
+    /// # Errors
+    ///
+    /// `NoSuchBucket` when the store's row policy says the bucket is missing.
+    pub async fn get_bucket_object_lock(
+        &self,
+        name: &bucket::Name,
+    ) -> Result<Option<object_lock::Config>, Error> {
+        match self.bucket_row {
+            BucketRow::Lazy => {
+                if self
+                    .meta
+                    .created_at(name)
+                    .await
+                    .map_err(projected)?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+            }
+            BucketRow::Guaranteed => self.present(name).await?,
+        }
+        self.meta.object_lock(name).await.map_err(projected)
+    }
+
+    /// Replace the bucket's Object Lock configuration (S3
+    /// PutObjectLockConfiguration — replace-all, no merge).
+    ///
+    /// The presence decision follows the receiver's [`BucketRow`] policy. A
+    /// guaranteed store answers `NoSuchBucket` when the contract's setter says
+    /// the bucket row is missing. A lazy store's bucket is its directory, so a
+    /// row-less name is a bucket that was never sighted: the row is recorded
+    /// first (the first-sight shape the tag/ACL/lifecycle writes use) and the
+    /// configuration follows. The caller supplies a request-validated
+    /// configuration; a configuration that is not enabled is refused here
+    /// rather than stored (OL13) — no partial lock-enabled bucket is created.
+    ///
+    /// # Errors
+    ///
+    /// `NoSuchBucket` when a guaranteed store has no bucket row, and
+    /// `InvalidBucketState` when the configuration is not enabled.
+    pub async fn put_bucket_object_lock(
+        &self,
+        name: &bucket::Name,
+        config: &object_lock::Config,
+    ) -> Result<(), Error> {
+        if let Err(invalid) = config.validate() {
+            tracing::warn!(
+                bucket = %name,
+                reason = invalid.reason,
+                "refusing a stored Object Lock configuration the request path would refuse"
+            );
+            return Err(storage::invalid_bucket_state(name));
+        }
+        match self.bucket_row {
+            BucketRow::Lazy => {
+                if !self
+                    .meta
+                    .set_object_lock(name, config)
+                    .await
+                    .map_err(projected)?
+                {
+                    // First sight: record the bucket row, then store the
+                    // configuration (the row writer clears any configuration,
+                    // so the order matters).
+                    let recorded = row::Row::at(SystemTime::now());
+                    self.meta
+                        .record_full(name, &recorded)
+                        .await
+                        .map_err(projected)?;
+                    if !self
+                        .meta
+                        .set_object_lock(name, config)
+                        .await
+                        .map_err(projected)?
+                    {
+                        return Err(storage::no_such_bucket(name));
+                    }
+                }
+                Ok(())
+            }
+            BucketRow::Guaranteed => {
+                if !self
+                    .meta
+                    .set_object_lock(name, config)
+                    .await
+                    .map_err(projected)?
+                {
+                    return Err(storage::no_such_bucket(name));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Create a bucket with Object Lock enabled (OL13): the bucket row, its
+    /// versioning state (`Enabled`) and `config` commit as one logical step.
+    ///
+    /// The engine owns the composition and the compensation:
+    /// [`create_bucket`](Self::create_bucket) first, then the backend's
+    /// versioning step (`enable_versioning` — the value plane is per backend,
+    /// so the engine cannot build it), then the stored configuration. Any
+    /// failure after the create undoes it through
+    /// [`delete_bucket`](Self::delete_bucket), so a returned error leaves no
+    /// partial lock-enabled bucket. A backend whose store can commit the three
+    /// facts atomically overrides the ops body instead of calling this one.
+    ///
+    /// # Errors
+    ///
+    /// The create's, the versioning step's or the configuration write's own
+    /// failure; the bucket does not survive it.
+    pub async fn create_bucket_with_lock<F, Fut>(
+        &self,
+        name: &bucket::Name,
+        owner: Option<&acl::OwnerId>,
+        acl: &Acl,
+        config: &object_lock::Config,
+        enable_versioning: F,
+    ) -> Result<(), Error>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), Error>>,
+    {
+        if let Err(invalid) = config.validate() {
+            tracing::warn!(
+                bucket = %name,
+                reason = invalid.reason,
+                "refusing to create a bucket with an Object Lock configuration the request path would refuse"
+            );
+            return Err(storage::invalid_bucket_state(name));
+        }
+        self.create_bucket(name, owner, acl).await?;
+        if let Err(err) = enable_versioning().await {
+            self.undo_create(name).await;
+            return Err(err);
+        }
+        if let Err(err) = self.put_bucket_object_lock(name, config).await {
+            self.undo_create(name).await;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// The `create_bucket_with_lock` compensation: take back the bucket the
+    /// composition created. A failure is logged, never escalated — the
+    /// original error is the caller's answer, and the residue is the startup
+    /// repair's (OL31/OL13).
+    async fn undo_create(&self, name: &bucket::Name) {
+        if let Err(err) = self.delete_bucket(name).await {
+            tracing::warn!(
+                bucket = %name,
+                error = %err,
+                "could not undo a partially created lock-enabled bucket"
+            );
+        }
+    }
+
     /// Create `name`, recording the create-time `owner` and `acl`.
     ///
     /// The namespace is the content plane's and comes first; the row follows,

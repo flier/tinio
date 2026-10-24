@@ -17,15 +17,8 @@
 //! `copy_object` toggle (FR-021); the tagging ops gate on `caps.tagging`.
 
 use std::sync::Arc;
-/// The stage tee slot's digest cell: the version-addressed copy carries the
-/// source version's recorded checksum into the destination's recorded row
-/// through it.
-#[cfg(feature = "copy")]
-/// The copy-only conditionals of [`op_copy_object`]/[`op_rename_object`]
-/// (`x-amz-if-match`/`x-amz-if-none-match`, the `x-amz-rename-source-if-*`
-/// String fields, and the shared 412 constructor): the destination-put
-/// conditional writes read the same header family through the s3s DTO
-/// instead.
+/// The copy answer's `LastModified` reads the clock; the write-lock seam
+/// owns its own reading.
 #[cfg(feature = "copy")]
 use std::time::SystemTime;
 
@@ -40,6 +33,8 @@ use s3s::{
 #[cfg(test)]
 use tinio_util::testing::object_key;
 
+#[cfg(feature = "acl")]
+use crate::_auth::may_bypass_authority;
 #[cfg(feature = "copy")]
 use crate::_auth::source::rename_source;
 #[cfg(feature = "acl")]
@@ -64,16 +59,17 @@ use crate::{
         storage::{Error as StorageError, GetObjectResult, Storage},
         version,
     },
+    _util::metrics::LockOperation,
     backend::{
-        ConditionalHeaders, DeleteConditions, S3Backend, byte_range, check_write_shape,
-        checked_if_match_size,
+        ConditionalHeaders, DeleteConditions, LockHeaders, S3Backend, bypass_of, byte_range,
+        check_write_shape, checked_if_match_size,
         checksum::{
             HasFields, Spec, VerifyState, VerifyStream, echo_recorded, echo_validated,
             map_part_error,
         },
         conditions::{ConditionFailure, condition_error},
-        decide_fetch, decide_range_error, generation_changed, map_backend_error,
-        normalize_page_size, parse_if_range, set_version_headers,
+        decide_fetch, decide_range_error, extension_may_bypass, generation_changed,
+        map_backend_error, normalize_page_size, parse_if_range, set_version_headers,
         tags::{parse_tagging_header, tag_set_from_tags, tags_from_tag_set},
         versioning::{object_of, query_version_id, read_object_of, require_versioning},
     },
@@ -89,6 +85,18 @@ use crate::{
 /// 400 is NOT here — the callers run `check_write_shape` up front
 /// (request-shape error, before the body is staged); this checker keeps
 /// only the state-dependent part.
+/// Record one protected permanent delete against the metric family (OL25).
+///
+/// The delete sites call this while the backend error is still in hand, so the
+/// `Locked` reason and the wire operation are recorded before the error is
+/// mapped to its S3 code. Every other failure belongs to the write-failure
+/// family, not this one.
+fn note_protected_deletion(err: &StorageError, operation: LockOperation) {
+    if let StorageError::Locked(reason) = err {
+        metrics::record_protected_deletion(operation, *reason);
+    }
+}
+
 impl<S: Storage> S3Backend<S> {
     /// Map a read's storage error: a missing key is the object family's
     /// `404` (with the delete-marker disclosure, [`Self::no_such_object`]),
@@ -267,6 +275,36 @@ impl<S: Storage> S3Backend<S> {
             req.input.if_none_match.as_ref(),
         )?;
 
+        // Object Lock (OL7, OL16): the three write headers are mapped, the
+        // effective lock is resolved ONCE against the bucket configuration,
+        // and the same value decides the checksum requirement below and
+        // rides the commit. `PostObject` reaches this handler through s3s's
+        // mapped `PutObjectInput`, so its form fields are read from the same
+        // input (never from the headers alone). OL20: the strip owns the
+        // request headers, never the stored default — a stripped build
+        // yields empty headers, and the shared seam still applies the
+        // bucket's stored configuration, so a PUT there cannot create an
+        // unprotected version and the checksum that lock requires is still
+        // enforced (OL16).
+        let lock_headers = LockHeaders::from_request(
+            req.input.object_lock_mode.as_ref(),
+            req.input.object_lock_retain_until_date.as_ref(),
+            req.input.object_lock_legal_hold_status.as_ref(),
+        )?;
+        let write_lock = self
+            .write_lock(
+                &bucket,
+                &lock_headers,
+                super::LockChecksum {
+                    dto_md5: req.input.content_md5.as_deref(),
+                    headers: &req.headers,
+                    trailing_headers: req.trailing_headers.is_some(),
+                    dto_checksum: super::checksum::dto_has_checksum(&req.input)
+                        || req.input.checksum_algorithm.is_some(),
+                },
+            )
+            .await?;
+
         // Object tagging on the write (spec 2026-08-31): parse the
         // `x-amz-tagging` header into the validated set the commit
         // records — under the toggle only; off keeps the established
@@ -387,7 +425,9 @@ impl<S: Storage> S3Backend<S> {
         };
         let put = self
             .storage
-            .commit_object(&bucket, &key, staged, tags, owner, acl)
+            // The resolved write lock rides the commit (Task 5a's seam); the
+            // checksum decision above used the same value.
+            .commit_object(&bucket, &key, staged, tags, owner, acl, write_lock.as_ref())
             .await
             .map_err(map_backend_error)?;
         let mut output = dto::PutObjectOutput {
@@ -473,6 +513,17 @@ impl<S: Storage> S3Backend<S> {
                 req.input.response_content_type,
             ));
             set_version_headers(&mut resp.headers, info.version_id.as_ref(), false);
+            // The version-lock echo (OL18), keyed by the identity wire — the
+            // addressed version may be the null one.
+            #[cfg(feature = "object-lock")]
+            self.echo_lock_headers(
+                &bucket,
+                &key,
+                info.version_id.as_ref(),
+                info.bucket_records_versions,
+                &mut resp.output,
+            )
+            .await?;
             return Ok(resp);
         }
         // If-Range gates the Range header only (RFC 9110 §13.1.5); a
@@ -640,6 +691,18 @@ impl<S: Storage> S3Backend<S> {
             info.version_id.as_ref(),
             info.bucket_records_versions,
         );
+        // The version-lock echo (OL18): the plain read reports the identity
+        // it served on the `Info`, so the null version (`None`) is keyed by
+        // its `null` wire and never skipped.
+        #[cfg(feature = "object-lock")]
+        self.echo_lock_headers(
+            &bucket,
+            &key,
+            info.version_id.as_ref(),
+            info.bucket_records_versions,
+            &mut resp.output,
+        )
+        .await?;
         Ok(resp)
     }
 
@@ -717,6 +780,15 @@ impl<S: Storage> S3Backend<S> {
             .check(&info.etag, info.last_modified, false)?;
             let mut resp = self.head_response(&info);
             set_version_headers(&mut resp.headers, info.version_id.as_ref(), false);
+            #[cfg(feature = "object-lock")]
+            self.echo_lock_headers(
+                &bucket,
+                &key,
+                info.version_id.as_ref(),
+                info.bucket_records_versions,
+                &mut resp.output,
+            )
+            .await?;
             return Ok(resp);
         }
         let head = match self.storage.head_object(&bucket, &key).await {
@@ -736,6 +808,15 @@ impl<S: Storage> S3Backend<S> {
             head.version_id.as_ref(),
             head.bucket_records_versions,
         );
+        #[cfg(feature = "object-lock")]
+        self.echo_lock_headers(
+            &bucket,
+            &key,
+            head.version_id.as_ref(),
+            head.bucket_records_versions,
+            &mut resp.output,
+        )
+        .await?;
         Ok(resp)
     }
 
@@ -1026,14 +1107,24 @@ impl<S: Storage> S3Backend<S> {
         // A version-addressed delete removes exactly the named version; a
         // plain one is the ordinary delete (a versioned bucket inserts a
         // marker — the design's delete rules).
+        // OL15: the bypass is `header && may_bypass`; the authority bit is
+        // the ACL pipeline's, resolved for the version this request
+        // addresses and carried in the extensions. No bit (ACL off / no
+        // identity plane) is no authority.
+        let requested_bypass = req.input.bypass_governance_retention.unwrap_or(false);
+        let bypass = bypass_of(requested_bypass, extension_may_bypass(&req.extensions));
         let marker = if address.is_addressed() {
             self.storage
-                .delete_object_version(&bucket, &key, address.id())
+                .delete_object_version(&bucket, &key, address.id(), bypass)
                 .await
         } else {
             self.storage.delete_object(&bucket, &key).await
         }
-        .map_err(map_backend_error)?;
+        .map_err(|err| {
+            let err: StorageError = err.into();
+            note_protected_deletion(&err, LockOperation::DeleteObject);
+            map_backend_error(err)
+        })?;
         let mut resp = S3Response::new(DeleteObjectOutput::default());
         // The delete's own report: the version it removed (or, on a plain
         // delete, the marker it created) and whether that version is a
@@ -1107,6 +1198,13 @@ impl<S: Storage> S3Backend<S> {
             };
         #[cfg(feature = "acl")]
         let denied = s3_error!(AccessDenied, "Access Denied");
+        // OL15's per-entry bypass: the header asks, and each entry's
+        // ADDRESSED version resolves its own authority. A protected entry a
+        // non-authorised caller names is this batch's per-key
+        // `AccessDenied`; the rest proceed (OL17).
+        let requested_bypass = req.input.bypass_governance_retention.unwrap_or(false);
+        #[cfg(feature = "acl")]
+        let authenticated = req.credentials.is_some();
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
         for id in req.input.delete.objects {
@@ -1136,13 +1234,26 @@ impl<S: Storage> S3Backend<S> {
             // bucket owners and READ grantees through; the whole-op
             // coarse gate holds elsewhere); any other ACL-read failure
             // is a per-key entry like a delete failure.
+            // One ACL snapshot for this entry. `can_delete` and the bypass
+            // authority below both read it, so a concurrent ACL write cannot
+            // make the two decisions disagree. The bucket owner's second
+            // disjunct authorizes every key — no per-key read can deny (the
+            // short-circuit skips N reads on every owner batch delete) — and
+            // that owner still has bypass parity without a snapshot.
             #[cfg(feature = "acl")]
-            if let Some((principal, bucket_owner, lazy_default)) = gate.as_ref() {
-                // The bucket owner's second disjunct authorizes every
-                // key — no per-key read can deny (the short-circuit
-                // skips N reads on every owner batch delete).
+            let acl_snapshot = if let Some((principal, bucket_owner, lazy_default)) = gate.as_ref()
+            {
                 if principal != bucket_owner {
-                    match self.storage.get_object_acl(&bucket, &key).await {
+                    // R23: a version-addressed entry gates against the
+                    // ADDRESSED version's ACL — the entry's own resource,
+                    // exactly as the single-object path does — while an
+                    // unaddressed entry keeps the current object's.
+                    let object_acl = if address.is_addressed() {
+                        self.storage.version_acl(&bucket, &key, address.id()).await
+                    } else {
+                        self.storage.get_object_acl(&bucket, &key).await
+                    };
+                    match object_acl {
                         Ok(acl) => {
                             // The one-home rule (`_core::acl::can_delete`);
                             // the empty wire's lazy default is the value
@@ -1161,10 +1272,59 @@ impl<S: Storage> S3Backend<S> {
                                 ));
                                 continue;
                             }
+                            Some(acl)
                         }
                         Err(err) => {
                             let err: StorageError = err.into();
-                            if !matches!(err, StorageError::NoSuchKey(_)) {
+                            // A missing object is the delete's own answer,
+                            // not a gate refusal: let it run. The snapshot
+                            // carries no ACL, so the bypass below has no
+                            // authority — the same `Err` answer a second
+                            // read used to give.
+                            if matches!(err, StorageError::NoSuchKey(_)) {
+                                None
+                            } else if matches!(err, StorageError::NoSuchVersion(_)) {
+                                // The class also covers a delete marker
+                                // (markers have no ACL). The shared head
+                                // split decides which: a marker has no owner
+                                // to prove, so it is this entry's per-key
+                                // refusal; an object the ACL read failed to
+                                // resolve keeps this `NoSuchVersion`; only an
+                                // id that names nothing keeps the delete's
+                                // 404. Any other head failure is the probe's
+                                // own error.
+                                match version::split_head(
+                                    self.storage
+                                        .head_object_version(&bucket, &key, address.id())
+                                        .await,
+                                ) {
+                                    version::HeadSplit::Marker { .. } => {
+                                        errors.push(delete_error(
+                                            &denied,
+                                            key.to_string(),
+                                            id.version_id.as_deref(),
+                                        ));
+                                        continue;
+                                    }
+                                    version::HeadSplit::Object(_) => {
+                                        errors.push(delete_error(
+                                            &map_backend_error(err),
+                                            key.to_string(),
+                                            id.version_id.as_deref(),
+                                        ));
+                                        continue;
+                                    }
+                                    version::HeadSplit::Missing(_) => None,
+                                    version::HeadSplit::Failed(probe) => {
+                                        errors.push(delete_error(
+                                            &map_backend_error(probe),
+                                            key.to_string(),
+                                            id.version_id.as_deref(),
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            } else {
                                 errors.push(delete_error(
                                     &map_backend_error(err),
                                     key.to_string(),
@@ -1174,14 +1334,46 @@ impl<S: Storage> S3Backend<S> {
                             }
                         }
                     }
+                } else {
+                    None
                 }
-            }
+            } else {
+                None
+            };
+            // OL15: this entry's authority, from the snapshot above. The
+            // bucket owner has parity over both an addressed version and the
+            // current object. A snapshot that is not an ACL is no authority
+            // — the delete answers the entry's own error.
+            #[cfg(feature = "acl")]
+            let entry_may_bypass = if requested_bypass {
+                match gate.as_ref() {
+                    Some((principal, bucket_owner, lazy_default)) if principal != bucket_owner => {
+                        match acl_snapshot.as_ref() {
+                            Some(acl) => may_bypass_authority(
+                                principal,
+                                authenticated,
+                                acl,
+                                bucket_owner,
+                                lazy_default,
+                            ),
+                            None => false,
+                        }
+                    }
+                    Some(_) => true, // the bucket owner's parity
+                    None => false,   // no identity plane: no authority
+                }
+            } else {
+                false
+            };
+            #[cfg(not(feature = "acl"))]
+            let entry_may_bypass = false;
+            let bypass = bypass_of(requested_bypass, entry_may_bypass);
             // Per-key write lock, as in `op_delete_object`; the same
             // version-addressed / plain delete branch too.
             let _guard = self.lock_object(&bucket, &key).await;
             let deleted_marker = if address.is_addressed() {
                 self.storage
-                    .delete_object_version(&bucket, &key, address.id())
+                    .delete_object_version(&bucket, &key, address.id(), bypass)
                     .await
             } else {
                 self.storage.delete_object(&bucket, &key).await
@@ -1194,6 +1386,8 @@ impl<S: Storage> S3Backend<S> {
                     }
                 }
                 Err(err) => {
+                    let err: StorageError = err.into();
+                    note_protected_deletion(&err, LockOperation::DeleteObjects);
                     let err = map_backend_error(err);
                     errors.push(delete_error(
                         &err,
@@ -1512,6 +1706,33 @@ impl<S: Storage> S3Backend<S> {
         let dest_if_none_match = parse_etag_condition_header(&req.headers, "x-amz-if-none-match")?;
         check_write_shape(dest_if_match.as_ref(), dest_if_none_match.as_ref())?;
 
+        // Object Lock (OL7, OL12, OL16): the DESTINATION's effective lock is
+        // resolved once from the destination bucket's configuration and this
+        // request's headers — a copy never inherits the source's lock. The
+        // same value decides the checksum requirement and rides both write
+        // seams below. OL20: the strip owns the request headers, never the
+        // stored default — a stripped copy yields empty headers, and the
+        // shared seam still applies the destination bucket's stored
+        // configuration, so the copy cannot create an unprotected version,
+        // and gates it on the checksum that lock requires (OL16).
+        let lock_headers = LockHeaders::from_request(
+            req.input.object_lock_mode.as_ref(),
+            req.input.object_lock_retain_until_date.as_ref(),
+            req.input.object_lock_legal_hold_status.as_ref(),
+        )?;
+        let write_lock = self
+            .write_lock(
+                &dst_bucket,
+                &lock_headers,
+                super::LockChecksum {
+                    dto_md5: None,
+                    headers: &req.headers,
+                    trailing_headers: req.trailing_headers.is_some(),
+                    dto_checksum: req.input.checksum_algorithm.is_some(),
+                },
+            )
+            .await?;
+
         // `x-amz-tagging-directive` (spec 2026-08-31): COPY and REPLACE
         // are all the wire defines — any other value is a request-shape
         // error (InvalidArgument), rejected before the source head like
@@ -1663,7 +1884,15 @@ impl<S: Storage> S3Backend<S> {
                     .await
                     .map_err(map_backend_error)?;
                 self.storage
-                    .commit_object(&dst_bucket, &dst_key, staged, tags, owner, acl)
+                    .commit_object(
+                        &dst_bucket,
+                        &dst_key,
+                        staged,
+                        tags,
+                        owner,
+                        acl,
+                        write_lock.as_ref(),
+                    )
                     .await
                     .map_err(map_backend_error)?
             }
@@ -1678,6 +1907,7 @@ impl<S: Storage> S3Backend<S> {
                     owner,
                     acl,
                     checksum,
+                    write_lock.as_ref(),
                 )
                 .await
                 .map_err(map_backend_error)?,
@@ -1862,10 +2092,10 @@ mod tests {
     use crate::_util::testing::tags;
     #[cfg(feature = "acl")]
     use crate::{
-        _core::storage::BucketOps,
+        _core::storage::{BucketOps, VersionOps},
         backend::testutil::{
-            acl_backend, canonical_grantee, credentials_for, grant, group_grantee, post_request,
-            signed_request, user_id, valid_md5,
+            self, acl_backend, canonical_grantee, credentials_for, grant, group_grantee,
+            post_request, signed_request, user_id, valid_md5,
         },
         capability::CapabilityS3,
     };
@@ -2528,6 +2758,7 @@ mod tests {
                     object::Tags::empty(),
                     Some(owner),
                     &Acl::default_private(Some(owner.clone())),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -2648,6 +2879,7 @@ mod tests {
                 object::Tags::empty(),
                 Some(&alice),
                 &Acl::default_private(Some(alice.clone())),
+                None,
             )
             .await
             .unwrap();
@@ -2670,6 +2902,297 @@ mod tests {
         let out = backend.delete_objects(req).await.unwrap().output;
         assert_eq!(out.deleted.as_ref().unwrap().len(), 1);
         assert!(out.errors.is_none());
+    }
+
+    /// Commit one recorded version of `key` owned by `owner`, answering its
+    /// identity (the R23 per-entry fixtures).
+    #[cfg(feature = "acl")]
+    async fn commit_version(
+        storage: &MemoryStorage,
+        b: &bucket::Name,
+        key: &str,
+        owner: &acl::OwnerId,
+    ) -> String {
+        let k = object::key(key).unwrap();
+        storage
+            .commit_object(
+                b,
+                &k,
+                storage
+                    .stage_body(b, &k, body(b"v"), None, None)
+                    .await
+                    .unwrap(),
+                object::Tags::empty(),
+                Some(owner),
+                &Acl::default_private(Some(owner.clone())),
+                None,
+            )
+            .await
+            .unwrap()
+            .version_id
+            .expect("a recording bucket gives every write an identity")
+            .to_string()
+    }
+
+    #[cfg(feature = "acl")]
+    #[tokio::test]
+    async fn delete_objects_gates_each_entry_on_the_addressed_version() {
+        // R23: the batch's per-key gate follows each entry's version
+        // address. BOB owns "owned"'s older (addressed) version and ALICE
+        // the current one; "denied" is the reverse — ALICE's addressed
+        // version with BOB current. BOB deletes the addressed version he
+        // owns and is refused the entry whose addressed version ALICE owns,
+        // even though he owns that key's CURRENT object; the rest of the
+        // batch proceeds.
+        let backend = acl_backend();
+        let storage = backend.storage();
+        let alice = user_id("AKID");
+        let bob = user_id("BKID");
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(
+                &b,
+                Some(&alice),
+                &Acl {
+                    owner: Some(alice.clone()),
+                    grants: vec![grant_to(&alice, acl::Permission::FullControl)],
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .set_bucket_versioning(&b, version::State::Enabled)
+            .await
+            .unwrap();
+        let owned = commit_version(storage, &b, "owned", &bob).await;
+        commit_version(storage, &b, "owned", &alice).await;
+        let denied = commit_version(storage, &b, "denied", &alice).await;
+        commit_version(storage, &b, "denied", &bob).await;
+
+        let mut req = s3_request(dto::DeleteObjectsInput {
+            bucket: "data".into(),
+            bypass_governance_retention: None,
+            checksum_algorithm: None,
+            delete: dto::Delete {
+                objects: vec![
+                    dto::ObjectIdentifier {
+                        key: "owned".into(),
+                        version_id: Some(owned),
+                        ..Default::default()
+                    },
+                    dto::ObjectIdentifier {
+                        key: "denied".into(),
+                        version_id: Some(denied),
+                        ..Default::default()
+                    },
+                ],
+                quiet: None,
+            },
+            expected_bucket_owner: None,
+            mfa: None,
+            request_payer: None,
+        });
+        req.credentials = Some(credentials_for("BKID"));
+        let out = backend.delete_objects(req).await.unwrap().output;
+        let deleted: Vec<&str> = out
+            .deleted
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d.key.as_deref())
+            .collect();
+        assert_eq!(
+            deleted,
+            ["owned"],
+            "the addressed version BOB owns is deleted"
+        );
+        let errors = out.errors.as_ref().unwrap();
+        assert_eq!(errors.len(), 1, "only the entry ALICE's version gates");
+        assert_eq!(errors[0].key.as_deref(), Some("denied"));
+        assert_eq!(errors[0].code.as_deref(), Some("AccessDenied"));
+    }
+
+    #[cfg(feature = "acl")]
+    #[tokio::test]
+    async fn delete_objects_toggle_off_stays_version_agnostic() {
+        // The ACL toggle is off: the per-key gate keeps its "ACL off
+        // permits" posture, so R23's addressed-version rule does not apply
+        // — a non-owner deletes ALICE's addressed version, and no authority
+        // is resolved.
+        let caps = Capabilities {
+            acl: false,
+            ..Default::default()
+        };
+        let backend = CapabilityS3::new(
+            S3Backend::new(MemoryStorage::new().unwrap(), caps)
+                .with_identity(testutil::acl_identity()),
+            caps,
+        );
+        let storage = backend.inner().storage();
+        let alice = user_id("AKID");
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, Some(&alice), &Acl::default_private(Some(alice.clone())))
+            .await
+            .unwrap();
+        storage
+            .set_bucket_versioning(&b, version::State::Enabled)
+            .await
+            .unwrap();
+        let addressed = commit_version(storage, &b, "alice.txt", &alice).await;
+        let mut req = s3_request(dto::DeleteObjectsInput {
+            bucket: "data".into(),
+            bypass_governance_retention: None,
+            checksum_algorithm: None,
+            delete: dto::Delete {
+                objects: vec![dto::ObjectIdentifier {
+                    key: "alice.txt".into(),
+                    version_id: Some(addressed),
+                    ..Default::default()
+                }],
+                quiet: None,
+            },
+            expected_bucket_owner: None,
+            mfa: None,
+            request_payer: None,
+        });
+        req.credentials = Some(credentials_for("BKID"));
+        let out = backend.delete_objects(req).await.unwrap().output;
+        assert_eq!(out.deleted.as_ref().unwrap().len(), 1);
+        assert!(out.errors.is_none());
+    }
+
+    #[cfg(feature = "versioning")]
+    #[tokio::test]
+    async fn a_missing_version_is_the_handlers_no_such_version() {
+        // Contract OL17: a well-formed id naming no version is the wire's
+        // `404 NoSuchVersion` once the request reaches the handler. The
+        // ACL gate passes it through for exactly this answer (R23). Without
+        // `versioning` the handler answers `NotImplemented`, so the leg is
+        // versioning-only (its siblings carry the same gate).
+        let (backend, b) = setup_name().await;
+        let missing = version::id("missing-version").unwrap().to_string();
+        let err = backend
+            .delete_object(s3_request(dto::DeleteObjectInput {
+                bucket: b.to_string(),
+                key: "k".into(),
+                version_id: Some(missing),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NoSuchVersion", "{err:?}");
+    }
+
+    #[cfg(feature = "object-lock")]
+    #[tokio::test]
+    async fn a_missing_version_is_the_retention_handlers_no_such_version() {
+        // The same OL17 answer on the retention write: the lock-config
+        // precondition is met, then the addressed identity is the store's
+        // miss.
+        let backend = S3Backend::new(MemoryStorage::new().unwrap(), Default::default());
+        backend
+            .op_create_bucket(s3_request(dto::CreateBucketInput {
+                bucket: "locked".into(),
+                object_lock_enabled_for_bucket: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let missing = version::id("missing-version").unwrap().to_string();
+        let err = backend
+            .op_put_object_retention(s3_request(dto::PutObjectRetentionInput {
+                bucket: "locked".into(),
+                key: "k".into(),
+                version_id: Some(missing),
+                // Base64 of 16 zero bytes: the request-shape Content-MD5 gate.
+                content_md5: Some("AAAAAAAAAAAAAAAAAAAAAA==".to_owned()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "NoSuchVersion", "{err:?}");
+    }
+
+    #[cfg(feature = "acl")]
+    #[tokio::test]
+    async fn delete_objects_refuses_an_addressed_marker_per_key() {
+        // A marker is a real version but holds no ACL, so `version_acl`
+        // answers the same `NoSuchVersion` as an unknown id: the per-key
+        // gate heads the address. A non-owner's marker entry is its own
+        // `AccessDenied` and the marker survives; the bucket owner's
+        // parity deletes it.
+        let backend = acl_backend();
+        let storage = backend.storage();
+        let alice = user_id("AKID");
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, Some(&alice), &Acl::default_private(Some(alice.clone())))
+            .await
+            .unwrap();
+        storage
+            .set_bucket_versioning(&b, version::State::Enabled)
+            .await
+            .unwrap();
+        commit_version(storage, &b, "k", &alice).await;
+        let k = object::key("k").unwrap();
+        let marker = storage.delete_object(&b, &k).await.unwrap();
+        let marker_id = marker
+            .id
+            .clone()
+            .expect("a recorded marker has an identity");
+
+        async fn batch(
+            backend: &S3Backend<MemoryStorage>,
+            access_key: &str,
+            version_id: &version::Id,
+        ) -> dto::DeleteObjectsOutput {
+            let mut req = s3_request(dto::DeleteObjectsInput {
+                bucket: "data".into(),
+                bypass_governance_retention: None,
+                checksum_algorithm: None,
+                delete: dto::Delete {
+                    objects: vec![dto::ObjectIdentifier {
+                        key: "k".into(),
+                        version_id: Some(version_id.to_string()),
+                        ..Default::default()
+                    }],
+                    quiet: None,
+                },
+                expected_bucket_owner: None,
+                mfa: None,
+                request_payer: None,
+            });
+            req.credentials = Some(credentials_for(access_key));
+            backend.delete_objects(req).await.unwrap().output
+        }
+
+        let out = batch(&backend, "BKID", &marker_id).await;
+        assert!(
+            out.deleted.is_none(),
+            "a non-owner's marker entry is refused"
+        );
+        let errors = out.errors.as_ref().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code.as_deref(), Some("AccessDenied"));
+        assert!(matches!(
+            storage
+                .head_object_version(&b, &k, Some(&marker_id))
+                .await
+                .unwrap(),
+            version::HeadResult::Marker { .. }
+        ));
+
+        let out = batch(&backend, "AKID", &marker_id).await;
+        assert_eq!(out.deleted.as_ref().unwrap().len(), 1);
+        assert!(out.errors.is_none());
+        assert!(
+            storage
+                .head_object_version(&b, &k, Some(&marker_id))
+                .await
+                .is_err(),
+            "the bucket owner's delete removed the marker"
+        );
     }
 
     #[cfg(feature = "copy")]
@@ -4300,6 +4823,7 @@ mod tests {
                 object::Tags::empty(),
                 Some(&alice),
                 &public,
+                None,
             )
             .await
             .unwrap();
@@ -4406,6 +4930,7 @@ mod tests {
                 object::Tags::empty(),
                 Some(&alice),
                 &public,
+                None,
             )
             .await
             .unwrap();
@@ -4480,6 +5005,7 @@ mod tests {
                 object::Tags::empty(),
                 Some(&alice),
                 &Acl::default_private(Some(alice.clone())),
+                None,
             )
             .await
             .unwrap();

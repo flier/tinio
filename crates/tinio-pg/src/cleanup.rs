@@ -104,7 +104,10 @@ use crate::{
         blocks::PgBlocks,
         cleanup::{HistoryRow, OrphanPart},
     },
-    _util::metrics::{Pass, PassTimer, PgSection, record_pg_pass_failure},
+    _util::metrics::{
+        LockOperation, Pass, PassTimer, PgSection, record_pg_pass_failure,
+        record_protected_deletion,
+    },
     Error,
 };
 
@@ -610,14 +613,27 @@ impl PgCleanup {
                 continue;
             };
             if remove {
-                match VersionMeta::expire_many(&self.store, bucket, &key, &seqs).await {
-                    Ok(()) => actions.push(Ok(RepairAction {
-                        level: RepairActionLevel::Warn,
-                        description: format!(
-                            "expired {} noncurrent version(s) of `{key}` in {bucket}",
-                            seqs.len()
-                        ),
-                    })),
+                // The lock-aware primitive (OL8): a protected sequence is
+                // skipped, never an error. The report's `removed` is the count
+                // the action states — `seqs` lists candidates, not removals —
+                // and each protected sequence is recorded for the
+                // protected-deletions family under `operation = sweeper`
+                // (OL19, OL25).
+                match VersionMeta::expire_many_report(&self.store, bucket, &key, &seqs).await {
+                    Ok(report) => {
+                        for (_seq, reason) in &report.protected {
+                            record_protected_deletion(LockOperation::Sweeper, *reason);
+                        }
+                        if report.removed > 0 {
+                            actions.push(Ok(RepairAction {
+                                level: RepairActionLevel::Warn,
+                                description: format!(
+                                    "expired {} noncurrent version(s) of `{key}` in {bucket}",
+                                    report.removed
+                                ),
+                            }));
+                        }
+                    }
                     Err(err) => {
                         record_pg_pass_failure(PgSection::Versions);
                         actions.push(Err(Error::from(err)));

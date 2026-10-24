@@ -3,7 +3,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -16,6 +16,7 @@ use crate::{
         blob::BlobRef,
         content::{ContentEntry, ContentKey},
         meta::object::PartRow,
+        object_lock,
         storage::{BodyStream, Error as StorageError, collect_body},
         version::State,
     },
@@ -173,6 +174,7 @@ async fn put_versioned(
             object::Tags::empty(),
             owner,
             &Acl::default_private(None),
+            None,
             plane.version_rows.as_ref(),
         )
         .await
@@ -526,7 +528,13 @@ async fn a_second_delete_keeps_the_previous_marker() {
     );
 
     ops(&base)
-        .delete_object_version(&plane, &name, &key, Some(&second_id))
+        .delete_object_version(
+            &plane,
+            &name,
+            &key,
+            Some(&second_id),
+            object_lock::Bypass::None,
+        )
         .await
         .unwrap();
     let current = plane.versions.current(&name, &key).await.unwrap();
@@ -547,7 +555,13 @@ async fn restoring_a_delete_marker_removes_the_keys_bytes() {
     let next_id = next.version_id.expect("the overwrite mints an identity");
 
     ops(&base)
-        .delete_object_version(&plane, &name, &key, Some(&next_id))
+        .delete_object_version(
+            &plane,
+            &name,
+            &key,
+            Some(&next_id),
+            object_lock::Bypass::None,
+        )
         .await
         .unwrap();
     let current = plane.versions.current(&name, &key).await.unwrap();
@@ -574,7 +588,7 @@ async fn deleting_a_version_refuses_a_stale_index_entry() {
     base.counted().answer_next_version_seq(history.seq);
 
     let err = ops(&base)
-        .delete_object_version(&plane, &name, &key, Some(&stale))
+        .delete_object_version(&plane, &name, &key, Some(&stale), object_lock::Bypass::None)
         .await
         .unwrap_err();
     assert!(
@@ -1187,6 +1201,7 @@ async fn a_missing_stat_after_publish_restores_the_outgoing_version() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
             plane.version_rows.as_ref(),
         )
         .await
@@ -1228,6 +1243,7 @@ async fn a_failed_advance_over_a_marker_restores_the_marker() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
             plane.version_rows.as_ref(),
         )
         .await
@@ -1250,7 +1266,13 @@ async fn deleting_the_current_version_restores_an_older_row_when_latest_fails_cl
     let second_id = second.version_id.expect("the overwrite mints an identity");
     base.counted().hide_next_latest();
     ops(&base)
-        .delete_object_version(&plane, &name, &key, Some(&second_id))
+        .delete_object_version(
+            &plane,
+            &name,
+            &key,
+            Some(&second_id),
+            object_lock::Bypass::None,
+        )
         .await
         .unwrap();
     let got = ops(&base).get_object(&name, &key, None).await.unwrap();
@@ -1334,6 +1356,7 @@ async fn a_refused_suspended_replacement_keeps_the_null_bytes() {
             object::Tags::empty(),
             None,
             &Acl::default_private(None),
+            None,
             plane.version_rows.as_ref(),
         )
         .await
@@ -1413,5 +1436,369 @@ async fn a_hidden_latest_does_not_reuse_a_live_history_sequence() {
             .unwrap()
             .is_some(),
         "the history row keeps its own sequence"
+    );
+}
+
+/// An enabled Object Lock configuration with no default rule.
+fn lock_config() -> object_lock::Config {
+    object_lock::Config {
+        enabled: true,
+        rule: None,
+    }
+}
+
+/// Store the enabled configuration on the engine's bucket receiver.
+async fn configure_lock(base: &Base, name: &bucket::Name) {
+    base.ops(BucketRow::Guaranteed)
+        .put_bucket_object_lock(name, &lock_config())
+        .await
+        .unwrap();
+}
+
+/// A retention of `mode` that is active at `now`.
+fn retention(mode: object_lock::Mode, now: SystemTime) -> object_lock::Retention {
+    object_lock::Retention {
+        mode,
+        retain_until: now + Duration::from_secs(3_600),
+    }
+}
+
+/// A versioned bucket with an enabled configuration and one current version.
+async fn lockable(
+    base: &Base,
+    key: &object::Key,
+) -> (bucket::Name, Plane<TestMeta, RedbContent, BlockMem>, Id) {
+    let (name, plane, info) = versioned(base, key, b"first").await;
+    configure_lock(base, &name).await;
+    let id = info.version_id.expect("an enabled write mints an identity");
+    (name, plane, id)
+}
+
+/// OL5/OL11: the three addresses resolve, the legal hold and the retention are
+/// independent, and the governance bypass is the only way to clear an unexpired
+/// governance retention.
+#[tokio::test]
+async fn set_retention_addresses_the_current_null_and_id_versions() {
+    let base = Base::new();
+    let key = object::key("locked.txt").unwrap();
+    let (name, plane, id) = lockable(&base, &key).await;
+    let now = SystemTime::now();
+    let ops = ops(&base);
+
+    // Current resolves the slot's identity; the hold is set and preserved.
+    let held = ops
+        .set_legal_hold(
+            &plane,
+            &name,
+            &key,
+            &version::Address::Current,
+            object_lock::LegalHold::On,
+        )
+        .await
+        .unwrap();
+    assert_eq!(held.legal_hold, object_lock::LegalHold::On);
+    assert_eq!(held.retention, None);
+
+    let applied = ops
+        .set_retention(
+            &plane,
+            &name,
+            &key,
+            &version::Address::Id(id.clone()),
+            Some(&retention(object_lock::Mode::Governance, now)),
+            object_lock::Bypass::None,
+            now,
+        )
+        .await
+        .unwrap()
+        .expect("the retention is stored");
+    assert!(applied.retention.is_some());
+    assert_eq!(
+        applied.legal_hold,
+        object_lock::LegalHold::On,
+        "setting a retention preserves the legal hold"
+    );
+
+    // A governance retention cannot be cleared without the bypass, and the
+    // bypass clears only the retention.
+    let refused = ops
+        .set_retention(
+            &plane,
+            &name,
+            &key,
+            &version::Address::Current,
+            None,
+            object_lock::Bypass::None,
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            StorageError::Locked(object_lock::RefusalReason::Governance)
+        ),
+        "{refused:?}"
+    );
+    let cleared = ops
+        .set_retention(
+            &plane,
+            &name,
+            &key,
+            &version::Address::Current,
+            None,
+            object_lock::Bypass::Governance,
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(cleared.is_some(), "the hold keeps the lock row");
+    let cleared = cleared.unwrap();
+    assert_eq!(cleared.retention, None);
+    assert_eq!(cleared.legal_hold, object_lock::LegalHold::On);
+}
+
+/// The null identity is addressed as [`version::Address::Null`] and through
+/// `Current` when it is the current version; clearing the hold preserves the
+/// retention.
+#[tokio::test]
+async fn set_retention_on_the_null_version_preserves_its_hold() {
+    let base = Base::new();
+    let name = bucket(&base, "data").await;
+    let key = object::key("null.txt").unwrap();
+    let plane = base.version_plane();
+    // A write before versioning is enabled is the null version.
+    let info = put_versioned(&base, &plane, &name, &key, b"plain", None).await;
+    assert_eq!(info.version_id, None, "the unversioned write is null");
+    plane
+        .versions
+        .set_state(&name, State::Enabled)
+        .await
+        .unwrap();
+    configure_lock(&base, &name).await;
+    let now = SystemTime::now();
+    let ops = ops(&base);
+
+    let applied = ops
+        .set_retention(
+            &plane,
+            &name,
+            &key,
+            &version::Address::Null,
+            Some(&retention(object_lock::Mode::Governance, now)),
+            object_lock::Bypass::None,
+            now,
+        )
+        .await
+        .unwrap()
+        .expect("the null version is lockable");
+    assert!(applied.retention.is_some());
+
+    let held = ops
+        .set_legal_hold(
+            &plane,
+            &name,
+            &key,
+            &version::Address::Current,
+            object_lock::LegalHold::On,
+        )
+        .await
+        .unwrap();
+    assert!(held.retention.is_some(), "the hold preserves the retention");
+    assert_eq!(held.legal_hold, object_lock::LegalHold::On);
+
+    let cleared = ops
+        .set_legal_hold(
+            &plane,
+            &name,
+            &key,
+            &version::Address::Null,
+            object_lock::LegalHold::Off,
+        )
+        .await
+        .unwrap();
+    assert!(
+        cleared.retention.is_some(),
+        "clearing the hold preserves the retention"
+    );
+    assert_eq!(cleared.legal_hold, object_lock::LegalHold::Off);
+}
+
+/// OL11: COMPLIANCE refuses a shortening and a removal even with the bypass.
+#[tokio::test]
+async fn a_compliance_retention_cannot_be_shortened_or_cleared() {
+    let base = Base::new();
+    let key = object::key("compliance.txt").unwrap();
+    let (name, plane, id) = lockable(&base, &key).await;
+    let now = SystemTime::now();
+    let ops = ops(&base);
+    let long = retention(object_lock::Mode::Compliance, now);
+    ops.set_retention(
+        &plane,
+        &name,
+        &key,
+        &version::Address::Id(id.clone()),
+        Some(&long),
+        object_lock::Bypass::None,
+        now,
+    )
+    .await
+    .unwrap();
+
+    let shorter = object_lock::Retention {
+        retain_until: long.retain_until - Duration::from_secs(60),
+        ..long
+    };
+    for requested in [Some(&shorter), None] {
+        let refused = ops
+            .set_retention(
+                &plane,
+                &name,
+                &key,
+                &version::Address::Id(id.clone()),
+                requested,
+                object_lock::Bypass::Governance,
+                now,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                StorageError::Locked(object_lock::RefusalReason::Compliance)
+            ),
+            "{refused:?}"
+        );
+    }
+}
+
+/// OL5: an unconfigured bucket and an absent/marker identity keep the store's
+/// refusal classes (the wire is Task 6's).
+#[tokio::test]
+async fn lock_writes_keep_the_store_refusal_classes() {
+    let base = Base::new();
+    let key = object::key("plain.txt").unwrap();
+    let name = bucket(&base, "data").await;
+    let plane = base.version_plane();
+    plane
+        .versions
+        .set_state(&name, State::Enabled)
+        .await
+        .unwrap();
+    let info = put_versioned(&base, &plane, &name, &key, b"first", None).await;
+    let id = info.version_id.expect("an enabled write mints an identity");
+    let now = SystemTime::now();
+    let ops = ops(&base);
+
+    // No configuration → InvalidBucketState.
+    let unconfigured = ops
+        .set_retention(
+            &plane,
+            &name,
+            &key,
+            &version::Address::Id(id.clone()),
+            Some(&retention(object_lock::Mode::Governance, now)),
+            object_lock::Bypass::None,
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(unconfigured, StorageError::InvalidBucketState(_)),
+        "{unconfigured:?}"
+    );
+
+    configure_lock(&base, &name).await;
+
+    // A missing current version → NoSuchVersion.
+    let absent = object::key("absent.txt").unwrap();
+    let missing = ops
+        .set_retention(
+            &plane,
+            &name,
+            &absent,
+            &version::Address::Current,
+            Some(&retention(object_lock::Mode::Governance, now)),
+            object_lock::Bypass::None,
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(missing, StorageError::NoSuchVersion(_)),
+        "{missing:?}"
+    );
+
+    // A delete marker is not a lockable identity.
+    let marker = delete_marker(&base, &plane, &name, &key).await;
+    let marker_id = marker.id.expect("the marker carries an identity");
+    let marked = ops
+        .set_legal_hold(
+            &plane,
+            &name,
+            &key,
+            &version::Address::Id(marker_id),
+            object_lock::LegalHold::On,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(marked, StorageError::NoSuchVersion(_)),
+        "{marked:?}"
+    );
+}
+
+/// OL8/OL11: the delete forwards the bypass to the store's atomic removal.
+#[tokio::test]
+async fn the_delete_forwards_the_governance_bypass() {
+    let base = Base::new();
+    let key = object::key("bypass.txt").unwrap();
+    let (name, plane, id) = lockable(&base, &key).await;
+    let now = SystemTime::now();
+    ops(&base)
+        .set_retention(
+            &plane,
+            &name,
+            &key,
+            &version::Address::Id(id.clone()),
+            Some(&retention(object_lock::Mode::Governance, now)),
+            object_lock::Bypass::None,
+            now,
+        )
+        .await
+        .unwrap();
+
+    let refused = ops(&base)
+        .delete_object_version(&plane, &name, &key, Some(&id), object_lock::Bypass::None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            StorageError::Locked(object_lock::RefusalReason::Governance)
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        plane.versions.current(&name, &key).await.unwrap().exists,
+        "a refusal removes nothing"
+    );
+
+    ops(&base)
+        .delete_object_version(
+            &plane,
+            &name,
+            &key,
+            Some(&id),
+            object_lock::Bypass::Governance,
+        )
+        .await
+        .unwrap();
+    assert!(
+        VersionMeta::version_lock(&*plane.version_rows, &name, &key, Some(&id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the bypassed delete removes the lock row with the version"
     );
 }

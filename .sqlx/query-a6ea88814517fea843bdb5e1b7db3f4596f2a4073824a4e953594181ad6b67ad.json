@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- The doctor's Object Lock scan (OL31): every stored bucket rule, so the\n-- model's own decoder can report the ones that do not read. An empty wire is\n-- \"no rule\"; the scan discards only a non-empty wire.\nSELECT\n    l.bucket,\n    l.enabled,\n    l.rule\nFROM bucket_object_lock AS l\nORDER BY l.bucket COLLATE \"C\"\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bucket",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bucket_object_lock",
+            "name": "bucket"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "bucket_object_lock",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "rule",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bucket_object_lock",
+            "name": "rule"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a6ea88814517fea843bdb5e1b7db3f4596f2a4073824a4e953594181ad6b67ad"
+}

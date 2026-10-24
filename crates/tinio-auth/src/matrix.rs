@@ -51,12 +51,16 @@ pub struct OpRule {
     /// (PutObject, PostObject, CopyObject, CompleteMultipartUpload,
     /// RenameObject).
     pub existence_dispatch: bool,
+    /// The op's base gate follows the request's `versionId` to the
+    /// ADDRESSED version's ACL instead of the current object's (R23:
+    /// DeleteObject and the four Object Lock per-version operations).
+    pub version_addressed: bool,
 }
 
 /// The rule for an s3s operation name (spec §4), resolved-but-unmapped
 /// ops → the owner-only default.
 pub fn rule_for(op: &str) -> OpRule {
-    fn rule(
+    const fn rule(
         base: Requirement,
         reads_source: bool,
         writes_destination_bucket: bool,
@@ -67,8 +71,23 @@ pub fn rule_for(op: &str) -> OpRule {
             reads_source,
             writes_destination_bucket,
             existence_dispatch,
+            version_addressed: false,
         }
     }
+
+    /// The version-address slice of the owner-parity rows (R23): the base
+    /// gate follows the request's `versionId` to the addressed version's
+    /// ACL (a delete marker included).
+    const fn version_addressed_rule(base: Requirement) -> OpRule {
+        OpRule {
+            base,
+            reads_source: false,
+            writes_destination_bucket: false,
+            existence_dispatch: false,
+            version_addressed: true,
+        }
+    }
+
     use Requirement::*;
     match op {
         // Bucket-level data reads.
@@ -82,6 +101,14 @@ pub fn rule_for(op: &str) -> OpRule {
         // Bucket ACL reads/writes.
         "GetBucketAcl" => rule(BucketReadAcp, false, false, false),
         "PutBucketAcl" => rule(BucketWriteAcp, false, false, false),
+        // Object Lock's bucket configuration: a bucket-configuration
+        // subresource like tagging and versioning — owner only. A bucket
+        // WRITE grantee must not be able to enable Object Lock or install a
+        // default retention (that would let a grantee make later objects
+        // undeletable).
+        "GetObjectLockConfiguration" | "PutObjectLockConfiguration" => {
+            rule(OwnerOnly, false, false, false)
+        }
         // Object data reads.
         "GetObject" | "HeadObject" => rule(ObjectRead, false, false, false),
         // Object ACL reads/writes.
@@ -95,18 +122,29 @@ pub fn rule_for(op: &str) -> OpRule {
         // the record).
         //
         // Creator-or-bucket-owner / object-or-bucket-owner rows:
-        // upload-scoped (creator of the upload row), delete parity
-        // (DeleteObject), and the default-A tagging/attributes class.
-        "ListParts"
-        | "UploadPart"
-        | "AbortMultipartUpload"
-        | "DeleteObject"
+        // upload-scoped (creator of the upload row).
+        "ListParts" | "UploadPart" | "AbortMultipartUpload" => {
+            rule(ObjectOrBucketOwner, false, false, false)
+        }
+        "UploadPartCopy" => rule(ObjectOrBucketOwner, true, false, false),
+        "CompleteMultipartUpload" => rule(ObjectOrBucketOwner, false, false, true),
+        // Object-metadata rows: owner parity, grants never satisfy it. The
+        // tagging/attributes class and Object Lock's four per-version
+        // operations all follow the request's `versionId` to the ADDRESSED
+        // version's ACL (R23, extended by R31): the current object may be a
+        // different object, or a delete marker, while the handler serves
+        // the addressed version's tags/attributes/retention. The
+        // retention/legal-hold metadata is not object data: a READ grantee
+        // must not see it (the tagging sibling denies the same way).
+        "DeleteObject"
         | "GetObjectTagging"
         | "PutObjectTagging"
         | "DeleteObjectTagging"
-        | "GetObjectAttributes" => rule(ObjectOrBucketOwner, false, false, false),
-        "UploadPartCopy" => rule(ObjectOrBucketOwner, true, false, false),
-        "CompleteMultipartUpload" => rule(ObjectOrBucketOwner, false, false, true),
+        | "GetObjectAttributes"
+        | "GetObjectRetention"
+        | "GetObjectLegalHold"
+        | "PutObjectRetention"
+        | "PutObjectLegalHold" => version_addressed_rule(ObjectOrBucketOwner),
         // CopyObject: source READ base, source READ + destination bucket
         // WRITE overlays, destination-key existence dispatch.
         "CopyObject" => rule(ObjectRead, true, true, true),
@@ -167,6 +205,16 @@ mod tests {
         assert_eq!(requirement_for("PutObjectTagging"), ObjectOrBucketOwner);
         assert_eq!(requirement_for("DeleteObjectTagging"), ObjectOrBucketOwner);
         assert_eq!(requirement_for("GetObjectAttributes"), ObjectOrBucketOwner);
+        // Object Lock (design 2026-10-20-s3-object-lock): the bucket
+        // configuration is the owner-only bucket-configuration family (the
+        // tagging/versioning precedent), and all four per-version rows are
+        // object-metadata rows taking the object-tagging owner parity.
+        assert_eq!(requirement_for("GetObjectLockConfiguration"), OwnerOnly);
+        assert_eq!(requirement_for("PutObjectLockConfiguration"), OwnerOnly);
+        assert_eq!(requirement_for("GetObjectRetention"), ObjectOrBucketOwner);
+        assert_eq!(requirement_for("GetObjectLegalHold"), ObjectOrBucketOwner);
+        assert_eq!(requirement_for("PutObjectRetention"), ObjectOrBucketOwner);
+        assert_eq!(requirement_for("PutObjectLegalHold"), ObjectOrBucketOwner);
         assert_eq!(requirement_for("GetBucketPolicy"), OwnerOnly); // resolved, unmapped → owner-only default B
     }
 
@@ -220,7 +268,35 @@ mod tests {
                 reads_source: false,
                 writes_destination_bucket: false,
                 existence_dispatch: false,
+                version_addressed: false,
             }
         );
+    }
+
+    #[test]
+    fn the_version_addressed_rows_follow_the_request_address() {
+        // R23/R31: DeleteObject, the four Object Lock per-version operations
+        // and the tagging/attributes class gate on the ACL of the version
+        // the request ADDRESSES — those handlers serve the addressed
+        // version's tags/attributes/retention. Every other row reads the
+        // current object — DeleteObjects included: its batch body is
+        // unavailable at the gate, so the handler resolves each entry's
+        // address itself.
+        for op in [
+            "DeleteObject",
+            "GetObjectRetention",
+            "PutObjectRetention",
+            "GetObjectLegalHold",
+            "PutObjectLegalHold",
+            "GetObjectTagging",
+            "PutObjectTagging",
+            "DeleteObjectTagging",
+            "GetObjectAttributes",
+        ] {
+            assert!(rule_for(op).version_addressed, "{op}");
+        }
+        for op in ["DeleteObjects", "GetObject", "GetObjectAcl", "RenameObject"] {
+            assert!(!rule_for(op).version_addressed, "{op}");
+        }
     }
 }

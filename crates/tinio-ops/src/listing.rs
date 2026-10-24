@@ -87,6 +87,7 @@
 //!             object::Tags::empty(),
 //!             None,
 //!             &Acl::default_private(None),
+//!             None,
 //!         )
 //!         .await
 //!         .unwrap();
@@ -361,6 +362,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();

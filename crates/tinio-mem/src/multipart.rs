@@ -44,7 +44,7 @@ use crate::{
         from_nanos,
         meta::{ObjectMeta, UploadMeta, object as object_row},
         multipart::{check_part_minimum, part_number},
-        now_nanos, object, storage,
+        now_nanos, object, object_lock, storage,
     },
     _store_redb::part_meta,
     Error,
@@ -170,6 +170,7 @@ impl MultipartOps for MemoryStorage {
         tags: object::Tags,
         owner: Option<&acl::OwnerId>,
         acl: &Acl,
+        lock: Option<&object_lock::Lock>,
     ) -> Result<MultipartUpload, Error> {
         // The pre-check is for error ORDER only: a reserved or marker key on
         // a missing bucket answers NoSuchBucket, exactly like the baseline
@@ -192,7 +193,7 @@ impl MultipartOps for MemoryStorage {
         // is gone (the guard closes the window the pre-check above leaves
         // open).
         self.multipart_ops()
-            .create_multipart_upload(bucket, key, checksum, tags, owner, acl)
+            .create_multipart_upload(bucket, key, checksum, tags, owner, acl, lock)
             .await
             .map_err(Error::from)
     }
@@ -520,6 +521,11 @@ impl MultipartOps for MemoryStorage {
                 number: *number,
             })
             .collect();
+        // OL6: the intent the create stored with the upload row — the lock
+        // fixed then, so a mid-upload configuration change cannot alter it.
+        // Read before the write paths; the drain below consumes it.
+        #[cfg(feature = "versioning")]
+        let intent = self.metadata().upload_lock(bucket, upload_id).await?;
         // A bucket that records versions takes the single-transaction core (the
         // object put path's shape): the outgoing version, the assembled bytes,
         // the OBJECT_META row, the retained OBJECT_PARTS rows and the fresh
@@ -548,7 +554,16 @@ impl MultipartOps for MemoryStorage {
                 self.content().check_object_bytes_unlocked(size)?;
                 let done = self.db.write(|txn| {
                     version::complete_versioned(
-                        self, txn, bucket, key, now, &data, &row, &retained, credit,
+                        self,
+                        txn,
+                        bucket,
+                        key,
+                        now,
+                        &data,
+                        &row,
+                        &retained,
+                        credit,
+                        intent.as_ref(),
                     )
                 })?;
                 drop(guard);
@@ -578,7 +593,13 @@ impl MultipartOps for MemoryStorage {
                 // bucket moves it (the hook's own answer).
                 if records_versions {
                     self.metadata()
-                        .advance_slot(bucket, key, version_id.clone(), version_seq)
+                        .advance_slot_with(
+                            bucket,
+                            key,
+                            version_id.clone(),
+                            version_seq,
+                            intent.as_ref(),
+                        )
                         .await?;
                 }
                 (version_id, records_versions)
@@ -684,13 +705,15 @@ mod tests {
             acl::Acl,
             bucket,
             content::ContentKey,
+            meta::UploadMeta,
             multipart::{self, MIN_PART_BYTES, part_number},
-            object,
-            storage::Error::*,
+            object, object_lock,
+            storage::{Error::*, VersionOps},
         },
         _util::testing::{
             body,
             metadata::{assert_content_conformance, assert_upload_meta_conformance},
+            object_lock::default_rule,
             read_body,
         },
         MemoryOptions,
@@ -731,6 +754,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -801,6 +825,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -975,6 +1000,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1173,6 +1199,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1241,6 +1268,7 @@ mod tests {
                     object::Tags::empty(),
                     None,
                     &Acl::default_private(None),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1309,6 +1337,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1362,6 +1391,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1420,6 +1450,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1448,6 +1479,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1459,6 +1491,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1478,6 +1511,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1541,6 +1575,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1624,6 +1659,7 @@ mod tests {
                 tags.clone(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1727,6 +1763,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1803,6 +1840,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1898,6 +1936,7 @@ mod tests {
                 object::Tags::empty(),
                 None,
                 &Acl::default_private(None),
+                None,
             )
             .await
             .unwrap();
@@ -1953,6 +1992,150 @@ mod tests {
                 .await
                 .is_err(),
             "the consumed part's bytes are gone"
+        );
+    }
+
+    /// The upload's stored lock intent.
+    async fn upload_intent(
+        storage: &MemoryStorage,
+        b: &Name,
+        upload_id: &str,
+    ) -> Option<object_lock::Lock> {
+        storage.metadata().upload_lock(b, upload_id).await.unwrap()
+    }
+
+    /// OL6: the create-time default is stored with the upload row, a mid-upload
+    /// configuration change cannot alter it, and the completion applies it to
+    /// the final version and consumes it.
+    #[tokio::test]
+    async fn the_create_time_lock_intent_rides_the_completion() {
+        use std::time::SystemTime;
+
+        use crate::_core::{meta::VersionMeta, version::State};
+
+        let (storage, b) = with_bucket().await;
+        storage
+            .set_bucket_versioning(&b, State::Enabled)
+            .await
+            .unwrap();
+        let k = object::key("locked.bin").unwrap();
+        storage
+            .put_bucket_object_lock(&b, &default_rule(object_lock::Mode::Governance, 7))
+            .await
+            .unwrap();
+        let intent = storage
+            .resolve_write_lock(&b, None, object_lock::LegalHold::Off, SystemTime::now())
+            .await
+            .unwrap()
+            .expect("the default resolves a governance lock");
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+                Some(&intent),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            upload_intent(&storage, &b, &upload.upload_id)
+                .await
+                .as_ref(),
+            Some(&intent),
+            "the create stores the intent with the upload row"
+        );
+
+        // A mid-upload configuration change must not alter the fixed intent.
+        storage
+            .put_bucket_object_lock(&b, &default_rule(object_lock::Mode::Compliance, 30))
+            .await
+            .unwrap();
+
+        let part = storage
+            .upload_part(
+                &b,
+                &k,
+                &upload.upload_id,
+                part_number(1).unwrap(),
+                body(b"assembled".to_vec()),
+                None,
+            )
+            .await
+            .unwrap();
+        let info = storage
+            .complete_multipart_upload(&b, &k, &upload.upload_id, &[completed(&part)], None)
+            .await
+            .unwrap();
+
+        let stored = storage
+            .metadata()
+            .version_lock(&b, &k, info.version_id.as_ref())
+            .await
+            .unwrap()
+            .expect("the completed version carries the create-time lock");
+        assert_eq!(
+            stored, intent,
+            "the create-time intent, not the mid-upload config"
+        );
+        assert!(
+            upload_intent(&storage, &b, &upload.upload_id)
+                .await
+                .is_none(),
+            "the completion consumes the intent"
+        );
+    }
+
+    /// OL6: aborting an upload clears its stored intent.
+    #[tokio::test]
+    async fn aborting_an_upload_clears_its_lock_intent() {
+        use std::time::{Duration, SystemTime};
+
+        use crate::_core::version::State;
+
+        let (storage, b) = with_bucket().await;
+        storage
+            .set_bucket_versioning(&b, State::Enabled)
+            .await
+            .unwrap();
+        let k = object::key("aborted.bin").unwrap();
+        let lock = object_lock::Lock {
+            retention: Some(object_lock::Retention {
+                mode: object_lock::Mode::Compliance,
+                retain_until: SystemTime::now() + Duration::from_secs(3_600),
+            }),
+            legal_hold: object_lock::LegalHold::On,
+        };
+        let upload = storage
+            .create_multipart_upload(
+                &b,
+                &k,
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+                Some(&lock),
+            )
+            .await
+            .unwrap();
+        assert!(
+            upload_intent(&storage, &b, &upload.upload_id)
+                .await
+                .is_some(),
+            "the intent is stored"
+        );
+
+        storage
+            .abort_multipart_upload(&b, &k, &upload.upload_id)
+            .await
+            .unwrap();
+        assert!(
+            upload_intent(&storage, &b, &upload.upload_id)
+                .await
+                .is_none(),
+            "the abort's drain removes the intent"
         );
     }
 }

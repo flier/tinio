@@ -44,7 +44,15 @@ pub(crate) mod cors;
 mod errors;
 #[cfg(feature = "lifecycle")]
 pub(crate) mod lifecycle;
+mod lock_headers;
 mod locks;
+pub(crate) use lock_headers::LockHeaders;
+#[cfg(feature = "object-lock")]
+pub(crate) mod object_lock;
+/// The stripped-build runtime refusal test (OL20): compiled only without the
+/// feature, so the six operations are absent from the dispatch by construction.
+#[cfg(all(test, not(feature = "object-lock")))]
+mod object_lock_stripped;
 pub(crate) mod ops;
 mod s3;
 mod versioning;
@@ -149,6 +157,7 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
+mod object_lock_cache;
 pub(crate) use conditions::{
     ConditionalHeaders, DeleteConditions, check_write_shape, checked_if_match_size, decide_fetch,
     decide_range_error, generation_changed, parse_if_range,
@@ -160,6 +169,7 @@ pub(crate) use conditions::{parse_etag_condition_header, parse_etag_condition_va
 pub(crate) use errors::map_backend_error;
 use futures::{TryStreamExt, stream};
 use mime_guess;
+pub use object_lock_cache::ObjectLockCache;
 #[cfg(feature = "select")]
 use rayon::ThreadPool;
 use s3s::{
@@ -173,6 +183,8 @@ use tokio::sync::Semaphore;
 #[cfg(feature = "acl")]
 use self::acls::object_write_acl;
 #[cfg(feature = "acl")]
+use crate::_auth::MayBypass;
+#[cfg(feature = "acl")]
 use crate::_auth::canned::GrantHeaders;
 #[cfg(feature = "acl")]
 use crate::_auth::identity::Identity;
@@ -182,11 +194,14 @@ use crate::_auth::source::copy_source_of;
 use crate::_core::acl;
 #[cfg(feature = "multipart")]
 use crate::_core::checksum as core_checksum;
+#[cfg(feature = "object-lock")]
+use crate::_core::object_lock::Config as ObjectLockConfig;
 pub use crate::s3::Capabilities;
 use crate::{
     _core::{
         BodyStream, ETag, bucket, object,
-        storage::{ByteRange, Error as StorageError, Storage},
+        object_lock::{Bypass, Lock},
+        storage::{ByteRange, Error as StorageError, Storage, resolve_write_lock},
         version,
     },
     _util::lockmap::{self, Map},
@@ -251,6 +266,46 @@ pub(crate) fn last_modified_header(t: SystemTime) -> Option<http::HeaderValue> {
         .format(dto::TimestampFormat::HttpDate, &mut buf)
         .ok()?;
     http::HeaderValue::from_bytes(&buf).ok()
+}
+
+/// OL15's request-extension bit: the governance-bypass authority the ACL
+/// pipeline (`tinio_auth::AclAccess`) resolved for this request. A build or
+/// data plane without that pipeline leaves no bit, and no bit is no
+/// authority (fail closed).
+pub(crate) fn extension_may_bypass(extensions: &http::Extensions) -> bool {
+    #[cfg(feature = "acl")]
+    {
+        extensions
+            .get::<MayBypass>()
+            .is_some_and(|bit| bit.granted())
+    }
+    #[cfg(not(feature = "acl"))]
+    {
+        let _ = extensions;
+        false
+    }
+}
+
+/// OL15's `header && may_bypass`: the only way a governance bypass rides
+/// the storage call. The header alone is a request, never an authority.
+pub(crate) fn bypass_of(requested: bool, may_bypass: bool) -> Bypass {
+    if requested && may_bypass {
+        Bypass::Governance
+    } else {
+        Bypass::None
+    }
+}
+
+/// The checksum facts the write-lock gate reads (OL16): the request's
+/// `Content-MD5` wherever it arrived (the DTO field or the raw header), the
+/// headers themselves, whether the request carries trailing headers, and
+/// whether one of the DTO's own checksum fields is present (`PostObject`'s
+/// mapped form fields never reach the headers).
+pub(crate) struct LockChecksum<'a> {
+    pub(crate) dto_md5: Option<&'a str>,
+    pub(crate) headers: &'a http::HeaderMap,
+    pub(crate) trailing_headers: bool,
+    pub(crate) dto_checksum: bool,
 }
 
 /// The S3 mapping over one [`Storage`] backend.
@@ -325,6 +380,17 @@ pub struct S3Backend<S: Storage> {
     /// otherwise live forever.
     #[cfg(feature = "multipart")]
     pub(crate) checksum_specs: Arc<Mutex<HashMap<String, Option<Arc<core_checksum::Upload>>>>>,
+    /// The process-local `has_lock_config` negative cache (OL18): `bucket` →
+    /// whether the bucket stores an Object Lock configuration. A `false` entry
+    /// makes every subsequent GET/HEAD/range skip the version-lock table
+    /// entirely; a bucket with a configuration still pays the one config read
+    /// the first time and the per-version point read on every answer. Keyed
+    /// by bucket name (the name is bounded at 63 bytes). Consulted only by the
+    /// GET/HEAD echo, and only while the capability and the bucket's
+    /// version-recording bit are on; written with the resulting fact by
+    /// `op_put_bucket_object_lock`, `op_create_bucket` and `op_delete_bucket`
+    /// (the three request paths that can change it).
+    pub(crate) object_lock_cache: ObjectLockCache,
     /// Cap on concurrently streaming select responses
     /// ([`Capabilities::select_concurrency`]): gates admission of the
     /// whole job (forwarder + channels + response). One semaphore per
@@ -369,12 +435,25 @@ impl<S: Storage> S3Backend<S> {
     /// wires the same `Arc<S>` into both the mapping and the
     /// authorization pipeline — one backend, one share.
     pub fn new_shared(storage: Arc<S>, caps: Capabilities) -> Self {
+        Self::new_shared_with_object_lock_cache(storage, caps, ObjectLockCache::default())
+    }
+
+    /// Construct the mapping over a shared `storage` handle with the caller's Object Lock cache
+    /// (OL18). **The management plane's admin shares the same handle**, so a configuration it
+    /// writes invalidates the backend's `has_lock_config` answer without the backend seeing the
+    /// request.
+    pub fn new_shared_with_object_lock_cache(
+        storage: Arc<S>,
+        caps: Capabilities,
+        object_lock_cache: ObjectLockCache,
+    ) -> Self {
         Self {
             storage,
             caps,
             conditional_put_locks: Map::new(),
             #[cfg(feature = "multipart")]
             checksum_specs: Arc::new(Mutex::new(HashMap::new())),
+            object_lock_cache,
             #[cfg(feature = "select")]
             select_semaphore: Arc::new(Semaphore::new(caps.select_concurrency as usize)),
             #[cfg(feature = "select")]
@@ -382,6 +461,68 @@ impl<S: Storage> S3Backend<S> {
             #[cfg(feature = "acl")]
             identity: None,
         }
+    }
+
+    /// A clone of this backend's Object Lock cache handle (OL18), for a writer outside the
+    /// request paths — the management plane's admin.
+    pub fn object_lock_cache(&self) -> ObjectLockCache {
+        self.object_lock_cache.clone()
+    }
+
+    /// The effective Object Lock of a write (OL7, OL16, OL20), resolved
+    /// **once**: the request's [`LockHeaders`] over the bucket's default
+    /// rule, evaluated at one clock reading. The same value drives the
+    /// checksum requirement, so a concurrent configuration change cannot
+    /// make the two disagree.
+    ///
+    /// Always compiled: [`LockHeaders`]'s two `cfg` constructors are the
+    /// whole feature split, so every write surface passes one value here; a
+    /// stripped build's empty headers still apply the bucket's stored
+    /// default and gate it on the checksum that lock requires.
+    ///
+    /// A request carrying a lock header on a bucket with no configuration is
+    /// OL17's `400 InvalidRequest` — the store's resolver would otherwise
+    /// place the explicit lock on a bucket that never opted in.
+    pub(crate) async fn write_lock(
+        &self,
+        bucket: &bucket::Name,
+        lock_headers: &LockHeaders,
+        checksum: LockChecksum<'_>,
+    ) -> S3Result<Option<Lock>> {
+        let now = SystemTime::now();
+        let config = self
+            .storage
+            .get_bucket_object_lock(bucket)
+            .await
+            .map_err(map_backend_error)?;
+        if lock_headers.requested {
+            if let Some(retention) = lock_headers.retention.as_ref() {
+                retention
+                    .validate(now)
+                    .map_err(|invalid| errors::invalid_error(invalid.kind, invalid.reason, None))?;
+            }
+            if config.is_none() {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "Bucket is missing Object Lock Configuration"
+                ));
+            }
+        }
+        let lock = resolve_write_lock(
+            config.as_ref(),
+            lock_headers.retention.as_ref(),
+            lock_headers.legal_hold,
+            now,
+        );
+        let content_md5 = checksum::request_content_md5(checksum.dto_md5, checksum.headers)?;
+        checksum::require_lock_checksum(
+            lock.as_ref(),
+            checksum.headers,
+            checksum.trailing_headers,
+            content_md5.as_deref(),
+            checksum.dto_checksum,
+        )?;
+        Ok(lock)
     }
 
     /// Attach the identity map (feature `acl`): the ACL ops' `Owner`
@@ -552,6 +693,53 @@ impl<S: Storage> S3Backend<S> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(upload_id);
+    }
+
+    /// The bucket's stored Object Lock configuration, read through — the
+    /// authoritative read the six lock operations and the write path use
+    /// (OL18's cache is the GET/HEAD echo's alone).
+    #[cfg(feature = "object-lock")]
+    pub(crate) async fn object_lock_config(
+        &self,
+        bucket: &bucket::Name,
+    ) -> S3Result<Option<ObjectLockConfig>> {
+        self.storage
+            .get_bucket_object_lock(bucket)
+            .await
+            .map_err(map_backend_error)
+    }
+
+    /// Whether the bucket stores an Object Lock configuration, through the
+    /// process-local cache (OL18): the GET/HEAD echo's first probe per bucket
+    /// reads the configuration once; a `false` answer then skips the
+    /// version-lock read for every subsequent GET/HEAD/range. The capability
+    /// off answers `false` without a read or a cache entry — the echo is a
+    /// surface the toggle owns, while enforcement (the write path's default
+    /// retention and the delete protection) never consults this cache.
+    ///
+    /// The miss path fills a missing entry through
+    /// [`ObjectLockCache::merge`], whose `entry().or_insert(read)` never
+    /// overwrites an entry a write path installed while the read was in
+    /// flight: the interleaving "reader sees no configuration →
+    /// `op_put_bucket_object_lock` commits and inserts `true` → the reader
+    /// tries to insert `false`" keeps the writer's `true`, so a new
+    /// configuration cannot be hidden for the process's lifetime (the OL18
+    /// "a stale `false` must not hide a new config" rule).
+    #[cfg(feature = "object-lock")]
+    pub(crate) async fn has_lock_config(&self, bucket: &bucket::Name) -> S3Result<bool> {
+        if !self.caps.object_lock {
+            return Ok(false);
+        }
+        if let Some(hit) = self.object_lock_cache.cached(bucket) {
+            return Ok(hit);
+        }
+        let has = self
+            .storage
+            .get_bucket_object_lock(bucket)
+            .await
+            .map_err(map_backend_error)?
+            .is_some();
+        Ok(self.object_lock_cache.merge(bucket, has))
     }
 
     /// The contract's [`BodyStream`] into a response `StreamingBlob`.

@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT kind = 'marker' AS \"marker!\" FROM version_rows WHERE bucket = $1 AND key = $2 AND seq = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "marker!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6afb46275455d741959089c3728ec2694a602efec0fca525550435e00563e60b"
+}

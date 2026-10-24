@@ -25,6 +25,10 @@ Rationale: the open side follows the **bind address**. A loopback-bound TCP port
 | GET | `/buckets/{bucket}/lifecycle` | token | The bucket's stored lifecycle configuration, the model's own JSON; `404` when none is stored or when the plane carries no lifecycle admin |
 | PUT | `/buckets/{bucket}/lifecycle` | token | Replace the stored configuration with the JSON body (the model); `204`; `400`/`413`/`415`/`422` when the body is unparseable or not the model (`{"error": …}`); `400 {"rule", "reason"}` when the model refuses it; `403` on a read-only run |
 | DELETE | `/buckets/{bucket}/lifecycle` | token | Remove the stored configuration, idempotently; `204`; `403` on a read-only run |
+| GET | `/buckets/{bucket}/object-lock` | token | The bucket's stored Object Lock configuration, the model's JSON; `404` when none is stored or when the plane carries no Object Lock admin |
+| PUT | `/buckets/{bucket}/object-lock` | token | Enable the bucket or replace its default-retention rule; `204`; `enabled:false` refused; `403` on a read-only run |
+| GET | `/buckets/{bucket}/object-lock/objects` | token | The addressed version's lock state, the key and version address in the JSON body; `404` when it carries none or the version does not exist |
+| PUT | `/buckets/{bucket}/object-lock/objects` | token | Set or clear the addressed version's retention and/or legal hold atomically; `204`; `403` on a read-only run |
 
 ## Responses
 
@@ -51,8 +55,8 @@ Rationale: the open side follows the **bind address**. A loopback-bound TCP port
 
 - `401 {"error": "unauthorized"}` — missing/wrong token on any guarded path.
 - `400 {"rule": …, "reason": …}` — a lifecycle configuration the model refuses; a body the parser rejects is `400`/`415`/`422` `{"error": …}` (see below).
-- `403 {"error": "access denied"}` — a read-only run's `PUT`/`DELETE /buckets/{bucket}/lifecycle` (LC18).
-- `404` — unknown path.
+- `403 {"error": "access denied"}` — a read-only run's `PUT`/`DELETE /buckets/{bucket}/lifecycle` (LC18), and either `PUT` on the object-lock routes.
+- `404` — unknown path; the object-lock routes' `404` distinguishes its causes in the body (see below).
 - `500 {"error": "..."}` — internal error.
 
 ### GET /metrics
@@ -61,7 +65,7 @@ Rationale: the open side follows the **bind address**. A loopback-bound TCP port
 
 ### GET /openapi.json
 
-`200` `application/json` — utoipa-generated spec; documents the token security scheme and all four endpoints, plus the three lifecycle routes in a build carrying the `lifecycle` feature (a build without it registers neither the routes nor their paths).
+`200` `application/json` — utoipa-generated spec; documents the token security scheme and all four endpoints, plus the three lifecycle routes in a build carrying the `lifecycle` feature and the four object-lock routes in a build carrying the `object-lock` feature (a build without either registers neither the routes nor their paths).
 
 ### Lifecycle configuration: `GET`/`PUT`/`DELETE /buckets/{bucket}/lifecycle`
 
@@ -80,6 +84,20 @@ FR-042's configuration surface on the plane (design LC14 owns the shape; `contra
 **The `404` precedes the body's verdict**: a plane carrying no admin answers every method without consulting what the body parsed to, so the absence is never reported as a parser status (`415`/`400`/`422`/`413`).
 
 **Status mapping** (the plane's, not the S3 operation table's): a read-only run's write refusal → `403` — the store spells it two ways, `AccessDenied` (pg) or the contract's read-only `Io` (fs), and both mean the same thing: nothing was written, and the read is still served (LC18); `NoSuchBucket` → `404`; anything else → `500 {"error": "internal server error"}`, detail in the server log only.
+
+### Object Lock: the bucket configuration and the per-version lock
+
+FR-043's management surface (design OL23 owns the shape; `contracts/s3-surface.md` §Object Lock owns the S3 subresource and `contracts/cli.md` the verbs).
+
+**The four routes exist only in a build carrying the `object-lock` feature, on a run with `[s3] object_lock` on, and when an Object Lock admin is injected.** Otherwise no path is registered and every method answers `404 {"error": "object lock is not served here"}`. A read-only run serves both `GET`s and answers `403` for both `PUT`s.
+
+**Bodies** are the stored model's JSON (`snake_case`, the field spelling `tinio-core` owns), never an S3 element name. The bucket route's body is `{"enabled": …, "rule": {"default_retention": {"mode": …, "period": …}} | null}`. The object route carries `{"key": "<key>", "version": "current" | "null" | "<version id>", …}` on both methods — never a path segment, and never an absent-versus-null collapse: `current` resolves the current slot (which may be the null version), `null` names the null version, any other value is a version id.
+
+**The bucket route.** `GET` answers the stored configuration, or `404 {"error": "no object lock configuration"}` when the bucket stores none. `PUT` enables the bucket or replaces its default-retention rule: `enabled:false` is refused as `400 {"error": …}` and the setter only enables or updates, never disables; enabling an unversioned bucket enables versioning first; `204`, replace-all.
+
+**The object route.** `GET` answers `{"retention": <the model's retention or null>, "legal_hold": <the model's legal hold>}`. `PUT` distinguishes set / clear / leave: a `retention` member absent leaves the retention alone, `null` clears it, an object sets it; a `legal_hold` member absent leaves the hold alone, a value sets it — so clearing one never clears the other. **The present members are applied in one store transaction**: a refused retention (a compliance change, or governance without the bypass) answers that member's status and applies **neither** member; the legal hold itself never refuses. The `PUT` body may also carry `"bypass": true`, the plane-token-authorized governance bypass for the retention change (the CLI's `--bypass` on `retention set` and its implicit bypass on `retention clear`); absent or `false` is no bypass, it never applies to a legal hold, and a compliance retention refuses it. `204`.
+
+**Status mapping** (this plane's, not the S3 operation table's): `Locked` → `403`, `InvalidBucketState` → `409`, `NoSuchBucket` → `404`, `NoSuchVersion` → `404`; every `404` body distinguishes "no such bucket" from "not enabled" and "no retention". A body the parser rejects is `400`/`415`/`422`/`413` `{"error": …}`, as on the lifecycle routes.
 
 ## CLI usage
 

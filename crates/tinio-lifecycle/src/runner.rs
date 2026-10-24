@@ -21,6 +21,8 @@ use std::{
 };
 
 use smart_default::SmartDefault;
+#[cfg(test)]
+use tinio_util::testing::metrics::test_lock;
 use tokio::sync::watch;
 use tracing::{field, instrument};
 
@@ -28,11 +30,14 @@ use crate::{
     _core::{
         ListBucketsParams, ListObjectsParams, ListPartsParams, ListUploadsParams, bucket,
         lifecycle::{self, DEFAULT_CYCLE, DEFAULT_DELAY},
-        object,
+        object, object_lock,
         storage::{self, Storage},
         version::{self, CurrentVersion, IdMarker, ListParams, State},
     },
-    _util::pacing,
+    _util::{
+        metrics::{LockOperation, record_protected_deletion},
+        pacing,
+    },
     clock::Clock,
     metrics::{self, Kind},
 };
@@ -66,7 +71,7 @@ pub struct Options {
     pub cycle: Duration,
 }
 
-/// What one pass did — the five counters of the pass's one summary line (LC16).
+/// What one pass did — the pass's counters, one summary line (LC16, OL19).
 ///
 /// # Examples
 ///
@@ -75,6 +80,7 @@ pub struct Options {
 ///
 /// let idle = Summary::default();
 /// assert_eq!(idle.expired_objects, 0);
+/// assert_eq!(idle.protected_versions, 0);
 /// assert!(idle.buckets_with_rules == 0);
 /// ```
 #[derive(Debug, Clone, Copy, SmartDefault, PartialEq, Eq)]
@@ -86,6 +92,11 @@ pub struct Summary {
     /// Versions removed permanently: noncurrent ones, and delete markers that
     /// were their key's only version.
     pub expired_versions: u64,
+    /// Noncurrent versions a stored Object Lock protected: a counted skip,
+    /// never an error (OL19). One refusal increments this counter, so it
+    /// counts refusals per pass, not distinct versions — a version an action
+    /// reaches twice increments it twice.
+    pub protected_versions: u64,
     /// Incomplete uploads aborted.
     pub aborted_uploads: u64,
     /// Failed reads and actions. An item that vanished before its action is
@@ -356,6 +367,7 @@ impl<S: Storage> Runner<S> {
             buckets_with_rules = field::Empty,
             expired_objects = field::Empty,
             expired_versions = field::Empty,
+            protected_versions = field::Empty,
             aborted_uploads = field::Empty,
             errors = field::Empty
         )
@@ -435,6 +447,7 @@ impl<S: Storage> Runner<S> {
         tracing::Span::current().record("buckets_with_rules", summary.buckets_with_rules);
         tracing::Span::current().record("expired_objects", summary.expired_objects);
         tracing::Span::current().record("expired_versions", summary.expired_versions);
+        tracing::Span::current().record("protected_versions", summary.protected_versions);
         tracing::Span::current().record("aborted_uploads", summary.aborted_uploads);
         tracing::Span::current().record("errors", summary.errors);
         summary
@@ -722,7 +735,12 @@ impl<S: Storage> Runner<S> {
             }
             if counted(
                 self.storage
-                    .delete_object_version(sweep.bucket, &newest.key, newest.id.as_ref())
+                    .delete_object_version(
+                        sweep.bucket,
+                        &newest.key,
+                        newest.id.as_ref(),
+                        object_lock::Bypass::None,
+                    )
                     .await,
                 sweep.summary,
                 Kind::Marker,
@@ -788,7 +806,12 @@ impl<S: Storage> Runner<S> {
             }
             if counted(
                 self.storage
-                    .delete_object_version(sweep.bucket, &entry.key, entry.id.as_ref())
+                    .delete_object_version(
+                        sweep.bucket,
+                        &entry.key,
+                        entry.id.as_ref(),
+                        object_lock::Bypass::None,
+                    )
                     .await,
                 sweep.summary,
                 Kind::Version,
@@ -950,6 +973,11 @@ async fn upload_bytes<S: Storage>(
 /// first is counted, not failed — otherwise the pass's accounting would depend
 /// on whether a backend's delete happens to be idempotent (S3's are). Either
 /// way the action family records one sample under `kind`.
+///
+/// A permanent delete a stored lock refuses is the third outcome (OL19): a
+/// **counted skip** — the summary's [`protected_versions`](Summary::protected_versions)
+/// grows and the protected-deletions counter records the operation and reason.
+/// It is not an error and does not count as expired.
 fn counted<M, E: Into<storage::Error>>(
     outcome: Result<M, E>,
     summary: &mut Summary,
@@ -959,6 +987,17 @@ fn counted<M, E: Into<storage::Error>>(
         Ok(_) => {
             metrics::record_action(kind, true);
             true
+        }
+        Err(error @ storage::Error::Locked(reason)) => {
+            tracing::debug!(%error, "a lifecycle action was refused by an object lock");
+            // The family is process-global: an exact-value test on the same
+            // binary holds `test_lock::window()`, and the writer takes the
+            // gate so a parallel test's refusal cannot inflate its delta.
+            #[cfg(test)]
+            let _gate = test_lock::writer();
+            record_protected_deletion(LockOperation::Lifecycle, reason);
+            summary.protected_versions += 1;
+            false
         }
         Err(error) => {
             if matches!(

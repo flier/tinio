@@ -2,7 +2,7 @@
 //! implements [`tinio_core::meta`] and [`tinio_core::content`] must satisfy,
 //! driven through the contracts' own methods only.
 //!
-//! Seven entry points — a backend calls the ones it implements:
+//! Nine entry points — a backend calls the ones it implements:
 //!
 //! - [`assert_metadata_conformance`] — the aggregate: [`BucketMeta`],
 //!   [`ObjectMeta`] and [`UploadMeta`] over a [`Metadata`] store: ordering,
@@ -26,6 +26,15 @@
 //! - [`assert_content_conformance`] — [`ObjectContent`]'s staged write and
 //!   its visibility point, the ranged read, the move/copy/remove primitives,
 //!   the content walk and the content-plane bucket lifecycle.
+//! - [`assert_object_lock_conformance`] — Object Lock's bucket configuration,
+//!   per-version retention/legal hold (current, history and null), the delete
+//!   enforcement with the governance bypass, compliance/legal-hold/expiry,
+//!   `expire_many_report`, and the drain's protected refusal and orphan
+//!   removal. A **new entry point**, not folded into
+//!   [`assert_version_conformance`] (R17): the lock tables land in the stores
+//!   after the contract.
+//! - [`assert_object_lock_upload_conformance`] — the multipart lock intent
+//!   written atomically with the upload row, its replacement and its clear.
 //!
 //! The three per-category entry points — [`assert_bucket_meta_conformance`],
 //! [`assert_object_meta_conformance`] and [`assert_upload_meta_conformance`]
@@ -51,50 +60,38 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use futures::stream;
 
-use super::{part_number, read_body, unique_bucket};
+pub use super::object_lock::{
+    assert_object_lock_conformance, assert_object_lock_upload_conformance, reservation,
+};
+use super::{
+    fixtures::{
+        ETAG_A, ETAG_B, bucket_at, bucket_name, etag, governance_reservation, key, t0, version_row,
+    },
+    part_number, read_body,
+};
 use crate::_core::{
-    ETag,
     acl::{Acl, AclGrants, OwnerId},
     blob::{BlobRef, BlockHash},
     bucket,
     content::{ContentEntry, ContentKey, ObjectContent, PublishId, StagedObject, stage_body},
     cors, lifecycle,
     meta::{
-        BucketMeta, Metadata, ObjectMeta, UploadMeta, bucket as bucket_row,
+        BucketMeta, Metadata, ObjectMeta, UploadMeta,
         object::{Identity, PartRow, Row},
         upload,
-        version::{Current, Kind, Stored, VersionMeta},
+        version::{Current, Kind, VersionMeta},
     },
     multipart::PartNumber,
-    object,
+    object, object_lock,
     storage::{self, BodyStream, ByteRange},
     version,
 };
 
-/// The time every leg records: a whole second, so a backend whose clock
-/// resolves to 100 ns stores it exactly.
-const T0: Duration = Duration::from_secs(1_700_000_000);
 /// A second distinction for the legs that need a *different* recorded time.
 const T1: Duration = Duration::from_secs(1_700_000_001);
 
-/// Two valid ETag literals (32 hex digits).
-const ETAG_A: &str = "d41d8cd98f00b204e9800998ecf8427e";
-const ETAG_B: &str = "0cc175b9c0f1b6a831c399e269772661";
-
-fn t0() -> SystemTime {
-    SystemTime::UNIX_EPOCH + T0
-}
-
 fn t1() -> SystemTime {
     SystemTime::UNIX_EPOCH + T1
-}
-
-fn key(name: &str) -> object::Key {
-    object::key(name).expect("a valid key literal")
-}
-
-fn bucket_name(prefix: &str) -> bucket::Name {
-    bucket::name(unique_bucket(prefix)).expect("a valid bucket name")
 }
 
 fn part(number: u32) -> PartNumber {
@@ -164,10 +161,6 @@ pub fn lifecycle_config(id: &str) -> lifecycle::Config {
     lifecycle_config_with(id, Some("logs/"), 30)
 }
 
-fn etag(value: &str) -> ETag {
-    value.parse::<ETag>().expect("a valid ETag literal")
-}
-
 /// One decoded object row with the given content identity.
 fn row(size: u64, tag: &str, identity: u64) -> Row {
     Row {
@@ -182,41 +175,12 @@ fn row(size: u64, tag: &str, identity: u64) -> Row {
     }
 }
 
-/// A fresh bucket row at `created`.
-fn bucket_at(created: SystemTime) -> bucket_row::Row {
-    bucket_row::Row::at(created)
-}
-
 /// One retained part row of a completed multipart object.
 fn retained_part(number: u32, size: u64) -> PartRow {
     PartRow {
         number,
         size,
         checksum: None,
-    }
-}
-
-/// One decoded version row: an object version of five bytes, or a delete
-/// marker.
-fn version_row(seq: u64, id: Option<version::Id>, kind: Kind) -> Stored {
-    let size = if kind.is_marker() { 0 } else { 5 };
-    Stored {
-        id,
-        blob: if kind.is_marker() {
-            BlobRef::empty()
-        } else {
-            BlobRef::single(BlockHash::of(b"conf"), size)
-        },
-        size,
-        etag: etag(ETAG_A),
-        created: t0(),
-        became_noncurrent: 0,
-        kind,
-        tags: object::Tags::empty(),
-        checksum: None,
-        owner: None,
-        acl: Acl::default_private(None),
-        seq,
     }
 }
 
@@ -735,7 +699,7 @@ async fn seed_current_object<V>(
 /// bucket: the row the slot moves off says it stopped being current, in the
 /// same commit that records the incoming version's row — the S5/RG5 rule whose
 /// one contract home is [`VersionMeta::restore_slot`]'s doc bullet ("The row
-/// the slot moves off is stamped [`Stored::became_noncurrent`]"), and which the
+/// the slot moves off is stamped [`version::Stored::became_noncurrent`]"), and which the
 /// [`VersionMeta::advance_slot`] trait doc now states too. It is pinned here
 /// for the forward writer [`restore_leg`] does not cover.
 ///
@@ -1123,6 +1087,63 @@ where
             .expect("the guarded create just landed")
             .upload_id,
         "conf-upload-guarded"
+    );
+
+    // The guarded twin with a lock intent (OL6): the same bucket-row check
+    // runs, and a landed create writes the row and the intent in one call.
+    let lock_row = upload::Row {
+        upload_id: "conf-upload-guarded-lock".to_owned(),
+        ..state.clone()
+    };
+    let intent = object_lock::Lock {
+        retention: Some(governance_reservation()),
+        legal_hold: object_lock::LegalHold::Off,
+    };
+    let refused = match UploadMeta::create_guarded_with_lock(
+        store,
+        &absent,
+        "conf-upload-guarded-lock",
+        &lock_row,
+        Some(&intent),
+    )
+    .await
+    {
+        Ok(()) => panic!("create_guarded_with_lock must refuse a bucket with no row"),
+        Err(err) => err.into(),
+    };
+    assert!(
+        matches!(refused, storage::Error::NoSuchBucket(_)),
+        "create_guarded_with_lock's refusal must project to NoSuchBucket, got {refused:?}"
+    );
+    assert_eq!(
+        UploadMeta::upload_lock(store, &absent, "conf-upload-guarded-lock")
+            .await
+            .unwrap(),
+        None,
+        "the refused guarded create wrote no intent"
+    );
+    UploadMeta::create_guarded_with_lock(
+        store,
+        &guarded,
+        "conf-upload-guarded-lock",
+        &lock_row,
+        Some(&intent),
+    )
+    .await
+    .unwrap();
+    assert!(
+        UploadMeta::get(store, &guarded, &target, "conf-upload-guarded-lock")
+            .await
+            .unwrap()
+            .is_some(),
+        "the guarded create wrote the upload row"
+    );
+    assert_eq!(
+        UploadMeta::upload_lock(store, &guarded, "conf-upload-guarded-lock")
+            .await
+            .unwrap(),
+        Some(intent),
+        "the guarded create wrote the lock intent with the row"
     );
     UploadMeta::drain_bucket(store, &guarded).await.unwrap();
     BucketMeta::remove(store, &guarded).await.unwrap();
