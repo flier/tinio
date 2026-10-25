@@ -645,7 +645,7 @@ mod tests {
         acl::{
             grant::{GrantSid, grant_to},
             icacls::icacls_binary,
-            test_support::{dacl_entries, descriptor_shape, masks, satisfied, standing},
+            test_support::{dacl_entries, masks, named_shape, satisfied, standing},
         },
         sid::{ALL_APPLICATION_PACKAGES, PackageSid, SALT_BYTES, Salt, package_name},
     };
@@ -666,6 +666,14 @@ mod tests {
     /// The tool is the oracle rather than a written-down constant, which is the
     /// same rule the DACL tests below follow for the whole layer: what the crate has to
     /// keep is the behaviour `icacls` had, and only the tool can say what that was.
+    ///
+    /// **The comparison is over the trustee the grant names, not over every entry.**
+    /// The other trustees' entries are the host's: what the volume already inherited and
+    /// whether `icacls` copies an inherited entry into an explicit one both differ
+    /// between hosts — on this workspace's CI the tool's half carried such copies and
+    /// the handle's half did not, for two trees of the same shape. Neither is a
+    /// behaviour the route change could have altered, and [`named_shape`] is the
+    /// reading that says so.
     #[test]
     fn the_descriptor_the_handle_route_writes_is_the_one_icacls_writes() {
         const USERS: &str = "S-1-5-32-545";
@@ -705,8 +713,8 @@ mod tests {
 
         for relative in [Path::new(""), Path::new("pre.txt"), Path::new("sub")] {
             assert_eq!(
-                descriptor_shape(&trees[0].join(relative), sid.raw()),
-                descriptor_shape(&trees[1].join(relative), sid.raw()),
+                named_shape(&trees[0].join(relative), sid.raw()),
+                named_shape(&trees[1].join(relative), sid.raw()),
                 "the two routes disagree about `{}`",
                 relative.display()
             );
@@ -763,12 +771,20 @@ mod tests {
         // **The oracle's control, and the false pass it removes.** Nothing has
         // been granted to this directory, yet a reading that counts every
         // access-allowed entry answers "RX is there": the entry is the
-        // *inherited* `(OI)(CI)(RX)` ACE the temp volume puts on every directory
-        // it creates, and it names `BUILTIN\Users`, the very SID the grants below
+        // *inherited* `(OI)(CI)(RX)` ACE a parent directory puts on everything it
+        // holds, and it names `BUILTIN\Users`, the very SID the grants below
         // name. An oracle over every entry therefore passed for a tool that wrote
         // nothing (SPEC-P2-03), and what the assertions from here on read is the
         // explicit set — the entries without `INHERITED_ACE`, which is what
         // "`icacls` stored this" means.
+        //
+        // **The inherited entry is constructed rather than assumed.** A temp volume
+        // does not have to inherit anything for that SID — on this workspace's CI it
+        // inherited none, and the assertion this replaces failed there on a host fact
+        // the test was not about. A parent this test grants to makes the inherited
+        // entry a property of the fixture: whatever the volume's own DACL says, a
+        // child created under a directory carrying `(OI)(CI)RX` for `Users` has that
+        // entry inherited, and nothing here granted it to the child itself.
         //
         // The two assertions are one demonstration: the inherited entry is
         // there, and it is not what the oracle counts.
@@ -776,12 +792,24 @@ mod tests {
         // trustees with `EqualSid`, and this test names the one its grants name.
         let users = "S-1-5-32-545";
         let sid = OwnedSid::parse(users, dir.path()).expect("a SID");
-        let untouched = dir.path().join("untouched");
+        let parent = dir.path().join("parent");
+        fs::create_dir_all(&parent).expect("create the parent");
+        let inherited = Command::new(icacls_binary())
+            .arg(&parent)
+            .args(["/grant", &format!("*{users}:(OI)(CI)RX"), "/q"])
+            .output()
+            .expect("grant the parent");
+        assert!(
+            inherited.status.success(),
+            "{}",
+            String::from_utf8_lossy(&inherited.stderr)
+        );
+        let untouched = parent.join("untouched");
         fs::create_dir_all(&untouched).expect("create");
         assert!(
             masks(&untouched, false, sid.raw()).contains(&RX),
-            "this host's temp volume puts no inherited (RX) entry on a new \
-directory, so the false pass this control is about is not exercised here: {:08X?}",
+            "the parent's inheritable (RX) entry was not inherited by a child created \
+under it, so the false pass this control is about is not exercised here: {:08X?}",
             masks(&untouched, false, sid.raw())
         );
         assert!(

@@ -51,6 +51,26 @@ pub(super) fn masks(path: &Path, explicit: bool, sid: PSID) -> Vec<u32> {
         .collect()
 }
 
+/// [`descriptor_shape`] for **the trustee the comparison is about** — the control word and the
+/// entries that name `sid`, in the DACL's own order.
+///
+/// **The host decides every other trustee's entries, so a comparison that keeps them compares
+/// hosts.** A route writes the ACE it was asked for; what was already there comes from the
+/// volume's DACL and from how `icacls` rewrites one — measured on this workspace's CI, where the
+/// `icacls` half of the route comparison carried an explicit copy of every inherited entry and
+/// the handle half did not, on two trees of the same shape. Neither entry is what the routes
+/// disagree about, and the trustee filter is what says so.
+///
+/// `Ace::Named` is the walk's case for an entry whose trustee is the `sid` handed in, so this is
+/// the same one read as [`descriptor_shape`] with the other-trustee entries dropped.
+pub(super) fn named_shape(path: &Path, sid: PSID) -> (u16, Vec<(u8, u32)>) {
+    dacl_reading(path, sid, |entry, entries| {
+        if let Ace::Named(ace) = entry {
+            entries.push((ace.Header.AceFlags, ace.Mask));
+        }
+    })
+}
+
 /// A descriptor as the comparison below needs it: **the control word and the
 /// sequence of access-allowed entries, each as its flags and its mask.**
 ///
@@ -185,33 +205,6 @@ pub(super) fn render_ace(ace: &ACCESS_ALLOWED_ACE, trustee: &str) -> String {
 /// module's own reading of a refusal.
 pub(super) fn render_sid(sid: PSID) -> String {
     sid_text(sid).unwrap_or_else(|| "a SID that would not render".to_string())
-}
-
-/// The ACE lines of `icacls`'s rendering of `path`.
-///
-/// One entry per ACE, with the path `icacls` prefixes the first line with
-/// removed and its own count line dropped. The name is distinct from the
-/// `ace_lines` helper above, which keeps the path and answers a different
-/// question.
-///
-/// The point of extracting them is that **a comparison of these is independent of
-/// how any ACE renders**. That matters for the foreign-ACE assertion below:
-/// `icacls` prints a well-known SID by its account name (`BUILTIN\Users…`, and
-/// the name is localised), so searching the text for `S-1-5-32-545` would fail on
-/// every host.
-pub(super) fn ace_lines_without_path(rendered: &str, path: &Path) -> Vec<String> {
-    let prefix = path.to_string_lossy().to_string();
-    rendered
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.contains(':'))
-        .map(|line| {
-            line.strip_prefix(prefix.as_str())
-                .unwrap_or(line)
-                .trim()
-                .to_string()
-        })
-        .collect()
 }
 
 /// The access masks this thread's opens have asked for, in order, for the test that

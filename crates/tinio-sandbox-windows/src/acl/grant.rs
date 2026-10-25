@@ -586,7 +586,7 @@ mod tests {
         acl::{
             Grants,
             icacls::{icacls_binary, mentions_sid},
-            test_support::{ace_lines_without_path, writes},
+            test_support::writes,
         },
         backend::SiblingScan,
         sid::{PackageSid, package_name},
@@ -752,7 +752,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("root");
         fs::create_dir_all(&root).expect("create the root");
-        let plain = ace_lines_without_path(&icacls(&root, &[]), &root);
+        // **The outsider is asked about by SID, not by a count of `icacls` lines.** A
+        // listing's line count is the host's business: `icacls` copies an inherited entry
+        // into an explicit one on some hosts and not on others, which is what made the
+        // count-based comparison fail on CI for a grant that touched nothing. `acl_names`
+        // is the crate's own read (`EqualSid` over the DACL), so "the outsider's entry is
+        // still there" is the property and the tool's rendering is not.
+        let users = OwnedSid::parse("S-1-5-32-545", &root).expect("a SID");
 
         // A foreign ACE the run must not touch, in the shape the verified row
         // describes: `Users` granted on the directory. Named by SID so this does not
@@ -767,16 +773,12 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&granted.stderr)
         );
-
-        let before = ace_lines_without_path(&icacls(&root, &[]), &root);
-        assert_eq!(
-            before.len(),
-            plain.len() + 1,
-            "the foreign ACE was written, so the comparison below is about a real one: {before:?}"
+        assert!(
+            acl_names(&root, users.raw()).expect("read the DACL"),
+            "the foreign ACE was written, so the assertions below are about a real one"
         );
 
         let sid = Arc::new(sid_for(&root));
-        let sid_text = sid.as_str().to_string();
         let grants = Grants::new(Arc::clone(&sid));
         grants
             .apply(&root, Target::Directory, AccessMode::ReadWrite)
@@ -785,30 +787,20 @@ mod tests {
             has_ace(&root, &sid).expect("read the DACL"),
             "the grant landed"
         );
-
-        let written = ace_lines_without_path(&icacls(&root, &[]), &root);
-        assert_eq!(
-            written.len(),
-            before.len() + 1,
-            "the grant added exactly one ACE and left every other ACE as it found it: {written:?}"
+        assert!(
+            acl_names(&root, users.raw()).expect("read the DACL"),
+            "the grant left the foreign ACE alone"
         );
 
         revoke(&root, &sid).expect("take the grant back by hand");
 
-        let after = ace_lines_without_path(&icacls(&root, &[]), &root);
         assert!(
-            !after.iter().any(|line| line.contains(&sid_text)),
-            "the package ACE is gone: {after:?}"
+            !has_ace(&root, &sid).expect("read the DACL"),
+            "the package ACE is gone"
         );
-        // The half that does not depend on how a SID renders, which is the half the
-        // first draft of this test got wrong: `icacls` prints `S-1-5-32-545` as
-        // `BUILTIN\Users` (and the name is localised), so the property — removing this
-        // SID's entry leaves every other ACE as it found it — is asserted as an
-        // equality of the ACE lines rather than as a search for a string the tool never
-        // prints.
-        assert_eq!(
-            before, after,
-            "the revoke removed exactly one ACE and left every other ACE as it found it"
+        assert!(
+            acl_names(&root, users.raw()).expect("read the DACL"),
+            "the revoke removed exactly the package ACE and left the outsider's entry"
         );
     }
 
