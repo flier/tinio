@@ -10,7 +10,11 @@
 //! read only when the listener element is present, and every path that cannot prove this process is
 //! a launched child returns `None` rather than an error a caller could mistake for a verdict.
 
-use std::{ffi::OsString, io::Read};
+use std::{
+    ffi::OsString,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use tracing::{debug, instrument};
 
@@ -102,6 +106,12 @@ pub struct Adopted {
     /// path and holds no secret — the same bytes `sandbox-exec` carries in its
     /// own process list — and a refusal here is diagnosed from exactly this text.
     pub(crate) confinement: Option<SandboxSpec>,
+    /// The canonical root the launcher resolved, when it stated one — see
+    /// [`Self::root`].
+    ///
+    /// **Not a secret**, so `Debug` prints it: it is the path the run serves and the
+    /// launcher's own log already names it.
+    pub(crate) root: Option<PathBuf>,
 }
 
 /// Split launcher descriptor elements out of `argv` and [`adopt`] the payload.
@@ -207,13 +217,16 @@ pub fn adopt(
     match serde_json::from_str::<LaunchPayload>(&text) {
         Ok(payload) => {
             debug!(step = "adopt", listener = true, payload = "decoded");
-            Ok(Some(Adopted::new(
-                payload.config,
-                Some(listener_fd),
-                control_fds,
-                payload.token,
-                payload.confinement,
-            )))
+            Ok(Some(
+                Adopted::new(
+                    payload.config,
+                    Some(listener_fd),
+                    control_fds,
+                    payload.token,
+                    payload.confinement,
+                )
+                .with_root(payload.root.map(PathBuf::from)),
+            ))
         }
         Err(_) => {
             debug!(step = "adopt", listener = true, payload = "rejected");
@@ -230,9 +243,9 @@ impl Adopted {
     /// child uses, decoding its launch payload — and it builds through this function, so a caller
     /// assembling the shape by hand (a test driving a role) produces exactly what the wire
     /// produces rather than a second spelling of it. Reads go through [`Self::config`],
-    /// [`Self::listener`], [`Self::controls`], [`Self::token`] and [`Self::confinement`]: every
-    /// field is private on purpose (the struct's own doc says why), with no exception left to
-    /// name.
+    /// [`Self::listener`], [`Self::controls`], [`Self::token`], [`Self::confinement`] and
+    /// [`Self::root`]: every field is private on purpose (the struct's own doc says why), with no
+    /// exception left to name.
     ///
     /// # Examples
     ///
@@ -257,7 +270,51 @@ impl Adopted {
             control_fds,
             token,
             confinement,
+            root: None,
         }
+    }
+
+    /// The same value with the launcher's canonical root attached — the spelling [`adopt`] reads
+    /// out of [`LaunchPayload::root`].
+    ///
+    /// **A builder rather than a sixth `new` parameter**, because the root is the one field whose
+    /// absence is ordinary: every unconfined run and every platform whose confinement leaves
+    /// `canonicalize` alone has none, and a constructor that demanded it would make every hand-
+    /// built test value spell `None` for a fact it is not about.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    ///
+    /// use tinio_sandbox_core::Adopted;
+    ///
+    /// let adopted = Adopted::new(String::new(), Some(7), Vec::new(), None, None)
+    ///     .with_root(Some(PathBuf::from(r"\\?\C:\data")));
+    /// assert_eq!(adopted.root(), Some(std::path::Path::new(r"\\?\C:\data")));
+    /// ```
+    pub fn with_root(mut self, root: Option<PathBuf>) -> Self {
+        self.root = root;
+        self
+    }
+
+    /// The canonical root the launcher resolved, when its payload stated one.
+    ///
+    /// **A confined child serves this value rather than canonicalizing its own argv**: the
+    /// confinement is applied to this process, and canonicalizing is a call it may be refused
+    /// (`LaunchPayload::root`'s own doc carries the observation). `None` — the ordinary answer —
+    /// means the caller resolves the root itself, exactly as every unconfined run does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox_core::Adopted;
+    ///
+    /// let adopted = Adopted::new(String::new(), Some(7), Vec::new(), None, None);
+    /// assert_eq!(adopted.root(), None);
+    /// ```
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     /// The configuration text the parent forwarded, unparsed (design decision
@@ -368,7 +425,7 @@ impl Adopted {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, ffi::OsString, fmt::Debug, io, mem, sync::Once};
+    use std::{cell::RefCell, ffi::OsString, fmt::Debug, io, mem, path::Path, sync::Once};
 
     use tracing::{
         Event, Subscriber,
@@ -525,6 +582,28 @@ mod tests {
             .unwrap()
             .expect("an element and a decodable payload");
         assert_eq!(adopted.token(), Some(token.as_str()));
+    }
+
+    #[test]
+    fn adopt_hands_back_the_root_the_frame_carried() {
+        // The fifth thing a payload can carry, and the one that spares the confined child a call
+        // its container may refuse: the launcher resolved the root unconfined, so the spelling
+        // travels here rather than being recomputed on the far side of the confinement
+        // (`LaunchPayload::root`). The absent direction is the other half — every unconfined run
+        // and every platform whose confinement leaves `canonicalize` alone carries none.
+        let frame = r#"{"config":"port = 9000","root":"C:/data"}"#;
+        let adopted = adopt([listener_fd_arg(7)], io::Cursor::new(frame))
+            .unwrap()
+            .expect("an element and a decodable payload");
+        assert_eq!(adopted.root(), Some(Path::new("C:/data")));
+
+        let absent = adopt(
+            [listener_fd_arg(7)],
+            io::Cursor::new(r#"{"config":"port = 9000"}"#),
+        )
+        .unwrap()
+        .expect("an element and a decodable payload");
+        assert_eq!(absent.root(), None, "the ordinary frame states no root");
     }
 
     #[test]

@@ -3,7 +3,9 @@
 //! [`run()`] is the public entry; [`command_line`] is the two-pass parse both entry points
 //! share; [`on_runtime`] is the process's one runtime, built last.
 
-use std::{env, ffi::OsString, future::Future, iter, process::ExitCode, sync::OnceLock};
+use std::{
+    env, ffi::OsString, future::Future, iter, path::Path, process::ExitCode, sync::OnceLock,
+};
 
 use either::{Either, Left, Right};
 use tokio::runtime::Builder;
@@ -146,7 +148,11 @@ fn try_run() -> Result<ExitCode, Error> {
     // **authoritative** parse: every value and `ValueSource` from here on is that one's.
     // `adopted`'s text travels with it: a confined child's discovery must not re-validate the
     // explicit `--config`, whose file may lie outside every exposure (see [`command_line`]).
-    let parsed = command_line(&argv, adopted.as_ref().map(|adopted| adopted.config()))?;
+    let parsed = command_line(
+        &argv,
+        adopted.as_ref().map(|adopted| adopted.config()),
+        adopted.as_ref().and_then(|adopted| adopted.root()),
+    )?;
 
     match parsed {
         // `service`, answered by the discovery parse alone (`command_line`'s doc states why).
@@ -245,6 +251,12 @@ fn try_run() -> Result<ExitCode, Error> {
 /// exactly as it was: `--config` must name a file that is there, and a mistyped one is a usage
 /// error.
 ///
+/// **`adopted_root` is the launcher's resolved root**, forwarded for the same reason the text is:
+/// the child is the confined process, and canonicalizing is a call its confinement may refuse —
+/// the launcher already resolved it and states the answer (see
+/// `tinio_sandbox_core::LaunchPayload::root`). `None` leaves the resolution to resolve and
+/// canonicalize the root itself, exactly as every unconfined run does.
+///
 /// # Errors
 ///
 /// A usage error from either parse (exit 2) and whatever [`locate`](crate::resolve::locate) or
@@ -252,6 +264,7 @@ fn try_run() -> Result<ExitCode, Error> {
 pub(crate) fn command_line(
     argv: &[OsString],
     adopted: Option<&str>,
+    adopted_root: Option<&Path>,
 ) -> Result<Either<Box<Resolved>, service::Args>, Error> {
     let (discovery, matches) = cli::parse(argv)?;
     // **The discovery parse's provenance is the one [`locate`](resolve::locate) gets**, whatever
@@ -283,9 +296,12 @@ pub(crate) fn command_line(
             // differently.
             let located_dsn = discovery.pg_dsn.clone();
             let mut located = match adopted {
-                Some(text) => {
-                    resolve::locate_confined(discovery.clone(), &discovery_provenance, text)?
-                }
+                Some(text) => resolve::locate_confined(
+                    discovery.clone(),
+                    &discovery_provenance,
+                    text,
+                    adopted_root,
+                )?,
                 None => resolve::locate(discovery.clone(), &discovery_provenance)?,
             };
             // §1's step e, for every shape the early load could not name: the located directory's
@@ -304,7 +320,12 @@ pub(crate) fn command_line(
             if located.pg_root.is_some() && authoritative != located_dsn {
                 discovery.pg_dsn = authoritative;
                 located = match adopted {
-                    Some(text) => resolve::locate_confined(discovery, &discovery_provenance, text)?,
+                    Some(text) => resolve::locate_confined(
+                        discovery,
+                        &discovery_provenance,
+                        text,
+                        adopted_root,
+                    )?,
                     None => resolve::locate(discovery, &discovery_provenance)?,
                 };
             }

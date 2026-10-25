@@ -25,11 +25,13 @@ Kernels below 5.2 fall back to a procfs-based bind, which **requires procfs moun
 - `sandbox-init` confinement is **one-shot and irreversible** — no fork or exec afterwards; a wrong profile costs a restart.
 - Its profile is **one rule shorter** (`process-exec` is helper-only) — a measurement, not a missing grant (decision 6).
 
-## Windows: a served root behind a junction is granted at its target, and the child resolves the operator's spelling
+## Windows: a served root behind a junction is granted at its target, and the child serves the launcher's canonical spelling
 
 The launcher grants the **canonical** spelling of every exposure; a path through a reparse point is refused. A root handed as a directory junction is therefore granted on the junction's *target*.
 
 The child re-invokes with the operator's argv and refuses before dispatch when it cannot resolve the junction as a confined process.
+
+**The root it serves for is the launcher's canonical spelling, stated on the launch frame** — the child does not canonicalize its own argv. The call is `GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS`, which asks the volume mount manager, and a container can be refused it with `Access denied` for a path its own ACEs allow: a confined child invoked through the 8.3 spelling `C:\Users\RUNNER~1\…` died on it in CI while the launcher resolved the same object. The launcher is unconfined and already resolved that root for the grant and the state file, so it states the answer and the child takes it as given (`LaunchPayload::root`).
 
 - macOS adds the resolved spelling *beside* the operator's; **ruled: Windows serves the canonical spelling alone**.
 - Record: `docs/superpowers/plans/2026-09-25-sandbox-followups.md` §22.

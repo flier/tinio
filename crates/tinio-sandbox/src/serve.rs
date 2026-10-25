@@ -70,6 +70,15 @@ pub struct Spec {
     /// Bearer credential for `/status` and `/stop`; [`Secret`] redacts in `Debug` while
     /// `Option` still shows whether a token was set.
     token: Option<Secret>,
+    /// The canonical spelling of the served root, when the caller resolved one — forwarded to a
+    /// launcher platform whose child must not compute it itself.
+    ///
+    /// **Only a launcher platform reads it.** An in-place confinement never spawns a child, and
+    /// a platform whose child resolves its own argv ignores the value; the field exists so that
+    /// the Windows launcher can state the root its confined child would otherwise have to
+    /// `canonicalize`, which the container may be refused
+    /// (`tinio_sandbox_core::LaunchPayload::root`'s doc carries the observation).
+    child_root: Option<PathBuf>,
     local_uid: bool,
 }
 
@@ -117,6 +126,26 @@ impl Spec {
     /// ```
     pub fn expose(mut self, host: impl Into<PathBuf>, access: AccessMode) -> Self {
         self.sandbox = self.sandbox.expose(host, access);
+        self
+    }
+
+    /// The canonical spelling of the served root, for a launcher platform whose child must not
+    /// compute it itself.
+    ///
+    /// **The caller that resolves the root is the only one that can honestly state it**: this
+    /// crate never resolves one. Passing it changes nothing on a platform whose confinement
+    /// leaves `canonicalize` alone; on the Windows launcher it is what the child serves for.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinio_sandbox::serve;
+    ///
+    /// let spec = serve::Spec::new().child_root("/srv/data");
+    /// assert!(spec.sandbox().exposures().is_empty());
+    /// ```
+    pub fn child_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.child_root = Some(root.into());
         self
     }
 
@@ -610,11 +639,13 @@ fn apply_platform(spec: Spec) -> Result<Confined> {
         Backend,
     };
 
+    let child_root = spec.child_root.clone();
     let (sandbox, plan) = spec.into_plan();
     let options = Options {
         capabilities: Capability::parse_list(
             env::var("TINIO_SANDBOX_CAPABILITIES").ok().as_deref(),
         )?,
+        root: child_root,
         ..Default::default()
     };
     let mut backend = WindowsBackend::with_options(options);

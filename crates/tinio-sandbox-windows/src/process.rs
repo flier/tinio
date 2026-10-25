@@ -972,7 +972,7 @@ mod tests {
         // The frame is the core's `encode_frame`'s — the payload derives no
         // `Serialize` — and the configuration it carries is the probe file's path,
         // which is what the child role reads back out of the payload.
-        let frame = LaunchPayload::encode_frame(&probe.to_string_lossy(), None, None)
+        let frame = LaunchPayload::encode_frame(&probe.to_string_lossy(), None, None, None)
             .expect("the frame is one JSON object");
         handles::write_payload(&mut payload_pipe, &frame)
             .expect("write the frame into the child's stdin");

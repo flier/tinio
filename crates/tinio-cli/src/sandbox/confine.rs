@@ -180,7 +180,14 @@ fn confine_enabled(
     // Read once, off the rule that owns it, and carried as a value: the spec takes it and the
     // confinement applies it.
     let local_uid = local_uid_configured(resolution.identity());
-    let spec = serve::Spec::from_sandbox(sandbox).local_uid(local_uid);
+    // **The root travels with the spec, and it is the launcher's own resolution** — the same
+    // canonical path `resolution` uses for the grant and the state file. The launcher is
+    // unconfined, so it can canonicalize; a confined child may be refused that call, which is
+    // why the value is stated here rather than left to `resolve_root` inside the child
+    // (`tinio_sandbox_core::LaunchPayload::root`).
+    let spec = serve::Spec::from_sandbox(sandbox)
+        .local_uid(local_uid)
+        .child_root(resolution.root.clone());
     if !facts.launches_child {
         let _ = args;
         // **The confinement first, the full stack second** — this thread is the one being
