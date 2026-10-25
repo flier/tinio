@@ -21,6 +21,7 @@ sha2.workspace = true
 tracing.workspace = true
 
 tinio-sandbox-core.workspace = true
+tinio-util.workspace = true
 
 [dev-dependencies]
 tinio-sandbox-linux = { path = ".", features = ["testing"] }

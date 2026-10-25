@@ -12,6 +12,6 @@ WHERE
             AND p.upload_id = u.upload_id
             AND p.modified_at >= $2
     )
-    AND u.bucket <> ALL ($3)
+    AND u.bucket <> all($3)
 ORDER BY u.bucket COLLATE "C", u.upload_id COLLATE "C"
 LIMIT $4

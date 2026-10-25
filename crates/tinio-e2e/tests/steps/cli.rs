@@ -904,6 +904,9 @@ impl Drop for Cli {
 }
 
 /// The scenario's scratch directory: `$TMPDIR` everywhere except macOS, where it is `/tmp`.
+/// Shared by this harness's `@cli` scenarios and the `@external` spawn
+/// ([`super::clients::External::start`]), whose served root sits under it too — one rule for
+/// every temp root a scenario's server derives its control socket from.
 ///
 /// **macOS is short for `sun_path`'s sake, not for tidiness** (`docs/tests.md`,
 /// "Platform-gated verification (macOS)"). A read-write run's control socket is
@@ -913,8 +916,8 @@ impl Drop for Cli {
 /// short scratch area (canonical `/private/tmp`, 12 bytes), and the root under it measures ~62
 /// bytes for the same socket. `TINIO_STATE_DIR` is not the remedy: a read-write run's state
 /// directory is `<root>/.tinio` whatever that variable says (`resolve::resolve_state_dir`), and
-/// these scenarios serve read-write.
-fn scratch_dir() -> TempDir {
+/// the plain spawn arms serve read-write.
+pub(super) fn scratch_dir() -> TempDir {
     #[cfg(target_os = "macos")]
     {
         TempDir::new_in("/tmp").expect("a scratch directory")

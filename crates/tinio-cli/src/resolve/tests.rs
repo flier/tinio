@@ -255,6 +255,7 @@ fn an_adopted_run_reads_the_payload_not_the_explicit_config_path() {
         discovery(),
         &Provenance::default(),
         "version = 1\n[server]\nread_only = true\n",
+        None,
     )
     .expect("the payload's text stands in for the path");
     assert!(located.read_only, "the mode is the payload text's");

@@ -25,7 +25,7 @@ env:
   # every ~6 weeks. Nightly is used only for rustfmt (no sccache), so it
   # stays on the moving channel unless a pinned date is desired for a fully
   # deterministic fmt gate.
-  RUST_STABLE: "1.98.1"
+  RUST_STABLE: "1.99.1"
   RUST_NIGHTLY: "nightly"
 
 permissions:
@@ -130,7 +130,7 @@ jobs:
     # output moves between releases.
     runs-on: ubuntu-latest
     env:
-      SQRRUFF_VERSION: "0.41.0"
+      SQRRUFF_VERSION: "0.43.0"
     steps:
       - *checkout
       - name: install sqruff
@@ -529,13 +529,16 @@ jobs:
       # cucumber keeps the args from reaching the plain-harness traceability
       # target (its own step below), and an explicit --tags REPLACES the
       # runner's default filter, so the mem pass must repeat the platform,
-      # external-tag, confinement and @pg exclusions itself — every platform
-      # tag, not one host's non-matching set: this one list is shared by the
+      # feature-gate (@parquet, @object-lock), external-tag, confinement and @pg
+      # exclusions itself — every platform tag, not one host's non-matching set:
+      # this one list is shared by the
       # ubuntu, windows and macos runners (`e2e-port`), so what it may keep is
       # what all three may run, and the runner's compound platform clause cannot
       # be spelled once (tests/steps/tag_filter.rs). `not @pg` is
       # load-bearing: the DB-backed scenarios belong to the `pg` job's own
-      # serial pass, never to this one.
+      # serial pass, never to this one. `not @object-lock` is the same kind of
+      # clause for the corpus whose operations are compiled out of this build:
+      # without `--features object-lock` every scenario answers 501.
       # --retry 2 on both passes: ConnectionAborted flakes on loaded legs
       # burned both retry-1 attempts in earlier runs (33764783657 fs,
       # 33750043137 mem).
@@ -556,7 +559,7 @@ jobs:
 
       - &e2e-mem
         name: e2e cucumber (mem backend)
-        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @interop and not @boto3 and not @mc and not @confinement and not @pg' --retry 2
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @object-lock and not @interop and not @boto3 and not @mc and not @confinement and not @pg' --retry 2
         env:
           TINIO_E2E_BACKEND: mem
           TINIO_E2E_REPORT: cucumber-report-mem.json
@@ -1063,7 +1066,7 @@ jobs:
       # shared database, so only a serial run keeps them from resetting each
       # other mid-scenario.
       - name: e2e cucumber (pg backend, serial)
-        run: cargo test --profile ci -p tinio-e2e --features pg --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @interop and not @boto3 and not @mc and not @confinement' --retry 2 --concurrency 1
+        run: cargo test --profile ci -p tinio-e2e --features pg --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @object-lock and not @interop and not @boto3 and not @mc and not @confinement' --retry 2 --concurrency 1
         env:
           # The backend the pass runs on. `config_from_tags` picks the backend
           # from a scenario tag, else this variable, else `Backend::Fs` — and no

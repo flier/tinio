@@ -116,6 +116,16 @@ pub struct Options {
     /// A test seam: a test binary's own argv belongs to libtest, so the harness
     /// points its child at one role function instead of at the suite.
     pub args: Option<Vec<OsString>>,
+    /// The canonical spelling of the storage root, when the caller resolved one — the value the
+    /// child is told to serve for, so it never canonicalizes its own argv.
+    ///
+    /// **The launcher states this because the child may not be able to compute it**: the child is
+    /// the confined process, and `Path::canonicalize` asks the volume mount manager for a DOS
+    /// path, which a container can be refused (`LaunchPayload::root`'s doc in
+    /// `tinio-sandbox-core` carries the observation from this workspace's CI). `None` leaves the
+    /// child to resolve the root itself, which is every unconfined run's answer and every host
+    /// whose confinement permits the call.
+    pub root: Option<PathBuf>,
 }
 
 /// The Windows backend.
@@ -544,14 +554,22 @@ fn spawn_supervised_child(
     // container the child was created in, so there is nothing for the child to apply to itself —
     // the field is the in-process mechanism's command, and a launcher that resolves one is the
     // only writer of it.
-    let payload =
-        LaunchPayload::encode_frame(plan.config(), plan.token(), None).map_err(|err| {
-            launch(
-                "serialize the launch payload",
-                "stdin",
-                io::Error::other(err),
-            )
-        })?;
+    let payload = LaunchPayload::encode_frame(
+        plan.config(),
+        plan.token(),
+        None,
+        // **A non-UTF-8 root is sent as none rather than lossily**: the child then
+        // canonicalizes as it always did, which is the behaviour this field spares it from but
+        // not one it may be given a wrong answer for (`LaunchPayload::root`).
+        options.root.as_deref().and_then(|root| root.to_str()),
+    )
+    .map_err(|err| {
+        launch(
+            "serialize the launch payload",
+            "stdin",
+            io::Error::other(err),
+        )
+    })?;
     // `skip(1)`: `command_args` inserts the listener element at index 1, and the
     // child drops `argv[0]` before reading it.
     let argv = options

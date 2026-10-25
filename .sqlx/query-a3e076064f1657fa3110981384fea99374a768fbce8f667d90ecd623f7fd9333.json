@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT seq, id, kind AS \"kind: Kind\"\nFROM version_rows\nWHERE bucket = $1 AND key = $2 AND seq = ANY($3::int8[])\nFOR UPDATE\n",
+  "query": "SELECT seq, id, kind AS \"kind: Kind\"\nFROM version_rows\nWHERE bucket = $1 AND key = $2 AND seq = any($3::int8[])\nFOR UPDATE\n",
   "describe": {
     "columns": [
       {
@@ -60,5 +60,5 @@
       false
     ]
   },
-  "hash": "b51f21085dbdac8957f562eb7af65b51a66d6390d7b0ae43d2da2f64fd3bc10f"
+  "hash": "a3e076064f1657fa3110981384fea99374a768fbce8f667d90ecd623f7fd9333"
 }

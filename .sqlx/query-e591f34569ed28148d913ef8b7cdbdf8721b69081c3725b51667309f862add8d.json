@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO buckets (name, created, tags, acl, cors)\nVALUES ($1, $2, $3, row(NULL, ARRAY[]::acl_grant[])::acl, '')\nON CONFLICT (\n    name) DO UPDATE\n    SET tags = excluded.tags\n    WHERE buckets.tags IS DISTINCT FROM excluded.tags\nRETURNING (xmax = 0) AS inserted\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "inserted",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "e591f34569ed28148d913ef8b7cdbdf8721b69081c3725b51667309f862add8d"
+}

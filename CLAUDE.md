@@ -11,7 +11,7 @@ Always-loaded pointers. Each named doc = source of truth for its branch — do n
 - **Benches** — flush regime, interleaved A/B verdicts, unmeasurable on this host. `docs/benches.md`.
 - **Specs/plans** — one definer; ownership check; progress ticks. `docs/superpowers/README.md`.
 - **Manual edits** — user hand edits = law; conflict → stop, ask. `docs/compress.md`.
-- **Chat language** — dialogue Chinese; artifacts English. `docs/compress.md`.
+- **Chat language** — dialogue and narrated reasoning Chinese; artifacts English. `docs/compress.md`.
 - **Plan progress** — tick in the same round; subagents never edit plans. `docs/superpowers/README.md`.
 
 ## Agent skills

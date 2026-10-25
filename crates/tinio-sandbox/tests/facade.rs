@@ -271,11 +271,12 @@ fn the_launcher_surface_is_re_exported() {
     // **The payload itself, from both sides**, and not only through the two field projections
     // above: those named it beneath the core's path alone, so the facade's own spelling was
     // never exercised. The literal is the facade's name over the core's declared type, so the
-    // two are pinned as one type and the three public fields are pinned with them.
+    // two are pinned as one type and the four public fields are pinned with them.
     let _: core::LaunchPayload = tinio_sandbox::LaunchPayload {
         config: String::new(),
         token: None,
         confinement: None,
+        root: None,
     };
     // **The fork probe's three names, bound where a probe exists** — the core publishes them under
     // the same `#[cfg]`, because a probe is a unix handshake (a fork, a pipe, a `waitpid`) and the

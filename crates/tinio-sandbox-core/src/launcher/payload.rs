@@ -73,10 +73,11 @@ use serde::{Deserialize, Serialize};
 /// use tinio_sandbox_core::LaunchPayload;
 ///
 /// // The launcher's spelling of the frame, and the child's read of it back.
-/// let frame = LaunchPayload::encode_frame("port = 9000", None, None)?;
+/// let frame = LaunchPayload::encode_frame("port = 9000", None, None, None)?;
 /// let payload: LaunchPayload = serde_json::from_slice(&frame)?;
 /// assert_eq!(payload.config, "port = 9000");
 /// assert_eq!(payload.token, None);
+/// assert_eq!(payload.root, None);
 /// # Ok::<(), serde_json::Error>(())
 /// ```
 #[derive(Clone, PartialEq, Eq, Deserialize, derive_more::Debug)]
@@ -117,6 +118,30 @@ pub struct LaunchPayload {
     /// was, so the shape every existing reader tests for is still the shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confinement: Option<SandboxSpec>,
+    /// The **canonical** spelling of the storage root, when the launcher resolved one — the
+    /// value the child must serve for, rather than the spelling it was invoked with.
+    ///
+    /// **The child is the confined process, and canonicalizing is what a confinement can
+    /// forbid.** `Path::canonicalize` on Windows asks the volume mount manager for the DOS name
+    /// behind a handle (`GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS`), and a container that
+    /// may not open the mount manager device is refused with `Access denied` for a path its own
+    /// ACLs allow — observed on this workspace's CI, where a confined child invoked with the 8.3
+    /// spelling `C:\Users\RUNNER~1\…` died on `resolve_root`'s canonicalization while the
+    /// launcher canonicalized the same object successfully. The launcher is unconfined and
+    /// already resolved the root — it is the path its grant and its state file use — so it states
+    /// the answer here and the child takes it as given.
+    ///
+    /// **Absent is the ordinary frame, and means "resolve it yourself"**: every unconfined run,
+    /// and every platform whose confinement leaves `canonicalize` alone. `#[serde(default)]` reads
+    /// a payload an older launcher wrote, and `skip_serializing_if` keeps a rootless frame
+    /// byte-for-byte what it was, so the shape every existing reader tests for is still the shape.
+    ///
+    /// **A `String`, because the frame is JSON**: a Windows path that is not valid UTF-8 cannot
+    /// travel here, and a launcher that meets one sends no root at all rather than a lossy one —
+    /// the child then canonicalizes as it always did, which is the behaviour this field spares it
+    /// from but not one it may be given a wrong answer for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 impl LaunchPayload {
@@ -151,7 +176,7 @@ impl LaunchPayload {
     /// // The three values as a launcher holds them: the plan's text, the token it
     /// // minted, and the confinement half when the mechanism asks for one.
     /// assert_eq!(
-    ///     LaunchPayload::encode_frame("port = 9000", None, None)?,
+    ///     LaunchPayload::encode_frame("port = 9000", None, None, None)?,
     ///     "{\"config\":\"port = 9000\"}".as_bytes()
     /// );
     /// # Ok::<(), serde_json::Error>(())
@@ -160,8 +185,9 @@ impl LaunchPayload {
         config: &str,
         token: Option<&str>,
         confinement: Option<&SandboxSpec>,
+        root: Option<&str>,
     ) -> Result<Vec<u8>, serde_json::Error> {
-        Wire::new(config, token, confinement).encode()
+        Wire::new(config, token, confinement, root).encode()
     }
 }
 
@@ -205,20 +231,26 @@ pub(crate) struct Wire<'a> {
     /// wire for the same reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confinement: Option<&'a SandboxSpec>,
+    /// The canonical root the launcher resolved — [`LaunchPayload::root`]'s value, borrowed and
+    /// absent on the wire for the reason that field's own doc states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<&'a str>,
 }
 
 impl<'a> Wire<'a> {
-    /// The frame a launcher writes from the three values it holds — **the one
+    /// The frame a launcher writes from the four values it holds — **the one
     /// constructor, and it takes borrows only.**
     pub fn new(
         config: &'a str,
         token: Option<&'a str>,
         confinement: Option<&'a SandboxSpec>,
+        root: Option<&'a str>,
     ) -> Self {
         Self {
             config,
             token,
             confinement,
+            root,
         }
     }
 
@@ -501,6 +533,7 @@ mod tests {
             config: "version = 1\n[server]\nport = 9000\n".into(),
             token: None,
             confinement: None,
+            root: None,
         }
     }
 
@@ -515,6 +548,7 @@ mod tests {
             payload.config.as_str(),
             payload.token.as_deref(),
             payload.confinement.as_ref(),
+            payload.root.as_deref(),
         )
         .encode()
         .expect("a payload this module builds always serializes")
@@ -538,6 +572,7 @@ mod tests {
             config: "port = 9000".into(),
             token: Some("00".repeat(32)),
             confinement: None,
+            root: None,
         };
         assert_eq!(
             serde_json::from_slice::<LaunchPayload>(&frame(&payload)).unwrap(),
@@ -555,6 +590,7 @@ mod tests {
             config: "port = 9000".into(),
             token: None,
             confinement: None,
+            root: None,
         };
         assert_eq!(frame(&payload), "{\"config\":\"port = 9000\"}".as_bytes());
     }
@@ -584,6 +620,7 @@ mod tests {
                     (String::from("E1"), String::from("/srv/state")),
                 ],
             }),
+            root: None,
         };
         assert_eq!(
             serde_json::from_slice::<LaunchPayload>(&frame(&payload)).unwrap(),
@@ -601,6 +638,7 @@ mod tests {
             config: "port = 9000".into(),
             token: None,
             confinement: None,
+            root: None,
         };
         assert_eq!(frame(&payload), "{\"config\":\"port = 9000\"}".as_bytes());
         // And the other direction: a frame with no such field decodes to `None` rather than
@@ -631,16 +669,19 @@ mod tests {
                 config: "port = 9000".into(),
                 token: None,
                 confinement: None,
+                root: None,
             },
             LaunchPayload {
                 config: "port = 9000".into(),
                 token: Some(token.clone()),
                 confinement: None,
+                root: None,
             },
             LaunchPayload {
                 config: sample().config,
                 token: Some(token),
                 confinement: Some(confinement),
+                root: None,
             },
         ] {
             assert_eq!(
@@ -656,7 +697,7 @@ mod tests {
         // borrowed `Option` is what keeps an absent field absent rather than a `null` — the same
         // rule the round-trip tests above assert, stated for the frame a launch writes.
         assert_eq!(
-            Wire::new("port = 9000", None, None).encode().unwrap(),
+            Wire::new("port = 9000", None, None, None).encode().unwrap(),
             "{\"config\":\"port = 9000\"}".as_bytes()
         );
     }
@@ -683,6 +724,7 @@ mod tests {
             config: String::new(),
             token: None,
             confinement: None,
+            root: None,
         };
         assert_eq!(
             serde_json::from_slice::<LaunchPayload>(&frame(&payload)).unwrap(),
@@ -698,8 +740,49 @@ mod tests {
             config: "port = 9000".into(),
             token: None,
             confinement: None,
+            root: None,
         };
         assert_eq!(frame(&payload), "{\"config\":\"port = 9000\"}".as_bytes());
+    }
+
+    #[test]
+    fn a_root_survives_a_round_trip() {
+        // The fifth field travels the same stream as the other four, and it is the one that
+        // spares the confined child a `canonicalize` its container may refuse: a payload that
+        // lost it would leave the child resolving — and re-refusing — the spelling its launcher
+        // already resolved.
+        let payload = LaunchPayload {
+            config: "port = 9000".into(),
+            token: None,
+            confinement: None,
+            root: Some(r"\\?\C:\Users\runneradmin\AppData\Local\Temp\data".into()),
+        };
+        assert_eq!(
+            serde_json::from_slice::<LaunchPayload>(&frame(&payload)).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn a_rootless_payload_is_the_frame_it_always_was() {
+        // The back-compatibility rule for the fifth field, pinned as text: the ordinary launch
+        // states no root, and its bytes are exactly the ones every earlier reader was written
+        // against — `skip_serializing_if`, not a `null`. And when it is stated, it is the last
+        // field, after the four the shape already had.
+        let payload = LaunchPayload {
+            config: "port = 9000".into(),
+            token: None,
+            confinement: None,
+            root: None,
+        };
+        assert_eq!(frame(&payload), "{\"config\":\"port = 9000\"}".as_bytes());
+        assert_eq!(
+            frame(&LaunchPayload {
+                root: Some("C:/data".into()),
+                ..payload.clone()
+            }),
+            "{\"config\":\"port = 9000\",\"root\":\"C:/data\"}".as_bytes()
+        );
     }
 
     #[test]

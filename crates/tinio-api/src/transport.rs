@@ -1386,7 +1386,7 @@ pub struct Options {
     pub metrics_requires_token: bool,
     /// The run's access mode, carried onto the plane's shared context so a write route's
     /// admission can refuse it before the request body is read. The caller passes the same
-    /// [`AccessMode`](crate::_core::mode::AccessMode) it built its storage options from.
+    /// [`AccessMode`] it built its storage options from.
     pub access: AccessMode,
     /// The token this plane serves with, when the caller supplies one instead of letting the
     /// plane generate it.

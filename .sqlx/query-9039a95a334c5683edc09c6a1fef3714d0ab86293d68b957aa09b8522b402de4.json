@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT\r\n    ckey COLLATE \"C\" AS \"ckey!\",\r\n    live_seq AS \"seq!\",\r\n    live_len AS \"len!\"\r\nFROM content_heads\r\nWHERE\r\n    bucket = $1\r\n    AND ckey = ANY ($2)\r\n    AND live_seq IS NOT NULL\r\n",
+  "query": "SELECT\n    ckey COLLATE \"C\" AS \"ckey!\",\n    live_seq AS \"seq!\",\n    live_len AS \"len!\"\nFROM content_heads\nWHERE\n    bucket = $1\n    AND ckey = any($2)\n    AND live_seq IS NOT NULL\n",
   "describe": {
     "columns": [
       {
@@ -44,5 +44,5 @@
       false
     ]
   },
-  "hash": "cd772f791f80bf3c9ec66a54072c763db5ece04be214d3e2527c052bd0eb4c74"
+  "hash": "9039a95a334c5683edc09c6a1fef3714d0ab86293d68b957aa09b8522b402de4"
 }

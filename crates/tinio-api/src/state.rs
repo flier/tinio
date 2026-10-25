@@ -98,12 +98,32 @@ pub fn pipe_name(root: &Path) -> Result<String, Error> {
 }
 
 /// The per-root channel stem both forms share: `tinio-<sha1(canonical root)[..16]>`.
+///
+/// **The canonicalization is best-effort: an absolute root the process may not canonicalize is
+/// used as it stands.** Every caller hands in the root a launcher already resolved — the
+/// `Resolution::root` the child serves for — and that launcher is also the process that derived
+/// this name for the channel the two ends share, so both digests are over one spelling and agree
+/// without a second lookup. Canonicalizing again inside the confined child asks the volume mount
+/// manager for a DOS name (`GetFinalPathNameByHandleW` with `VOLUME_NAME_DOS`), which an
+/// AppContainer is refused with `Access denied` on a directory its own ACEs allow — measured on
+/// this workspace's CI, where the confined server died naming its channel. Whether the process may
+/// read that device map is not a fact about the root, so it must not decide whether the server
+/// starts.
+///
+/// A relative root stays an error: a channel name has to be a function of one directory, and a
+/// relative spelling names a different one for every reader's working directory.
 fn channel_stem(root: &Path) -> Result<String, Error> {
-    let canonical = root.canonicalize().map_err(|err| Error::State {
-        path: root.to_path_buf(),
-        message: format!("the served root cannot be canonicalized: {err}"),
-    })?;
-    let digest = hex::encode(Sha1::digest(canonical.as_os_str().as_encoded_bytes()));
+    let resolved = match root.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) if root.is_absolute() => root.to_path_buf(),
+        Err(err) => {
+            return Err(Error::State {
+                path: root.to_path_buf(),
+                message: format!("the served root cannot be canonicalized: {err}"),
+            });
+        }
+    };
+    let digest = hex::encode(Sha1::digest(resolved.as_os_str().as_encoded_bytes()));
     Ok(format!("tinio-{}", &digest[..16]))
 }
 
@@ -503,15 +523,46 @@ mod tests {
         );
 
         // The name is a function of the *canonical* root: any spelling of the same root
-        // derives the same socket, and a root that cannot be canonicalized is an error
-        // rather than a silently different name.
+        // derives the same socket, and a relative root is refused because the directory it
+        // names depends on whoever reads it.
         let leaf = a.path().file_name().expect("leaf");
         let respelled = a.path().join("..").join(leaf);
         assert_eq!(
             socket_path(state_dir.path(), &respelled).expect("respelled"),
             first
         );
-        assert!(socket_path(state_dir.path(), Path::new("/no/such/root")).is_err());
+        assert!(socket_path(state_dir.path(), Path::new("no/such/root")).is_err());
+    }
+
+    /// **The channel name needs no canonicalization of its own.** A confined child is handed the
+    /// launcher's already-canonical root and may be refused the volume-name lookup that
+    /// `canonicalize` makes (`channel_stem`'s doc names the measurement), so an absolute root that
+    /// is not on disk still has to name a channel — the same one on every derivation, which is
+    /// what makes the launcher's digest and the child's the same name. A relative root keeps the
+    /// refusal.
+    #[test]
+    fn an_absolute_root_names_a_channel_without_canonicalizing_it() {
+        let state_dir = dir();
+        let uncreated = state_dir.path().join("not-created-yet");
+        assert!(
+            !uncreated.exists(),
+            "the leg is vacuous unless the root is missing: {}",
+            uncreated.display()
+        );
+
+        let first = socket_path(state_dir.path(), &uncreated).expect("an absolute root");
+        let stem = pipe_name(&uncreated).expect("the pipe's name is the socket's stem");
+        assert_eq!(first, state_dir.path().join(format!("{stem}.sock")));
+        assert_eq!(
+            socket_path(state_dir.path(), &uncreated).expect("re-derived"),
+            first,
+            "the name is the root's own spelling, so a second derivation agrees"
+        );
+
+        assert!(
+            socket_path(state_dir.path(), Path::new("no/such/root")).is_err(),
+            "a relative root cannot be resolved outside a working directory"
+        );
     }
 
     #[test]

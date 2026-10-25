@@ -4,8 +4,8 @@ Agent-facing `docs/*.md` (cargo, tests, style, git, this file). Specs/plans unde
 
 ## Language
 
-- English only: docs, code, artifacts, comments, commits, PRs.
-- Chat with the user: Chinese.
+- Chat with the user, and reason out loud in Chinese.
+- English only otherwise: docs, code, artifacts, comments, commits, PRs.
 - Non-English in docs: cross-check before finish.
 
 ## Intent

@@ -1142,6 +1142,10 @@ fn hand_over(
         // `None` is the helper's launch, whose confinement was applied by
         // `sandbox-exec` at the `exec` — the field is absent on that wire.
         confinement,
+        // **The canonical root is Windows' field**: it exists for a confined child's
+        // `canonicalize`, and this platform's profile leaves that call alone — the child here
+        // resolves its own argv exactly as it always has.
+        None,
     )
     .map_err(step("serialize payload"))?;
     stdin.write_all(&frame).map_err(step("write payload"))?;

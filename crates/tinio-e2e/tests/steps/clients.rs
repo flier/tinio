@@ -44,6 +44,7 @@ use tinio_util::testing::{frame_line, job, kill_and_reap};
 
 use super::{
     FsKind, World,
+    cli::scratch_dir,
     common::{contains_ignore_case, deterministic_bytes},
     has_tag,
 };
@@ -177,8 +178,12 @@ impl External {
     /// exposure set carries it for the same reason the served root is carried
     /// (`sandbox::product::exposures`), so the confined child can write where an unconfined one
     /// would have written `<root>/.tinio`.
+    ///
+    /// **The workdir is the harness's [`scratch_dir`]**, not a bare tempdir: the child's control
+    /// socket is `<root>/.tinio/tinio-<16 hex>.sock`, and on macOS `$TMPDIR` is too long for
+    /// `sun_path` — the server refuses to start (that helper owns the rationale).
     pub fn start(caps: &Capabilities, fs_kind: FsKind, confinement: Confinement) -> Self {
-        let workdir = tempfile::tempdir().unwrap();
+        let workdir = scratch_dir();
         let root = workdir.path().join("root");
         fs::create_dir_all(&root).unwrap();
         let state = (confinement == Confinement::ReadOnly).then(|| {

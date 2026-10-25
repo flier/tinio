@@ -488,7 +488,7 @@ mod tests {
         // The frame comes from the core's one writer — the payload derives no
         // `Serialize` — so this is the byte string a launch really writes, config
         // text and all.
-        let frame = LaunchPayload::encode_frame("version = 1\n", None, None)
+        let frame = LaunchPayload::encode_frame("version = 1\n", None, None, None)
             .expect("the frame is one JSON object");
         child
             .stdin

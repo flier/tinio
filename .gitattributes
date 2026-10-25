@@ -10,3 +10,7 @@ packaging/tinio.service text eol=lf
 # Compiled into text a supervisor reads, or compared byte for byte with such a
 # file. LF-only, whatever the checkout platform.
 *.hbs text eol=lf
+
+# Compiled into the offline statement cache: sqlx hashes the file's bytes, so a
+# CRLF checkout re-hashes every statement and the cache misses.
+*.sql text eol=lf

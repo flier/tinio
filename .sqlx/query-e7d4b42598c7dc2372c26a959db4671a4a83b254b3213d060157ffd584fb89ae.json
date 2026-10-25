@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone_locks AS (\n    DELETE FROM upload_object_lock\n    WHERE bucket = $1 AND upload_id = any($2)\n),\n\ngone_parts AS (\n    DELETE FROM parts WHERE bucket = $1 AND upload_id = any($2)\n),\n\ngone_part_checksums AS (\n    DELETE FROM part_checksums\n    WHERE bucket = $1 AND upload_id = any($2)\n),\n\ngone_checksums AS (\n    DELETE FROM upload_checksums\n    WHERE bucket = $1 AND upload_id = any($2)\n)\n\nDELETE FROM uploads WHERE bucket = $1 AND upload_id = any($2)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e7d4b42598c7dc2372c26a959db4671a4a83b254b3213d060157ffd584fb89ae"
+}

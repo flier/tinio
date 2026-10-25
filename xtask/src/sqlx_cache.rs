@@ -3,12 +3,21 @@
 //! Generation is the driver's own prepare path, driven without `cargo-sqlx`:
 //! `cargo check -p tinio-store-pg --all-targets` with `SQLX_OFFLINE=false` and a
 //! fresh `SQLX_OFFLINE_DIR`, so each statement is described and written as
-//! `query-<hash>.json` into that scratch directory. Cargo does not track
-//! `SQLX_OFFLINE_DIR`, so an already-fresh crate skips the driver's macros and
-//! leaves the scratch empty; that case is detected and retried after
-//! `cargo clean -p tinio-store-pg`. `sqlx check` compares the generated set
-//! with the cache and never writes to it; `sqlx update` makes the cache exactly
-//! the generated set, and touches it only after generation succeeds.
+//! `query-<hash>.json` into that scratch directory. `sqlx check` compares the
+//! generated set with the cache and never writes to it; `sqlx update` makes the
+//! cache exactly the generated set, and touches it only after generation
+//! succeeds.
+//!
+//! **Every generation pass rebuilds the package first, and that is the rule.**
+//! Cargo does not track `SQLX_OFFLINE_DIR`: freshness is the crate's, not the
+//! scratch directory's, so a pass that follows any other build of this package —
+//! the database legs' own test build above all — re-expands the driver's macros
+//! for just the targets the freshness check lets through, and the scratch holds a
+//! subset. A subset is indistinguishable from a complete set to a comparison:
+//! the entries the pass never generated read as `extra`, and an `update` run from
+//! that reading deletes a cache entry whose SQL still needs it. One package
+//! rebuild buys the set that is the same on every run, which is what both modes
+//! already assume it is.
 //!
 //! A generated entry is the driver's inference about the **live database**, not
 //! a function of the SQL text alone: a column's `nullable` comes from
@@ -142,21 +151,25 @@ fn guard_paths(cache_dir: &Path, scratch_dir: &Path) -> Result<(), Error> {
 }
 
 /// Run the driver's prepare build into the scratch directory.
+///
+/// The clean is unconditional, for the reason the module states: a pass over a crate the
+/// freshness check considers built expands a subset of the statements, and a subset compares
+/// as drift. An empty result after a clean rebuild is the driver having expanded nothing at
+/// all, which is a failure of this pass rather than a cache to reconcile.
 fn generate(root: &Path, dsn: &str, scratch_dir: &Path) -> Result<(), Error> {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    clean_package(&cargo, root)?;
     clear_scratch(scratch_dir)?;
     run_check(&cargo, root, dsn, scratch_dir)?;
-    if !read_entries(scratch_dir)
+    if read_entries(scratch_dir)
         .map_err(Error::Runtime)?
         .is_empty()
     {
-        return Ok(());
+        return Err(Error::Runtime(
+            "generation produced no entries: the driver expanded no statement".to_owned(),
+        ));
     }
-
-    eprintln!("no entries generated; forcing a rebuild of tinio-store-pg");
-    clean_package(&cargo, root)?;
-    clear_scratch(scratch_dir)?;
-    run_check(&cargo, root, dsn, scratch_dir)
+    Ok(())
 }
 
 /// Run `cargo check -p tinio-store-pg --all-targets` with the prepare env.

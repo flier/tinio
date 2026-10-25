@@ -140,7 +140,17 @@ fn rooted(
     explicit: Option<&Path>,
     from: Option<&Path>,
     pg_dsn: bool,
+    adopted: Option<&Path>,
 ) -> Result<Option<PathBuf>, Error> {
+    // **The launcher's answer wins, and it is taken as given rather than re-canonicalized.** A
+    // confined child may be refused the call that computes it (the function's own doc, and
+    // `tinio_sandbox_core::LaunchPayload::root`), and the value the launcher stated is already
+    // the answer: it resolved this root before the child existed and granted its ACE on that
+    // spelling. Re-canonicalizing would at best be idle work and at worst be the refusal this
+    // parameter exists to avoid.
+    if let Some(root) = adopted {
+        return Ok(Some(root.to_path_buf()));
+    }
     if let Some(dir) = explicit {
         // `from` is deliberately unused on this branch: `resolve_root` never reads it, and passing
         // the working directory here would be the lookup this function exists to avoid.
@@ -354,7 +364,7 @@ pub fn state_dir_candidates(
 /// assert!(located.state_dir.ends_with(".tinio"));
 /// ```
 pub fn locate(discovery: Discovery, provenance: &Provenance) -> Result<Located, Error> {
-    locate_with(discovery, provenance, None)
+    locate_with(discovery, provenance, None, None)
 }
 
 /// [`locate`] for a process a confinement launched: the configuration **text** the payload
@@ -368,6 +378,21 @@ pub fn locate(discovery: Discovery, provenance: &Provenance) -> Result<Located, 
 /// the text instead, which *is* that file's content, so the child and the launcher that resolved
 /// it cannot disagree about the mode.
 ///
+/// §2.9's `root` argument, and the reason it is a parameter rather than a lookup.
+///
+/// **The root a confined child serves for is the launcher's**, and the launcher states it on the
+/// launch frame (design decision 17's channel, the one the configuration text already travels).
+/// The child is the confined process, so `Path::canonicalize` is a call its confinement may
+/// refuse — on Windows the call asks the volume mount manager for a DOS name, which an
+/// AppContainer can be denied with `Access denied` even though its own ACEs allow the path
+/// (`tinio_sandbox_core::LaunchPayload::root` carries the observation from this workspace's CI).
+/// The launcher is unconfined, resolved the root before the child existed, and granted the ACE on
+/// that very spelling, so this value is the canonical one by construction and is **not**
+/// canonicalized again.
+///
+/// `None` — every unconfined run, and every platform whose confinement leaves the call alone —
+/// resolves the root from `DIR` or the walk-up exactly as it always has.
+///
 /// # Errors
 ///
 /// Whatever [`resolve_root`] refuses (a root that cannot be canonicalized is a usage error).
@@ -375,6 +400,8 @@ pub fn locate(discovery: Discovery, provenance: &Provenance) -> Result<Located, 
 /// # Examples
 ///
 /// ```rust
+/// use std::path::Path;
+///
 /// use tinio_cli::{
 ///     cli::{Discovery, Provenance},
 ///     resolve::locate_confined,
@@ -390,15 +417,34 @@ pub fn locate(discovery: Discovery, provenance: &Provenance) -> Result<Located, 
 ///     pg_dsn: None,
 /// };
 /// let located =
-///     locate_confined(discovery, &Provenance::default(), "version = 1\n").expect("a root");
+///     locate_confined(discovery, &Provenance::default(), "version = 1\n", None).expect("a root");
 /// assert!(!located.read_only);
+/// let from_the_launcher = Discovery {
+///     dir: Some(".".into()),
+///     config: None,
+///     read_only: false,
+///     state_dir: None,
+///     pg_dsn: None,
+/// };
+/// assert_eq!(
+///     locate_confined(
+///         from_the_launcher,
+///         &Provenance::default(),
+///         "version = 1\n",
+///         Some(Path::new("/a/launcher/said/so")),
+///     )
+///     .expect("the launcher's root is taken as given, not canonicalized")
+///     .root,
+///     Path::new("/a/launcher/said/so")
+/// );
 /// ```
 pub fn locate_confined(
     discovery: Discovery,
     provenance: &Provenance,
     config_text: &str,
+    root: Option<&Path>,
 ) -> Result<Located, Error> {
-    locate_with(discovery, provenance, Some(config_text))
+    locate_with(discovery, provenance, Some(config_text), root)
 }
 
 /// [`locate`] and [`locate_confined`]'s one body: the mode's file level is the only thing the
@@ -414,8 +460,9 @@ fn locate_with(
     discovery: Discovery,
     provenance: &Provenance,
     adopted: Option<&str>,
+    adopted_root: Option<&Path>,
 ) -> Result<Located, Error> {
-    locate_in(discovery, provenance, adopted, None)
+    locate_in(discovery, provenance, adopted, adopted_root, None)
 }
 
 /// [`locate`] with the walk-up's **starting directory named** — the `#[cfg(test)]` entry below,
@@ -430,6 +477,7 @@ fn locate_in(
     discovery: Discovery,
     provenance: &Provenance,
     adopted: Option<&str>,
+    adopted_root: Option<&Path>,
     from: Option<&Path>,
 ) -> Result<Located, Error> {
     // The document the operator named, read and parsed **once**: it answers the pg selector here,
@@ -450,7 +498,12 @@ fn locate_in(
     // the database, and a pg run has no served root for the walk-up to find. `rooted` returns
     // `None` for exactly that arm and nothing else; with no dsn it returns the usage error, so the
     // no-root-with-no-dsn case is unchanged.
-    let root = match rooted(discovery.dir.as_deref(), from, discovery.pg_dsn.is_some())? {
+    let root = match rooted(
+        discovery.dir.as_deref(),
+        from,
+        discovery.pg_dsn.is_some(),
+        adopted_root,
+    )? {
         Some(root) => root,
         None => {
             let mut located = pg_located(discovery, provenance, &Config::default())?;
@@ -546,7 +599,7 @@ pub(crate) fn locate_from(
     provenance: &Provenance,
     from: &Path,
 ) -> Result<Located, Error> {
-    locate_in(discovery, provenance, None, Some(from))
+    locate_in(discovery, provenance, None, None, Some(from))
 }
 
 /// The configuration an operator **named** — `--config`, or the payload text a confinement

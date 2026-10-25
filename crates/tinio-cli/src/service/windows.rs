@@ -219,9 +219,10 @@ fn run_service(
     let argv: Vec<OsString> = iter::once(OsString::from("tinio"))
         .chain(arguments)
         .collect();
-    // `None`: a service is the SCM's process, never a confinement's child, so its explicit
-    // `--config` keeps the must-exist contract `command_line`'s own doc states.
-    let Either::Left(resolved) = command_line(&argv, None)? else {
+    // `None` twice: a service is the SCM's process, never a confinement's child, so its explicit
+    // `--config` keeps the must-exist contract `command_line`'s own doc states, and it has no
+    // launcher-resolved root either — it resolves one itself.
+    let Either::Left(resolved) = command_line(&argv, None, None)? else {
         return Err(not_a_server());
     };
     let Resolved {
