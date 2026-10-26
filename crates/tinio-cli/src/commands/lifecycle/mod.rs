@@ -20,6 +20,8 @@ pub mod ls;
 pub mod put;
 pub mod rm;
 
+#[cfg(test)]
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Args as ClapArgs, Subcommand};
@@ -32,7 +34,7 @@ use crate::{
         client::{self, RawResponse},
         router::InvalidBody,
     },
-    _core::bucket,
+    _core::{bucket, lifecycle},
     Error,
     resolve::Located,
 };
@@ -180,6 +182,7 @@ pub async fn run(args: Args, located: Located) -> Result<ExitCode, Error> {
 pub(crate) struct Plane {
     state: State,
     target: String,
+    supports_tiers: bool,
 }
 
 impl Plane {
@@ -192,11 +195,31 @@ impl Plane {
         let Ok(bucket) = bucket::name(bucket.to_owned()) else {
             return Err(Error::Usage(format!("invalid bucket name: {bucket}")));
         };
-        let state = super::server_state(args, located).await?;
+        let (state, supports_tiers) = super::server_state_with_tiers(args, located).await?;
         Ok(Self {
             state,
             target: format!("/buckets/{bucket}/lifecycle"),
+            supports_tiers,
         })
+    }
+
+    /// Whether the served root's backend stores objects in tiers (T11).
+    pub(crate) fn supports_tiers(&self) -> bool {
+        self.supports_tiers
+    }
+
+    /// The tier gate both write verbs apply before their `PUT` (T11), over this plane's own
+    /// capability.
+    ///
+    /// This method is what the verbs call, so the link between the plane's answer and the
+    /// refusal is the tested unit: a test drives it with either capability without a live
+    /// server.
+    pub(crate) fn refuse_transitions(
+        &self,
+        bucket: &str,
+        config: &lifecycle::Config,
+    ) -> Result<(), Error> {
+        refuse_transitions(bucket, config, self.supports_tiers())
     }
 
     /// One call over the plane's route.
@@ -209,6 +232,51 @@ impl Plane {
             .await
             .map_err(Into::into)
     }
+}
+
+/// A plane fixture for the verbs' gate tests: a control channel no test calls, and the
+/// capability the gate reads.
+#[cfg(test)]
+pub(crate) fn test_plane(supports_tiers: bool) -> Plane {
+    Plane {
+        state: State::new(
+            "tinio-0123456789abcdef.sock",
+            Some(9000),
+            Path::new("/srv/data"),
+        )
+        .expect("the fixture state"),
+        target: "/buckets/photos/lifecycle".to_owned(),
+        supports_tiers,
+    }
+}
+
+/// The tier gate the two write verbs apply before their `PUT` (T11).
+///
+/// A backend without tiers refuses a configuration carrying a transition in the same sentence
+/// [`refusal`] prints for the plane's `400 {"rule","reason"}` — the reason every write path
+/// shares, with the rule's ID leading when it has one — so an operator sees one answer
+/// whichever surface refused. [`Plane::refuse_transitions`] is the verbs' door to it.
+fn refuse_transitions(
+    bucket: &str,
+    config: &lifecycle::Config,
+    supports_tiers: bool,
+) -> Result<(), Error> {
+    if supports_tiers {
+        return Ok(());
+    }
+    let Some(rule) = config.transition_rule() else {
+        return Ok(());
+    };
+    // The same sentence [`refusal`] prints for the plane's `400 {"rule","reason"}`: the reason
+    // is [`TRANSITIONS_NEED_TIERS`](lifecycle::TRANSITIONS_NEED_TIERS), and the rule's ID leads
+    // when it has one.
+    Err(Error::Operational(match &rule.id {
+        Some(id) => format!(
+            "lifecycle {bucket}: rule {id}: {}",
+            lifecycle::TRANSITIONS_NEED_TIERS
+        ),
+        None => format!("lifecycle {bucket}: {}", lifecycle::TRANSITIONS_NEED_TIERS),
+    }))
 }
 
 /// The status a verb requires, or the plane's own refusal sentence.

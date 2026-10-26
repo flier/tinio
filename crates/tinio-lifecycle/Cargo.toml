@@ -6,6 +6,7 @@ description = "The S3 object lifecycle pass for tinio: one stateless sweep over 
 publish = false
 
 [dependencies]
+futures.workspace = true
 parse-display.workspace = true
 prometheus.workspace = true
 smart-default.workspace = true
@@ -16,8 +17,8 @@ tinio-core.workspace = true
 tinio-util.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 bytes.workspace = true
-futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing-subscriber.workspace = true
 

@@ -9,7 +9,7 @@ use std::{
 use smart_default::SmartDefault;
 use time::{OffsetDateTime, SignedDuration};
 
-use super::model::{And, Config, Expiration, Filter, Rule, Status, Tag};
+use super::model::{And, Config, Expiration, Filter, Rule, Status, Tag, Transition};
 use crate::{bucket, object};
 
 /// One object's facts, all of them from the listing the pass already made
@@ -123,6 +123,7 @@ impl Config {
     ///             date: None,
     ///             expired_object_delete_marker: None,
     ///         }),
+    ///         transitions: Vec::new(),
     ///         noncurrent_version_expiration: None,
     ///         abort_incomplete_multipart_upload: None,
     ///     }],
@@ -172,6 +173,7 @@ impl Config {
     ///             date: None,
     ///             expired_object_delete_marker: None,
     ///         }),
+    ///         transitions: Vec::new(),
     ///         noncurrent_version_expiration: None,
     ///         abort_incomplete_multipart_upload: None,
     ///     }],
@@ -189,7 +191,9 @@ impl Config {
     pub fn expiry_for(&self, facts: &Facts<'_>) -> Option<SystemTime> {
         self.rules_for(facts)
             .filter_map(|rule| rule.expiration.as_ref())
-            .filter_map(|expiration| expiry_instant(expiration, facts.last_modified))
+            .filter_map(|expiration| {
+                instant_from_parts(expiration.date, expiration.days, facts.last_modified)
+            })
             .min()
     }
 
@@ -224,6 +228,7 @@ impl Config {
     ///         status: Status::Enabled,
     ///         filter: Default::default(),
     ///         expiration: None,
+    ///         transitions: Vec::new(),
     ///         noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
     ///             noncurrent_days: Some(30),
     ///             newer_noncurrent_versions: Some(3),
@@ -272,6 +277,7 @@ impl Config {
     ///         status: Status::Enabled,
     ///         filter: Default::default(),
     ///         expiration: None,
+    ///         transitions: Vec::new(),
     ///         noncurrent_version_expiration: None,
     ///         abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUpload {
     ///             days_after_initiation: 7,
@@ -315,6 +321,7 @@ impl Config {
     ///         status: Status::Enabled,
     ///         filter: Default::default(),
     ///         expiration: None,
+    ///         transitions: Vec::new(),
     ///         noncurrent_version_expiration: None,
     ///         abort_incomplete_multipart_upload: None,
     ///     }
@@ -350,6 +357,7 @@ impl Config {
     ///         status: Status::Enabled,
     ///         filter: Default::default(),
     ///         expiration: None,
+    ///         transitions: Vec::new(),
     ///         noncurrent_version_expiration: None,
     ///         abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUpload {
     ///             days_after_initiation: 7,
@@ -381,6 +389,7 @@ impl Config {
     ///             date: None,
     ///             expired_object_delete_marker: None,
     ///         }),
+    ///         transitions: Vec::new(),
     ///         noncurrent_version_expiration: None,
     ///         abort_incomplete_multipart_upload: None,
     ///     }],
@@ -414,6 +423,7 @@ impl Config {
     ///             date: None,
     ///             expired_object_delete_marker: Some(true),
     ///         }),
+    ///         transitions: Vec::new(),
     ///         noncurrent_version_expiration: None,
     ///         abort_incomplete_multipart_upload: None,
     ///     }],
@@ -506,14 +516,48 @@ fn size_bounds(size: u64, greater: Option<u64>, less: Option<u64>) -> bool {
     greater.is_none_or(|bound| size > bound) && less.is_none_or(|bound| size < bound)
 }
 
-/// The instant an `Expiration` names, or `None` for the delete-marker action.
-fn expiry_instant(expiration: &Expiration, last_modified: SystemTime) -> Option<SystemTime> {
-    if let Some(date) = expiration.date {
+impl Transition {
+    /// The instant this transition names, or `None` when it names none the
+    /// platform's clock can hold.
+    ///
+    /// The same clock an `Expiration` reads: `Days` counts to [`midnight_utc`]
+    /// of `last_modified + days`, and `Date` is absolute — so the two actions
+    /// can never name different days for the same object.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// use tinio_core::{Class, lifecycle::Transition};
+    ///
+    /// let noon = SystemTime::UNIX_EPOCH + Duration::from_secs(43_200);
+    /// let after_thirty = Transition {
+    ///     days: Some(30),
+    ///     date: None,
+    ///     storage_class: Class::StandardIa,
+    /// };
+    /// assert_eq!(
+    ///     after_thirty.instant(noon),
+    ///     Some(SystemTime::UNIX_EPOCH + Duration::from_secs(31 * 86_400))
+    /// );
+    /// ```
+    pub fn instant(&self, last_modified: SystemTime) -> Option<SystemTime> {
+        instant_from_parts(self.date, self.days, last_modified)
+    }
+}
+
+/// The instant a `Days`/`Date` pair names, the one conversion both a rule's
+/// `Expiration` and its `Transition` read.
+fn instant_from_parts(
+    date: Option<i64>,
+    days: Option<i32>,
+    last_modified: SystemTime,
+) -> Option<SystemTime> {
+    if let Some(date) = date {
         return from_unix_seconds(date);
     }
-    expiration
-        .days
-        .map(|days| midnight_utc(last_modified, count(days)))
+    days.map(|days| midnight_utc(last_modified, count(days)))
 }
 
 /// A `Date` is Unix seconds at midnight UTC, so its instant needs no calendar.

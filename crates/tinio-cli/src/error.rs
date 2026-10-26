@@ -13,7 +13,8 @@ use tinio_util::testing::{bucket_name, object_key};
 use crate::_api;
 use crate::{
     _core::storage, _fs::Error as FsError, _sandbox::Error as SandboxError,
-    _server::Error as ServerError, _util::state::Error as StateError, config,
+    _server::Error as ServerError, _tier::Error as TierError, _util::state::Error as StateError,
+    config,
 };
 
 /// A CLI failure carrying its exit code.
@@ -51,6 +52,11 @@ pub enum Error {
     /// A storage-backend failure — exit code 1.
     #[error("storage error: {0}")]
     Fs(#[from] FsError),
+    /// A tier-layer failure — exit code 1. The layer's own sentence is kept:
+    /// its bind refusals (`--adopt`, a root-ID mismatch) are exactly what the
+    /// operator has to act on.
+    #[error("tier error: {0}")]
+    Tier(#[from] TierError),
     /// A data-plane failure — exit code 1.
     #[error("server error: {0}")]
     Server(#[from] ServerError),

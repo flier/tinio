@@ -29,6 +29,10 @@ use crate::{
 /// a week, a year or the parser's own floor are what the file spells and this is what it refuses.
 const MAX_DAYS: u32 = i32::MAX as u32;
 
+/// `concurrency`: one transition at a time, the gentlest walk over a store the server is also
+/// serving (the runner's own default).
+const DEFAULT_CONCURRENCY: usize = 1;
+
 /// The pass's pacing and the declarative seed (`[lifecycle]`; the section is optional).
 ///
 /// # Examples
@@ -41,6 +45,7 @@ const MAX_DAYS: u32 = i32::MAX as u32;
 /// let defaults = Config::default();
 /// assert_eq!(defaults.delay, Duration::from_secs(10));
 /// assert_eq!(defaults.cycle, Duration::from_secs(3600));
+/// assert_eq!(defaults.concurrency, 1);
 /// assert!(defaults.rules.is_empty());
 /// ```
 #[derive(Debug, Clone, PartialEq, SmartDefault, Serialize, Deserialize, Validate)]
@@ -60,6 +65,11 @@ pub struct Config {
     #[serde(with = "humantime_serde")]
     #[default(_code = "DEFAULT_CYCLE")]
     pub cycle: Duration,
+    /// How many transitions one pass runs at once. Zero would mean a pass that can only skip
+    /// the action, so it is refused where the document is parsed rather than read as one.
+    #[garde(range(min = 1))]
+    #[default(_code = "DEFAULT_CONCURRENCY")]
+    pub concurrency: usize,
     /// The rules the file declares (`[[lifecycle.rules]]`, repeatable). Last, so the serializer
     /// emits them after the two scalar keys — TOML's own ordering rule.
     #[garde(skip)]
@@ -195,6 +205,7 @@ pub(crate) fn options(resolution: &Resolution) -> (Options, Vec<Seed>) {
     let options = Options {
         delay: section.delay,
         cycle: section.cycle,
+        concurrency: section.concurrency,
     };
     let seeds = section
         .rules
@@ -285,6 +296,35 @@ mod tests {
         let parsed = Root::parse(&seeded("[lifecycle]\ndelay = \"0s\"\ncycle = \"1s\"\n"))
             .expect("the floor parses, and a zero delay stays legal");
         assert_eq!(parsed.lifecycle.as_ref().unwrap().cycle.as_secs(), 1);
+    }
+
+    /// The pass's worker count is the operator's: one by default, a written value replaces it,
+    /// and zero is refused at parse because a pass with no worker could only skip the action.
+    #[test]
+    fn the_concurrency_defaults_to_one_and_rejects_zero() {
+        assert_eq!(super::Config::default().concurrency, 1);
+
+        let parsed = Root::parse(&seeded("[lifecycle]\nconcurrency = 4\n")).expect("config");
+        assert_eq!(parsed.lifecycle.as_ref().unwrap().concurrency, 4);
+
+        let error = Root::parse(&seeded("[lifecycle]\nconcurrency = 0\n"))
+            .expect_err("a zero worker count is refused");
+        assert!(matches!(error, Error::InvalidValue { .. }), "{error}");
+        assert!(
+            error.to_string().contains("lifecycle.concurrency"),
+            "{error}"
+        );
+    }
+
+    /// The wiring: the value the document carries is what the runner's options receive.
+    #[cfg(feature = "lifecycle")]
+    #[test]
+    fn the_concurrency_reaches_the_pass_options() {
+        let (configured, _) = options(&resolution(&seeded("[lifecycle]\nconcurrency = 3\n")));
+        assert_eq!(configured.concurrency, 3);
+
+        let (defaults, _) = options(&resolution("version = 1\n"));
+        assert_eq!(defaults.concurrency, 1, "no section, the default worker");
     }
 
     /// LC13: `id` is the merge key, so a file rule without one is a configuration error rather

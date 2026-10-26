@@ -149,6 +149,7 @@ pub fn lifecycle_config_with(id: &str, prefix: Option<&str>, days: i32) -> lifec
                 date: None,
                 expired_object_delete_marker: None,
             }),
+            transitions: Vec::new(),
             noncurrent_version_expiration: None,
             abort_incomplete_multipart_upload: None,
         }],

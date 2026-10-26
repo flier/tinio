@@ -1,0 +1,86 @@
+[package]
+name = "tinio-tier"
+version.workspace = true
+edition.workspace = true
+description = "Tiered storage layer for tinio: a memory cache, the filesystem as the warm tier and PostgreSQL as the cold tier"
+publish = false
+
+[features]
+bench = [
+    "dep:tinio-bench",
+    "dep:tinio-store-redb",
+    "tinio-util/bench",
+    "tinio-util/testing",
+]
+default = []
+testing = []
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+garde = { workspace = true, features = ["derive"] }
+humantime-serde.workspace = true
+redb.workspace = true
+secrecy.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+tinio-bench = { workspace = true, optional = true }
+tinio-core.workspace = true
+tinio-fs = { workspace = true, features = ["tier", "versioning"] }
+tinio-pg.workspace = true
+tinio-store-pg.workspace = true
+tinio-store-redb = { workspace = true, optional = true }
+tinio-util.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["cargo_bench_support"] }
+tempfile.workspace = true
+tinio-store-pg = { workspace = true, features = ["testing"] }
+tinio-store-redb.workspace = true
+tinio-tier = { path = ".", features = ["testing"] }
+tinio-util = { workspace = true, features = ["bench", "testing"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[[bin]]
+name = "tier-leg"
+path = "src/bin/tier-leg.rs"
+required-features = ["bench"]
+
+[[bench]]
+name = "tier"
+harness = false
+
+[lints.clippy]
+absolute_paths = "warn"
+allow_attributes = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_used = "warn"
+
+[lints.rust]
+unsafe_code = "deny"

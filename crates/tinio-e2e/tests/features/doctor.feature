@@ -162,6 +162,26 @@ Feature: Doctor diagnostics
     And its stdout contains "there is no store; nothing to clear"
     And the file "{root}/.tinio/meta.redb" does not exist
 
+  # T17/T28: either tier file makes the root tier mode's, so a non-tier
+  # command refuses it whole. The marker is planted as the seam reads it
+  # (existence, 16 bytes) — the refusal is the rule, not the file's format.
+  # `--fix` is the half a marker-blind doctor would get wrong: its store
+  # stages would create `<state dir>/meta.redb` in a root tier mode owns, so
+  # the assertion is that no repair ran and no store appeared.
+  @cli
+  Scenario: doctor refuses a tier root and `--fix` repairs nothing
+    Given a storage root
+    And the root holds the tier marker
+    When I run "tinio doctor {root}"
+    Then the run fails with exit code 1
+    And its stdout contains "tier root"
+    And its stdout contains "tier mode"
+    When I run "tinio doctor {root} --fix"
+    Then the run fails with exit code 1
+    And its stdout contains "0 repairs applied"
+    And its stdout contains "tier mode"
+    And the file "{root}/.tinio/meta.redb" does not exist
+
   # Neither rendering may quote the bytes it read, and the fixture's token is
   # what makes the assertion witnessable: `the root's state file carries the
   # fixture's token` fails here if a later edit stopped writing it, rather than

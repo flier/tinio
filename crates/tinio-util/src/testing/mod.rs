@@ -1406,6 +1406,9 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         get.info.tags == write_tags,
         "get must serve the committed tags",
     );
+    // A backend may hold a read's lock through the body (T14's tier): drain
+    // the metadata-only read before the later delete of the same key.
+    read_body(get.body).await.unwrap();
 
     // Object ACL (spec 2026-09-05): the write paths record the
     // caller-provided owner and grant set, a put_object_acl replaces
@@ -1527,6 +1530,8 @@ async fn conformance_objects<S: Storage>(storage: &S, b: &bucket::Name) {
         get.info.checksum == Some(expected),
         "get must echo the recorded checksum",
     );
+    // See the tagged read above: the same key is committed next.
+    read_body(get.body).await.unwrap();
     let staged = storage
         .stage_body(b, &recorded, body(b"abc"), None, None)
         .await
@@ -2612,6 +2617,9 @@ async fn conformance_multipart<S: Storage>(storage: &S, b: &bucket::Name) {
         get.info.checksum == Some(composite.clone()),
         "get must echo the recorded composite",
     );
+    // The same key is renamed later in this leg; drain the metadata-only read
+    // first so a lock-through-body backend is not blocked.
+    read_body(get.body).await.unwrap();
     // The retained rows carry each part's tee checksum and uploaded size.
     let rows = storage.list_object_parts(b, &attrs).await.unwrap();
     check(

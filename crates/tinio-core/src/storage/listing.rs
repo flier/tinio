@@ -5,6 +5,73 @@ use std::{
     collections::{BinaryHeap, HashSet},
 };
 
+/// What one input item contributes to a listing page after delimiter
+/// grouping and the marker filter — the classification shared by the page
+/// engine ([`group_and_paginate`]) and the truncation predicate
+/// ([`past_page`]).
+enum Contribution<'a> {
+    /// A repeat row of the rollup already emitted, or an entry not strictly
+    /// after the marker: no page entry.
+    Skip,
+    /// A newly rolled-up common prefix; its comparison view is the prefix.
+    Prefix(&'a str),
+    /// An object key; its comparison view is the key itself.
+    Object,
+}
+
+/// The delimiter grouping and exclusive-after marker filter of a key-ordered
+/// listing scan, one item at a time. [`Self::classify`] is the single home of
+/// the grouping and marker rules both [`group_and_paginate`] and
+/// [`past_page`] ask.
+struct Grouping<'a> {
+    prefix: &'a str,
+    delimiter: Option<&'a str>,
+    marker: Option<&'a str>,
+    rollup: RollupMirror,
+}
+
+impl<'a> Grouping<'a> {
+    fn new(prefix: &'a str, delimiter: Option<&'a str>, marker: Option<&'a str>) -> Self {
+        Self {
+            prefix,
+            delimiter,
+            marker,
+            rollup: RollupMirror::new(),
+        }
+    }
+
+    /// Classify one item by its key. A new group is recorded before the
+    /// marker check, so a marker-skipped prefix stays emitted and the rest of
+    /// its group is absorbed (the no-repeat rule).
+    fn classify<'k>(&mut self, key: &'k str) -> Contribution<'k> {
+        let cp = match self
+            .delimiter
+            .and_then(|delim| common_prefix(key, self.prefix, delim))
+        {
+            Some(cp) => {
+                if self.rollup.is_rolled(cp) {
+                    return Contribution::Skip;
+                }
+                self.rollup.record_rollup(cp);
+                Some(cp)
+            }
+            None => {
+                self.rollup.reset();
+                None
+            }
+        };
+        // The marker is exclusive-after: rolled-up entries compare with their
+        // prefix string, objects with their key.
+        if self.marker.is_some_and(|after| cp.unwrap_or(key) <= after) {
+            return Contribution::Skip;
+        }
+        match cp {
+            Some(cp) => Contribution::Prefix(cp),
+            None => Contribution::Object,
+        }
+    }
+}
+
 /// Group, filter, and paginate a key-sorted item stream — the shared S3
 /// listing engine for both object and multipart-upload listings.
 ///
@@ -48,7 +115,7 @@ pub fn group_and_paginate<T>(
     // recomputed from the page once, at the probe.
     let mut keys = Vec::with_capacity(max.min(1024));
     let mut common_prefixes = Vec::with_capacity(max.min(1024));
-    let mut rollup = RollupMirror::new();
+    let mut grouping = Grouping::new(prefix, delimiter, marker);
     let mut count = 0usize;
     let mut last_was_prefix = false;
     if max == 0 {
@@ -58,26 +125,11 @@ pub fn group_and_paginate<T>(
         let key = key_of(&item);
         // The key drives delimiter grouping only — a delimiter-less
         // caller never materializes it (objects compare by key).
-        let entry = match delimiter.and_then(|delim| common_prefix(key, prefix, delim)) {
-            Some(cp) => {
-                if rollup.is_rolled(cp) {
-                    continue;
-                }
-                let cp = cp.to_string();
-                rollup.record_rollup(&cp);
-                (cp, true)
-            }
-            None => {
-                rollup.reset();
-                (String::new(), false)
-            }
+        let entry = match grouping.classify(key) {
+            Contribution::Skip => continue,
+            Contribution::Prefix(cp) => (cp.to_string(), true),
+            Contribution::Object => (String::new(), false),
         };
-        // The marker is exclusive-after: rolled-up entries compare with
-        // their prefix string, objects with their key.
-        let compare = if entry.1 { entry.0.as_str() } else { key };
-        if marker.is_some_and(|after| compare <= after) {
-            continue;
-        }
         if count == max {
             // The resume marker is the last emitted entry: the last
             // page key, or the last rolled-up prefix.
@@ -97,6 +149,51 @@ pub fn group_and_paginate<T>(
         count += 1;
     }
     (keys, common_prefixes, false, None)
+}
+
+/// Whether a key-sorted stream holds more than `max` listing entries after
+/// delimiter grouping and the exclusive-after marker filter — the truncation
+/// flag of [`group_and_paginate`] without building the page.
+///
+/// The merged listing asks this of its accumulated stream each round and
+/// stops the merge on `true`, so the cut is decided by the engine's own
+/// grouping and marker rules, not a second spelling. The scan stops at the
+/// first entry past the page; nothing is cloned and no page is materialized.
+/// `max = 0` requests nothing and is never past the page. `items` must be
+/// ordered by key, exactly as for [`group_and_paginate`].
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::storage::past_page;
+///
+/// let items = ["a.txt", "b.txt", "c.txt"].map(str::to_owned);
+/// assert!(past_page(items.clone(), "", None, None, 2, String::as_str));
+/// assert!(!past_page(items, "", None, None, 3, String::as_str));
+/// ```
+pub fn past_page<T>(
+    items: impl IntoIterator<Item = T>,
+    prefix: &str,
+    delimiter: Option<&str>,
+    marker: Option<&str>,
+    max: usize,
+    key_of: impl Fn(&T) -> &str,
+) -> bool {
+    if max == 0 {
+        return false;
+    }
+    let mut grouping = Grouping::new(prefix, delimiter, marker);
+    let mut count = 0usize;
+    for item in items {
+        if matches!(grouping.classify(key_of(&item)), Contribution::Skip) {
+            continue;
+        }
+        if count == max {
+            return true;
+        }
+        count += 1;
+    }
+    false
 }
 
 /// The composite `key\0upload_id` order of a multipart-upload listing.
@@ -778,6 +875,47 @@ mod tests {
         assert!(prefixes.is_empty());
         assert!(!truncated);
         assert_eq!(next, None);
+    }
+
+    #[test]
+    fn past_page_agrees_with_the_engine_truncation_flag() {
+        // The shared predicate must answer exactly the page engine's
+        // `truncated` flag on every marker/rollup combination — the merge's
+        // cut relies on it, so a second spelling would drift here first.
+        let items = ["a.txt", "dir/b.txt", "dir/c.txt", "dir/sub/d.txt", "z.txt"];
+        let mut combos = 0usize;
+        for (prefix, delim) in [
+            ("", None),
+            ("", Some("/")),
+            ("dir/", Some("/")),
+            ("z", None),
+        ] {
+            for marker in [
+                None,
+                Some("a.txt"),
+                Some("dir/b.txt"),
+                Some("dir/"),
+                Some("z.txt"),
+            ] {
+                for max in [0usize, 1, 2, 3, 1000] {
+                    combos += 1;
+                    let truncated = paginate(&items, prefix, delim, marker, max).2;
+                    assert_eq!(
+                        past_page(
+                            items.iter().map(|s| (*s).to_string()),
+                            prefix,
+                            delim,
+                            marker,
+                            max,
+                            String::as_str,
+                        ),
+                        truncated,
+                        "prefix={prefix:?} delim={delim:?} marker={marker:?} max={max}"
+                    );
+                }
+            }
+        }
+        assert_eq!(combos, 100, "the matrix ran");
     }
 
     #[test]

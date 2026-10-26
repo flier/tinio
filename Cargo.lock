@@ -4799,6 +4799,7 @@ dependencies = [
  "tinio-sandbox",
  "tinio-server",
  "tinio-store-pg",
+ "tinio-tier",
  "tinio-util",
  "tokio",
  "toml",
@@ -4859,11 +4860,13 @@ dependencies = [
  "tinio-cli",
  "tinio-core",
  "tinio-fs",
+ "tinio-lifecycle",
  "tinio-mem",
  "tinio-pg",
  "tinio-sandbox",
  "tinio-sandbox-windows",
  "tinio-server",
+ "tinio-tier",
  "tinio-util",
  "tokio",
  "toml",
@@ -4912,6 +4915,7 @@ dependencies = [
 name = "tinio-lifecycle"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "futures",
  "parse-display",
@@ -5202,6 +5206,37 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tinio-tier"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "criterion",
+ "futures",
+ "garde",
+ "humantime-serde",
+ "redb",
+ "rustix 1.1.4",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tinio-bench",
+ "tinio-core",
+ "tinio-fs",
+ "tinio-pg",
+ "tinio-store-pg",
+ "tinio-store-redb",
+ "tinio-tier",
+ "tinio-util",
+ "tokio",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

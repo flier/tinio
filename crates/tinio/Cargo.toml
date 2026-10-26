@@ -45,6 +45,7 @@ full=[
     "pg",
     "sandbox",
     "select",
+    "tier",
     "tls",
     "versioning",
 ]
@@ -64,6 +65,7 @@ otel = ["tinio-server/otel"]
 pg = ["tinio-cli/pg"]
 sandbox = ["tinio-cli/sandbox"]
 select = ["tinio-server/select"]
+tier = ["tinio-cli/tier"]
 tls = ["tinio-api/tls", "tinio-cli/tls"]
 versioning = ["tinio-server/versioning", "tinio-cli/versioning"]
 

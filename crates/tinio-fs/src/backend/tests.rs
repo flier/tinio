@@ -1103,17 +1103,26 @@ async fn write_lock_stats_reports_the_database_snapshot() {
     assert_eq!(snapshot.total_sum_us, 0);
 }
 
+/// **The cap is a construction-time input.** The options a caller opens with carry
+/// `max_concurrent_uploads`, and the store built from them refuses a second live upload — no
+/// post-construction setter exists.
 #[tokio::test]
-async fn set_max_concurrent_uploads_is_enforced() {
+async fn the_upload_cap_is_enforced_from_construction() {
     let root = tempfile::tempdir().unwrap();
-    let mut storage = FsStorage::new(root.path(), fs_options()).unwrap();
+    let storage = FsStorage::new(
+        root.path(),
+        FsOptions {
+            max_concurrent_uploads: 1,
+            ..fs_options()
+        },
+    )
+    .unwrap();
     let b = name("data").unwrap();
     storage
         .create_bucket(&b, None, &Acl::default_private(None))
         .await
         .unwrap();
     let k = object::key("k").unwrap();
-    storage.set_max_concurrent_uploads(1);
     storage
         .multipart_store()
         .create(

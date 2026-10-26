@@ -348,6 +348,19 @@ async fn repair(run: &Run<'_>) -> Repaired {
     let mut notes: Vec<String> = Vec::new();
     let mut failures: Vec<Finding> = Vec::new();
 
+    // **A tier root is refused whole, before any stage runs (T17, T28).** The store
+    // stages below create and rewrite `<state dir>/meta.redb`; a root whose marker or
+    // index makes it tier mode's is not this command's to repair, and the refusal is
+    // the same one the check list answers with.
+    if let Some(finding) = checks::tier_root_finding(run.resolution) {
+        return Repaired {
+            summary: "0 repairs applied: the root is in tier mode (the marker or the index is \
+                      present)"
+                .to_owned(),
+            failures: vec![finding],
+        };
+    }
+
     let applied = repair_store(run, &mut notes, &mut failures).await;
     repair_plane(run, &mut notes, &mut failures).await;
 

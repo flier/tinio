@@ -11,7 +11,9 @@ sqlx = { workspace = true, optional = true, features = [
     "runtime-tokio",
     "tls-rustls-ring-native-roots",
 ] }
+tinio-lifecycle = { path = "../tinio-lifecycle", optional = true }
 tinio-pg = { path = "../tinio-pg", optional = true }
+tinio-tier = { path = "../tinio-tier", optional = true }
 tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",
@@ -56,6 +58,7 @@ lifecycle = ["tinio-server/lifecycle"]
 object-lock = ["tinio-server/object-lock", "tinio-cli/object-lock"]
 parquet = ["tinio-server/select-parquet"]
 pg = ["dep:tinio-pg", "dep:sqlx", "tinio-pg/versioning", "tinio-pg/testing"]
+tier = ["pg", "dep:tinio-tier", "dep:tinio-lifecycle", "tinio-tier/testing"]
 
 [[test]]
 name = "cucumber"

@@ -11,10 +11,18 @@ Domain glossary for the tinio workspace. English only. This file is a glossary �
 - **World** — the per-scenario shared state: the server under test and the last response.
 - **Spec scenario** — a scenario that carries a spec ID (`@FR-xxx` / `@SC-xxx` / `@Txxx`) and documents a contract behavior.
 - **Spec traceability tags** — the `@FR-xxx`/`@SC-xxx`/`@Txxx` tags linking a scenario to the spec; feature-level (inherited by tag filters, invisible to the hooks).
-- **Scenario-level tags** — the tags the `#[before]` hook reads (`config_from_tags`, one mapping shared by the in-process server and the `@external` spawn): backend (`@fs`/`@mem`/`@pg`), `@nested-root`, `@checksum-on`, `@minimal-caps`, `@cold-listing`, `@max-buckets-3`, and the external-client tags `@interop`/`@boto3`/`@mc`; `@aws`/`@rclone` are declarative markers of which client an `@interop` scenario drives (not read by the hook).
+- **Scenario-level tags** — read by the `#[before]` hook via `config_from_tags`, shared by the in-process and `@external` spawns.
+- **Backend scenario tags** — `@fs`/`@mem`/`@pg`/`@tier`; the hook maps the tag to the backend under test.
+- **Other scenario tags** — `@nested-root`, `@checksum-on`, `@minimal-caps`, `@cold-listing`, `@max-buckets-3`.
+- **External-client tags** — `@interop`/`@boto3`/`@mc`; `@aws`/`@rclone` mark the driven client (not read by the hook).
 - **Backend-neutral scenario** — no backend tag; runs on the default backend and in every backend pass.
-- **Backend-tagged scenario** — carries `@fs`, `@mem` or `@pg`; runs only on that backend. An explicit backend tag wins over the environment, which (`TINIO_E2E_BACKEND`) wins over the fs default.
-- **Backend pass** — a full run of the backend-neutral suite on one backend; CI runs the fs pass (default), the mem pass (`TINIO_E2E_BACKEND=mem`, excluding `@fs`-only scenarios) and the pg pass (`TINIO_E2E_BACKEND=pg`, serialized, in the PostgreSQL job).
+- **Backend-tagged scenario** — carries `@fs`, `@mem`, `@pg` or `@tier`; runs only on that backend.
+- **Tag precedence** — an explicit backend tag wins over `TINIO_E2E_BACKEND`, which wins over the fs default.
+- **Backend pass** — a full run of the backend-neutral suite on one backend.
+- **fs pass** — the default run, with no environment variable set.
+- **mem pass** — `TINIO_E2E_BACKEND=mem`, excluding `@fs`-only scenarios.
+- **pg pass** — `TINIO_E2E_BACKEND=pg`, serialized, in the PostgreSQL job.
+- **tier pass** — `TINIO_E2E_BACKEND=tier` with `--features tier`, serialized, excluding `@pg` and the external clients.
 - **@external umbrella** — the union of `@interop` ∪ `@boto3` ∪ `@mc`; scenarios that need external client binaries and are excluded from default runs.
 - **fail_on_skipped** — the runner's always-on mode: undefined or otherwise skipped steps fail the run, so a feature that drifts out of sync with its step definitions never passes silently.
 - **Traceability check** — `cargo test -p tinio-e2e --test traceability`: cross-references the spec corpus and the feature tags both ways (with the documented `NOT_COVERED_BY_CUCUMBER` allow-list).
@@ -35,6 +43,20 @@ Domain glossary for the tinio workspace. English only. This file is a glossary �
 - **Scanner** — the fs backend's background sweeper (temp cleanup, interrupted-upload cleanup); "cold listing" exercises listing before the scanner has caught up.
 - **Capability toggle** — a server configuration switch that enables/disables an S3 operation or feature (multipart, copy, list v1/v2, delete-objects, checksum validation).
 - **Read-only mode** — the served plane's write policy (FR-023): every mutating S3 operation answers `AccessDenied` and the storage root is never written, so a genuinely read-only filesystem can be served. **Tool state** — state file, control socket, logs, auto-created config — relocates from `<root>/.tinio/` to `~/.tinio/roots/<hash>/` (`TINIO_STATE_DIR` overrides the location), while the storage's metadata source stays the root's own `<root>/.tinio/meta.redb`, opened read-only: metadata written by an earlier read-write run — tags, ACLs, CORS, upload records and the version history — is served, and an open that fails (no database, a corrupt one, a format this build refuses, or a read-write server holding the same root) degrades the run to serving current versions with an empty metadata view.
+
+## Tiered storage
+
+- **Tier** — one content plane of `[storage] type = "tier"`: the mem cache (hot), the filesystem (warm, durable) or PostgreSQL (cold); `tinio-tier` layers them over the existing planes.
+- **Absent** — a demoted object's cold representation: the filesystem file is gone, the row and `ColdInfo` remain; no sparse file, no mode switch.
+- **ColdInfo** — the cold metadata authority for a pg-placed object (key, size, last-modified, ETag, tags, checksum, owner, ACL, version identity, version-recording flag); HEAD, GET info, tags, ACL and listings answer from it, and the fs row is its mirror.
+- **TierRows** — the fs crate's row-only seam, shipped as `tinio_fs::tier::Rows` (`info`, `facts` → `tier::Facts`, `set_row`, `parts`, bounded `scan`) behind `FsStorage::tier_rows()`; no content I/O, no change outside tier mode.
+- **Placement** — one key's index entry: tier (`fs`/`pg`), state (`live`/`copying`/`deleting`), the `ColdInfo` when cold, and an mtime that is state-start for a transient state, completion for a settled pg placement, or the object's mtime when warm.
+- **Warm candidate** — a warm row in the index's `warm` table, mtime-ordered, that the capacity pass may demote down to the low watermark; oldest-mtime candidates lead.
+- **Idle demotion** — the mover stage demoting a warm object unread for `demote_idle`, oldest first, apart from capacity moves; zero `demote_idle` disables it. Durable heat rows are retained for `max(heat_window, demote_idle)` so a read inside the idle threshold stays visible.
+- **Quarantine** — a buffered write whose flush keeps failing, set aside under the tier state dir with the metadata that recovers it, so one poisoned entry never wedges a later flush, a listing or a shutdown; verify reports an entry and the destructive repair clears it.
+- **Copying** — the placement state recorded before a demotion publishes to pg, so GC skips in-flight content.
+- **Tier marker** — `<root>/.tinio/tier.mode`, recording the root ID; it marks the root as tier-owned and blocks a non-tier start and `tinio doctor`.
+- **Prepare-downgrade** — `tinio tier prepare-downgrade`: promote every cold object, remove the index and marker, verify the root is fs-only; required before an older binary serves the root. It has no `--adopt`: a lost index is bound with `tinio tier repair --adopt` first, then the downgrade is retried.
 
 ## Persistence contracts
 

@@ -57,6 +57,7 @@ tinio-mem = { workspace = true, optional = true }
 tinio-pg = { workspace = true, optional = true }
 tinio-sandbox.workspace = true
 tinio-server = { workspace = true, features = ["acl", "config"] }
+tinio-tier.workspace = true
 tinio-util = { workspace = true, features = ["render", "state"] }
 
 [dev-dependencies]
@@ -90,6 +91,7 @@ object-lock = ["api", "tinio-api/object-lock", "tinio-server/object-lock", "dep:
 otel = ["tinio-server/otel"]
 pg = ["dep:tinio-pg"]
 sandbox = ["api"]
+tier = ["pg", "versioning"]
 tls = ["api", "tinio-api/tls"]
 versioning = ["tinio-server/versioning", "tinio-pg?/versioning"]
 

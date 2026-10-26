@@ -1021,3 +1021,39 @@ fn the_otlp_trade_is_named_together_or_not_at_all() {
         "and neither half is a trade"
     );
 }
+
+/// **A tier run under a confinement is refused up front** (T1, T17): the tier layer's cold plane
+/// is a PostgreSQL connection — the same outbound path the pg backend's own refusal names — so a
+/// jailed tier run has no route to its store and could never serve. The filesystem backend keeps
+/// the confinement, and a tier run that asked for none is not refused.
+#[test]
+fn tier_under_confinement_is_refused() {
+    use crate::{
+        config::storage::Backend,
+        sandbox::{Channel, Request},
+    };
+
+    let asked = Request {
+        channel: Some(Channel::Flag),
+    };
+    let refusal = refuse_store_under_confinement(&asked, Backend::Tier)
+        .expect("a tier run under a confinement is refused");
+    // A usage error: the operator asked for two settings that cannot both hold.
+    assert!(matches!(refusal, Error::Usage(_)), "{refusal}");
+    let text = refusal.to_string();
+    assert!(text.contains("tier"), "names the backend: {text}");
+    assert!(text.contains("confinement"), "{text}");
+    assert!(
+        text.contains("cold plane"),
+        "names what the confinement costs: {text}"
+    );
+
+    assert!(
+        refuse_store_under_confinement(&asked, Backend::Fs).is_none(),
+        "the filesystem backend serves from local files and keeps its confinement"
+    );
+    assert!(
+        refuse_store_under_confinement(&Request { channel: None }, Backend::Tier).is_none(),
+        "a tier run that asked for no confinement is not refused"
+    );
+}

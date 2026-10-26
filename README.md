@@ -2,11 +2,15 @@
 
 [![CI](https://github.com/flier/tinio/actions/workflows/ci.yml/badge.svg)](https://github.com/flier/tinio/actions/workflows/ci.yml)
 
-An S3-compatible object storage server in Rust. tinio hosts the [`s3s`](https://crates.io/crates/s3s) protocol layer over a pluggable storage contract: filesystem, in-memory and PostgreSQL backends, driven by real third-party clients (`aws` cli v2, `rclone`, `mc`, `boto3`) in CI.
+An S3-compatible object storage server in Rust. tinio hosts the [`s3s`](https://crates.io/crates/s3s) protocol layer over a pluggable storage contract: filesystem, in-memory, PostgreSQL and tiered (warm filesystem + cold PostgreSQL) backends, driven by real third-party clients (`aws` cli v2, `rclone`, `mc`, `boto3`) in CI.
+
+## Status
+
+tinio is experimental. It is a research project for exploring how an agent working from specs and plans can build a complex system end to end, and it is not recommended for production use.
 
 ## Layout
 
-Every crate carries its own README; those are the detail, this is the index.
+Crate READMEs are the detail; this is the index.
 
 **Contracts and shared layers**
 
@@ -28,6 +32,7 @@ Every crate carries its own README; those are the detail, this is the index.
 | [`tinio-fs`](crates/tinio-fs/README.md) | Filesystem backend — object files under `<root>/<bucket>/`, redb metadata, async pipelines |
 | [`tinio-mem`](crates/tinio-mem/README.md) | In-memory reference backend — the conformance oracle |
 | [`tinio-pg`](crates/tinio-pg/README.md) | The servable PostgreSQL backend: `PgStorage` and `PgCleanup` over the ops engine and `tinio-store-pg` |
+| [`tinio-tier`](crates/tinio-tier/README.md) | Tiered backend: filesystem warm tier + PostgreSQL cold tier, an in-memory cache and write buffer, and a placement index |
 
 **Serving, auth and the control plane**
 
@@ -79,6 +84,14 @@ aws --endpoint-url http://127.0.0.1:9000 s3 cp file.bin s3://demo/
 ```
 
 Lifecycle: `tinio status ./root`, `tinio stop ./root`, and `tinio service install ./root` to register the server with the platform's supervisor. Run `tinio --help` for the full surface; `[s3]`-section config toggles the capabilities (checksum, tagging, page-size caps, strippable feature groups).
+
+## Tiered storage
+
+`[storage] type = "tier"` serves one filesystem root from three content planes: an in-memory cache and write buffer, the filesystem (warm, durable) and PostgreSQL (cold); the `tier` feature enables the backend and `[storage.pg]` is required.
+
+- Keys, defaults and validation: `specs/001-s3-local-server/contracts/config.md` (`[storage.tier]`).
+- Wire — classes, classed writes, transitions, deviations: `specs/001-s3-local-server/contracts/s3-surface.md` §Tiered storage.
+- Model, moves, offline verbs and accepted limits: [tier design](docs/superpowers/specs/2026-10-24-tiered-storage-design.md).
 
 ## Testing
 

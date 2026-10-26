@@ -2,7 +2,7 @@
 //! `tests/features/`; step definitions live in `tests/steps/`.
 //!
 //! Default tag filter: scenarios that cannot pass in this build are excluded
-//! unless the user passes an explicit `--tags` on the CLI. The six exclusion
+//! unless the user passes an explicit `--tags` on the CLI. The seven exclusion
 //! axes are independent (`steps/tag_filter.rs` owns the composition): `@parquet`
 //! drops out unless the binary was compiled `--features parquet` (the parquet
 //! input reader lives behind `tinio-server/select-parquet`, off by default);
@@ -25,8 +25,9 @@
 //! Windows target pays the launcher's ACL grant, and no budget here covers what
 //! `docs/tests.md`'s "Grant cost" measures (see that section's owner rule; the
 //! platform scripts are the real gate); and the database-backed scenarios
-//! (`@pg`) always drop out — the `@pg` pass is its own explicit `--tags` run
-//! against a live database (PG17), never the default run.
+//! (`@pg` and `@tier`) always drop out — each backend's pass is its own
+//! explicit `--tags` run (PG17's `@pg` against a live database, T25's `@tier`
+//! over the tier layer and the same shared database), never the default run.
 //!
 //! `TINIO_E2E_REPORT=<path>` additionally writes a Cucumber-JSON report
 //! to the given file (CI uses this for the PR test report).

@@ -21,7 +21,7 @@ use crate::{
     _server::log,
     Error,
     cli::{self, Cli, Command, Provenance},
-    commands::{doctor, start, start::Server},
+    commands::{doctor, start, start::Server, tier},
     events,
     resolve::{self, Located},
     sandbox, service,
@@ -198,6 +198,10 @@ fn try_run() -> Result<ExitCode, Error> {
                 // Not feature-gated, and `cli::Command`'s doc is why: `doctor` diagnoses the
                 // always-present layers, so only the parts of it that need the plane are.
                 Command::Doctor(args) => on_runtime(doctor::run(args, located)),
+                // The offline tier verbs: they open the root themselves and take the runtime's
+                // async half (the fs plane and the cold database), so they ride the same one
+                // runtime every other command does.
+                Command::Tier(args) => on_runtime(tier::run(args, located)),
                 // Unreachable — `command_line` answers `service` with the arm above — and
                 // spelled out rather than `unreachable!()`, because library code does not
                 // panic. The answer is the helper's own, so a future edit cannot dispatch it

@@ -1,6 +1,6 @@
 //! The command implementations: `start` (server/start), `status`, `stop`, `doctor`, the
-//! `service` verbs' driver, and the plane-backed groups (`lifecycle`, `object-lock`,
-//! `retention`, `legalhold`).
+//! `service` verbs' driver, the offline `tier` verbs, and the plane-backed groups (`lifecycle`,
+//! `object-lock`, `retention`, `legalhold`).
 //!
 //! The plane-backed groups are compiled out with their own features, which all require `api`:
 //! `lifecycle` needs the `lifecycle` feature and `object-lock`, `retention` and `legalhold` need
@@ -32,6 +32,7 @@ pub mod start;
 pub mod status;
 #[cfg(feature = "api")]
 pub mod stop;
+pub mod tier;
 
 use std::path::{Path, PathBuf};
 
@@ -41,6 +42,8 @@ use clap::{ArgAction, Args};
 use crate::_api::State;
 #[cfg(feature = "api")]
 use crate::_api::client::{self, Report};
+#[cfg(any(feature = "lifecycle", feature = "object-lock"))]
+use crate::config::storage::Backend;
 use crate::{
     _util::secret::{Secret, SecretKey},
     config::state::parse_state_dir,
@@ -320,17 +323,36 @@ pub(crate) async fn probe_pair(candidates: &[PathBuf]) -> Result<Answer, Error> 
 ///
 /// **The pair `status` and `stop` probe and not a third search**: [`client_resolution`] resolves
 /// the root and decision 19's candidate pair, [`probe_pair`] asks the one a server is live in — so
-/// a plane-backed verb reaches the same server `tinio status` reports for that root. The
-/// lifecycle group and the three Object Lock groups all call this one helper; it is the one
-/// definition of "the server for this root".
-#[cfg(any(feature = "lifecycle", feature = "object-lock"))]
+/// a plane-backed verb reaches the same server `tinio status` reports for that root. This is the
+/// one definition of "the server for this root".
+///
+/// The Object Lock groups need the server alone, so they take this shape; the lifecycle group
+/// asks [`server_state_with_tiers`] because its write verbs gate on the backend's tier
+/// capability (T11).
+#[cfg(feature = "object-lock")]
 pub(crate) async fn server_state(args: DirArgs, located: Located) -> Result<State, Error> {
+    Ok(server_state_with_tiers(args, located).await?.0)
+}
+
+/// The same answer as `server_state`, plus whether the root's configuration selects the tier
+/// backend (T11).
+///
+/// The capability is read off the same [`Resolution`] the control channel was resolved from, so
+/// the server a verb reaches and the backend the CLI believes it serves cannot come from
+/// different documents. `type = "tier"` is the only backend that stores objects in tiers
+/// (`Storage::supports_tiers`), so the selector is the whole answer.
+#[cfg(any(feature = "lifecycle", feature = "object-lock"))]
+pub(crate) async fn server_state_with_tiers(
+    args: DirArgs,
+    located: Located,
+) -> Result<(State, bool), Error> {
     let (resolution, candidates) = client_resolution(args, located)?;
+    let supports_tiers = resolution.config.backend() == Backend::Tier;
     let Answer { report, .. } = probe_pair(&candidates).await?;
     if report.running
         && let Some(state) = report.state
     {
-        return Ok(state);
+        return Ok((state, supports_tiers));
     }
     Err(Error::Operational(format!(
         "no running server for {}",

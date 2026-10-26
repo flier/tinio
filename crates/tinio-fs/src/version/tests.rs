@@ -2224,6 +2224,7 @@ async fn the_orphan_passes_leave_a_current_delete_marker_alone() {
             max_wait: Duration::from_millis(10),
             cycle: Duration::from_millis(50),
             access: AccessMode::ReadWrite,
+            reconcile_objects: true,
         },
     );
     let summary = scanner.scan_once().await.unwrap();

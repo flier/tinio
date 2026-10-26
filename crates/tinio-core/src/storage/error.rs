@@ -142,6 +142,18 @@ pub enum Error {
     /// refused.
     #[error("invalid bucket state: `{0}`")]
     InvalidBucketState(bucket::Name),
+    /// The backend has no storage tiers, so a transition cannot run
+    /// (mapped to `NotImplemented` at the S3 layer). The other tier hooks
+    /// still answer: the capability is `false`, a class read is
+    /// `STANDARD`, and the metrics scan is the plain listing.
+    #[error("storage tiers are not supported by this backend")]
+    NoTiers,
+    /// The request asks a backend for a state it cannot reach — a tier
+    /// transition to a class the backend refuses (mapped to `InvalidRequest`
+    /// at the S3 layer). The payload is a fixed operator-facing detail, never
+    /// a wire value.
+    #[error("invalid request: {0}")]
+    InvalidRequest(&'static str),
     /// A stored row violates an invariant this contract guarantees — the
     /// undecodable lock row a fail-closed read or delete refuses rather than
     /// guessing an unlocked version. The payload is the operator-facing

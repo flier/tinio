@@ -31,7 +31,7 @@ use crate::commands::{status, stop};
 use crate::{
     _util::secret::Secret,
     Error,
-    commands::{EnvArgs, doctor, start},
+    commands::{EnvArgs, doctor, start, tier},
     resolve::pg,
     service,
 };
@@ -319,7 +319,12 @@ pub fn parse(argv: &[OsString]) -> Result<(Cli, ArgMatches), Error> {
 /// names, symlinks, free space, the `Cleanup` trait's private-state legs, the meta store), which
 /// need no plane, so the command exists in both builds. **Which of its parts are gated, and why,
 /// is the contract's doctor section's statement** — this doc keeps only the operational half —
-/// and without the feature the subcommand list is `Server`, `Service` and `Doctor`.
+/// and without the feature the subcommand list is `Server`, `Service`, `Doctor` and `Tier`.
+///
+/// **`Tier` does not either, for the same reason**: its three verbs open a root's own planes
+/// offline and need no control channel; `tinio-tier` is a non-optional dependency of this crate,
+/// so the group compiles in every graph. The `tier` cargo feature gates the *serving* wiring, not
+/// these offline verbs.
 ///
 /// # Examples
 ///
@@ -360,6 +365,8 @@ pub enum Command {
     LegalHold(legalhold::Args),
     /// Diagnose a directory without a server.
     Doctor(doctor::Args),
+    /// Inspect, repair or downgrade a tier root without a server.
+    Tier(tier::Args),
     /// Manage the OS service that supervises a server.
     Service(service::Args),
 }
@@ -482,6 +489,10 @@ impl Command {
             }
             Self::Doctor(args) => {
                 client_discovery(args.dir.dir.clone(), args.dir.read_only, &args.dir.env)
+            }
+            Self::Tier(args) => {
+                let dir = args.dir_args();
+                client_discovery(dir.dir.clone(), dir.read_only, &dir.env)
             }
             Self::Service(args) => client_discovery(args.dir.clone(), args.read_only, &args.env),
         }

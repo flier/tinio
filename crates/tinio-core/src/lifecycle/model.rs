@@ -5,6 +5,8 @@ use std::{collections::HashSet, fmt, time::Duration};
 use serde::{Deserialize, Serialize};
 use smart_default::SmartDefault;
 
+use crate::Class;
+
 /// Maximum rules per configuration (AWS: 1,000, "not adjustable").
 pub(in crate::lifecycle) const MAX_RULES: usize = 1000;
 /// Maximum rule ID length, in characters (AWS: 255).
@@ -14,6 +16,9 @@ pub(in crate::lifecycle) const MAX_RULE_ID: usize = 255;
 pub(in crate::lifecycle) const MAX_SIZE: u64 = 50_000_000_000_000;
 /// The largest `NewerNoncurrentVersions` AWS accepts.
 const MAX_NEWER_NONCURRENT: i32 = 100;
+/// The transition floor AWS enforces: an object may not leave `STANDARD`
+/// before its thirtieth day (T11).
+const MIN_TRANSITION_DAYS: i32 = 30;
 /// Seconds in a day: a `Date` is always midnight UTC, so its Unix seconds
 /// are a multiple of this. The one home of the value, shared by the model's
 /// date check and the pass's age arithmetic.
@@ -53,6 +58,18 @@ pub(in crate::lifecycle) const TAG_FILTER_ACTION: &str =
     "a tag filter excludes AbortIncompleteMultipartUpload and ExpiredObjectDeleteMarker";
 pub(in crate::lifecycle) const NEWER_NEEDS_FILTER: &str = "NewerNoncurrentVersions needs a Filter";
 pub(in crate::lifecycle) const NEWER_RANGE: &str = "NewerNoncurrentVersions is between 1 and 100";
+pub(in crate::lifecycle) const TRANSITION_CLASS: &str = "Transition StorageClass is STANDARD_IA";
+pub(in crate::lifecycle) const TRANSITION_DAYS_MIN: &str = "Transition Days is at least 30";
+pub(in crate::lifecycle) const TRANSITION_DAYS_AND_DATE: &str =
+    "Transition carries Days or Date, never both";
+pub(in crate::lifecycle) const TRANSITION_DATE_MIDNIGHT: &str = "Transition Date is midnight UTC";
+
+/// The reason every write path refuses a transition on a backend without tiers (T11).
+///
+/// One home for the sentence the S3 surface, the management plane, the CLI and the seed answer
+/// with: a stored transition would promise a migration the backend can never run.
+pub const TRANSITIONS_NEED_TIERS: &str =
+    "storage-class transitions are not supported: this server has no storage tiers";
 
 /// A bucket's lifecycle configuration: the stored row and the management
 /// plane's body are this one shape (LC17).
@@ -72,6 +89,7 @@ pub(in crate::lifecycle) const NEWER_RANGE: &str = "NewerNoncurrentVersions is b
 ///             date: None,
 ///             expired_object_delete_marker: None,
 ///         }),
+///         transitions: Vec::new(),
 ///         noncurrent_version_expiration: None,
 ///         abort_incomplete_multipart_upload: None,
 ///     }],
@@ -95,8 +113,10 @@ impl Config {
     /// each action), `Days ≥ 1` for all three day counts, a `Date` at
     /// midnight UTC, `Days`/`Date`/`ExpiredObjectDeleteMarker` exclusivity,
     /// the actions a tag filter excludes, duplicate tag keys within an `And`,
-    /// the size order and ceiling, and
-    /// `NewerNoncurrentVersions ∈ 1..=100` with a filter to scope it.
+    /// the size order and ceiling,
+    /// `NewerNoncurrentVersions ∈ 1..=100` with a filter to scope it, and a
+    /// transition targeting `STANDARD_IA` at `Days ≥ 30` or a midnight
+    /// `Date`.
     ///
     /// # Examples
     ///
@@ -134,6 +154,49 @@ impl Config {
         self.rules.iter().try_for_each(Rule::validate)
     }
 
+    /// The first rule that asks for a storage-class transition, or `None` (T11's gate).
+    ///
+    /// One home for "which rule the refusal names": every write path asks this before it stores
+    /// a configuration its backend cannot honour, and the answer is the rule whose ID the
+    /// refusal carries.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use tinio_core::{
+    ///     Class,
+    ///     lifecycle::{Config, Expiration, Rule, Status, Transition},
+    /// };
+    ///
+    /// let rule = |transitions| Rule {
+    ///     id: Some("archive".into()),
+    ///     status: Status::Enabled,
+    ///     filter: Default::default(),
+    ///     expiration: Some(Expiration {
+    ///         days: Some(30),
+    ///         date: None,
+    ///         expired_object_delete_marker: None,
+    ///     }),
+    ///     transitions,
+    ///     noncurrent_version_expiration: None,
+    ///     abort_incomplete_multipart_upload: None,
+    /// };
+    /// let config = Config {
+    ///     rules: vec![rule(vec![Transition {
+    ///         days: Some(30),
+    ///         date: None,
+    ///         storage_class: Class::StandardIa,
+    ///     }])],
+    /// };
+    /// assert_eq!(
+    ///     config.transition_rule().and_then(|rule| rule.id.as_deref()),
+    ///     Some("archive")
+    /// );
+    /// ```
+    pub fn transition_rule(&self) -> Option<&Rule> {
+        self.rules.iter().find(|rule| !rule.transitions.is_empty())
+    }
+
     /// Upsert `rule` by its ID: the rule carrying the same ID is replaced in
     /// place, and a rule whose ID is new is appended — LC14's merge key, one
     /// home for the seed and `tinio lifecycle add`.
@@ -152,6 +215,7 @@ impl Config {
     ///         date: None,
     ///         expired_object_delete_marker: None,
     ///     }),
+    ///     transitions: Vec::new(),
     ///     noncurrent_version_expiration: None,
     ///     abort_incomplete_multipart_upload: None,
     /// };
@@ -197,6 +261,7 @@ impl Config {
     ///         date: None,
     ///         expired_object_delete_marker: None,
     ///     }),
+    ///     transitions: Vec::new(),
     ///     noncurrent_version_expiration: None,
     ///     abort_incomplete_multipart_upload: None,
     /// };
@@ -368,6 +433,7 @@ pub enum Merged {
 ///         date: None,
 ///         expired_object_delete_marker: None,
 ///     }),
+///     transitions: Vec::new(),
 ///     noncurrent_version_expiration: None,
 ///     abort_incomplete_multipart_upload: None,
 /// };
@@ -381,6 +447,10 @@ pub struct Rule {
     #[serde(default)]
     pub filter: Filter,
     pub expiration: Option<Expiration>,
+    /// Where the current version moves, and when (T11). Empty means none, and
+    /// an empty list is not serialised.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<Transition>,
     pub noncurrent_version_expiration: Option<NoncurrentVersionExpiration>,
     pub abort_incomplete_multipart_upload: Option<AbortIncompleteMultipartUpload>,
 }
@@ -427,6 +497,7 @@ impl Rule {
                 date: None,
                 expired_object_delete_marker: None,
             }),
+            transitions: Vec::new(),
             noncurrent_version_expiration: noncurrent_days.map(|days| {
                 NoncurrentVersionExpiration {
                     noncurrent_days: Some(days),
@@ -461,6 +532,7 @@ impl Rule {
             return Err(self.refusal(reason, kind));
         }
         if self.expiration.is_none()
+            && self.transitions.is_empty()
             && self.noncurrent_version_expiration.is_none()
             && self.abort_incomplete_multipart_upload.is_none()
         {
@@ -490,6 +562,9 @@ impl Rule {
             .as_ref()
             .and_then(AbortIncompleteMultipartUpload::violation)
         {
+            return Err(self.refusal(reason, InvalidKind::Semantic));
+        }
+        if let Some(reason) = self.transitions.iter().find_map(Transition::violation) {
             return Err(self.refusal(reason, InvalidKind::Semantic));
         }
         if let Some(noncurrent) = &self.noncurrent_version_expiration {
@@ -772,6 +847,56 @@ impl Expiration {
         self.date
             .is_some_and(|date| date.rem_euclid(SECONDS_PER_DAY as i64) != 0)
             .then_some(DATE_MIDNIGHT)
+    }
+}
+
+/// When the current version moves to `STANDARD_IA`: `Days` after it was
+/// created, or at `Date` (T11).
+///
+/// `STANDARD_IA` is the only target: this build's tiers are the filesystem
+/// plane and the cold plane, so there is nowhere else to go, and a
+/// transition that names its current class would not be a transition.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_core::{Class, lifecycle::Transition};
+///
+/// let transition = Transition {
+///     days: Some(30),
+///     date: None,
+///     storage_class: Class::StandardIa,
+/// };
+/// assert_eq!(transition.storage_class, Class::StandardIa);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transition {
+    /// Days after the object was created; at least 30.
+    pub days: Option<i32>,
+    /// Unix seconds, always midnight UTC. A date in the past is accepted: AWS
+    /// makes the objects eligible immediately.
+    pub date: Option<i64>,
+    /// The target class; `STANDARD_IA` is the only accepted one.
+    pub storage_class: Class,
+}
+
+impl Transition {
+    fn violation(&self) -> Option<&'static str> {
+        if self.days.is_none() && self.date.is_none() {
+            return Some(NO_ACTION);
+        }
+        if self.days.is_some() && self.date.is_some() {
+            return Some(TRANSITION_DAYS_AND_DATE);
+        }
+        if self.storage_class != Class::StandardIa {
+            return Some(TRANSITION_CLASS);
+        }
+        if self.days.is_some_and(|days| days < MIN_TRANSITION_DAYS) {
+            return Some(TRANSITION_DAYS_MIN);
+        }
+        self.date
+            .is_some_and(|date| date.rem_euclid(SECONDS_PER_DAY as i64) != 0)
+            .then_some(TRANSITION_DATE_MIDNIGHT)
     }
 }
 

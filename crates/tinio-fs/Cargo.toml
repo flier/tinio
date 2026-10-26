@@ -43,6 +43,7 @@ tinio-version.workspace = true
 
 [features]
 default = []
+tier = []
 versioning = []
 testing = ["tinio-core/testing", "tinio-store-redb/testing"]
 

@@ -122,6 +122,7 @@ mod tests {
                     date: None,
                     expired_object_delete_marker: None,
                 }),
+                transitions: Vec::new(),
                 noncurrent_version_expiration: None,
                 abort_incomplete_multipart_upload: None,
             }],

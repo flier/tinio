@@ -106,6 +106,12 @@ pub(crate) fn map_backend_error<E: Into<StorageError>>(err: E) -> S3Error {
             "invalid bucket state: `{}`",
             printable(name.as_ref())
         ),
+        // The tier hooks' refusal: a backend without a cold plane cannot run
+        // a transition (T10, T26).
+        StorageError::NoTiers => s3_error!(NotImplemented),
+        // A tier transition to a class the backend refuses (T10): the payload
+        // is the backend's fixed explanation, never client data.
+        StorageError::InvalidRequest(detail) => s3_error!(InvalidRequest, "{}", detail),
         // An invariant the contract guarantees was violated on disk — an
         // undecodable lock row. A server fault, never a client error.
         StorageError::Corrupt(detail) => {
@@ -218,6 +224,11 @@ mod tests {
             (
                 StorageError::InvalidBucketState(b.clone()),
                 S3ErrorCode::InvalidBucketState,
+            ),
+            (StorageError::NoTiers, S3ErrorCode::NotImplemented),
+            (
+                StorageError::InvalidRequest("target class"),
+                S3ErrorCode::InvalidRequest,
             ),
             (
                 StorageError::Corrupt("bad lock row"),

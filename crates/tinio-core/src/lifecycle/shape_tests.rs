@@ -1,3 +1,4 @@
+use crate::Class;
 
     /// A midnight UTC `Expiration` date (2023-11-14T00:00:00Z). It is in the
     /// past, so the accepted cases also pin that a past date is accepted.
@@ -24,6 +25,7 @@
             status: Status::Enabled,
             filter,
             expiration,
+            transitions: Vec::new(),
             noncurrent_version_expiration: None,
             abort_incomplete_multipart_upload: None,
         }
@@ -275,6 +277,7 @@
                 status: Status::Enabled,
                 filter: Filter::default(),
                 expiration: expiration(Some(RULE_DAYS)),
+                transitions: Vec::new(),
                 noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
                     noncurrent_days: Some(10),
                     newer_noncurrent_versions: None,
@@ -509,20 +512,124 @@
         }
     }
 
+    fn transition(days: Option<i32>, date: Option<i64>, storage_class: Class) -> Transition {
+        Transition {
+            days,
+            date,
+            storage_class,
+        }
+    }
+
+    /// A rule whose only action is the given transitions.
+    fn transition_rule(transitions: Vec<Transition>) -> Config {
+        Config {
+            rules: vec![Rule {
+                transitions,
+                ..rule(None, Filter::default(), None)
+            }],
+        }
+    }
+
     #[test]
-    fn a_transition_is_refused() {
-        // LC9: tinio has no storage tiers, so a transition is refused at the
-        // S3 surface, where the dto carries one. The model has no field to
-        // hold it — this exhaustive destructure is the pin: a stored rule can
-        // say these six things and nothing else.
-        let Rule {
-            id: _,
-            status: _,
-            filter: _,
-            expiration: _,
-            noncurrent_version_expiration: _,
-            abort_incomplete_multipart_upload: _,
-        } = rule(None, Filter::default(), expiration(Some(RULE_DAYS)));
+    fn a_transition_only_rule_is_valid() {
+        // T11: a transition is an action on its own — a rule may carry one and
+        // no expiration at all.
+        let cfg = transition_rule(vec![transition(Some(30), None, Class::StandardIa)]);
+        assert_eq!(cfg.validate(), Ok(()));
+
+        // With no transitions and no other action the rule still carries no
+        // action: an empty list is not an action.
+        let bare = Config {
+            rules: vec![rule(None, Filter::default(), None)],
+        };
+        assert_eq!(refusal(&bare).reason, NO_ACTION);
+    }
+
+    #[test]
+    fn a_standard_target_is_refused() {
+        let cfg = transition_rule(vec![transition(Some(30), None, Class::Standard)]);
+        let invalid = refusal(&cfg);
+        assert_eq!(invalid.reason, TRANSITION_CLASS);
+        assert_eq!(invalid.kind, InvalidKind::Semantic);
+        // `STANDARD_IA` is the only accepted target:
+        // `a_transition_only_rule_is_valid` stores exactly that one.
+    }
+
+    #[test]
+    fn a_transition_day_is_at_least_thirty() {
+        let by_days =
+            |days: i32| transition_rule(vec![transition(Some(days), None, Class::StandardIa)]);
+        for days in [0, 1, 29] {
+            let invalid = refusal(&by_days(days));
+            assert_eq!(invalid.reason, TRANSITION_DAYS_MIN, "Transition Days {days}");
+            assert_eq!(invalid.kind, InvalidKind::Semantic);
+        }
+        for days in [30, 31] {
+            assert_eq!(by_days(days).validate(), Ok(()), "Transition Days {days}");
+        }
+        // A transition names Days or Date, never both.
+        let both = transition_rule(vec![transition(Some(30), Some(MIDNIGHT), Class::StandardIa)]);
+        assert_eq!(refusal(&both).reason, TRANSITION_DAYS_AND_DATE);
+    }
+
+    #[test]
+    fn a_past_date_is_accepted() {
+        let by_date =
+            |date: Option<i64>| transition_rule(vec![transition(None, date, Class::StandardIa)]);
+        // 2023-11-14T00:00Z: in the past, accepted as AWS accepts it.
+        assert_eq!(by_date(Some(MIDNIGHT)).validate(), Ok(()));
+        let invalid = refusal(&by_date(Some(MIDNIGHT + 1)));
+        assert_eq!(invalid.reason, TRANSITION_DATE_MIDNIGHT);
+        assert_eq!(invalid.kind, InvalidKind::Semantic);
+        // Neither Days nor Date names no instant.
+        assert_eq!(refusal(&by_date(None)).reason, NO_ACTION);
+    }
+
+    #[test]
+    fn an_empty_transitions_list_is_omitted() {
+        // A rule without transitions keeps the wire it has always had: the
+        // empty list is not serialised (T11).
+        let expiring = Config {
+            rules: vec![rule(None, Filter::default(), expiration(Some(RULE_DAYS)))],
+        };
+        let wire = expiring.to_wire();
+        assert!(!wire.contains("transitions"), "{wire}");
+
+        let transitioning = transition_rule(vec![transition(Some(30), None, Class::StandardIa)]);
+        let wire = transitioning.to_wire();
+        assert!(
+            wire.contains(
+                r#""transitions":[{"days":30,"date":null,"storage_class":"STANDARD_IA"}]"#
+            ),
+            "{wire}"
+        );
+        assert_eq!(Config::from_wire(&wire), Some(transitioning));
+
+        // A hand-written body carrying the members decodes to the same rule,
+        // so the wire is not write-only.
+        let hand_written = r#"{"rules":[{"id":null,"status":"Enabled","filter":{},"expiration":null,"noncurrent_version_expiration":null,"abort_incomplete_multipart_upload":null,"transitions":[{"days":null,"date":1699920000,"storage_class":"STANDARD_IA"}]}]}"#;
+        let decoded = Config::from_wire(hand_written).expect("the hand-written body decodes");
+        assert_eq!(
+            decoded.rules[0].transitions,
+            vec![transition(None, Some(MIDNIGHT), Class::StandardIa)]
+        );
+    }
+
+    #[test]
+    fn the_class_wire_spelling_is_screaming_snake() {
+        assert_eq!(
+            serde_json::to_string(&Class::Standard).expect("a class serialises"),
+            r#""STANDARD""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Class::StandardIa).expect("a class serialises"),
+            r#""STANDARD_IA""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Class>(r#""STANDARD_IA""#).expect("a class decodes"),
+            Class::StandardIa
+        );
+        assert_eq!(Class::StandardIa.to_string(), "STANDARD_IA");
     }
 
     fn full_config() -> Config {
@@ -544,6 +651,7 @@
                     date: Some(MIDNIGHT),
                     expired_object_delete_marker: None,
                 }),
+                transitions: Vec::new(),
                 noncurrent_version_expiration: Some(NoncurrentVersionExpiration {
                     noncurrent_days: Some(30),
                     newer_noncurrent_versions: Some(100),
@@ -564,7 +672,7 @@
 
         // LC17: one shape. A field a later binary adds is carried past this
         // one, not refused — the wire is not strict about unknown members.
-        let later = wire.replace("\"Enabled\"", "\"Enabled\",\"transitions\":[]");
+        let later = wire.replace("\"Enabled\"", "\"Enabled\",\"future_member\":true");
         assert_ne!(later, wire);
         assert_eq!(
             Config::from_wire(&later),

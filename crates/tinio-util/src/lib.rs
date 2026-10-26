@@ -67,6 +67,7 @@
 //! - [`switch`] — the tolerant `1`/`true`/`0`/`false` grammar, the one
 //!   definer behind `TINIO_READ_ONLY`/`TINIO_SANDBOX` and the CLI's
 //!   `--read-only`/`--sandbox` flags.
+//! - [`time`] — [`civil_from_days`](time::civil_from_days), the one calendar conversion behind the tier verbs' RFC 3339 report timestamps and the test signer's SigV4 `x-amz-date`.
 //! - `testing` — the conformance test harness (behind the `testing`
 //!   feature: requires `tinio-core` types).
 //! - `win32` — `error_message`, the one sentence a failed `*W` call is reported
@@ -113,6 +114,7 @@ pub mod secret;
 #[cfg(feature = "state")]
 pub mod state;
 pub mod switch;
+pub mod time;
 
 // **The job guard sits outside the `testing` feature on purpose.** The feature exists for the
 // conformance suite and everything that pulls in `tinio-core` behind it; the guard needs `std`, a

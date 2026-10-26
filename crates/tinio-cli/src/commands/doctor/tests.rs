@@ -1685,3 +1685,205 @@ async fn a_root_that_is_also_the_state_dir_override_still_runs_the_root_legs() {
         "a filesystem run runs its root legs: {row:?}"
     );
 }
+
+/// T17/T28: a root carrying the tier **marker** or the tier **index** is refused — either
+/// file means tier mode owns the root — and `--fix`'s full repair never runs there.
+///
+/// Both files are planted as the seam reads them (existence, 16 bytes), because the rule is
+/// the refusal rather than the tier's own format gate: a doctor that could read a corrupt
+/// marker would still be diagnosing a root a non-tier build must not serve.
+#[tokio::test]
+async fn doctor_refuses_a_marker_or_index_root() {
+    use crate::{
+        _tier::{index_path, marker_path},
+        cli::{Discovery, Provenance},
+        report::PRIVATE_STATE,
+        resolve::{for_doctor, locate},
+    };
+
+    for file in ["marker", "index"] {
+        let dir = tempfile::TempDir::new().expect("temp");
+        crate::test_support::seed_config(dir.path());
+        let path = if file == "marker" {
+            marker_path(dir.path())
+        } else {
+            index_path(dir.path())
+        };
+        std::fs::create_dir_all(path.parent().expect("the layer directory"))
+            .expect("the layer directory");
+        std::fs::write(&path, [0u8; 16]).expect("the tier record");
+
+        // The plain run refuses through the report: an error row, exit 1 — and the usual
+        // legs never read the root, so the store's rows are not in the report at all.
+        let report =
+            crate::test_support::run_checks(dir.path(), false, Proposals::Informational).await;
+        assert_eq!(report.exit_code(), 1, "{file}: {:?}", report.findings());
+        assert!(
+            report
+                .findings()
+                .iter()
+                .any(|finding| finding.check == super::checks::TIER_ROOT
+                    && finding.severity == Severity::Error),
+            "{file}: {:?}",
+            report.findings()
+        );
+        assert!(
+            !report
+                .findings()
+                .iter()
+                .any(|finding| finding.check == PRIVATE_STATE),
+            "{file}: the check list stops at the refusal: {:?}",
+            report.findings()
+        );
+
+        // `--fix`'s full repair refuses whole: the store stages (which create and rewrite
+        // `<state dir>/meta.redb`) never run, so the seeded root gains no store file.
+        let located = locate(
+            Discovery {
+                dir: Some(dir.path().to_path_buf()),
+                config: None,
+                read_only: false,
+                state_dir: None,
+                pg_dsn: None,
+            },
+            &Provenance::default(),
+        )
+        .expect("the temp root resolves");
+        let resolution = for_doctor(located, &DirArgs::default()).expect("the root resolves");
+        let state = StateDir {
+            dir: resolution.state_dir.clone(),
+            resolved: true,
+            liveness: Liveness::NoStateFile,
+            control_name: None,
+            channel_answers: false,
+        };
+        let outcome = repair(&Run {
+            resolution: &resolution,
+            state: &state,
+        })
+        .await;
+        assert!(
+            outcome
+                .failures
+                .iter()
+                .any(|finding| finding.check == super::checks::TIER_ROOT),
+            "{file}: {:?}",
+            outcome.failures
+        );
+        assert!(
+            outcome.summary.contains("0 repairs applied"),
+            "{file}: {}",
+            outcome.summary
+        );
+        assert!(
+            !resolution.state_dir.join("meta.redb").exists(),
+            "{file}: the repair's store stage never ran"
+        );
+    }
+}
+
+/// T17/T28: **the storage type does not qualify the tier-root refusal.** A pg resolution's root is
+/// synthetic, but a marker or index planted there is tier mode's record just as it is under a
+/// served root — so `doctor` refuses it instead of diagnosing a database's synthetic directory,
+/// and `--fix`'s full repair never reaches the store stages there either.
+///
+/// Before the fix `tier_root_finding` returned `None` on `resolution.is_pg()`, so the check list
+/// answered the pg leg's rows and `--fix` created `<state dir>/meta.redb` in a root tier mode owns.
+/// The marker and the index are checked separately because either file alone is the disqualifier.
+#[tokio::test]
+async fn doctor_refuses_a_tier_root_under_a_pg_resolution() {
+    use crate::{
+        _tier::{index_path, marker_path},
+        report::PRIVATE_STATE,
+    };
+
+    for file in ["marker", "index"] {
+        let dir = tempfile::TempDir::new().expect("temp");
+        let path = if file == "marker" {
+            marker_path(dir.path())
+        } else {
+            index_path(dir.path())
+        };
+        std::fs::create_dir_all(path.parent().expect("the layer directory"))
+            .expect("the layer directory");
+        std::fs::write(&path, [0u8; 16]).expect("the tier record");
+
+        // The shape `locate`'s pg arm produces: the root *is* the synthetic one it recorded.
+        let root = dir.path().to_path_buf();
+        let resolution = Resolution {
+            pg_root: Some(root.clone()),
+            root,
+            config: crate::config::Config::default(),
+            config_text: String::new(),
+            config_path: dir.path().join(".tinio").join(".tinio.toml"),
+            read_only: false,
+            state_dir: dir.path().join(".tinio"),
+            state_dir_override: Some(dir.path().to_path_buf()),
+            config_error: None,
+            identity: Default::default(),
+        };
+        assert!(
+            resolution.is_pg(),
+            "{file}: the fixture resolves as a pg run"
+        );
+        let state = StateDir {
+            dir: resolution.state_dir.clone(),
+            resolved: true,
+            liveness: Liveness::NoStateFile,
+            control_name: None,
+            channel_answers: false,
+        };
+
+        let report = checks(
+            &Run {
+                resolution: &resolution,
+                state: &state,
+            },
+            Proposals::Informational,
+        )
+        .await;
+        assert_eq!(report.exit_code(), 1, "{file}: {:?}", report.findings());
+        assert!(
+            report
+                .findings()
+                .iter()
+                .any(|finding| finding.check == super::checks::TIER_ROOT
+                    && finding.severity == Severity::Error),
+            "{file}: {:?}",
+            report.findings()
+        );
+        assert!(
+            !report
+                .findings()
+                .iter()
+                .any(|finding| finding.check == PRIVATE_STATE),
+            "{file}: the check list stops at the refusal: {:?}",
+            report.findings()
+        );
+
+        // `--fix`'s full repair refuses whole: the store stages never run, so the root gains no
+        // store file, and the failure is the same refusal row.
+        let outcome = repair(&Run {
+            resolution: &resolution,
+            state: &state,
+        })
+        .await;
+        assert!(
+            outcome
+                .failures
+                .iter()
+                .any(|finding| finding.check == super::checks::TIER_ROOT),
+            "{file}: {:?}",
+            outcome.failures
+        );
+        assert!(
+            outcome.summary.contains("0 repairs applied"),
+            "{file}: {}",
+            outcome.summary
+        );
+        assert!(
+            !resolution.state_dir.join("meta.redb").exists(),
+            "{file}: the repair's store stage never ran"
+        );
+    }
+}

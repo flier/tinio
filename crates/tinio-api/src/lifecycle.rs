@@ -93,6 +93,7 @@ use crate::{
 ///             date: None,
 ///             expired_object_delete_marker: None,
 ///         }),
+///         transitions: Vec::new(),
 ///         noncurrent_version_expiration: None,
 ///         abort_incomplete_multipart_upload: None,
 ///     }],
@@ -108,6 +109,17 @@ use crate::{
 /// ```
 #[async_trait]
 pub trait LifecycleAdmin: Send + Sync {
+    /// Whether the served backend stores objects in tiers (T11).
+    ///
+    /// The plane's write path refuses a configuration carrying a transition unless this is
+    /// `true`: storing one for a backend that cannot run it would promise a migration that never
+    /// happens (LC9). The default is `false` — every backend without a cold plane — and the CLI's
+    /// admin forwards its storage handle's own
+    /// [`Storage::supports_tiers`](crate::_core::storage::Storage::supports_tiers) answer.
+    fn supports_tiers(&self) -> bool {
+        false
+    }
+
     /// The bucket's stored configuration, or `None` when it has none. `NoSuchBucket` when the
     /// bucket is missing, which the plane answers `404`.
     ///
@@ -218,6 +230,7 @@ pub trait LifecycleAdmin: Send + Sync {
     ///             date: None,
     ///             expired_object_delete_marker: None,
     ///         }),
+    ///         transitions: Vec::new(),
     ///         noncurrent_version_expiration: None,
     ///         abort_incomplete_multipart_upload: None,
     ///     }],
@@ -322,6 +335,8 @@ async fn lifecycle_get(AxumState(shared): AxumState<Shared>, Path(wire): Path<St
 /// advertises itself with a parser's status. With an admin in hand the body is parsed and
 /// **validated before it is written** — the plane is a write path, so LC8's rule applies here as
 /// it does on the S3 surface: an invalid rule must not be stored and then enforced by the pass.
+/// The tier gate (T11) comes first, as it does there: a configuration carrying a transition is
+/// refused unless the admin's backend [`supports_tiers`](LifecycleAdmin::supports_tiers).
 async fn lifecycle_put(
     AxumState(shared): AxumState<Shared>,
     Path(wire): Path<String>,
@@ -344,6 +359,18 @@ async fn lifecycle_put(
             );
         }
     };
+    // The tier gate comes first, as it does on the S3 surface (T11): a backend without tiers
+    // refuses a configuration carrying a transition in the one sentence every write path uses,
+    // naming the rule whose ID the refusal carries.
+    if !admin.supports_tiers()
+        && let Some(rule) = config.transition_rule()
+    {
+        return lifecycle_invalid(lifecycle::Invalid {
+            rule: rule.id.clone(),
+            reason: lifecycle::TRANSITIONS_NEED_TIERS,
+            kind: lifecycle::InvalidKind::Semantic,
+        });
+    }
     if let Err(invalid) = config.validate() {
         return lifecycle_invalid(invalid);
     }
@@ -484,7 +511,11 @@ mod tests {
 
     use super::LifecycleAdmin;
     use crate::{
-        _core::{bucket, lifecycle, storage},
+        _core::{
+            Class, bucket,
+            lifecycle::{self, TRANSITIONS_NEED_TIERS},
+            storage,
+        },
         _util::testing::metadata::lifecycle_config,
         ErrorBody, State,
         router::{Auth, Context, InvalidBody, Shared, router},
@@ -503,6 +534,17 @@ mod tests {
 
     fn config() -> lifecycle::Config {
         lifecycle_config("expire-logs")
+    }
+
+    /// The stored fixture with the one transition this build accepts (T11).
+    fn transition_config() -> lifecycle::Config {
+        let mut config = config();
+        config.rules[0].transitions = vec![lifecycle::Transition {
+            days: Some(30),
+            date: None,
+            storage_class: Class::StandardIa,
+        }];
+        config
     }
 
     /// What the admin answers instead of `Ok`.
@@ -538,12 +580,13 @@ mod tests {
         }
     }
 
-    /// The CLI's admin in miniature: one stored configuration, and the refusal every call
-    /// answers with when it is not `Ok`.
+    /// The CLI's admin in miniature: one stored configuration, the refusal every call answers
+    /// with when it is not `Ok`, and the backend's tier capability (T11).
     #[derive(Default)]
     struct Admin {
         stored: Mutex<Option<lifecycle::Config>>,
         failure: Failure,
+        tiers: bool,
     }
 
     impl Admin {
@@ -560,10 +603,22 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        /// The admin of a tier-capable backend: the one that stores a transition.
+        fn tiered() -> Self {
+            Self {
+                tiers: true,
+                ..Self::default()
+            }
+        }
     }
 
     #[async_trait]
     impl LifecycleAdmin for Admin {
+        fn supports_tiers(&self) -> bool {
+            self.tiers
+        }
+
         async fn get(
             &self,
             bucket: &bucket::Name,
@@ -733,6 +788,62 @@ mod tests {
             response.status(),
             StatusCode::NOT_FOUND,
             "the delete cleared it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_tier_plane_write_refuses_transitions() {
+        // T11: the tier gate covers the management plane. A backend without tiers refuses the
+        // body in the one sentence every surface uses, naming the offending rule — and nothing
+        // is stored, which the `404` after it proves.
+        let (shared, token) = plane(Auth::Local, Some(Arc::new(Admin::default())));
+        let response = router(shared.clone())
+            .oneshot(request(
+                "PUT",
+                Some(&token),
+                Some(transition_config().to_wire()),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let refused: InvalidBody =
+            serde_json::from_str(&body_text(response).await).expect("the refusal body");
+        assert_eq!(refused.rule.as_deref(), Some("expire-logs"));
+        assert_eq!(refused.reason, TRANSITIONS_NEED_TIERS);
+
+        let response = router(shared)
+            .oneshot(request("GET", Some(&token), None))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "the refused configuration was never stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tier_plane_round_trips_standard_ia() {
+        // T11: on a tier-capable backend the plane stores the transition and serves it back, so
+        // the JSON a caller `PUT` is the JSON a `GET` answers.
+        let (shared, token) = plane(Auth::Local, Some(Arc::new(Admin::tiered())));
+        let config = transition_config();
+        let response = router(shared.clone())
+            .oneshot(request("PUT", Some(&token), Some(config.to_wire())))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = router(shared)
+            .oneshot(request("GET", Some(&token), None))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_text(response).await;
+        assert_eq!(
+            serde_json::from_str::<lifecycle::Config>(&text).expect("the model's own JSON"),
+            config,
+            "{text}"
         );
     }
 

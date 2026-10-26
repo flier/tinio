@@ -1,11 +1,17 @@
 //! The pass: one stateless sweep of every bucket's stored rules (design LC4,
 //! LC12).
 //!
-//! Three actions, and each is the API's own deletion — the engine owns no
-//! version-aware removal of its own (LC2):
+//! Three actions are the API's own deletion — the engine owns no version-aware
+//! removal of its own (LC2) — and the fourth is the storage contract's own
+//! move:
 //!
 //! - **current versions** — [`ObjectOps::delete_object`](crate::_core::storage::ObjectOps::delete_object):
 //!   a delete marker in a versioned bucket, an unlink otherwise;
+//! - **transitions** — [`Storage::transition`](crate::_core::storage::Storage::transition):
+//!   the object moves to its rule's storage class, on a backend with tiers
+//!   only. Expiration is evaluated first and wins when both are due, a delete
+//!   marker is never moved, and a bucket that records versions skips this
+//!   action alone (T11);
 //! - **noncurrent versions** — [`VersionOps::delete_object_version`](crate::_core::storage::VersionOps::delete_object_version):
 //!   permanent, evaluated per key over the whole chain, newest first;
 //! - **incomplete uploads** — [`MultipartOps::abort_multipart_upload`](crate::_core::storage::MultipartOps::abort_multipart_upload).
@@ -20,6 +26,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use futures::{StreamExt as _, stream};
 use smart_default::SmartDefault;
 #[cfg(test)]
 use tinio_util::testing::metrics::test_lock;
@@ -28,7 +35,7 @@ use tracing::{field, instrument};
 
 use crate::{
     _core::{
-        ListBucketsParams, ListObjectsParams, ListPartsParams, ListUploadsParams, bucket,
+        Class, ListBucketsParams, ListObjectsParams, ListPartsParams, ListUploadsParams, bucket,
         lifecycle::{self, DEFAULT_CYCLE, DEFAULT_DELAY},
         object, object_lock,
         storage::{self, Storage},
@@ -46,8 +53,13 @@ use crate::{
 /// one page is the normal case, not an edge.
 const PAGE: usize = 1000;
 
+/// The transitions one pass runs at once (T14): one, the gentlest walk over a
+/// store the server is also serving.
+const DEFAULT_CONCURRENCY: usize = 1;
+
 /// How hard the pass works: the pause between two actions and the wait between
-/// two passes. Both are the operator's `[lifecycle]` keys.
+/// two passes — the operator's `[lifecycle]` keys — and how many transitions
+/// run at once, which this build sets in code only.
 ///
 /// # Examples
 ///
@@ -59,6 +71,7 @@ const PAGE: usize = 1000;
 /// let defaults = Options::default();
 /// assert_eq!(defaults.delay, Duration::from_secs(10));
 /// assert_eq!(defaults.cycle, Duration::from_secs(3600));
+/// assert_eq!(defaults.concurrency, 1);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SmartDefault)]
 pub struct Options {
@@ -69,6 +82,10 @@ pub struct Options {
     /// Wait between the end of one pass and the start of the next.
     #[default(_code = "DEFAULT_CYCLE")]
     pub cycle: Duration,
+    /// How many transitions one pass runs at once (T14). A zero is read as one:
+    /// a pass with no worker could only skip the action.
+    #[default(_code = "DEFAULT_CONCURRENCY")]
+    pub concurrency: usize,
 }
 
 /// What one pass did — the pass's counters, one summary line (LC16, OL19).
@@ -80,6 +97,7 @@ pub struct Options {
 ///
 /// let idle = Summary::default();
 /// assert_eq!(idle.expired_objects, 0);
+/// assert_eq!(idle.transitioned_objects, 0);
 /// assert_eq!(idle.protected_versions, 0);
 /// assert!(idle.buckets_with_rules == 0);
 /// ```
@@ -89,6 +107,9 @@ pub struct Summary {
     pub buckets_with_rules: usize,
     /// Current versions expired.
     pub expired_objects: u64,
+    /// Current versions moved to another storage class by a transition. An
+    /// object already in its rule's class is a no-op and is not counted.
+    pub transitioned_objects: u64,
     /// Versions removed permanently: noncurrent ones, and delete markers that
     /// were their key's only version.
     pub expired_versions: u64,
@@ -127,6 +148,7 @@ pub struct Summary {
 ///             date: None,
 ///             expired_object_delete_marker: None,
 ///         }),
+///         transitions: Vec::new(),
 ///         noncurrent_version_expiration: None,
 ///         abort_incomplete_multipart_upload: None,
 ///     },
@@ -191,6 +213,15 @@ struct Sweep<'a> {
     summary: &'a mut Summary,
 }
 
+/// Which object action a [`Runner::walk_objects`] walk serves.
+#[derive(Clone, Copy)]
+enum ObjectAction {
+    /// Expire a due current version.
+    Expire,
+    /// Move a due current version to its rule's storage class.
+    Transition,
+}
+
 impl<S: Storage> Runner<S> {
     /// Build a pass. `stop` is the server's own shutdown channel: the pass
     /// ends quietly once it turns true.
@@ -237,6 +268,12 @@ impl<S: Storage> Runner<S> {
     /// client added. A rule naming a bucket that does not exist is warned about
     /// and skipped — a bucket created later is seeded on the next start.
     ///
+    /// **The seed is a write path, so the tier gate covers it** (T11): on a
+    /// backend whose [`Storage::supports_tiers`] is `false`, a bucket whose
+    /// rules carry a transition is refused wholesale — nothing of that bucket
+    /// is written, and the refusal is counted in [`Summary::errors`] like a
+    /// configuration the model rejects.
+    ///
     /// The answer counts the buckets that took a rule in
     /// [`buckets_with_rules`](Summary::buckets_with_rules), and the ones whose
     /// write failed in [`errors`](Summary::errors); the action counters are the
@@ -278,6 +315,7 @@ impl<S: Storage> Runner<S> {
     ///             date: None,
     ///             expired_object_delete_marker: None,
     ///         }),
+    ///         transitions: Vec::new(),
     ///         noncurrent_version_expiration: None,
     ///         abort_incomplete_multipart_upload: None,
     ///     },
@@ -308,6 +346,21 @@ impl<S: Storage> Runner<S> {
             // shutdown interrupted.
             if self.stopping() {
                 return summary;
+            }
+            // The tier gate (T11): a backend without tiers refuses the bucket's merge when any
+            // of its rules carries a transition. Nothing of the bucket is written, and the
+            // refusal is the counted failure a configuration the model rejects gets.
+            if !self.storage.supports_tiers()
+                && let Some(rule) = rules.iter().find(|rule| !rule.transitions.is_empty())
+            {
+                let invalid = lifecycle::Invalid {
+                    rule: rule.id.clone(),
+                    reason: lifecycle::TRANSITIONS_NEED_TIERS,
+                    kind: lifecycle::InvalidKind::Semantic,
+                };
+                tracing::warn!(%invalid, "a lifecycle seed was refused");
+                summary.errors += 1;
+                continue;
             }
             // One store call: the read, the upsert and the validation are the
             // store's transaction, so a configuration written between them is
@@ -366,6 +419,7 @@ impl<S: Storage> Runner<S> {
         fields(
             buckets_with_rules = field::Empty,
             expired_objects = field::Empty,
+            transitioned_objects = field::Empty,
             expired_versions = field::Empty,
             protected_versions = field::Empty,
             aborted_uploads = field::Empty,
@@ -446,6 +500,7 @@ impl<S: Storage> Runner<S> {
         // of a second event beside the line.
         tracing::Span::current().record("buckets_with_rules", summary.buckets_with_rules);
         tracing::Span::current().record("expired_objects", summary.expired_objects);
+        tracing::Span::current().record("transitioned_objects", summary.transitioned_objects);
         tracing::Span::current().record("expired_versions", summary.expired_versions);
         tracing::Span::current().record("protected_versions", summary.protected_versions);
         tracing::Span::current().record("aborted_uploads", summary.aborted_uploads);
@@ -518,12 +573,18 @@ impl<S: Storage> Runner<S> {
         !self.stopping()
     }
 
-    /// One bucket's three actions. `false` once the run is stopping.
+    /// One bucket's four actions. `false` once the run is stopping.
     async fn expire(&self, sweep: &mut Sweep<'_>) -> bool {
         // A bucket whose rules carry no `Days`/`Date` expiration pays nothing
         // for the object listing (LC21's per-action ownership, read from the
         // model's own predicate).
         if sweep.config.governs_expiration() && !self.expire_objects(sweep).await {
+            return false;
+        }
+        // Expiration is evaluated first: a transition never moves an object
+        // this pass is already deleting, and it is a bucket-level decision —
+        // a bucket that records versions skips this action alone (T11).
+        if governs_transitions(sweep.config) && !self.transition_objects(sweep).await {
             return false;
         }
         // One owner per action: a bucket whose rules carry neither version
@@ -538,9 +599,14 @@ impl<S: Storage> Runner<S> {
         true
     }
 
-    /// Expire current versions, page by page.
-    #[instrument(target = "tinio::lifecycle", level = "debug", skip_all)]
-    async fn expire_objects(&self, sweep: &mut Sweep<'_>) -> bool {
+    /// Walk every page of the sweep's bucket, running `action` on each current
+    /// version the listing describes.
+    ///
+    /// The one skeleton the object actions share: the listing parameters, the
+    /// per-item stop check, [`lifecycle::Facts`] from the listing and the
+    /// truncation cursor. `false` once the run is stopping.
+    async fn walk_objects(&self, sweep: &mut Sweep<'_>, action: ObjectAction) -> bool {
+        let mut due = Vec::new();
         let mut start_after: Option<String> = None;
         loop {
             let page = match self
@@ -575,36 +641,26 @@ impl<S: Storage> Runner<S> {
                 // The listing is the facts (LC10): no read per object.
                 let facts =
                     lifecycle::Facts::new(&info.key, info.size, info.last_modified, &info.tags);
-                let Some(expiry) = sweep.config.expiry_for(&facts) else {
-                    continue;
-                };
-                if expiry > sweep.now {
-                    continue;
-                }
-                match self.due(sweep.bucket, &info.key).await {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) => {
-                        read_failed(
-                            error,
-                            sweep.bucket,
-                            sweep.summary,
-                            "read a due key's current version",
-                            Kind::Object,
-                        );
-                        continue;
+                let keep_going = match action {
+                    ObjectAction::Expire => self.expire_object(sweep, &facts, info).await,
+                    ObjectAction::Transition => {
+                        self.transition_object(sweep, &facts, info, &mut due).await
                     }
-                }
-                if counted(
-                    self.storage.delete_object(sweep.bucket, &info.key).await,
-                    sweep.summary,
-                    Kind::Object,
-                ) {
-                    sweep.summary.expired_objects += 1;
-                }
-                if !self.wait(self.options.delay).await {
+                };
+                if !keep_going {
                     return false;
                 }
+            }
+            // A page-scoped action runs what it collected before the next page
+            // is listed, so a move never waits for the whole bucket.
+            let keep_going = match action {
+                ObjectAction::Expire => true,
+                ObjectAction::Transition => {
+                    due.is_empty() || self.transition_due(sweep, &mut due).await
+                }
+            };
+            if !keep_going {
+                return false;
             }
             if !page.truncated {
                 return true;
@@ -614,6 +670,195 @@ impl<S: Storage> Runner<S> {
                 None => return true,
             }
         }
+    }
+
+    /// Expire current versions, page by page.
+    #[instrument(target = "tinio::lifecycle", level = "debug", skip_all)]
+    async fn expire_objects(&self, sweep: &mut Sweep<'_>) -> bool {
+        self.walk_objects(sweep, ObjectAction::Expire).await
+    }
+
+    /// Expire one current version. `false` once the run is stopping.
+    async fn expire_object(
+        &self,
+        sweep: &mut Sweep<'_>,
+        facts: &lifecycle::Facts<'_>,
+        info: &object::Info,
+    ) -> bool {
+        let Some(expiry) = sweep.config.expiry_for(facts) else {
+            return true;
+        };
+        if expiry > sweep.now {
+            return true;
+        }
+        match self.due(sweep.bucket, &info.key).await {
+            Ok(true) => {}
+            Ok(false) => return true,
+            Err(error) => {
+                read_failed(
+                    error,
+                    sweep.bucket,
+                    sweep.summary,
+                    "read a due key's current version",
+                    Kind::Object,
+                );
+                return true;
+            }
+        }
+        if counted(
+            self.storage.delete_object(sweep.bucket, &info.key).await,
+            sweep.summary,
+            Kind::Object,
+        ) {
+            sweep.summary.expired_objects += 1;
+        }
+        self.wait(self.options.delay).await
+    }
+
+    /// Move the bucket's due current versions to their rule's storage class,
+    /// `Options.concurrency` moves at a time.
+    ///
+    /// Only a backend with tiers and a bucket that records no versions runs a
+    /// transition (T11); everything else pays one versioning read and nothing
+    /// more. That read is the runner's own, not a second opinion on the tier
+    /// backend's: a versioned bucket is never listed for moves at all, and the
+    /// backend's own skip is silent, so counting it here would report a
+    /// transition that never happened. A key whose expiration is also due is
+    /// left to expiration — this walk runs after [`Runner::expire_objects`] and
+    /// re-asks the question, so the order holds even over a stale listing. A
+    /// key whose current slot is a delete marker is never moved, and a target
+    /// class the object already holds is a no-op: the class is read before the
+    /// move, so a demoted key costs one read on every later pass and no move.
+    #[instrument(target = "tinio::lifecycle", level = "debug", skip_all)]
+    async fn transition_objects(&self, sweep: &mut Sweep<'_>) -> bool {
+        if !self.storage.supports_tiers() {
+            return true;
+        }
+        match self.storage.bucket_versioning(sweep.bucket).await {
+            Ok(State::Unversioned) => {}
+            Ok(_) => return true,
+            Err(error) => {
+                read_failed(
+                    error,
+                    sweep.bucket,
+                    sweep.summary,
+                    "read a bucket's versioning state",
+                    Kind::Object,
+                );
+                return true;
+            }
+        }
+        self.walk_objects(sweep, ObjectAction::Transition).await
+    }
+
+    /// Collect one due current version for its page's move. `false` once the
+    /// run is stopping.
+    async fn transition_object(
+        &self,
+        sweep: &mut Sweep<'_>,
+        facts: &lifecycle::Facts<'_>,
+        info: &object::Info,
+        due: &mut Vec<DueTransition>,
+    ) -> bool {
+        // Expiration is evaluated first and wins when both are due.
+        if sweep
+            .config
+            .expiry_for(facts)
+            .is_some_and(|expiry| expiry <= sweep.now)
+        {
+            return true;
+        }
+        let Some((at, class)) = transition_for(sweep.config, facts) else {
+            return true;
+        };
+        if at > sweep.now {
+            return true;
+        }
+        // A delete marker holds no content to move (T11). Paid only for
+        // a key already due.
+        match self.due(sweep.bucket, &info.key).await {
+            Ok(true) => {}
+            Ok(false) => return true,
+            Err(error) => {
+                read_failed(
+                    error,
+                    sweep.bucket,
+                    sweep.summary,
+                    "read a due key's current version",
+                    Kind::Object,
+                );
+                return true;
+            }
+        }
+        // A target class the object already holds is a no-op.
+        match self.storage.storage_class(sweep.bucket, &info.key).await {
+            Ok(current) if current == class => return true,
+            Ok(_) => {}
+            Err(error) => {
+                read_failed(
+                    error,
+                    sweep.bucket,
+                    sweep.summary,
+                    "read a due key's storage class",
+                    Kind::Object,
+                );
+                return true;
+            }
+        }
+        due.push(DueTransition {
+            key: info.key.clone(),
+            class,
+        });
+        true
+    }
+
+    /// Run one page's due transitions, `Options.concurrency` at a time, each
+    /// followed by the operator's pause. `false` once the run is stopping.
+    ///
+    /// The buffer is drained, never taken, so its allocation is reused across
+    /// pages. The pause lives inside the workers: a pause taken serially
+    /// between them would serialize exactly the moves the worker count was
+    /// raised to parallelize.
+    async fn transition_due(&self, sweep: &mut Sweep<'_>, due: &mut Vec<DueTransition>) -> bool {
+        let workers = self.options.concurrency.max(1);
+        let now = sweep.now;
+        let bucket = sweep.bucket;
+        let mut moves = stream::iter(due.drain(..).map(|due| async move {
+            let outcome = self
+                .storage
+                .transition(bucket, &due.key, due.class, now)
+                .await;
+            self.wait(self.options.delay).await;
+            outcome
+        }))
+        .buffer_unordered(workers);
+        while let Some(outcome) = moves.next().await {
+            let outcome: Result<(), storage::Error> = outcome.map_err(Into::into);
+            // The action family's contract holds for a transition as for every
+            // other action: `ok` when it did what it wanted — an object already
+            // gone included — and `error` when the store refused, so the two
+            // series stay paired.
+            match outcome {
+                Ok(()) => {
+                    metrics::record_action(Kind::Object, true);
+                    sweep.summary.transitioned_objects += 1;
+                }
+                Err(error @ storage::Error::NoSuchKey(_))
+                | Err(error @ storage::Error::NoSuchBucket(_)) => {
+                    // The object vanished before the move: the outcome the
+                    // action wanted, so it is `ok` — and not a transition.
+                    metrics::record_action(Kind::Object, true);
+                    tracing::debug!(%error, "a lifecycle transition found its object already gone");
+                }
+                Err(error) => {
+                    action_failed(error, sweep.summary, "transition an object", Kind::Object);
+                }
+            }
+            if self.stopping() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Whether a due key still has a content version to expire (LC2): a key
@@ -913,6 +1158,44 @@ impl<S: Storage> Runner<S> {
             }
         }
     }
+}
+
+/// One current version a pass moves: the key and the class it lands in.
+struct DueTransition {
+    key: object::Key,
+    class: Class,
+}
+
+/// Whether any `Enabled` rule carries a transition — the question the bucket
+/// walk asks before paying for the object listing's transition checks (LC21's
+/// per-action ownership).
+fn governs_transitions(config: &lifecycle::Config) -> bool {
+    config
+        .rules
+        .iter()
+        .any(|rule| rule.status == lifecycle::Status::Enabled && !rule.transitions.is_empty())
+}
+
+/// The earliest transition any rule selecting `facts` asks for, with the class
+/// it moves to, or `None` when no such rule matches.
+///
+/// The earliest instant wins, as the shortest expiration policy does: the
+/// rule's own [`Transition::instant`](lifecycle::Transition::instant) reads
+/// the shared clock, so a `Days` count lands on the same midnight an
+/// `Expiration.Days` would.
+fn transition_for<'a>(
+    config: &'a lifecycle::Config,
+    facts: &'a lifecycle::Facts<'_>,
+) -> Option<(SystemTime, Class)> {
+    config
+        .rules_for(facts)
+        .flat_map(|rule| rule.transitions.iter())
+        .filter_map(|transition| {
+            transition
+                .instant(facts.last_modified)
+                .map(|at| (at, transition.storage_class))
+        })
+        .min_by_key(|(at, _)| *at)
 }
 
 /// Whether any rule needs the version listing at all — `NoncurrentVersionExpiration`

@@ -16,6 +16,7 @@ use crate::{
         log::{AccessFormat, Verbosity},
         pipeline::{Db, Io, Priority, Remove},
     },
+    _tier::FlushMode,
 };
 
 /// A config file on disk, for the assertions that go through `Config::load`'s fs path
@@ -1090,4 +1091,198 @@ fn absent_pipeline_section_resolves_to_none() {
     // Q8: presence-gated — no `[pipeline]` section, no `pipeline` key.
     let config = Config::parse("version = 1").unwrap();
     assert!(config.pipeline.is_none());
+}
+
+/// `[storage] type = "tier"` selects the tiered backend: the selector parses, `[storage.pg]` is
+/// the cold plane, and every `[storage.tier]` key reaches its field.
+#[test]
+fn tier_parses() {
+    let text = r#"
+    version = 1
+
+    [storage]
+    type = "tier"
+
+    [storage.pg]
+    dsn = "postgres://user:password@db.example:5432/tinio"
+
+    [storage.tier]
+    capacity_bytes = 536870912
+    max_object_bytes = 8388608
+    flush_mode = "batch"
+    batch_bytes = 16777216
+    batch_interval = "2s"
+    heat_window = "90m"
+    promote_reads = 5
+    stats_flush = "20s"
+    high_water_percent = 95
+    low_water_percent = 70
+    demote_idle = "2h"
+    dwell = "45m"
+    scan_interval = "30s"
+    move_concurrency = 4
+    index_compact_percent = 50
+    gc_grace = "10m"
+"#;
+    let config = Config::parse(text).unwrap();
+    assert_eq!(config.backend(), storage::Backend::Tier);
+    assert!(config.pg_section().is_some());
+    let tier = config.storage.as_ref().unwrap().tier.as_ref().unwrap();
+    assert_eq!(tier.capacity_bytes, 536_870_912);
+    assert_eq!(tier.max_object_bytes, 8_388_608);
+    assert_eq!(tier.flush_mode, FlushMode::Batch);
+    assert_eq!(tier.batch_bytes, 16_777_216);
+    assert_eq!(tier.batch_interval, Duration::from_secs(2));
+    assert_eq!(tier.heat_window, Duration::from_secs(90 * 60));
+    assert_eq!(tier.promote_reads, 5);
+    assert_eq!(tier.stats_flush, Duration::from_secs(20));
+    assert_eq!(tier.high_water_percent, 95);
+    assert_eq!(tier.low_water_percent, 70);
+    assert_eq!(tier.demote_idle, Duration::from_secs(2 * 3600));
+    assert_eq!(tier.dwell, Duration::from_secs(45 * 60));
+    assert_eq!(tier.scan_interval, Duration::from_secs(30));
+    assert_eq!(tier.move_concurrency, 4);
+    assert_eq!(tier.index_compact_percent, 50);
+    assert_eq!(tier.gc_grace, Duration::from_secs(10 * 60));
+
+    // The section's keys are the contract's shape in both directions.
+    let again = Config::parse(&config.to_toml().unwrap()).unwrap();
+    assert_eq!(config, again);
+}
+
+/// Every `[storage.tier]` default is the plan's (T22): the CLI is the only definer, and a
+/// section written with no keys is the same configuration as no section at all.
+#[test]
+fn tier_defaults() {
+    let text = "version = 1\n[storage]\ntype = \"tier\"\n[storage.pg]\ndsn = \"postgres://db/tinio\"\n[storage.tier]";
+    let config = Config::parse(text).unwrap();
+    let tier = config.storage.as_ref().unwrap().tier.as_ref().unwrap();
+    assert_eq!(tier.capacity_bytes, 256 * 1024 * 1024);
+    assert_eq!(tier.max_object_bytes, 4 * 1024 * 1024);
+    assert_eq!(tier.flush_mode, FlushMode::Sync);
+    assert_eq!(tier.batch_bytes, 8 * 1024 * 1024);
+    assert_eq!(tier.batch_interval, Duration::from_secs(1));
+    assert_eq!(tier.heat_window, Duration::from_secs(3600));
+    assert_eq!(tier.promote_reads, 3);
+    assert_eq!(tier.stats_flush, Duration::from_secs(10));
+    assert_eq!(tier.high_water_percent, 90);
+    assert_eq!(tier.low_water_percent, 80);
+    assert_eq!(tier.demote_idle, Duration::from_secs(3600));
+    assert_eq!(tier.dwell, Duration::from_secs(3600));
+    assert_eq!(tier.scan_interval, Duration::from_secs(60));
+    assert_eq!(tier.move_concurrency, 1);
+    assert_eq!(tier.index_compact_percent, 30);
+    assert_eq!(tier.gc_grace, Duration::from_secs(5 * 60));
+
+    // `type = "tier"` with its pg plane and no section is still a complete configuration: the
+    // defaults answer as the runtime value.
+    let absent = Config::parse(
+        "version = 1\n[storage]\ntype = \"tier\"\n[storage.pg]\ndsn = \"postgres://db/tinio\"",
+    )
+    .unwrap();
+    assert!(absent.storage.as_ref().unwrap().tier.is_none());
+    let runtime = absent
+        .storage
+        .as_ref()
+        .unwrap()
+        .tier_runtime()
+        .expect("the selector makes a runtime");
+    assert_eq!(runtime.capacity_bytes, 256 * 1024 * 1024);
+    assert!(runtime.validate().is_ok());
+}
+
+/// The tier layer's cold plane is the `[storage.pg]` section: a `type = "tier"` document
+/// without it is refused at parse, naming the missing section.
+#[test]
+fn tier_requires_pg() {
+    let err = Config::parse("version = 1\n[storage]\ntype = \"tier\"").unwrap_err();
+    assert!(matches!(err, Error::InvalidValue { .. }), "{err}");
+    assert!(err.to_string().contains("storage.pg"), "{err}");
+
+    // The section satisfies the rule; its dsn may still come from `TINIO_PG_DSN`.
+    Config::parse("version = 1\n[storage]\ntype = \"tier\"\n[storage.pg]\npool = 4").unwrap();
+}
+
+/// The `[storage.tier]` durations are `humantime_serde` strings, never bare numbers.
+#[test]
+fn tier_durations() {
+    let text = "version = 1\n[storage]\ntype = \"tier\"\n[storage.pg]\ndsn = \"postgres://db/tinio\"\n[storage.tier]\nbatch_interval = \"1500ms\"\nheat_window = \"90m\"\nstats_flush = \"45s\"\ndemote_idle = \"2h\"\ndwell = \"15m\"\nscan_interval = \"90s\"\ngc_grace = \"10m\"";
+    let config = Config::parse(text).unwrap();
+    let tier = config.storage.as_ref().unwrap().tier.as_ref().unwrap();
+    assert_eq!(tier.batch_interval, Duration::from_millis(1500));
+    assert_eq!(tier.heat_window, Duration::from_secs(90 * 60));
+    assert_eq!(tier.stats_flush, Duration::from_secs(45));
+    assert_eq!(tier.demote_idle, Duration::from_secs(2 * 3600));
+    assert_eq!(tier.dwell, Duration::from_secs(15 * 60));
+    assert_eq!(tier.scan_interval, Duration::from_secs(90));
+    assert_eq!(tier.gc_grace, Duration::from_secs(10 * 60));
+
+    // A bare number and a bogus spelling are both parse errors, never a silently read zero.
+    for bad in ["batch_interval = 2", "heat_window = \"bogus\""] {
+        let text = format!(
+            "version = 1\n[storage]\ntype = \"tier\"\n[storage.pg]\ndsn = \"postgres://db/tinio\"\n[storage.tier]\n{bad}"
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(matches!(err, Error::Parse { .. }), "{text}: {err}");
+    }
+}
+
+/// The auto-created first-start config carries no `[storage.tier]`: the section is
+/// `skip_serializing_if` absent, exactly like every other presence-gated section.
+#[test]
+fn generated_config_omits_an_absent_section() {
+    let generated = Config::generated(false, credentials::generate().unwrap()).unwrap();
+    assert!(generated.storage.as_ref().unwrap().tier.is_none());
+    let toml = generated.to_toml().unwrap();
+    assert!(!toml.contains("[storage.tier]"), "{toml}");
+
+    // The default document has no tier section either.
+    assert!(!Config::default().to_toml().unwrap().contains("tier"));
+}
+
+/// The parsed section converts to the runtime value the tier layer consumes, and that value
+/// owns the cross-field rules: the schema admits the keys, `tinio_tier::Config::validate()`
+/// refuses the incoherent combinations.
+#[test]
+fn tier_converts_to_runtime() {
+    let text = "version = 1\n[storage]\ntype = \"tier\"\n[storage.pg]\ndsn = \"postgres://db/tinio\"\n[storage.tier]\ncapacity_bytes = 536870912\nmax_object_bytes = 8388608\nflush_mode = \"batch\"\nbatch_bytes = 16777216\nbatch_interval = \"2s\"\nheat_window = \"90m\"\npromote_reads = 5\nstats_flush = \"20s\"\nhigh_water_percent = 95\nlow_water_percent = 70\ndemote_idle = \"2h\"\ndwell = \"45m\"\nscan_interval = \"30s\"\nmove_concurrency = 4\nindex_compact_percent = 50\ngc_grace = \"10m\"";
+    let config = Config::parse(text).unwrap();
+    let runtime = config
+        .storage
+        .as_ref()
+        .unwrap()
+        .tier_runtime()
+        .expect("the selector makes a runtime");
+    assert_eq!(runtime.capacity_bytes, 536_870_912);
+    assert_eq!(runtime.max_object_bytes, 8_388_608);
+    assert_eq!(runtime.flush_mode, FlushMode::Batch);
+    assert_eq!(runtime.batch_bytes, 16_777_216);
+    assert_eq!(runtime.batch_interval, Duration::from_secs(2));
+    assert_eq!(runtime.heat_window, Duration::from_secs(90 * 60));
+    assert_eq!(runtime.promote_reads, 5);
+    assert_eq!(runtime.stats_flush, Duration::from_secs(20));
+    assert_eq!(runtime.high_water_percent, 95);
+    assert_eq!(runtime.low_water_percent, 70);
+    assert_eq!(runtime.demote_idle, Duration::from_secs(2 * 3600));
+    assert_eq!(runtime.dwell, Duration::from_secs(45 * 60));
+    assert_eq!(runtime.scan_interval, Duration::from_secs(30));
+    assert_eq!(runtime.move_concurrency, 4);
+    assert_eq!(runtime.index_compact_percent, 50);
+    assert_eq!(runtime.gc_grace, Duration::from_secs(10 * 60));
+    assert!(runtime.validate().is_ok());
+
+    // The runtime rules refuse what the flat schema cannot: each is a parse error naming the
+    // field, the CLI having built the runtime value and asked it to validate.
+    for (bad, named) in [
+        ("low_water_percent = 95", "low_water_percent"),
+        ("max_object_bytes = 268435457", "max_object_bytes"),
+        ("batch_bytes = 268435457", "batch_bytes"),
+    ] {
+        let text = format!(
+            "version = 1\n[storage]\ntype = \"tier\"\n[storage.pg]\ndsn = \"postgres://db/tinio\"\n[storage.tier]\n{bad}"
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(matches!(err, Error::InvalidValue { .. }), "{text}: {err}");
+        assert!(err.to_string().contains(named), "{text}: {err}");
+    }
 }

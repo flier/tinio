@@ -1,15 +1,21 @@
-//! The six cross-backend Prometheus families, declared once.
+//! The cross-backend Prometheus families, declared once.
 //!
 //! A family two backends observe cannot live in either: the default registry
 //! is process-global, so the second `register_*` is `AlreadyReg`. This module
 //! owns the names the spec assigns to `tinio-util`; backends call
 //! `record_*`, never `register_*`.
 //!
-//! Labels are bounded by their call sites — `backend` (`fs`, `mem`, `pg`),
-//! `op`/`kind` (the failed write and its closed failure class), `pass`
-//! (`fs_sweep`, `blob_sweep`, `pg_cleanup`), `section` (the failing stage) and
-//! `operation`/`reason` (the Object Lock refusal class). No path, key, bucket
-//! or identifier may become a label.
+//! The tier families are their own lazily registered group: only a process
+//! that serves the tiered backend ever initializes them, and a second call to
+//! any `record_tier_*` reuses the same families rather than registering a
+//! duplicate.
+//!
+//! Labels are bounded by their call sites — `backend` (`fs`, `mem`, `pg`,
+//! `tier`), `op`/`kind` (the failed write and its closed failure class), `pass`
+//! (`fs_sweep`, `blob_sweep`, `pg_cleanup`), `section` (the failing stage),
+//! `operation`/`reason` (the Object Lock refusal class), and the tier families'
+//! `tier` (`warm`, `cold`) and `direction` (`promote`, `demote`). No path, key,
+//! bucket or identifier may become a label.
 //!
 //! This is a metrics vocabulary, not a layer: no `tracing`, no `tokio`, and
 //! only the model's [`RefusalReason`] from `tinio-core` — the one enum the
@@ -21,9 +27,9 @@
 //! use std::time::Duration;
 //!
 //! use tinio_util::metrics::{
-//!     Backend, FsSection, LockOperation, Pass, WriteFailureKind, WriteOp, record_corrupt_rows,
-//!     record_fs_pass_failure, record_pass_duration, record_protected_deletion, record_read_only,
-//!     record_write_failure,
+//!     Backend, FsSection, LockOperation, Pass, TierPlane, WriteFailureKind, WriteOp,
+//!     record_corrupt_rows, record_fs_pass_failure, record_pass_duration,
+//!     record_protected_deletion, record_read_only, record_tier_hit, record_write_failure,
 //! };
 //!
 //! record_write_failure(Backend::Fs, WriteOp::Put, WriteFailureKind::Io);
@@ -31,6 +37,7 @@
 //! record_fs_pass_failure(FsSection::Tmp);
 //! record_read_only(Backend::Fs, false);
 //! record_corrupt_rows(Backend::Fs, 1);
+//! record_tier_hit(TierPlane::Warm);
 //! record_protected_deletion(
 //!     LockOperation::Lifecycle,
 //!     tinio_core::object_lock::RefusalReason::Governance,
@@ -44,7 +51,8 @@ use std::{
 };
 
 use prometheus::{
-    HistogramVec, IntCounterVec, IntGaugeVec, register_histogram_vec, register_int_counter_vec,
+    Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, register_histogram,
+    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
     register_int_gauge_vec,
 };
 use tinio_core::object_lock::RefusalReason;
@@ -53,6 +61,12 @@ use tinio_core::object_lock::RefusalReason;
 /// scan to the hour-scale sweep's walk.
 pub const PASS_DURATION_BUCKETS: &[f64] = &[
     0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 900.0, 3600.0,
+];
+
+/// Tier move and flush buckets, in seconds: a move copies bytes between two
+/// planes, so its sub-second range matters as much as the hour-scale flush.
+pub const TIER_DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0, 3600.0,
 ];
 
 /// The registered families.
@@ -98,6 +112,66 @@ static FAMILIES: LazyLock<Families> = LazyLock::new(|| Families {
     .registered("tinio_object_lock_protected_deletions_total"),
 });
 
+/// The tier families, in their own `LazyLock`: a process that never serves
+/// the tiered backend registers none of them, and every later
+/// `record_tier_*` reuses the one registration.
+static TIER_FAMILIES: LazyLock<TierFamilies> = LazyLock::new(|| TierFamilies {
+    hits: register_int_counter_vec!(
+        "tinio_tier_hits_total",
+        "Object reads a tier served, by tier",
+        &["tier"]
+    )
+    .registered("tinio_tier_hits_total"),
+    misses: register_int_counter_vec!(
+        "tinio_tier_misses_total",
+        "Object reads a tier could not serve, by tier",
+        &["tier"]
+    )
+    .registered("tinio_tier_misses_total"),
+    bytes: register_int_counter_vec!(
+        "tinio_tier_bytes_total",
+        "Bytes served by a tier, by tier (a full GET's size, a ranged GET's inclusive \
+         extent; HEAD contributes nothing)",
+        &["tier"]
+    )
+    .registered("tinio_tier_bytes_total"),
+    moves: register_int_counter_vec!(
+        "tinio_tier_moves_total",
+        "Objects moved between planes, by direction (a client copy, rename or copy_part that \
+         promotes a cold source books a promote, as the mover's own moves do)",
+        &["direction"]
+    )
+    .registered("tinio_tier_moves_total"),
+    move_duration: register_histogram_vec!(
+        "tinio_tier_move_duration_seconds",
+        "Object move durations, by direction",
+        &["direction"],
+        TIER_DURATION_BUCKETS.to_vec()
+    )
+    .registered("tinio_tier_move_duration_seconds"),
+    flush_duration: register_histogram!(
+        "tinio_tier_flush_duration_seconds",
+        "Flush durations, one sample per drain that published an entry",
+        TIER_DURATION_BUCKETS.to_vec()
+    )
+    .registered("tinio_tier_flush_duration_seconds"),
+    orphans: register_int_gauge!(
+        "tinio_tier_orphans",
+        "Cold copies a verify or garbage-collection pass reported as orphans"
+    )
+    .registered("tinio_tier_orphans"),
+    quarantine: register_int_gauge!(
+        "tinio_tier_quarantine",
+        "Quarantined batch writes waiting for an operator"
+    )
+    .registered("tinio_tier_quarantine"),
+    cache_evictions: register_int_counter!(
+        "tinio_tier_cache_evictions_total",
+        "Cached objects evicted before they were served"
+    )
+    .registered("tinio_tier_cache_evictions_total"),
+});
+
 /// Registration helper: a duplicate or malformed family name is a source-level
 /// collision, so the process refuses it at start-up instead of carrying a
 /// wrong label set.
@@ -129,6 +203,20 @@ struct Families {
     read_only: IntGaugeVec,
     corrupt_rows: IntCounterVec,
     protected_deletions: IntCounterVec,
+}
+
+/// The tier families, held together so one `LazyLock` runs the nine
+/// registrations exactly once.
+struct TierFamilies {
+    hits: IntCounterVec,
+    misses: IntCounterVec,
+    bytes: IntCounterVec,
+    moves: IntCounterVec,
+    move_duration: HistogramVec,
+    flush_duration: Histogram,
+    orphans: IntGauge,
+    quarantine: IntGauge,
+    cache_evictions: IntCounter,
 }
 
 /// A status code as a metric label: the common codes are static, the rest
@@ -169,6 +257,9 @@ pub enum Backend {
     Mem,
     /// The PostgreSQL backend.
     Pg,
+    /// The tiered backend: the filesystem warm plane plus the PostgreSQL
+    /// cold plane.
+    Tier,
 }
 
 impl Backend {
@@ -178,6 +269,7 @@ impl Backend {
             Self::Fs => "fs",
             Self::Mem => "mem",
             Self::Pg => "pg",
+            Self::Tier => "tier",
         }
     }
 }
@@ -451,6 +543,197 @@ pub fn record_corrupt_rows(backend: Backend, count: u64) {
         .inc_by(count);
 }
 
+/// The physical tier a tier family observes: the filesystem warm plane and
+/// the PostgreSQL cold plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierPlane {
+    /// The filesystem warm plane.
+    Warm,
+    /// The PostgreSQL cold plane.
+    Cold,
+}
+
+impl TierPlane {
+    /// The label value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::Cold => "cold",
+        }
+    }
+}
+
+/// The direction of one object move between the tier planes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveDirection {
+    /// A cold object moved back to the warm plane — the mover's promotion,
+    /// and a client copy, rename or `copy_part` that promotes a cold source.
+    Promote,
+    /// A warm object moved to the cold plane.
+    Demote,
+}
+
+impl MoveDirection {
+    /// The label value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Promote => "promote",
+            Self::Demote => "demote",
+        }
+    }
+}
+
+/// Record one read a tier served.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_util::metrics::{TierPlane, record_tier_hit};
+///
+/// record_tier_hit(TierPlane::Warm);
+/// ```
+pub fn record_tier_hit(tier: TierPlane) {
+    TIER_FAMILIES.hits.with_label_values(&[tier.as_str()]).inc();
+}
+
+/// Record one read a tier could not serve — the object was not there, so the
+/// read went on to the next plane.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_util::metrics::{TierPlane, record_tier_miss};
+///
+/// record_tier_miss(TierPlane::Cold);
+/// ```
+pub fn record_tier_miss(tier: TierPlane) {
+    TIER_FAMILIES
+        .misses
+        .with_label_values(&[tier.as_str()])
+        .inc();
+}
+
+/// Record the bytes one served object read handed the caller.
+///
+/// A full GET books the object's size, a ranged GET books the inclusive
+/// extent `end - start + 1`, and a HEAD books nothing because it serves no
+/// body — its caller must not call this.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_util::metrics::{TierPlane, record_tier_bytes};
+///
+/// record_tier_bytes(TierPlane::Cold, 4096);
+/// ```
+pub fn record_tier_bytes(tier: TierPlane, bytes: u64) {
+    TIER_FAMILIES
+        .bytes
+        .with_label_values(&[tier.as_str()])
+        .inc_by(bytes);
+}
+
+/// Record one object move between the planes in `direction`.
+///
+/// A client-side copy or rename of a cold source books a
+/// [`MoveDirection::Promote`] too: the bytes changed plane, whichever path
+/// drove them. No label separates the paths — the direction is the axis.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_util::metrics::{MoveDirection, record_tier_move};
+///
+/// record_tier_move(MoveDirection::Promote);
+/// ```
+pub fn record_tier_move(direction: MoveDirection) {
+    TIER_FAMILIES
+        .moves
+        .with_label_values(&[direction.as_str()])
+        .inc();
+}
+
+/// Record one completed object move's duration, in `direction`.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::time::Duration;
+///
+/// use tinio_util::metrics::{MoveDirection, record_tier_move_duration};
+///
+/// record_tier_move_duration(MoveDirection::Demote, Duration::from_millis(40));
+/// ```
+pub fn record_tier_move_duration(direction: MoveDirection, duration: Duration) {
+    TIER_FAMILIES
+        .move_duration
+        .with_label_values(&[direction.as_str()])
+        .observe(duration.as_secs_f64());
+}
+
+/// Record one completed batch flush's duration.
+///
+/// A sample is booked only for a drain that published at least one entry: an
+/// empty drain is not a flush, and a drain whose every entry was quarantined
+/// published nothing. A single-key `flush_key` that publishes counts.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::time::Duration;
+///
+/// use tinio_util::metrics::record_tier_flush_duration;
+///
+/// record_tier_flush_duration(Duration::from_millis(15));
+/// ```
+pub fn record_tier_flush_duration(duration: Duration) {
+    TIER_FAMILIES.flush_duration.observe(duration.as_secs_f64());
+}
+
+/// Set the number of orphaned cold copies the last verify or garbage pass
+/// reported.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_util::metrics::record_tier_orphans;
+///
+/// record_tier_orphans(3);
+/// ```
+pub fn record_tier_orphans(count: u64) {
+    TIER_FAMILIES.orphans.set(count as i64);
+}
+
+/// Set the number of quarantined batch writes waiting for an operator.
+///
+/// A batch write whose flush fails every retry is persisted under the layer's
+/// state directory and dropped from the buffer; the gauge reports how many
+/// such records are waiting, and it returns to zero when they are cleared.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_util::metrics::record_tier_quarantine;
+///
+/// record_tier_quarantine(2);
+/// ```
+pub fn record_tier_quarantine(count: u64) {
+    TIER_FAMILIES.quarantine.set(count as i64);
+}
+
+/// Record `count` cached objects evicted before they were served.
+///
+/// # Examples
+///
+/// ```rust
+/// use tinio_util::metrics::record_tier_cache_eviction;
+///
+/// record_tier_cache_eviction(2);
+/// ```
+pub fn record_tier_cache_eviction(count: u64) {
+    TIER_FAMILIES.cache_evictions.inc_by(count);
+}
+
 /// The operation whose permanent delete a stored Object Lock refused — the
 /// closed `operation` label of
 /// `tinio_object_lock_protected_deletions_total` (OL25).
@@ -578,6 +861,57 @@ mod tests {
                 r#"tinio_object_lock_protected_deletions_total{operation="lifecycle",reason="compliance"}"#
             ),
             "the protected-deletions counter carries its two labels: {text}"
+        );
+    }
+
+    #[test]
+    fn the_tier_families_render_their_recorded_values() {
+        record_tier_hit(TierPlane::Cold);
+        record_tier_miss(TierPlane::Warm);
+        record_tier_bytes(TierPlane::Cold, 4096);
+        record_tier_move(MoveDirection::Promote);
+        record_tier_move_duration(MoveDirection::Demote, Duration::from_millis(7));
+        record_tier_flush_duration(Duration::from_millis(3));
+        record_tier_orphans(2);
+        record_tier_quarantine(4);
+        record_tier_cache_eviction(3);
+
+        let text = exposition();
+        assert!(
+            text.contains(r#"tinio_tier_hits_total{tier="cold"}"#),
+            "the tier hits counter carries its tier: {text}"
+        );
+        assert!(
+            text.contains(r#"tinio_tier_misses_total{tier="warm"}"#),
+            "the tier misses counter carries its tier: {text}"
+        );
+        assert!(
+            text.contains(r#"tinio_tier_bytes_total{tier="cold"} 4096"#),
+            "the tier bytes counter accumulates its served bytes: {text}"
+        );
+        assert!(
+            text.contains(r#"tinio_tier_moves_total{direction="promote"}"#),
+            "the move counter carries its direction: {text}"
+        );
+        assert!(
+            text.contains(r#"tinio_tier_move_duration_seconds_sum{direction="demote"}"#),
+            "the move histogram records its seconds: {text}"
+        );
+        assert!(
+            text.contains("tinio_tier_flush_duration_seconds_sum"),
+            "the flush histogram records its seconds: {text}"
+        );
+        assert!(
+            text.contains("tinio_tier_orphans 2"),
+            "the orphan gauge reports the count: {text}"
+        );
+        assert!(
+            text.contains("tinio_tier_quarantine 4"),
+            "the quarantine gauge reports the waiting count: {text}"
+        );
+        assert!(
+            text.contains("tinio_tier_cache_evictions_total 3"),
+            "the eviction counter accumulates: {text}"
         );
     }
 

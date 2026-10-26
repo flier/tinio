@@ -36,6 +36,8 @@ use crate::_api::Plane;
 use crate::_pg;
 #[cfg(feature = "object-lock")]
 use crate::_server::ObjectLockCache;
+#[cfg(feature = "tier")]
+use crate::_tier::Config as TierConfig;
 use crate::{
     _fs::FsStorage,
     _sandbox::Adopted,
@@ -99,6 +101,24 @@ pub(crate) enum Served {
         config: _pg::Config,
         /// The run's access mode (PG6/PG12): `ReadWrite` migrates and takes the ownership lock,
         /// `ReadOnly` does neither.
+        access: _pg::Access,
+    },
+    /// A tiered run: the layer's runtime configuration, its cold plane's pg configuration and
+    /// the access mode, to be constructed inside the runtime. It joins the pg arm's reason for
+    /// being late — the cold plane connects, takes the ownership lock and binds the layer's
+    /// index asynchronously — and carries the tier settings the constructor and the background
+    /// passes both need, so the resolution's config is not read a second time on the runtime.
+    #[cfg(feature = "tier")]
+    Tier {
+        /// The tier layer's runtime value, built once by
+        /// [`tier_runtime`](crate::config::storage::Config::tier_runtime) from the CLI's
+        /// `[storage.tier]` schema and defaults (T22).
+        config: TierConfig,
+        /// The cold plane's pg configuration: the same resolved pair the pg arm would build, so
+        /// the tier layer and a pg run open one dsn by one rule (T18).
+        pg: _pg::Config,
+        /// The run's access mode: `ReadWrite` takes the cold plane's ownership and creates the
+        /// layer's index; `ReadOnly` opens both read-only and starts nothing (T27).
         access: _pg::Access,
     },
 }

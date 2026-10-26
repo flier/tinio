@@ -15,7 +15,7 @@
 - **No PostObject work.** s3s's default `post_object` delegates to `put_object` (s3_trait.rs:4654-4659), carrying `if_match`/`if_none_match` through the conversion (dto/generated.rs:41967-41982) — conditions are already enforced via that delegation today.
 - **No If-Range on HEAD.** HEAD has no body; `Range` is inapplicable. If-Range applies to GET only.
 - **No tagging / RenameObject / GetObjectAttributes** — the companion spec `2026-08-31-s3-tagging-ops-design.md`.
-- **No RestoreObject / SelectObjectContent / WriteGetObjectResponse** — RestoreObject is Glacier-tier restore semantics tinio has no tiering for; SelectObjectContent is a SQL-engine-scale feature; WriteGetObjectResponse is a data-plane write-back op. All stay `NotImplemented`.
+- **No RestoreObject / SelectObjectContent / WriteGetObjectResponse** — RestoreObject is archive-tier restore semantics tinio has no archive class for; SelectObjectContent is a SQL-engine-scale feature; WriteGetObjectResponse is a data-plane write-back op. All stay `NotImplemented`.
 - **No removal of existing Rust tests.** They stay until the cucumber migration (separate plan) reaches parity; new HTTP-level coverage lands as cucumber features from the start.
 
 ## Decisions (locked in brainstorming + grilling, 2026-08-31)

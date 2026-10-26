@@ -161,11 +161,11 @@ where
 
 /// The three numbers one scan publishes.
 #[derive(Debug, Default)]
-struct Counts {
+pub(super) struct Counts {
     /// Buckets the listing pass saw.
     buckets: u64,
     /// Objects across every bucket.
-    objects: u64,
+    pub(super) objects: u64,
     /// Their total size in bytes.
     bytes: u64,
 }
@@ -199,11 +199,18 @@ fn count_storage<S: Storage>(storage: &S) -> Counts {
 
 /// The walk itself: every bucket, then every page of its objects.
 ///
+/// **Objects are read through [`Storage::metrics_scan`], never the client listing** (T26). A
+/// client listing is allowed to flush the tier layer's batch buffer first — a reader would then
+/// publish a key that is still buffered and write the buffer at every tick — while the metrics
+/// scan is the contract's "count what is stored without side effects" entry: the tier layer takes
+/// its merge directly and flushes nothing. On the filesystem and pg backends the default is the
+/// ordinary listing, so this one call site serves every backend.
+///
 /// A failed page is warned and ends the walk with what it has counted so far — a scrape's
 /// gauges are an observation, and a half-counted root is a better answer than a panic or a
 /// stale one. A truncated page with no continuation marker ends the walk too, rather than
 /// looping on the same marker forever.
-async fn scan<S: Storage>(storage: &S) -> Counts {
+pub(super) async fn scan<S: Storage>(storage: &S) -> Counts {
     let mut counts = Counts::default();
     let mut start_after = None;
     loop {
@@ -244,7 +251,7 @@ async fn scan_objects<S: Storage>(storage: &S, name: &Name, counts: &mut Counts)
     let mut start_after = None;
     loop {
         let page = match storage
-            .list_objects(ListObjectsParams {
+            .metrics_scan(ListObjectsParams {
                 bucket: name.clone(),
                 prefix: String::new(),
                 delimiter: None,

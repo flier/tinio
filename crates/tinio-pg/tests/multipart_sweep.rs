@@ -139,6 +139,7 @@ fn abort_rule() -> lifecycle::Config {
             status: lifecycle::Status::Enabled,
             filter: lifecycle::Filter::default(),
             expiration: None,
+            transitions: Vec::new(),
             noncurrent_version_expiration: None,
             abort_incomplete_multipart_upload: Some(lifecycle::AbortIncompleteMultipartUpload {
                 days_after_initiation: 7,

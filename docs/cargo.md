@@ -21,6 +21,7 @@
 - Facade's feature list decides the shipped binary; a dep pin forcing a feature on survives `--no-default-features`.
 - Transitive set spelled once at the shipping crate; consumers forward the name, never the set.
 - Carrier is optional normal deps (each-feature pruning stays valid); the seam is a runtime wiring test, not a compile cfg.
+- `tier` wires the backend arm and its `pg`/`versioning` prerequisites; `tinio-tier` is a non-optional `tinio-cli` dependency.
 
 ## sqlx cache
 

@@ -529,16 +529,16 @@ jobs:
       # cucumber keeps the args from reaching the plain-harness traceability
       # target (its own step below), and an explicit --tags REPLACES the
       # runner's default filter, so the mem pass must repeat the platform,
-      # feature-gate (@parquet, @object-lock), external-tag, confinement and @pg
-      # exclusions itself — every platform tag, not one host's non-matching set:
-      # this one list is shared by the
+      # feature-gate (@parquet, @object-lock), external-tag, confinement, @pg
+      # and @tier exclusions itself — every platform tag, not one host's
+      # non-matching set: this one list is shared by the
       # ubuntu, windows and macos runners (`e2e-port`), so what it may keep is
       # what all three may run, and the runner's compound platform clause cannot
-      # be spelled once (tests/steps/tag_filter.rs). `not @pg` is
-      # load-bearing: the DB-backed scenarios belong to the `pg` job's own
-      # serial pass, never to this one. `not @object-lock` is the same kind of
-      # clause for the corpus whose operations are compiled out of this build:
-      # without `--features object-lock` every scenario answers 501.
+      # be spelled once (tests/steps/tag_filter.rs). `not @pg` and `not @tier`
+      # are load-bearing: each database-backed backend has its own serial pass
+      # (the `pg` and `tier` jobs), never this one. `not @object-lock` is the
+      # same kind of clause for the corpus whose operations are compiled out of
+      # this build: without `--features object-lock` every scenario answers 501.
       # --retry 2 on both passes: ConnectionAborted flakes on loaded legs
       # burned both retry-1 attempts in earlier runs (33764783657 fs,
       # 33750043137 mem).
@@ -559,7 +559,7 @@ jobs:
 
       - &e2e-mem
         name: e2e cucumber (mem backend)
-        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @object-lock and not @interop and not @boto3 and not @mc and not @confinement and not @pg' --retry 2
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @object-lock and not @interop and not @boto3 and not @mc and not @confinement and not @pg and not @tier' --retry 2
         env:
           TINIO_E2E_BACKEND: mem
           TINIO_E2E_REPORT: cucumber-report-mem.json
@@ -806,6 +806,8 @@ jobs:
       # constitution VI: API changes MUST be checked with cargo-semver-checks.
       # check-release compares against the last published version on crates.io;
       # before the first release there is no baseline, so the check is skipped.
+      # Recorded exemptions for the additive `storage::Error` variants: docs/semver.md.
+      # The gate stays unchanged — no lint is downgraded and no step may fail open.
       - name: semver-checks (vs last published release)
         run: |
           ver=$(cargo metadata --no-deps --format-version 1 | \
@@ -897,10 +899,13 @@ jobs:
       # scenarios) into this job — and no hosted runner can confine a server
       # (ubuntu's AppArmor refuses the userns, macOS/Windows runners owe no
       # grant budget): those legs are the platform gates' and the operator's,
-      # never CI's.
+      # never CI's. `and not @tier` is load-bearing for the same reason: this
+      # build carries no tier feature, and the tier external legs (their own
+      # `tier-external` job) must not be selected here where their steps do
+      # not compile.
       - &interop-cucumber
         name: interop cucumber (@interop)
-        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags '@interop and not @confinement' --retry 1
+        run: cargo test --profile ci -p tinio-e2e --test cucumber -- --tags '@interop and not @confinement and not @tier' --retry 1
         env:
           TINIO_E2E_REPORT: interop-report.json
 
@@ -990,7 +995,10 @@ jobs:
       # landed" list is inaccurate: the compose fixture does NOT match (it
       # spells the credential as YAML env vars) and the CLI tests DO, so the
       # allow-list below is the measured set, not the design's guess. A file the
-      # pattern newly names is a leaked credential and fails the job.
+      # pattern newly names is a leaked credential and fails the job. The tier
+      # crate's own fixtures (`pg.rs`, `storage.rs`, `pg_plane.rs`) are the
+      # measured additions the tiered backend brought; they pin the same dev
+      # credential, not a secret.
       - name: credential scan (PG25)
         run: |
           set -euo pipefail
@@ -998,8 +1006,13 @@ jobs:
           allowed=$(printf '%s\n' \
             crates/tinio-cli/src/commands/doctor/tests.rs \
             crates/tinio-cli/src/commands/start/run.rs \
+            crates/tinio-cli/src/commands/start/serve_tests.rs \
+            crates/tinio-cli/src/resolve/tests.rs \
             crates/tinio-pg/README.md \
-            crates/tinio-store-pg/README.md | sort -u)
+            crates/tinio-store-pg/README.md \
+            crates/tinio-tier/src/pg.rs \
+            crates/tinio-tier/src/storage.rs \
+            crates/tinio-tier/tests/pg_plane.rs | sort -u)
           unexpected=$(comm -23 <(printf '%s\n' "$hits") <(printf '%s\n' "$allowed"))
           if [ -n "$unexpected" ]; then
             echo "::error::the pinned dev credential appears outside the allowed fixtures:"
@@ -1061,12 +1074,13 @@ jobs:
       # via TINIO_E2E_BACKEND=pg, and the list carries no `not @pg` (unlike the
       # mem leg's): the DB-backed scenarios are this pass's own. An explicit
       # --tags REPLACES the runner's default filter, so every other exclusion
-      # is restated (platform, @parquet, @external, @confinement). --concurrency
+      # is restated (platform, @parquet, @external, @confinement, and the tier
+      # server's own @tier pass — this build carries no tier feature). --concurrency
       # 1 is the serialization PG8 requires: every scenario truncates ONE
       # shared database, so only a serial run keeps them from resetting each
       # other mid-scenario.
       - name: e2e cucumber (pg backend, serial)
-        run: cargo test --profile ci -p tinio-e2e --features pg --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @object-lock and not @interop and not @boto3 and not @mc and not @confinement' --retry 2 --concurrency 1
+        run: cargo test --profile ci -p tinio-e2e --features pg --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @object-lock and not @interop and not @boto3 and not @mc and not @confinement and not @tier' --retry 2 --concurrency 1
         env:
           # The backend the pass runs on. `config_from_tags` picks the backend
           # from a scenario tag, else this variable, else `Backend::Fs` — and no
@@ -1098,6 +1112,151 @@ jobs:
       - name: sqlx cache drift (cargo xtask sqlx check)
         if: always()
         run: cargo xtask sqlx check
+
+  # The tiered backend's own in-process pass (T25): the `@tier` scenarios run
+  # against a PostgreSQL cold plane, so this job carries the workflow's second
+  # database service (the `pg` job's is the first) and the same pinned dsn. The
+  # pass is serial for PG8's reason: every scenario truncates ONE shared
+  # database before it starts, and a writable tier server owns that database.
+  tier:
+    name: Tier backend (postgres:18-alpine)
+    needs: e2e
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: tinio
+          POSTGRES_PASSWORD: tinio
+          POSTGRES_DB: tinio
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tinio -d tinio"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      TINIO_PG_DSN: postgres://tinio:tinio@127.0.0.1:5432/tinio?sslmode=disable
+      # Fail closed, as the pg job does: the tier harness refuses an unset dsn
+      # rather than skipping the database-backed scenarios.
+      TINIO_PG_REQUIRED: "1"
+    steps:
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
+
+      # The tier crate's own DSN-backed suites ran nowhere before this step:
+      # `conformance` and `pg_plane` are the layer's acceptance over a live
+      # PostgreSQL, and the `testing` feature is what compiles them. This job
+      # already carries the service, the dsn and `TINIO_PG_REQUIRED`, so they
+      # belong here, before the slower cucumber pass. `--test-threads=4` bounds
+      # the scratch pools the store job's steps do.
+      - name: tinio-tier database-backed suites (conformance + pg_plane)
+        run: TINIO_PG_REQUIRED=1 cargo test -p tinio-tier --features testing --test conformance --test pg_plane -- --test-threads=4
+
+      # `--features tier` compiles the step module and the in-process
+      # constructor the @tier scenarios are written on; without it the default
+      # filter drops the corpus and the explicit list would select nothing.
+      # `TINIO_E2E_BACKEND=tier` is the backend selector for a scenario without
+      # its own backend tag; the explicit list restates the non-platform
+      # exclusions --tags replaces (@parquet, @object-lock, external,
+      # @confinement, @pg). No @tier scenario is platform-bound, so the list
+      # needs no platform clause.
+      - name: e2e cucumber (tier backend, serial)
+        run: cargo test --profile ci -p tinio-e2e --features tier --test cucumber -- --tags '@tier and not @parquet and not @object-lock and not @interop and not @boto3 and not @mc and not @confinement and not @pg' --retry 2 --concurrency 1
+        env:
+          TINIO_E2E_BACKEND: tier
+          TINIO_E2E_REPORT: tier-report.json
+
+      - *upload-report
+
+  # The external clients against a spawned tier server (T25): aws cli v2,
+  # rclone, mc and the boto3 venv are all required by this leg — the harness's
+  # presence check fails the run when one is missing, and the versions step
+  # below states the requirement before the suite starts. This is the only leg
+  # where boto3 is CI-gating; FR-025's best-effort tier is unchanged elsewhere.
+  # The spawned server is a product start (`[storage] type = "tier"` with
+  # `[storage.pg]`), so the binary is built with the feature, and the database
+  # service is the same fixture the `pg` job carries.
+  tier-external:
+    name: Tier external clients (aws cli v2 + rclone + mc + boto3)
+    needs: interop
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: tinio
+          POSTGRES_PASSWORD: tinio
+          POSTGRES_DB: tinio
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tinio -d tinio"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      TINIO_PG_DSN: postgres://tinio:tinio@127.0.0.1:5432/tinio?sslmode=disable
+      # Fail closed, as the pg job does: the spawned tier server cannot start
+      # without a database, and the harness refuses an unset dsn.
+      TINIO_PG_REQUIRED: "1"
+    steps:
+      - *checkout
+      - *lld
+      - *toolchain
+      - *rust-cache
+      - *sccache
+      - *install-rclone
+
+      # mc has no install-action manifest; the release binary is the official
+      # distribution. It lands in the runner's own bin dir, put on PATH for the
+      # steps below.
+      - name: install mc
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSLo "$HOME/.local/bin/mc" https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x "$HOME/.local/bin/mc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # boto3 is not on the hosted image; the harness reads the venv python at
+      # <target-dir>/tinio-e2e-venv (or TINIO_BOTO3_PYTHON).
+      - name: install the boto3 venv
+        run: |
+          set -euo pipefail
+          python3 -m venv target/tinio-e2e-venv
+          target/tinio-e2e-venv/bin/pip install --disable-pip-version-check boto3
+
+      # Fail here, before the suite, when any of the four is missing — the
+      # statement T25 makes about this leg (a skipped client is a red job, not
+      # a green suite with fewer legs).
+      - name: client versions (tier-external harness)
+        run: |
+          set -euo pipefail
+          aws --version
+          rclone version
+          mc --version
+          target/tinio-e2e-venv/bin/python -c "import boto3; print('boto3', boto3.__version__)"
+
+      # The external-client steps spawn the `tinio` binary; the build profile
+      # matches the test profile, as in the interop job.
+      - name: build the tinio binary (tier-external harness)
+        run: cargo build --profile ci -p tinio --features tier
+
+      - name: tier external cucumber (@tier and (@interop or @boto3 or @mc))
+        run: cargo test --profile ci -p tinio-e2e --features tier --test cucumber -- --tags '@tier and (@interop or @boto3 or @mc) and not @confinement' --retry 1
+        env:
+          TINIO_E2E_EXTERNAL: "1"
+          TINIO_E2E_BACKEND: tier
+          TINIO_E2E_REPORT: tier-external-report.json
+
+      - *upload-report
 
   # P3 removed the `pg-meta-check` job with the spike it guarded. The spike
   # lived in `spike/pg-meta` as its own cargo workspace (the root Cargo.toml

@@ -21,9 +21,11 @@
 //! **Three refusals are the dto's, not the model's**, and they come first,
 //! in this order within each rule:
 //!
-//! 1. a rule carrying a `Transition` or a `NoncurrentVersionTransition`
-//!    (LC9 — tinio has no storage tiers, so accepting the action would
-//!    promise a migration that cannot happen);
+//! 1. a transition this backend cannot honour (LC9, T11): a
+//!    `NoncurrentVersionTransition` anywhere, and a `Transition` on a
+//!    backend whose [`Storage::supports_tiers`] is `false` — accepting one
+//!    would promise a migration that cannot happen. A tier-capable backend
+//!    maps `STANDARD_IA` into the stored model and back;
 //! 2. a `Status` the model has no variant for (neither `Enabled` nor
 //!    `Disabled`);
 //! 3. a rule with both a `Filter` and a legacy rule-level `Prefix` — the
@@ -32,16 +34,19 @@
 //!
 //! Ordering the transition first is deliberate: a document that carries one
 //! is told what this server cannot do, rather than that something else
-//! about the same rule is malformed.
+//! about the same rule is malformed. The message is
+//! [`TRANSITIONS_NEED_TIERS`](crate::_core::lifecycle::TRANSITIONS_NEED_TIERS),
+//! the one sentence every write path refuses with.
 
 use http::HeaderMap;
 use s3s::{S3Error, S3Request, S3Response, S3Result, dto, s3_error};
 
 use crate::{
     _core::{
+        Class,
         lifecycle::{
             AbortIncompleteMultipartUpload, And, Config, Expiration, Filter,
-            NoncurrentVersionExpiration, Rule, Status, Tag,
+            NoncurrentVersionExpiration, Rule, Status, TRANSITIONS_NEED_TIERS, Tag, Transition,
         },
         storage::Storage,
     },
@@ -84,7 +89,7 @@ impl<S: Storage> S3Backend<S> {
         } = req.input;
         let bucket = self.bucket(bucket)?;
         require_checksum(&req.headers, req.trailing_headers.is_some())?;
-        let config = config_from_dto(lifecycle_configuration)?;
+        let config = config_from_dto(lifecycle_configuration, self.storage.supports_tiers())?;
         config.validate().map_err(|invalid| {
             invalid_error(invalid.kind, invalid.reason, invalid.rule.as_deref())
         })?;
@@ -140,17 +145,22 @@ fn invalid_request(id: Option<&str>, reason: &str) -> S3Error {
     }
 }
 
-/// The reason a rule carrying a transition is refused (LC9).
-const NO_TIERS: &str =
-    "storage-class transitions are not supported: this server has no storage tiers";
+/// The reason a noncurrent-version transition is refused even on a tier backend (T11): this
+/// build transitions current versions only.
+const NONCURRENT_TRANSITION: &str =
+    "noncurrent version transitions are not supported by this server";
 
 // --- dto to the stored model ---
 
 /// The request body as the stored model. Three refusals are the dto's own and
 /// happen here, before [`Config::validate`] sees the document: the
-/// transitions (LC9), a `Status` outside `Enabled`/`Disabled`, and the
-/// filter/legacy-`Prefix` shape (see the module docs for the order and why).
-fn config_from_dto(xml: Option<dto::BucketLifecycleConfiguration>) -> S3Result<Config> {
+/// transitions this backend cannot honour (LC9, T11), a `Status` outside
+/// `Enabled`/`Disabled`, and the filter/legacy-`Prefix` shape (see the module
+/// docs for the order and why).
+fn config_from_dto(
+    xml: Option<dto::BucketLifecycleConfiguration>,
+    supports_tiers: bool,
+) -> S3Result<Config> {
     let Some(xml) = xml else {
         return Err(malformed(
             None,
@@ -160,15 +170,23 @@ fn config_from_dto(xml: Option<dto::BucketLifecycleConfiguration>) -> S3Result<C
     let rules = xml
         .rules
         .into_iter()
-        .map(rule_from_dto)
+        .map(|rule| rule_from_dto(rule, supports_tiers))
         .collect::<S3Result<Vec<_>>>()?;
     Ok(Config { rules })
 }
 
-fn rule_from_dto(mut rule: dto::LifecycleRule) -> S3Result<Rule> {
+fn rule_from_dto(mut rule: dto::LifecycleRule, supports_tiers: bool) -> S3Result<Rule> {
     let id = rule.id.take();
-    if rule.transitions.is_some() || rule.noncurrent_version_transitions.is_some() {
-        return Err(invalid_request(id.as_deref(), NO_TIERS));
+    // A backend without tiers keeps today's refusal for either transition
+    // spelling. A tier backend honours a current-version transition but still
+    // refuses the noncurrent one: this build has no model for it (T11).
+    if !supports_tiers
+        && (rule.transitions.is_some() || rule.noncurrent_version_transitions.is_some())
+    {
+        return Err(invalid_request(id.as_deref(), TRANSITIONS_NEED_TIERS));
+    }
+    if rule.noncurrent_version_transitions.is_some() {
+        return Err(invalid_request(id.as_deref(), NONCURRENT_TRANSITION));
     }
     let status = match rule.status.as_str() {
         dto::ExpirationStatus::ENABLED => Status::Enabled,
@@ -190,9 +208,33 @@ fn rule_from_dto(mut rule: dto::LifecycleRule) -> S3Result<Rule> {
         status,
         filter,
         expiration: rule.expiration.map(expiration_from_dto),
+        transitions: rule
+            .transitions
+            .unwrap_or_default()
+            .into_iter()
+            .map(transition_from_dto)
+            .collect(),
         noncurrent_version_expiration: rule.noncurrent_version_expiration.map(noncurrent_from_dto),
         abort_incomplete_multipart_upload,
     })
+}
+
+/// One wire transition as the stored model (T11).
+///
+/// The class maps through the model's own parser; a spelling this build does not accept lands on
+/// `STANDARD`, which [`Config::validate`] refuses with `Transition StorageClass is
+/// STANDARD_IA` — the semantic class an unknown target gets on the request path.
+fn transition_from_dto(transition: dto::Transition) -> Transition {
+    Transition {
+        days: transition.days,
+        date: transition
+            .date
+            .map(|date| time::OffsetDateTime::from(date).unix_timestamp()),
+        storage_class: transition
+            .storage_class
+            .and_then(|class| class.as_str().parse::<Class>().ok())
+            .unwrap_or_default(),
+    }
 }
 
 /// The rule's selector: a `Filter`, or the legacy rule-level `Prefix` in its
@@ -318,7 +360,29 @@ fn rule_to_dto(rule: Rule) -> dto::LifecycleRule {
             Status::Enabled => dto::ExpirationStatus::from_static(dto::ExpirationStatus::ENABLED),
             Status::Disabled => dto::ExpirationStatus::from_static(dto::ExpirationStatus::DISABLED),
         },
-        transitions: None,
+        // An empty list is absent on the wire (T11), so a `GET` body carries no `Transition`
+        // member unless the stored rule has one.
+        transitions: (!rule.transitions.is_empty()).then(|| {
+            rule.transitions
+                .into_iter()
+                .map(transition_to_dto)
+                .collect()
+        }),
+    }
+}
+
+/// One stored transition back on the wire (T11): the class's S3 spelling, and a `Date` the
+/// framework's timestamp cannot hold is dropped for the same reason an oversized size is.
+fn transition_to_dto(transition: Transition) -> dto::Transition {
+    dto::Transition {
+        date: transition
+            .date
+            .and_then(|date| time::OffsetDateTime::from_unix_timestamp(date).ok())
+            .map(dto::Date::from),
+        days: transition.days,
+        storage_class: Some(dto::TransitionStorageClass::from(
+            transition.storage_class.as_str().to_owned(),
+        )),
     }
 }
 
@@ -386,10 +450,17 @@ mod tests {
     use http::HeaderValue;
     use s3s::{S3, dto};
 
-    use crate::backend::{
-        Capabilities,
-        checksum::CONTENT_MD5,
-        testutil::{s3_request, setup, setup_gated_with_caps},
+    use super::{NONCURRENT_TRANSITION, config_from_dto, rule_to_dto};
+    use crate::{
+        _core::{
+            Class,
+            lifecycle::{TRANSITIONS_NEED_TIERS, Transition},
+        },
+        backend::{
+            Capabilities,
+            checksum::CONTENT_MD5,
+            testutil::{s3_request, setup, setup_gated_with_caps},
+        },
     };
 
     /// A well-formed `Content-MD5`: base64 of 16 zero bytes. The value is
@@ -428,6 +499,20 @@ mod tests {
             status: enabled(),
             transitions: None,
         }
+    }
+
+    /// A rule carrying the one transition this build accepts (T11): `STANDARD_IA`, whose
+    /// `Days` sits on the AWS floor.
+    fn transition_rule(id: &str, days: i32) -> dto::LifecycleRule {
+        let mut rule = days_rule(id, "logs/", days);
+        rule.transitions = Some(vec![dto::Transition {
+            days: Some(days),
+            storage_class: Some(dto::TransitionStorageClass::from_static(
+                dto::TransitionStorageClass::STANDARD_IA,
+            )),
+            ..Default::default()
+        }]);
+        rule
     }
 
     /// A rule with no filter and no legacy prefix: every object.
@@ -675,6 +760,94 @@ mod tests {
         assert!(
             err.message().is_some_and(|m| m.contains("storage tiers")),
             "the transition is named, not the shape violation: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_tier_s3_put_refuses_transitions() {
+        // T11: the tier gate covers the S3 surface. A backend without tiers keeps today's
+        // refusal — the one sentence every write path uses — and stores nothing.
+        let (backend, b) = setup().await;
+        let err = backend
+            .op_put_bucket_lifecycle(put(&b, vec![transition_rule("archive", 30)]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code().as_str(), "InvalidRequest", "{err:?}");
+        assert!(
+            err.message()
+                .is_some_and(|message| message.contains(TRANSITIONS_NEED_TIERS)),
+            "{err:?}"
+        );
+        assert_eq!(
+            backend
+                .op_get_bucket_lifecycle(get(&b))
+                .await
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "NoSuchLifecycleConfiguration",
+            "the refused configuration was never stored"
+        );
+    }
+
+    #[test]
+    fn a_tier_surface_round_trips() {
+        // T11: on a tier-capable backend the dto's `STANDARD_IA` reaches the stored model and
+        // comes back for both ways of saying "when" — the `Days` floor and a midnight `Date` —
+        // so a GET body a client can PUT again carries the class.
+        let mut xml = transition_rule("archive", 30);
+        xml.transitions
+            .as_mut()
+            .expect("the fixture carries a transition")
+            .push(dto::Transition {
+                date: Some(dto::Date::from(
+                    time::OffsetDateTime::from_unix_timestamp(MIDNIGHT).expect("midnight UTC"),
+                )),
+                days: None,
+                storage_class: Some(dto::TransitionStorageClass::from_static(
+                    dto::TransitionStorageClass::STANDARD_IA,
+                )),
+            });
+        let config = config_from_dto(Some(configuration(vec![xml.clone()])), true)
+            .expect("a tier-capable backend accepts a STANDARD_IA transition");
+        config
+            .validate()
+            .expect("the mapped configuration is one the model stores");
+        assert_eq!(
+            config.rules[0].transitions,
+            vec![
+                Transition {
+                    days: Some(30),
+                    date: None,
+                    storage_class: Class::StandardIa,
+                },
+                Transition {
+                    days: None,
+                    date: Some(MIDNIGHT),
+                    storage_class: Class::StandardIa,
+                },
+            ]
+        );
+        let wire = rule_to_dto(config.rules[0].clone());
+        assert_eq!(
+            wire.transitions, xml.transitions,
+            "both spellings round-trip"
+        );
+
+        // A noncurrent transition has no model at all, so it stays refused even where tiers
+        // exist: the tier answer widens only the current-version gate (T11).
+        let mut noncurrent = days_rule("noncurrent", "logs/", 30);
+        noncurrent.noncurrent_version_transitions = Some(vec![dto::NoncurrentVersionTransition {
+            noncurrent_days: Some(30),
+            ..Default::default()
+        }]);
+        let err = config_from_dto(Some(configuration(vec![noncurrent])), true)
+            .expect_err("a noncurrent transition is refused on a tier backend too");
+        assert_eq!(err.code().as_str(), "InvalidRequest", "{err:?}");
+        assert!(
+            err.message()
+                .is_some_and(|message| message.contains(NONCURRENT_TRANSITION)),
+            "{err:?}"
         );
     }
 

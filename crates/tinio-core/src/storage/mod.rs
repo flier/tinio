@@ -31,6 +31,7 @@
 
 mod body;
 mod bucket;
+mod class;
 mod error;
 mod listing;
 mod multipart;
@@ -39,10 +40,11 @@ mod range;
 mod time;
 mod version;
 
-use std::error::Error as StdError;
+use std::{error::Error as StdError, time::SystemTime};
 
 pub use body::{BodyStream, collect_body};
 pub use bucket::{BucketOps, BucketsListing, ListBucketsParams};
+pub use class::Class;
 pub use error::{
     Denied, Error, access_denied, access_denied_bucket, already_exists, corrupt, entity_too_large,
     invalid_bucket_name, invalid_bucket_state, invalid_checksum, invalid_etag, invalid_key,
@@ -52,8 +54,8 @@ pub use error::{
 };
 pub use listing::{
     RollupMirror, UnorderedPager, common_prefix, group_and_paginate, group_and_paginate_ordered,
-    group_and_paginate_unordered, key_marker_order, paginate_ordered, split_uploads_order,
-    uploads_order,
+    group_and_paginate_unordered, key_marker_order, paginate_ordered, past_page,
+    split_uploads_order, uploads_order,
 };
 pub use multipart::{
     ListPartsParams, ListUploadsParams, MultipartOps, PartsListing, UploadsListing,
@@ -66,7 +68,7 @@ pub use range::ByteRange;
 pub use time::{from_nanos, now_nanos, to_nanos};
 pub use version::{VersionOps, marker_has_no_metadata, rename_allowed};
 
-use crate::{bucket::Name, lifecycle};
+use crate::{bucket::Name, lifecycle, object::Key};
 
 /// The write-lock histogram bucket upper bounds, microseconds
 /// (pipeline-spec.md §4): `<10, <100, <1k, <5k, <20k, <100k, >100k`. A
@@ -151,6 +153,11 @@ pub trait LifecycleRules: Send + Sync {
 /// `<Self as Storage>::Error`, so they are only usable on a complete
 /// backend (`S: Storage`).
 ///
+/// The aggregate also carries the tier hooks (T1, T10) —
+/// [`Storage::supports_tiers`], [`Storage::storage_class`],
+/// [`Storage::transition`] and [`Storage::metrics_scan`] — defaulted so a
+/// backend without tiers needs no code and keeps today's behavior.
+///
 /// The conformance harness (`tinio_util::testing`, behind the `testing`
 /// feature) verifies the behavioral contract; every backend must pass it.
 ///
@@ -199,6 +206,7 @@ pub trait LifecycleRules: Send + Sync {
 ///
 /// (`ignore`: a runnable example would require dev-depending on a backend
 /// crate, which would create a dependency cycle with `tinio-mem`.)
+#[async_trait::async_trait]
 pub trait Storage:
     Send + Sync + 'static + BucketOps + ObjectOps + MultipartOps + VersionOps + LifecycleRules
 {
@@ -210,6 +218,65 @@ pub trait Storage:
     /// refusal in the backend's own error type ([`VersionOps`]'s nine
     /// refusal defaults are the reason the second bound exists).
     type Error: StdError + Send + Sync + 'static + Into<Error> + From<Error>;
+
+    /// Whether this backend stores objects in tiers: the filesystem warm
+    /// plane plus the PostgreSQL cold plane (T1).
+    ///
+    /// The default is `false`: a backend without tiers keeps every object in
+    /// [`Class::Standard`], ignores a requested class, and refuses a
+    /// transition.
+    fn supports_tiers(&self) -> bool {
+        false
+    }
+
+    /// The storage class of one object.
+    ///
+    /// The default answers [`Class::Standard`] — a backend without tiers
+    /// stores every object in the filesystem plane (T10). A tier backend
+    /// overrides it from its placement rows.
+    ///
+    /// # Errors
+    ///
+    /// The backend's read failure, projected onto the contract error.
+    async fn storage_class(&self, bucket: &Name, key: &Key) -> Result<Class, Self::Error> {
+        let _ = (bucket, key);
+        Ok(Class::Standard)
+    }
+
+    /// Move one object to `class`, recording the transition at `now`.
+    ///
+    /// The default refuses with [`Error::NoTiers`] — a backend without tiers
+    /// has no cold plane to move the object to (T10). Only a backend whose
+    /// [`Storage::supports_tiers`] is `true` overrides it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoTiers`] by default; a tier backend answers its own classes
+    /// (a missing object, or a target class it refuses).
+    async fn transition(
+        &self,
+        bucket: &Name,
+        key: &Key,
+        class: Class,
+        now: SystemTime,
+    ) -> Result<(), Self::Error> {
+        let _ = (bucket, key, class, now);
+        Err(Error::NoTiers.into())
+    }
+
+    /// The listing a metrics reader counts, without the side effects a
+    /// client listing may carry.
+    ///
+    /// The default is [`ObjectOps::list_objects`], so a backend without a
+    /// write buffer needs no override; a tier backend overrides it to scan
+    /// the planes without flushing the buffer first (T26).
+    ///
+    /// # Errors
+    ///
+    /// [`ObjectOps::list_objects`]'s own.
+    async fn metrics_scan(&self, params: ListObjectsParams) -> Result<ObjectListing, Self::Error> {
+        self.list_objects(params).await
+    }
 }
 
 /// The default symlink policy of the filesystem backend: `false` = reject

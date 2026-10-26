@@ -84,7 +84,8 @@ pub struct Args {
 /// **Read, merge, write** (LC14): the stored configuration is the plane's `GET`, the one rule is
 /// replaced or appended by its ID, and the merged document is the plane's `PUT` — so the other
 /// rules survive an `add`, and the plane validates the document it is handed exactly as it
-/// validates one a `put` sends (LC8).
+/// validates one a `put` sends (LC8). The tier gate (T11) applies to the merged document too: a
+/// backend without tiers refuses one carrying a transition, in the same sentence `put` uses.
 ///
 /// # Errors
 ///
@@ -143,6 +144,9 @@ pub async fn run(args: Args, located: Located) -> Result<ExitCode, Error> {
         _ => return Err(refusal(&args.bucket, &stored)),
     };
     config.upsert_rule(rule);
+    // The merged document is a write like any other, so the tier gate covers it (T11): a
+    // backend without tiers refuses a stored transition the merge would carry.
+    plane.refuse_transitions(&args.bucket, &config)?;
     let answer = plane.call(Method::PUT, Some(&config.to_wire())).await?;
     require_status(&args.bucket, &answer, 204)?;
     Ok(ExitCode::SUCCESS)
@@ -188,6 +192,7 @@ mod tests {
                 date: None,
                 expired_object_delete_marker: None,
             }),
+            transitions: Vec::new(),
             noncurrent_version_expiration: None,
             abort_incomplete_multipart_upload: None,
         }

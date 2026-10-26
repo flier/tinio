@@ -56,7 +56,8 @@ pub struct Args {
 /// sentence for the whole body. **What is sent is the file's text**, not a re-serialization: a
 /// member this build's model does not carry is still the operator's document, and the plane
 /// ignores it as it ignores one on any read (LC17). No rule is validated here — the plane is the
-/// request path (LC8).
+/// request path (LC8) — but the tier gate is the CLI's too (T11): a configuration carrying a
+/// transition is refused on a root whose backend has no tiers, before the plane is asked.
 ///
 /// # Errors
 ///
@@ -101,11 +102,72 @@ pub async fn run(args: Args, located: Located) -> Result<ExitCode, Error> {
     let text = fs::read_to_string(&args.file)
         .await
         .map_err(|err| Error::Usage(format!("{}: {err}", args.file.display())))?;
-    if let Err(err) = serde_json::from_str::<Config>(&text) {
-        return Err(Error::Usage(format!("{}: {err}", args.file.display())));
-    }
+    let config = match serde_json::from_str::<Config>(&text) {
+        Ok(config) => config,
+        Err(err) => return Err(Error::Usage(format!("{}: {err}", args.file.display()))),
+    };
     let plane = Plane::connect(args.dir, located, &args.bucket).await?;
+    plane.refuse_transitions(&args.bucket, &config)?;
     let answer = plane.call(Method::PUT, Some(&text)).await?;
     require_status(&args.bucket, &answer, 204)?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::_core::{
+        Class,
+        lifecycle::{Filter, Rule, Status, TRANSITIONS_NEED_TIERS, Transition},
+    };
+
+    /// A rule whose only action is the transition this build accepts (T11).
+    fn transition_rule() -> Rule {
+        Rule {
+            id: Some("archive".to_owned()),
+            status: Status::Enabled,
+            filter: Filter::default(),
+            expiration: None,
+            transitions: vec![Transition {
+                days: Some(30),
+                date: None,
+                storage_class: Class::StandardIa,
+            }],
+            noncurrent_version_expiration: None,
+            abort_incomplete_multipart_upload: None,
+        }
+    }
+
+    #[test]
+    fn a_non_tier_cli_put_refuses_transitions() {
+        // T11: the tier gate covers the CLI's `put`, over the capability the plane reports. A
+        // backend without tiers refuses the file in the same sentence the plane and the S3
+        // surface use, naming the rule; a tier backend carries the same file, and a
+        // transition-free file passes either way.
+        use super::super::test_plane;
+
+        let config = Config {
+            rules: vec![transition_rule()],
+        };
+        let non_tier = test_plane(false);
+        assert!(
+            !non_tier.supports_tiers(),
+            "the fixture carries the non-tier answer the gate reads"
+        );
+        let refused = non_tier
+            .refuse_transitions("photos", &config)
+            .expect_err("a backend without tiers refuses the transition");
+        assert_eq!(
+            refused.to_string(),
+            format!("lifecycle photos: rule archive: {TRANSITIONS_NEED_TIERS}")
+        );
+
+        let tier = test_plane(true);
+        assert!(tier.supports_tiers());
+        tier.refuse_transitions("photos", &config)
+            .expect("a tier backend carries the same file");
+        non_tier
+            .refuse_transitions("photos", &Config { rules: Vec::new() })
+            .expect("a configuration with no transition passes");
+    }
 }

@@ -12,7 +12,7 @@ use crate::{error::Error, state};
 
 /// Compact never triggers below this allocated size — a small database
 /// gains nothing from a rewrite (meta-redb-spec Q1).
-const MIN_ALLOCATED: u64 = 64 * 1024 * 1024;
+pub const MIN_ALLOCATED: u64 = 64 * 1024 * 1024;
 
 /// A fragmentation snapshot of the state database (compact evaluation,
 /// meta-redb-spec §5.9). All values in bytes.

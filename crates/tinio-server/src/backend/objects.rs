@@ -17,9 +17,8 @@
 //! `copy_object` toggle (FR-021); the tagging ops gate on `caps.tagging`.
 
 use std::sync::Arc;
-/// The copy answer's `LastModified` reads the clock; the write-lock seam
-/// owns its own reading.
-#[cfg(feature = "copy")]
+/// The class demotion's transition stamp, and the copy answer's
+/// `LastModified` (the write-lock seam owns its own reading).
 use std::time::SystemTime;
 
 use http::HeaderValue;
@@ -52,7 +51,7 @@ use crate::{
 };
 use crate::{
     _core::{
-        BodyStream, acl, bucket,
+        BodyStream, Class, acl, bucket,
         checksum::Algorithm,
         object,
         object::OBJECT_TAGS_MAX,
@@ -242,6 +241,59 @@ fn deleted_entry(
 }
 
 impl<S: Storage> S3Backend<S> {
+    /// The demotion a PUT asks for (T10): `None` when the backend has no
+    /// tiers (the field is ignored — no refusal, today's behavior), when the
+    /// request names no class, or when it names `STANDARD`; `Some` when the
+    /// object must be moved to the cold plane after its commit.
+    ///
+    /// The gate runs before any class logic: a backend without tiers never
+    /// even parses the value. A tiered backend refuses an unrecognized class
+    /// with `InvalidStorageClass`, and a demotion on a versioned or suspended
+    /// bucket with `InvalidRequest` — a version's placement is its own, so
+    /// the post-commit demotion this path answers has no version to follow.
+    async fn requested_demotion(
+        &self,
+        requested: Option<&dto::StorageClass>,
+        bucket: &bucket::Name,
+    ) -> S3Result<Option<Class>> {
+        let Some(requested) = requested else {
+            return Ok(None);
+        };
+        if !self.storage.supports_tiers() {
+            return Ok(None);
+        }
+        let class = requested
+            .as_str()
+            .parse::<Class>()
+            .map_err(|_| s3_error!(InvalidStorageClass))?;
+        if class == Class::Standard {
+            return Ok(None);
+        }
+        let state = self
+            .storage
+            .bucket_versioning(bucket)
+            .await
+            .map_err(map_backend_error)?;
+        if state.records_versions() {
+            return Err(s3_error!(
+                InvalidRequest,
+                "STANDARD_IA cannot be requested on a versioned or suspended bucket"
+            ));
+        }
+        Ok(Some(class))
+    }
+
+    /// The plain object write (`PutObject`, and `PostObject`'s delegated
+    /// destination).
+    ///
+    /// The storage class a write asks for is best-effort (T10): the answer
+    /// describes the commit, never the demotion — [`Storage::storage_class`]
+    /// is the mover's answer at read time, so a placement can move between
+    /// this write and a later attributes read. A demotion that can no longer
+    /// be honoured therefore leaves the object as committed: a concurrent
+    /// delete answers the transition `NoSuchKey` (the delete is the client's
+    /// own later write), and a bucket that begins recording versions between
+    /// the pre-commit gate and the demotion keeps its object warm.
     pub(crate) async fn op_put_object(
         &self,
         req: S3Request<dto::PutObjectInput>,
@@ -274,6 +326,14 @@ impl<S: Storage> S3Backend<S> {
             req.input.if_match.as_ref(),
             req.input.if_none_match.as_ref(),
         )?;
+
+        // The storage-class gate (T10), before any body is staged: a backend
+        // without tiers ignores the field entirely (today's behavior), a
+        // tiered one accepts `STANDARD`/`STANDARD_IA` and refuses the rest,
+        // and a demotion is only answerable on a plain unversioned bucket.
+        let demote = self
+            .requested_demotion(req.input.storage_class.as_ref(), &bucket)
+            .await?;
 
         // Object Lock (OL7, OL16): the three write headers are mapped, the
         // effective lock is resolved ONCE against the bucket configuration,
@@ -430,6 +490,34 @@ impl<S: Storage> S3Backend<S> {
             .commit_object(&bucket, &key, staged, tags, owner, acl, write_lock.as_ref())
             .await
             .map_err(map_backend_error)?;
+        // The write is committed, so the per-key write lock has done its
+        // job; release it before the demotion (a tier backend's transition
+        // owns its own locking).
+        drop(_guard);
+        if let Some(class) = demote {
+            // T10: the commit above lands in the warm plane synchronously and
+            // the demotion follows it before the answer — a 200 means the
+            // object already sits in the class GetObjectAttributes reports.
+            //
+            // The versioning gate ran before the commit's lock, and the tier
+            // backend reads the bucket's state again under its own finalize
+            // gate: a bucket that became versioned or suspended in between
+            // keeps the object warm there, the same answer the gate gives for
+            // that state, so this path asks nothing a second time.
+            let moved = self
+                .storage
+                .transition(&bucket, &key, class, SystemTime::now())
+                .await;
+            if let Err(err) = moved {
+                // A concurrent DELETE between the commit and the move is the
+                // client's own later write: the bytes were published, so the
+                // missing key answers the 200, not a 404.
+                let err: StorageError = err.into();
+                if !matches!(err, StorageError::NoSuchKey(_)) {
+                    return Err(map_backend_error(err));
+                }
+            }
+        }
         let mut output = dto::PutObjectOutput {
             e_tag: Some(Self::etag_wire(&put.etag)),
             ..Default::default()
@@ -865,7 +953,8 @@ impl<S: Storage> S3Backend<S> {
     /// ObjectParts container (AWS). No capability gate (plan): nothing
     /// is recorded while the checksum toggle is off, so an object
     /// written under it has no checksum or part checksums to echo.
-    /// StorageClass is always STANDARD (tinio has no tiers).
+    /// StorageClass is the object's placement on a tiered backend
+    /// ([`Storage::storage_class`]) and STANDARD on one without tiers.
     ///
     /// A version-addressed request describes the VERSION it names, from
     /// that version's own row (the plan-2 `head_object_version`: ETag,
@@ -941,7 +1030,17 @@ impl<S: Storage> S3Backend<S> {
             ..Default::default()
         };
         if want("StorageClass") {
-            out.storage_class = Some(dto::StorageClass::from_static(dto::StorageClass::STANDARD));
+            // T10: the only surface that reports the class. A tiered backend
+            // answers the object's placement; one without tiers answers
+            // STANDARD through the contract default, without a
+            // placement read (HEAD and the listings keep STANDARD for
+            // third-party compatibility, T24).
+            let class = self
+                .storage
+                .storage_class(&bucket, &key)
+                .await
+                .map_err(map_backend_error)?;
+            out.storage_class = Some(dto::StorageClass::from_static(class.as_str()));
         }
         // The recorded-checksum echo (spec 2026-08-31), in the
         // attribute container: the matching per-algorithm field plus
@@ -2068,9 +2167,14 @@ impl<S: Storage> S3Backend<S> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unreachable,
+    reason = "test context: the `TierDouble` double's undriven trait methods are unreachable by construction — the tier tests drive only the seam (`supports_tiers`/`storage_class`/`transition`) and the calls the `S3Backend` handlers make under it, so those bodies are never entered (docs/style.md §Panics)"
+)]
 mod tests {
-    use std::io;
+    use std::{collections::HashMap, io, sync::Mutex, time::SystemTime};
 
+    use async_trait::async_trait;
     use bytes::Bytes;
     use futures::{StreamExt, stream};
     use http::HeaderValue;
@@ -2090,23 +2194,32 @@ mod tests {
     use super::*;
     #[cfg(feature = "copy")]
     use crate::_util::testing::tags;
-    #[cfg(feature = "acl")]
     use crate::{
-        _core::storage::{BucketOps, VersionOps},
-        backend::testutil::{
-            self, acl_backend, canonical_grantee, credentials_for, grant, group_grantee,
-            post_request, signed_request, user_id, valid_md5,
+        _core::{
+            Class, bucket, checksum, cors, lifecycle,
+            multipart::{CompletedPart, MultipartUpload, ObjectPart, PartInfo, PartNumber},
+            object_lock,
+            storage::{
+                BucketOps, BucketsListing, ByteRange, LifecycleRules, ListBucketsParams,
+                ListObjectsParams, ListPartsParams, ListUploadsParams, MultipartOps, ObjectListing,
+                ObjectOps, PartsListing, TagWriteResult, UploadsListing, VersionOps,
+            },
+            version::{CurrentVersion, Id, ListParams, Listing, Marker, State},
         },
-        capability::CapabilityS3,
-    };
-    use crate::{
-        _core::{bucket, checksum, storage::ObjectOps},
         _mem::MemoryStorage,
         _util::testing::{body, read_body},
         backend::{
             Capabilities,
             testutil::{s3_request, setup, setup_gated_with_caps, setup_with_caps},
         },
+    };
+    #[cfg(feature = "acl")]
+    use crate::{
+        backend::testutil::{
+            self, acl_backend, canonical_grantee, credentials_for, grant, group_grantee,
+            post_request, signed_request, user_id, valid_md5,
+        },
+        capability::CapabilityS3,
     };
 
     async fn setup_name() -> (S3Backend<MemoryStorage>, bucket::Name) {
@@ -5067,5 +5180,870 @@ mod tests {
         put(declared(99)).await.unwrap();
         let err = put(declared(100)).await.unwrap_err();
         assert_eq!(err.code().as_str(), "InvalidArgument");
+    }
+
+    // --- S3 storage class (Task 19, T10) ---
+
+    /// The tier hooks' seam over the in-memory backend: `tinio-tier`'s own
+    /// `storage_class`/`transition` land in a later task, so these tests hold
+    /// a double that owns just the hooks — a placement map answering the
+    /// class, and a `transition` that records every attempt and models the
+    /// backend's own versioned skip — while the operations the tier tests
+    /// drive delegate to `MemoryStorage` (every other trait method answers
+    /// `unreachable!`). The event log records the operations in call order, so
+    /// a test can assert the commit happened before the demotion that answers
+    /// it.
+    struct TierDouble {
+        inner: MemoryStorage,
+        classes: Mutex<HashMap<String, Class>>,
+        events: Mutex<Vec<TierEvent>>,
+        /// `true` makes every transition answer `NoSuchKey` — the shape a
+        /// concurrent delete leaves between a commit and its demotion.
+        transition_missing: Mutex<bool>,
+        /// A non-missing-key failure every transition answers — the refusal
+        /// that must still fail the PUT.
+        transition_error: Mutex<Option<StorageError>>,
+        /// A versioning state applied inside the commit itself, after the
+        /// pre-commit gate read and before the demotion meets it.
+        flip_on_commit: Mutex<Option<State>>,
+    }
+
+    /// One completed storage operation, in the order the backend finished it.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum TierEvent {
+        Commit(object::Key),
+        Transition(object::Key, Class),
+    }
+
+    impl TierDouble {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStorage::new().expect("an in-memory store"),
+                classes: Mutex::new(HashMap::new()),
+                events: Mutex::new(Vec::new()),
+                transition_missing: Mutex::new(false),
+                transition_error: Mutex::new(None),
+                flip_on_commit: Mutex::new(None),
+            }
+        }
+
+        /// Place `key` in `class` — the cold-object fixture.
+        fn place(&self, key: &str, class: Class) {
+            self.classes
+                .lock()
+                .expect("the class map")
+                .insert(key.to_owned(), class);
+        }
+
+        /// Answer every transition `NoSuchKey` — a key a concurrent delete
+        /// removed after its commit.
+        fn lose_transitions(&self) {
+            *self.transition_missing.lock().expect("the failure flag") = true;
+        }
+
+        /// Answer every transition `err` — a demotion the store refuses for a
+        /// reason other than a vanished key.
+        fn fail_transitions_with(&self, err: StorageError) {
+            *self.transition_error.lock().expect("the failure") = Some(err);
+        }
+
+        /// Flip the bucket to `state` from inside the commit, so the demotion
+        /// meets a state the pre-commit gate did not see.
+        fn flip_versioning_on_commit(&self, state: State) {
+            *self.flip_on_commit.lock().expect("the flip") = Some(state);
+        }
+
+        fn events(&self) -> Vec<TierEvent> {
+            self.events.lock().expect("the event log").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LifecycleRules for TierDouble {
+        async fn lifecycles(&self) -> Result<Vec<(bucket::Name, lifecycle::Config)>, StorageError> {
+            unreachable!("the tier tests never exercise lifecycles")
+        }
+    }
+
+    #[async_trait]
+    impl Storage for TierDouble {
+        type Error = StorageError;
+
+        fn supports_tiers(&self) -> bool {
+            true
+        }
+
+        async fn storage_class(
+            &self,
+            _bucket: &bucket::Name,
+            key: &object::Key,
+        ) -> Result<Class, StorageError> {
+            Ok(self
+                .classes
+                .lock()
+                .expect("the class map")
+                .get(key.as_ref())
+                .copied()
+                .unwrap_or(Class::Standard))
+        }
+
+        async fn transition(
+            &self,
+            bucket: &bucket::Name,
+            key: &object::Key,
+            class: Class,
+            _now: SystemTime,
+        ) -> Result<(), StorageError> {
+            // Booked on entry: the event log answers how often the demotion was
+            // asked for.
+            self.events
+                .lock()
+                .expect("the event log")
+                .push(TierEvent::Transition(key.clone(), class));
+            // The backend's own finalize gate: a bucket that records versions
+            // keeps its objects warm, so the move is a skip, not an error
+            // (T11, T16) — the one refusal a versioned bucket gets.
+            if self
+                .inner
+                .bucket_versioning(bucket)
+                .await?
+                .records_versions()
+            {
+                return Ok(());
+            }
+            if *self.transition_missing.lock().expect("the failure flag") {
+                return Err(StorageError::NoSuchKey(key.clone()));
+            }
+            if let Some(err) = self.transition_error.lock().expect("the failure").take() {
+                return Err(err);
+            }
+            self.classes
+                .lock()
+                .expect("the class map")
+                .insert(key.to_string(), class);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl BucketOps for TierDouble {
+        async fn create_bucket(
+            &self,
+            name: &bucket::Name,
+            owner: Option<&acl::OwnerId>,
+            acl: &acl::Acl,
+        ) -> Result<(), StorageError> {
+            Ok(self.inner.create_bucket(name, owner, acl).await?)
+        }
+
+        async fn get_bucket_object_lock(
+            &self,
+            name: &bucket::Name,
+        ) -> Result<Option<object_lock::Config>, StorageError> {
+            Ok(self.inner.get_bucket_object_lock(name).await?)
+        }
+
+        async fn put_bucket_object_lock(
+            &self,
+            _name: &bucket::Name,
+            _config: &object_lock::Config,
+        ) -> Result<(), StorageError> {
+            unreachable!("the tier tests never exercise put_bucket_object_lock")
+        }
+
+        async fn delete_bucket(&self, _name: &bucket::Name) -> Result<(), StorageError> {
+            unreachable!("the tier tests never exercise delete_bucket")
+        }
+
+        async fn head_bucket(&self, _name: &bucket::Name) -> Result<bucket::Bucket, StorageError> {
+            unreachable!("the tier tests never exercise head_bucket")
+        }
+
+        async fn list_buckets(
+            &self,
+            _params: ListBucketsParams,
+            _owner: Option<&acl::OwnerId>,
+            _lazy_default: Option<&acl::OwnerId>,
+        ) -> Result<BucketsListing, StorageError> {
+            unreachable!("the tier tests never exercise list_buckets")
+        }
+
+        async fn get_bucket_tags(
+            &self,
+            _name: &bucket::Name,
+        ) -> Result<object::Tags, StorageError> {
+            unreachable!("the tier tests never exercise get_bucket_tags")
+        }
+
+        async fn put_bucket_tags(
+            &self,
+            _name: &bucket::Name,
+            _tags: &object::Tags,
+        ) -> Result<(), StorageError> {
+            unreachable!("the tier tests never exercise put_bucket_tags")
+        }
+
+        async fn delete_bucket_tags(&self, _name: &bucket::Name) -> Result<(), StorageError> {
+            unreachable!("the tier tests never exercise delete_bucket_tags")
+        }
+
+        async fn get_bucket_cors(
+            &self,
+            _name: &bucket::Name,
+        ) -> Result<Option<cors::Config>, StorageError> {
+            unreachable!("the tier tests never exercise get_bucket_cors")
+        }
+
+        async fn put_bucket_cors(
+            &self,
+            _name: &bucket::Name,
+            _cors: &cors::Config,
+        ) -> Result<(), StorageError> {
+            unreachable!("the tier tests never exercise put_bucket_cors")
+        }
+
+        async fn delete_bucket_cors(&self, _name: &bucket::Name) -> Result<(), StorageError> {
+            unreachable!("the tier tests never exercise delete_bucket_cors")
+        }
+
+        async fn get_bucket_lifecycle(
+            &self,
+            _name: &bucket::Name,
+        ) -> Result<Option<lifecycle::Config>, StorageError> {
+            unreachable!("the tier tests never exercise get_bucket_lifecycle")
+        }
+
+        async fn put_bucket_lifecycle(
+            &self,
+            _name: &bucket::Name,
+            _config: &lifecycle::Config,
+        ) -> Result<(), StorageError> {
+            unreachable!("the tier tests never exercise put_bucket_lifecycle")
+        }
+
+        async fn merge_bucket_lifecycle(
+            &self,
+            _name: &bucket::Name,
+            _rules: &[lifecycle::Rule],
+        ) -> Result<lifecycle::Merged, StorageError> {
+            unreachable!("the tier tests never exercise merge_bucket_lifecycle")
+        }
+
+        async fn delete_bucket_lifecycle(&self, _name: &bucket::Name) -> Result<(), StorageError> {
+            unreachable!("the tier tests never exercise delete_bucket_lifecycle")
+        }
+
+        async fn get_bucket_acl(&self, _name: &bucket::Name) -> Result<acl::Acl, StorageError> {
+            unreachable!("the tier tests never exercise get_bucket_acl")
+        }
+
+        async fn put_bucket_acl(
+            &self,
+            _name: &bucket::Name,
+            _grants: &acl::AclGrants,
+        ) -> Result<(), StorageError> {
+            unreachable!("the tier tests never exercise put_bucket_acl")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectOps for TierDouble {
+        type StagedBody = <MemoryStorage as ObjectOps>::StagedBody;
+
+        async fn stage_body(
+            &self,
+            bucket: &bucket::Name,
+            key: &object::Key,
+            body: BodyStream,
+            tee: Option<Arc<checksum::PartChecksum>>,
+            carried: Option<checksum::Recorded>,
+        ) -> Result<Self::StagedBody, StorageError> {
+            Ok(self
+                .inner
+                .stage_body(bucket, key, body, tee, carried)
+                .await?)
+        }
+
+        async fn resolve_write_lock(
+            &self,
+            bucket: &bucket::Name,
+            explicit: Option<&object_lock::Retention>,
+            legal_hold: object_lock::LegalHold,
+            now: SystemTime,
+        ) -> Result<Option<object_lock::Lock>, StorageError> {
+            Ok(self
+                .inner
+                .resolve_write_lock(bucket, explicit, legal_hold, now)
+                .await?)
+        }
+
+        async fn commit_object(
+            &self,
+            bucket: &bucket::Name,
+            key: &object::Key,
+            staged: Self::StagedBody,
+            tags: object::Tags,
+            owner: Option<&acl::OwnerId>,
+            acl: &acl::Acl,
+            lock: Option<&object_lock::Lock>,
+        ) -> Result<object::Info, StorageError> {
+            let info = self
+                .inner
+                .commit_object(bucket, key, staged, tags, owner, acl, lock)
+                .await?;
+            self.events
+                .lock()
+                .expect("the event log")
+                .push(TierEvent::Commit(key.clone()));
+            // The flip lands inside the commit: the pre-commit gate has
+            // already answered and the demotion has not read the state yet.
+            let flip = *self.flip_on_commit.lock().expect("the flip");
+            if let Some(state) = flip {
+                self.inner.set_bucket_versioning(bucket, state).await?;
+            }
+            Ok(info)
+        }
+
+        async fn get_object(
+            &self,
+            bucket: &bucket::Name,
+            key: &object::Key,
+            range: Option<ByteRange>,
+        ) -> Result<GetObjectResult, StorageError> {
+            Ok(self.inner.get_object(bucket, key, range).await?)
+        }
+
+        async fn rename_object(
+            &self,
+            _bucket: &bucket::Name,
+            _src: &object::Key,
+            _dst: &object::Key,
+        ) -> Result<object::Info, StorageError> {
+            unreachable!("the tier tests never exercise rename_object")
+        }
+
+        async fn head_object(
+            &self,
+            bucket: &bucket::Name,
+            key: &object::Key,
+        ) -> Result<object::Info, StorageError> {
+            Ok(self.inner.head_object(bucket, key).await?)
+        }
+
+        async fn delete_object(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+        ) -> Result<Marker, StorageError> {
+            unreachable!("the tier tests never exercise delete_object")
+        }
+
+        async fn get_object_tags(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+        ) -> Result<object::Tags, StorageError> {
+            unreachable!("the tier tests never exercise get_object_tags")
+        }
+
+        async fn put_object_tags(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+            _tags: &object::Tags,
+        ) -> Result<TagWriteResult, StorageError> {
+            unreachable!("the tier tests never exercise put_object_tags")
+        }
+
+        async fn delete_object_tags(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+        ) -> Result<TagWriteResult, StorageError> {
+            unreachable!("the tier tests never exercise delete_object_tags")
+        }
+
+        async fn get_object_acl(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+        ) -> Result<acl::Acl, StorageError> {
+            unreachable!("the tier tests never exercise get_object_acl")
+        }
+
+        async fn put_object_acl(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+            _grants: &acl::AclGrants,
+        ) -> Result<(), StorageError> {
+            unreachable!("the tier tests never exercise put_object_acl")
+        }
+
+        async fn list_objects(
+            &self,
+            _params: ListObjectsParams,
+        ) -> Result<ObjectListing, StorageError> {
+            unreachable!("the tier tests never exercise list_objects")
+        }
+
+        async fn list_object_parts(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+        ) -> Result<Vec<ObjectPart>, StorageError> {
+            unreachable!("the tier tests never exercise list_object_parts")
+        }
+    }
+
+    #[async_trait]
+    impl MultipartOps for TierDouble {
+        async fn create_multipart_upload(
+            &self,
+            bucket: &bucket::Name,
+            key: &object::Key,
+            checksum: Option<checksum::Upload>,
+            tags: object::Tags,
+            owner: Option<&acl::OwnerId>,
+            acl: &acl::Acl,
+            lock: Option<&object_lock::Lock>,
+        ) -> Result<MultipartUpload, StorageError> {
+            Ok(self
+                .inner
+                .create_multipart_upload(bucket, key, checksum, tags, owner, acl, lock)
+                .await?)
+        }
+
+        async fn get_multipart_upload(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+            _upload_id: &str,
+        ) -> Result<MultipartUpload, StorageError> {
+            unreachable!("the tier tests never exercise get_multipart_upload")
+        }
+
+        async fn upload_part(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+            _upload_id: &str,
+            _part_number: PartNumber,
+            _body: BodyStream,
+            _checksum: Option<Arc<checksum::PartChecksum>>,
+        ) -> Result<PartInfo, StorageError> {
+            unreachable!("the tier tests never exercise upload_part")
+        }
+
+        async fn list_parts(&self, _params: ListPartsParams) -> Result<PartsListing, StorageError> {
+            unreachable!("the tier tests never exercise list_parts")
+        }
+
+        async fn complete_multipart_upload(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+            _upload_id: &str,
+            _parts: &[CompletedPart],
+            _checksum: Option<checksum::Recorded>,
+        ) -> Result<object::Info, StorageError> {
+            unreachable!("the tier tests never exercise complete_multipart_upload")
+        }
+
+        async fn abort_multipart_upload(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+            _upload_id: &str,
+        ) -> Result<(), StorageError> {
+            unreachable!("the tier tests never exercise abort_multipart_upload")
+        }
+
+        async fn list_multipart_uploads(
+            &self,
+            _params: ListUploadsParams,
+        ) -> Result<UploadsListing, StorageError> {
+            unreachable!("the tier tests never exercise list_multipart_uploads")
+        }
+    }
+
+    #[async_trait]
+    impl VersionOps for TierDouble {
+        async fn bucket_versioning(&self, bucket: &bucket::Name) -> Result<State, StorageError> {
+            Ok(self.inner.bucket_versioning(bucket).await?)
+        }
+
+        async fn set_bucket_versioning(
+            &self,
+            bucket: &bucket::Name,
+            state: State,
+        ) -> Result<(), StorageError> {
+            Ok(self.inner.set_bucket_versioning(bucket, state).await?)
+        }
+
+        async fn delete_object_version(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+            _version: Option<&Id>,
+            _bypass: object_lock::Bypass,
+        ) -> Result<Marker, StorageError> {
+            unreachable!("the tier tests never exercise delete_object_version")
+        }
+
+        async fn list_object_versions(
+            &self,
+            _bucket: &bucket::Name,
+            _params: ListParams,
+        ) -> Result<Listing, StorageError> {
+            unreachable!("the tier tests never exercise list_object_versions")
+        }
+
+        async fn current_version(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+        ) -> Result<CurrentVersion, StorageError> {
+            unreachable!("the tier tests never exercise current_version")
+        }
+
+        async fn version_tags(
+            &self,
+            _bucket: &bucket::Name,
+            _key: &object::Key,
+            _version: Option<&Id>,
+        ) -> Result<object::Tags, StorageError> {
+            unreachable!("the tier tests never exercise version_tags")
+        }
+    }
+
+    /// A tiered backend with a fresh `data` bucket.
+    async fn tier_setup() -> (S3Backend<TierDouble>, bucket::Name) {
+        let backend = S3Backend::new(TierDouble::new(), Capabilities::default());
+        let b = bucket::name("data").expect("a bucket name");
+        backend
+            .storage()
+            .create_bucket(&b, None, &acl::Acl::default_private(None))
+            .await
+            .expect("the bucket");
+        (backend, b)
+    }
+
+    /// A PUT naming `class`.
+    fn class_put(
+        b: &bucket::Name,
+        key: &str,
+        class: &'static str,
+    ) -> S3Request<dto::PutObjectInput> {
+        s3_request(dto::PutObjectInput {
+            bucket: b.to_string(),
+            key: key.into(),
+            body: Some(StreamingBlob::wrap(stream::once(async {
+                Ok::<_, io::Error>(Bytes::from_static(b"hello"))
+            }))),
+            storage_class: Some(dto::StorageClass::from_static(class)),
+            ..Default::default()
+        })
+    }
+
+    /// The `StorageClass` attribute of one object.
+    async fn attributes_class(
+        backend: &S3Backend<TierDouble>,
+        b: &bucket::Name,
+        key: &str,
+    ) -> Option<String> {
+        backend
+            .get_object_attributes(s3_request(dto::GetObjectAttributesInput {
+                bucket: b.to_string(),
+                key: key.into(),
+                object_attributes: vec!["StorageClass".parse().unwrap()],
+                ..Default::default()
+            }))
+            .await
+            .expect("the attributes")
+            .output
+            .storage_class
+            .map(|c| c.as_str().to_owned())
+    }
+
+    #[tokio::test]
+    async fn attributes_report_ia_for_cold() {
+        // T10: GetObjectAttributes is the only surface that reports the
+        // class. A cold object — one the tier backend places in the pg
+        // plane — answers STANDARD_IA; HEAD keeps the compatibility
+        // default, so third-party tools see STANDARD (T24).
+        let (backend, b) = tier_setup().await;
+        backend
+            .storage()
+            .put_object(
+                &b,
+                &object::key("cold.bin").expect("an object key"),
+                body(b"cold"),
+            )
+            .await
+            .expect("the object");
+        backend.storage().place("cold.bin", Class::StandardIa);
+
+        assert_eq!(
+            attributes_class(&backend, &b, "cold.bin").await.as_deref(),
+            Some(Class::StandardIa.as_str())
+        );
+
+        let head = backend
+            .head_object(s3_request(dto::HeadObjectInput {
+                bucket: b.to_string(),
+                key: "cold.bin".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("the head")
+            .output;
+        assert_eq!(head.storage_class, None, "HEAD stays STANDARD");
+    }
+
+    #[tokio::test]
+    async fn a_non_tier_backend_ignores_standard_ia() {
+        // T10: on a backend without tiers the field is ignored entirely —
+        // no 501, no transition, today's behavior — and the object answers
+        // STANDARD. The backend never parses the value, so even an unknown
+        // class rides through.
+        let (backend, b) = setup_name().await;
+        backend
+            .put_object(class_put(&b, "ia.bin", dto::StorageClass::STANDARD_IA))
+            .await
+            .expect("STANDARD_IA is ignored");
+        backend
+            .put_object(class_put(&b, "glacier.bin", dto::StorageClass::GLACIER))
+            .await
+            .expect("an unknown class is ignored");
+
+        let out = backend
+            .get_object_attributes(s3_request(dto::GetObjectAttributesInput {
+                bucket: b.to_string(),
+                key: "ia.bin".into(),
+                object_attributes: vec!["StorageClass".parse().unwrap()],
+                ..Default::default()
+            }))
+            .await
+            .expect("the attributes")
+            .output;
+        assert_eq!(
+            out.storage_class.as_ref().map(|c| c.as_str()),
+            Some(dto::StorageClass::STANDARD)
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_standard_ia_demotes_before_answering() {
+        // T10: an IA PUT commits synchronously, then demotes — the 200
+        // means the object already sits in the class it reports. The event
+        // log pins the order.
+        let (backend, b) = tier_setup().await;
+        backend
+            .put_object(class_put(&b, "cold.bin", dto::StorageClass::STANDARD_IA))
+            .await
+            .expect("the demoting put");
+
+        let k = object::key("cold.bin").expect("an object key");
+        assert_eq!(
+            backend.storage().events(),
+            vec![
+                TierEvent::Commit(k.clone()),
+                TierEvent::Transition(k.clone(), Class::StandardIa),
+            ],
+            "commit first, then the demotion that answers the request"
+        );
+        assert_eq!(
+            backend
+                .storage()
+                .storage_class(&b, &k)
+                .await
+                .expect("a class"),
+            Class::StandardIa
+        );
+        assert_eq!(
+            attributes_class(&backend, &b, "cold.bin").await.as_deref(),
+            Some(Class::StandardIa.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transition_that_finds_the_key_gone_still_answers() {
+        // T10: the demotion answers a committed write, so a concurrent DELETE
+        // between the two is the client's own later write — the transition's
+        // NoSuchKey never turns the published PUT into a 404.
+        let (backend, b) = tier_setup().await;
+        backend.storage().lose_transitions();
+        backend
+            .put_object(class_put(&b, "gone.bin", dto::StorageClass::STANDARD_IA))
+            .await
+            .expect("the committed write answers, not the demotion");
+
+        let k = object::key("gone.bin").expect("an object key");
+        assert_eq!(
+            backend.storage().events(),
+            vec![
+                TierEvent::Commit(k.clone()),
+                TierEvent::Transition(k.clone(), Class::StandardIa),
+            ],
+            "the commit stands and the demotion was attempted"
+        );
+        assert!(
+            backend.storage().head_object(&b, &k).await.is_ok(),
+            "the bytes the 200 promised are there"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transition_failure_that_is_not_a_missing_key_fails_the_put() {
+        // T10: only the vanished-key answer is swallowed. A demotion the
+        // store refuses for any other reason still fails the write — the
+        // tolerance is the concurrent delete's shape, never "ignore a failed
+        // demotion".
+        let (backend, b) = tier_setup().await;
+        backend
+            .storage()
+            .fail_transitions_with(StorageError::InvalidRequest("a refused class"));
+        let err = backend
+            .put_object(class_put(&b, "refused.bin", dto::StorageClass::STANDARD_IA))
+            .await
+            .expect_err("a refused demotion is not a successful write");
+        assert_eq!(err.code().as_str(), "InvalidRequest");
+
+        let k = object::key("refused.bin").expect("an object key");
+        assert_eq!(
+            backend.storage().events(),
+            vec![
+                TierEvent::Commit(k.clone()),
+                TierEvent::Transition(k, Class::StandardIa),
+            ],
+            "the commit happened and the refusal came from the demotion"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_versioning_flip_before_the_demotion_leaves_the_object_warm() {
+        // T10: the versioning gate is a read before the commit's lock. A
+        // bucket that starts recording versions inside that window keeps its
+        // object on the warm plane: the demotion is asked for once and the
+        // backend's own finalize gate skips it, so the committed write still
+        // answers and exactly one layer refuses.
+        for state in [State::Enabled, State::Suspended] {
+            let (backend, b) = tier_setup().await;
+            backend.storage().flip_versioning_on_commit(state);
+            backend
+                .put_object(class_put(&b, "warm.bin", dto::StorageClass::STANDARD_IA))
+                .await
+                .unwrap_or_else(|err| panic!("{state:?}: the committed write answers: {err:?}"));
+
+            let k = object::key("warm.bin").expect("an object key");
+            assert_eq!(
+                backend.storage().events(),
+                vec![
+                    TierEvent::Commit(k.clone()),
+                    TierEvent::Transition(k.clone(), Class::StandardIa),
+                ],
+                "{state:?}: the demotion is asked for once and skips itself"
+            );
+            assert_eq!(
+                backend
+                    .storage()
+                    .storage_class(&b, &k)
+                    .await
+                    .expect("a class"),
+                Class::Standard,
+                "{state:?}: the backend's skip keeps the object warm"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tier_ia_on_a_versioned_or_suspended_bucket_is_refused() {
+        // T10: a versioned or suspended bucket refuses STANDARD_IA with
+        // InvalidRequest — before the body is staged, so neither a commit
+        // nor a transition happens.
+        let (backend, b) = tier_setup().await;
+        let k = object::key("cold.bin").expect("an object key");
+        for state in [State::Enabled, State::Suspended] {
+            backend
+                .storage()
+                .set_bucket_versioning(&b, state)
+                .await
+                .expect("the versioning state");
+            let err = backend
+                .put_object(class_put(&b, "cold.bin", dto::StorageClass::STANDARD_IA))
+                .await
+                .expect_err("a versioned bucket refuses the demotion");
+            assert_eq!(err.code().as_str(), "InvalidRequest", "{state:?}");
+            assert!(
+                backend.storage().events().is_empty(),
+                "{state:?}: a refused PUT neither commits nor transitions"
+            );
+            assert!(
+                backend.storage().head_object(&b, &k).await.is_err(),
+                "{state:?}: nothing was written"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_class_is_invalid() {
+        // T10: a tiered backend refuses a class outside STANDARD /
+        // STANDARD_IA with InvalidStorageClass, before any write.
+        let (backend, b) = tier_setup().await;
+        let err = backend
+            .put_object(class_put(&b, "cold.bin", dto::StorageClass::GLACIER))
+            .await
+            .expect_err("an unknown class is invalid on a tiered backend");
+        assert_eq!(err.code().as_str(), "InvalidStorageClass");
+        assert!(backend.storage().events().is_empty());
+    }
+
+    #[cfg(all(feature = "copy", feature = "multipart"))]
+    #[tokio::test]
+    async fn copy_and_mpu_ignore_the_class() {
+        // T10: CopyObject and CreateMultipartUpload accept the field but
+        // ignore it — no demotion follows either. The MPU carries an
+        // unknown class to show the value is never even read.
+        let (backend, b) = tier_setup().await;
+        backend
+            .storage()
+            .put_object(&b, &object_key("src.txt"), body(b"source"))
+            .await
+            .expect("the source");
+
+        backend
+            .copy_object(s3_request(
+                CopyObjectInput::builder()
+                    .bucket(b.to_string())
+                    .key("dst.txt".to_string())
+                    .copy_source(CopySource::parse(&format!("{b}/src.txt")).expect("a source"))
+                    .storage_class(Some(dto::StorageClass::from_static(
+                        dto::StorageClass::STANDARD_IA,
+                    )))
+                    .build()
+                    .expect("a copy request"),
+            ))
+            .await
+            .expect("the copy");
+
+        backend
+            .create_multipart_upload(s3_request(dto::CreateMultipartUploadInput {
+                bucket: b.to_string(),
+                key: "mpu.bin".into(),
+                storage_class: Some(dto::StorageClass::from_static(dto::StorageClass::GLACIER)),
+                ..Default::default()
+            }))
+            .await
+            .expect("the multipart create");
+
+        assert!(
+            !backend
+                .storage()
+                .events()
+                .iter()
+                .any(|e| matches!(e, TierEvent::Transition(..))),
+            "neither copy nor MPU demotes"
+        );
     }
 }

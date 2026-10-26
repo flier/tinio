@@ -8,7 +8,7 @@
 - Scratch outside the repo and not `target/`; clear stale leftovers before a round, the round's own at its end.
 - Placement: unit next to the subject; cucumber iff the migration rule admits, else integration.
 - DB-backed legs pin 4 test threads (`--test-threads=4`; nextest test group) — a 4-conn pool per leg vs the fixture's `max_connections`.
-- DB legs fail closed: `TINIO_PG_REQUIRED` set in the DB job ⇒ a missing `TINIO_PG_DSN` aborts, never skips.
+- DB legs (pg, tier): `TINIO_PG_REQUIRED` aborts on a missing `TINIO_PG_DSN`, never skips; the cucumber pg/tier passes panic regardless.
 
 ## PostgreSQL fixture
 
@@ -27,13 +27,23 @@ docker compose -f tools/pg/docker-compose.yml down
 
 - Stop with `down`; add `-v` only to reset the data volume.
 
+## Tiered storage legs
+
+- Conformance: shared `assert_conformance` + versioning suite over real fs warm and pg cold planes — never a fake.
+- Harness drain rule: drain a metadata-only GET body before writing or deleting the same key; the tier holds the read lock through it.
+- Crash matrix: the rows, placements and files a crashed copy, removal, publish, index clear or tombstone leaves are planted, never mocked.
+- Layer tests own the paths a contract cannot reach: read path, write path, batch, stage, listing, capacity/heat mover, index open.
+- e2e: `@tier` stays out of the default pass; its own serial `--features tier` leg needs a live database and a `TINIO_PG_DSN`.
+- External: `interop/tier.feature`; client presence and the CI requirement are the e2e README's.
+- Run commands, tags and harness detail: `crates/tinio-e2e/README.md`; the tier tasks are the design's T25.
+
 ## Harness & guards
 
 - Shared harness = lib behind a test feature; shared include = file-scope.
 - Integration for crate boundary / foreign oracle / bench-shared / public-API properties.
 - One-module property suite inline with its subject; a harness spawns via `job::spawn` only; an outside-guard site: record the reason.
 - Drop a duplicate only when the survivor covers the same rule; fold missing asserts first.
-- State-dir layout: closed set the fs backend tests pin — `meta.redb`, `tmp/`, `multipart/`, `blobs/`, tool-state files.
+- State-dir layout: closed set the fs backend tests pin, owned by `data-model.md` §Reserved Directory.
 - State-dir classes: fs reserved dir, read-only home leaf, pg synthetic root — owner `contracts/config.md` (`[storage.pg]`).
 
 ## Standard acceptance (pre-push gate)

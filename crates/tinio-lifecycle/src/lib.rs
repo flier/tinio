@@ -8,11 +8,13 @@
 //! implementation and not a cleanup pass over a backend's private state.
 //!
 //! The pass keeps no cursor (LC12): every cycle re-lists, so a restarted run
-//! resumes by re-deriving what is due. Each action is the API's own deletion
-//! (LC2) — a current version expires through a delete marker in a versioned
-//! bucket and an unlink otherwise, a noncurrent version is removed
-//! permanently, an incomplete upload is aborted — so the engine owns no
-//! version-aware deletion of its own.
+//! resumes by re-deriving what is due. Three of its four actions are the API's
+//! own deletion (LC2) — a current version expires through a delete marker in a
+//! versioned bucket and an unlink otherwise, a noncurrent version is removed
+//! permanently, an incomplete upload is aborted — and the fourth is the storage
+//! contract's own move: a due transition is `Storage::transition`, on a backend
+//! with tiers and only while the bucket records no versions (T11). So the
+//! engine owns no version-aware deletion of its own.
 //!
 //! [`Storage`]: crate::_core::storage::Storage
 

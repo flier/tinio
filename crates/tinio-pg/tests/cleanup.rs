@@ -953,6 +953,7 @@ async fn a_bucket_with_a_noncurrent_rule_keeps_its_versions_past_the_server_knob
             status,
             filter: lifecycle::Filter::default(),
             expiration: None,
+            transitions: Vec::new(),
             noncurrent_version_expiration: Some(lifecycle::NoncurrentVersionExpiration {
                 noncurrent_days: Some(30),
                 newer_noncurrent_versions: None,

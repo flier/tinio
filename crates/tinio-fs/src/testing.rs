@@ -13,7 +13,8 @@ use crate::{
         mode::AccessMode,
         pipeline::InlineRunner,
         storage::{
-            DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
+            DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_MAX_CONCURRENT_UPLOADS,
+            DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
         },
     },
     FsOptions,
@@ -40,6 +41,7 @@ pub fn fs_options() -> FsOptions {
         compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
         meta_batch_size: DEFAULT_META_BATCH_SIZE,
         meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+        max_concurrent_uploads: DEFAULT_MAX_CONCURRENT_UPLOADS,
         owner_uids: HashMap::new(),
         io_pipeline: Arc::new(InlineRunner::default()),
         remove_pipeline: Arc::new(InlineRunner::default()),

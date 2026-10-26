@@ -8,6 +8,7 @@ use std::process;
 use std::sync::Arc;
 use std::{
     fs,
+    path::Path,
     process::{ExitCode, ExitStatus},
 };
 
@@ -26,15 +27,22 @@ use crate::_core::storage::Storage;
 use crate::_core::{bucket, storage::Error as StorageError};
 #[cfg(feature = "object-lock")]
 use crate::_server::ObjectLockCache;
+#[cfg(feature = "tier")]
+use crate::commands::tier::require_root_state_dir;
 #[cfg(feature = "api")]
 use crate::daemon;
 #[cfg(feature = "lifecycle")]
 use crate::{_api::lifecycle::LifecycleAdmin, _core::lifecycle};
 use crate::{
-    _fs::{Error as FsError, FsStorage},
+    _core::storage::DEFAULT_MAX_CONCURRENT_UPLOADS,
+    _fs::{Error as FsError, FsOptions, FsStorage},
     _sandbox::{Adopted, Attribution, Child, Refused, disarm_signal_relay, supervise},
     _server::log,
-    _util::state::{prepare_home_derived, prepare_synthetic_root},
+    _tier::refuse_non_tier_root,
+    _util::{
+        secret::Secret,
+        state::{prepare_home_derived, prepare_synthetic_root},
+    },
     Error,
     cli::Provenance,
     commands::is_pg_root,
@@ -46,7 +54,7 @@ use crate::{
     sandbox, signal,
 };
 #[cfg(feature = "pg")]
-use crate::{_pg, _util::secret::Secret, config::storage::pg::DEFAULT_POOL_SIZE};
+use crate::{_pg, config::storage::pg::DEFAULT_POOL_SIZE};
 
 /// §1's pre-runtime half: steps a–j, resolve through the control-channel bind.
 ///
@@ -168,6 +176,20 @@ pub fn run(
     if resolution.config.backend() == Backend::Pg {
         return Err(pg_not_servable());
     }
+    // The tier selector's own feature-off refusal, in the same position and for the same reason:
+    // `tinio-tier` is a non-optional dependency, so the keys parse in every build, but the start
+    // arm that would serve them exists only with the `tier` feature. Falling through to the
+    // filesystem backend is the one answer that is never acceptable.
+    #[cfg(not(feature = "tier"))]
+    if resolution.config.backend() == Backend::Tier {
+        return Err(tier_not_servable());
+    }
+    // **A root the tier layer owns is never served by another backend** (T17): the marker, the
+    // index or both make the root tier mode's — its warm rows, cold placements and root identity
+    // all belong to that layer. Both of the other backends ask this one seam, and the tier arm
+    // passes because it is the owner. It sits here — before the fork, the directories and the
+    // confinement — so a refused start has not touched the tree it refuses to serve.
+    refuse_tier_root(resolution.config.backend(), &resolution.root)?;
     // The other arm of the synthetic-root guard: a **named** configuration that does not select pg
     // resolved a filesystem run under the dsn's synthetic root. Nothing was created (the named
     // document was read, not minted) and serving it would be the wrong backend silently.
@@ -207,15 +229,16 @@ pub fn run(
         sandbox::plan(&resolution, &args, provenance)?
     };
 
-    // **A confinement and a pg store cannot be honoured together** (the sandbox crate's own
-    // finding): the confinement cuts the confined process's outbound connections, and a pg run's
-    // store connection is exactly such a path, so a jailed pg run could never serve. It is refused
-    // **here** — after `plan` has answered which channel asked (the request is that record), and
-    // before the fork and the directories — so a refused run neither forks nor confines itself.
-    // The fs backend is unaffected: it serves from local files, and its confinement is the whole
-    // point of the mode.
+    // **A confinement and a database cannot be honoured together** (the sandbox crate's own
+    // finding): the confinement cuts the confined process's outbound connections, and both remote
+    // backends reach a PostgreSQL server over exactly such a path — the pg backend's store
+    // connection and the tier layer's connection to its cold plane — so a jailed run of either
+    // could never serve. It is refused **here** — after `plan` has answered which channel asked
+    // (the request is that record), and before the fork and the directories — so a refused run
+    // neither forks nor confines itself. The fs backend is unaffected: it serves from local files,
+    // and its confinement is the whole point of the mode.
     if let Some(refusal) =
-        sandbox::refuse_pg_under_confinement(&request, resolution.config.backend())
+        sandbox::refuse_store_under_confinement(&request, resolution.config.backend())
     {
         return Err(refusal);
     }
@@ -469,17 +492,39 @@ pub fn run(
     let pipeline_section = resolution.config.pipeline.clone().unwrap_or_default();
     let pipelines = Pipelines::build(&pipeline_section)?;
     let backend = match resolution.config.backend() {
+        #[cfg(feature = "tier")]
+        // The tier arm is a **selection** here, like the pg one: its storage is built on the
+        // runtime (the cold plane connects and takes ownership there, and the layer's index is
+        // bound there). The selector is what answers, not the presence of `[storage.pg]` — a
+        // tier document carries that section and must never be served as pg.
+        Backend::Tier => {
+            tier_selection(&resolution, args.env.pg_dsn.as_ref())?.ok_or_else(|| {
+                Error::Operational(
+                    "the tier selector answered no backend for a `[storage] type = \"tier\"` \
+                 configuration"
+                        .into(),
+                )
+            })?
+        }
+        #[cfg(not(feature = "tier"))]
+        Backend::Tier => {
+            // The selector's refusal is this build's answer; its `Ok` arm cannot exist, and the
+            // build's own sentence is the fallback rather than an unreachable promise.
+            return Err(tier_selection(&resolution, args.env.pg_dsn.as_ref())
+                .err()
+                .unwrap_or_else(tier_not_servable));
+        }
         #[cfg(feature = "pg")]
         Backend::Pg => {
             let (config, access) = pg_backend_config(&resolution, args.env.pg_dsn.as_ref())?;
             Served::Pg { config, access }
         }
-        _ => {
-            let mut storage = FsStorage::new(
-                &resolution.root,
-                resolve::fs_options(&resolution, Some(&pipelines)),
-            )
-            .map_err(|err| match err {
+        #[cfg(not(feature = "pg"))]
+        Backend::Pg => return Err(pg_not_servable()),
+        Backend::Fs => {
+            let mut options = resolve::fs_options(&resolution, Some(&pipelines));
+            apply_upload_cap(&mut options, &resolution);
+            let storage = FsStorage::new(&resolution.root, options).map_err(|err| match err {
                 // The storage constructor's own io failure, classified like the two above: what it
                 // opens under the root — the state database and the staging areas — is the path a
                 // confinement refuses first, and it arrives wrapped in the backend's error rather
@@ -489,11 +534,6 @@ pub fn run(
                 }
                 other => Error::from(other),
             })?;
-            if let Some(s3) = resolution.config.s3.as_ref() {
-                // `[s3] max_concurrent_uploads` caps in-progress multipart uploads, so an
-                // authenticated client cannot accumulate an unbounded number of them.
-                storage.set_max_concurrent_uploads(s3.max_concurrent_uploads);
-            }
             #[cfg(feature = "object-lock")]
             let object_lock_cache = object_lock_cache_for(&resolution);
             #[cfg(feature = "api")]
@@ -528,6 +568,25 @@ pub fn run(
     // k is `run::on_runtime`'s: no runtime is created anywhere in this module.
 }
 
+/// The upload cap a **serving** run applies to the warm plane: `[s3] max_concurrent_uploads`,
+/// over [`DEFAULT_MAX_CONCURRENT_UPLOADS`] when the section is absent.
+///
+/// **A serving policy, applied at the serving constructions rather than by
+/// [`resolve::fs_options`]**: the cap governs a served instance's live multipart uploads, so an
+/// offline command (`tier verify`/`repair`, `doctor`) keeps the default instead of constructing a
+/// warm store with a policy only the server enforces. Both serving constructions — the
+/// filesystem arm above and the tier arm's warm plane
+/// ([`prepare_tier`](super::serve)) — call this, so the two cannot apply different caps.
+pub(super) fn apply_upload_cap(options: &mut FsOptions, resolution: &Resolution) {
+    options.max_concurrent_uploads = resolution
+        .config
+        .s3
+        .as_ref()
+        .map_or(DEFAULT_MAX_CONCURRENT_UPLOADS, |s3| {
+            s3.max_concurrent_uploads
+        });
+}
+
 /// The management plane's lifecycle admin (LC14): the three `/buckets/{bucket}/lifecycle` routes
 /// are served from it, so the plane carries this run's storage handle without `tinio-api` ever
 /// depending on the crate that owns one.
@@ -543,6 +602,10 @@ struct StorageAdmin<S> {
 #[cfg(feature = "lifecycle")]
 #[async_trait::async_trait]
 impl<S: Storage + Send + Sync> LifecycleAdmin for StorageAdmin<S> {
+    fn supports_tiers(&self) -> bool {
+        self.storage.supports_tiers()
+    }
+
     async fn get(&self, bucket: &bucket::Name) -> Result<Option<lifecycle::Config>, StorageError> {
         self.storage
             .get_bucket_lifecycle(bucket)
@@ -737,6 +800,91 @@ pub(crate) fn pg_backend_config(
         _pg::Access::ReadWrite
     };
     Ok((_pg::Config::new(dsn, pool), access))
+}
+
+/// The tier backend's selection (T1, T17): the layer's runtime configuration, the cold plane's pg
+/// configuration and the access mode — **a pure decision that connects to nothing**, because the
+/// storage itself is built on the runtime (the cold plane connects, takes its ownership lock and
+/// binds the layer's index there).
+///
+/// **The selector is the configuration's `[storage] type`**, never the presence of
+/// `[storage.pg]`: a tier document carries that section because it *is* the cold plane, and
+/// reading it as a pg selection would serve the wrong backend. `None` means this configuration
+/// does not select tier; the arm exists in every build (with `tinio-tier` a non-optional
+/// dependency) so the refusal for a build without the `tier` feature is this function's own
+/// answer rather than a silence that falls through to the filesystem backend.
+///
+/// The dsn is [`pg_backend_config`]'s answer, so a tier run's cold plane and a pg run's store
+/// resolve one dsn by one rule; `TINIO_PG_DSN` overrides the section for both.
+#[cfg(feature = "tier")]
+pub(crate) fn tier_selection(
+    resolution: &Resolution,
+    pg_dsn: Option<&Secret>,
+) -> Result<Option<Served>, Error> {
+    if resolution.config.backend() != Backend::Tier {
+        return Ok(None);
+    }
+    // **A tier start keeps its records in the root's own state directory** (marker, index and
+    // the tier configuration), so a run that relocated its state dir would read and write two
+    // different directories. The offline verbs refuse the same relocation
+    // (`commands::tier::open`), and one helper words both refusals.
+    require_root_state_dir(resolution)?;
+    let config = resolution
+        .config
+        .storage
+        .as_ref()
+        .and_then(config::storage::Config::tier_runtime)
+        .ok_or_else(|| {
+            Error::Config(config::Error::invalid_value(
+                "storage",
+                "`[storage] type = \"tier\"` resolved no tier configuration",
+            ))
+        })?;
+    let (pg, access) = pg_backend_config(resolution, pg_dsn)?;
+    Ok(Some(Served::Tier { config, pg, access }))
+}
+
+/// The same selection in a build without the `tier` feature — the refusal, never an answer.
+///
+/// This is a separate function rather than a `cfg` arm inside [`tier_selection`] so the
+/// feature-carrying build keeps one body: the two builds differ in what they can carry, and the
+/// feature-off answer is the build's, not a branch of the feature-on one.
+#[cfg(not(feature = "tier"))]
+pub(crate) fn tier_selection(
+    resolution: &Resolution,
+    pg_dsn: Option<&Secret>,
+) -> Result<Option<Served>, Error> {
+    let _ = pg_dsn;
+    if resolution.config.backend() != Backend::Tier {
+        return Ok(None);
+    }
+    Err(tier_not_servable())
+}
+
+/// **The feature-off tier refusal**: the keys parse in every build, so a build that cannot serve
+/// them says so rather than ignoring a configuration it read — and names both remedies (the
+/// build, or the filesystem backend), the shape [`pg_not_servable`] has.
+#[cfg(not(feature = "tier"))]
+fn tier_not_servable() -> Error {
+    Error::Usage(
+        "`[storage] type = \"tier\"` needs the `tier` cargo feature, which this build does not \
+         carry: rebuild with it, or set `[storage] type = \"fs\"`"
+            .into(),
+    )
+}
+
+/// **A non-tier start refuses a root the tier layer owns** (T17): the marker, the index or both
+/// make the root tier mode's. The tier backend answers `Ok` because it is the owner — the one
+/// backend allowed to serve such a root.
+///
+/// Both of the other backends ask this one seam, so neither can serve a root whose warm rows,
+/// cold placements and root identity belong to the layer. The refusal is the layer's own
+/// ([`refuse_non_tier_root`](crate::_tier::refuse_non_tier_root)), which names what it found.
+pub(crate) fn refuse_tier_root(backend: Backend, root: &Path) -> Result<(), Error> {
+    match backend {
+        Backend::Tier => Ok(()),
+        Backend::Fs | Backend::Pg => refuse_non_tier_root(root).map_err(Error::from),
+    }
 }
 
 /// **The feature-off pg refusal** (PG15/§6): a build without the `pg` feature cannot serve
@@ -1545,7 +1693,7 @@ mod tests {
         let asked = Request {
             channel: Some(Channel::Flag),
         };
-        let refusal = sandbox::refuse_pg_under_confinement(&asked, Backend::Pg)
+        let refusal = sandbox::refuse_store_under_confinement(&asked, Backend::Pg)
             .expect("a pg run under a confinement is refused");
         // A usage error: the operator asked for two settings that cannot both hold.
         assert!(matches!(refusal, Error::Usage(_)), "{refusal}");
@@ -1555,11 +1703,12 @@ mod tests {
         assert!(text.contains("confinement"), "{text}");
 
         assert!(
-            sandbox::refuse_pg_under_confinement(&asked, Backend::Fs).is_none(),
+            sandbox::refuse_store_under_confinement(&asked, Backend::Fs).is_none(),
             "a filesystem run serves from local files and keeps its confinement"
         );
         assert!(
-            sandbox::refuse_pg_under_confinement(&Request { channel: None }, Backend::Pg).is_none(),
+            sandbox::refuse_store_under_confinement(&Request { channel: None }, Backend::Pg)
+                .is_none(),
             "a pg run that asked for no confinement is not refused"
         );
     }

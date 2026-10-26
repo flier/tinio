@@ -63,6 +63,14 @@ use tinio_util::testing::{walk_files, workspace_root};
 #[path = "steps/tag_filter.rs"]
 mod tag_filter;
 
+/// The in-process backend selector (Task 25): the `TINIO_E2E_BACKEND` grammar
+/// gets its unit tests here for the same reason the tag filter does — the
+/// cucumber binary is `harness = false`, so a module it owns can only be
+/// asserted from a default-harness target.
+#[cfg(test)]
+#[path = "steps/backend.rs"]
+mod backend;
+
 /// Where an allow-listed ID's verification actually lives.
 enum Home {
     /// A test/bench/script path that must exist on disk.

@@ -82,6 +82,12 @@ pub struct ScannerOptions {
     /// purge, the one pass stage that writes the storage root (FR-023;
     /// see [`AccessMode`]).
     pub access: AccessMode,
+    /// Reconcile object rows against the files' presence. On everywhere
+    /// the filesystem is the content source (a row whose file is gone is
+    /// a stale row); off in tier mode (T3/T17), where a row without a
+    /// file is a legitimate cold object — the pass then skips object
+    /// reconciliation and still runs the non-object sweeps.
+    pub reconcile_objects: bool,
 }
 
 /// The background ETag scanner of a storage backend.
@@ -113,6 +119,7 @@ pub struct ScannerOptions {
 ///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///     max_concurrent_uploads: tinio_core::storage::DEFAULT_MAX_CONCURRENT_UPLOADS,
 ///     owner_uids: std::collections::HashMap::new(),
 ///     io_pipeline: Arc::new(InlineRunner::default()),
 ///     remove_pipeline: Arc::new(InlineRunner::default()),
@@ -128,6 +135,7 @@ pub struct ScannerOptions {
 ///     max_wait: Duration::from_millis(10),
 ///     cycle: Duration::from_millis(50),
 ///     access: AccessMode::ReadWrite,
+///     reconcile_objects: true,
 /// };
 /// let scanner = Scanner::new(storage.clone(), options);
 /// Runtime::new().unwrap().block_on(async {
@@ -230,13 +238,19 @@ impl Scanner {
     /// traffic between buckets (and after each batch of entries within a
     /// bucket); returns the pass summary.
     ///
+    /// Object reconciliation runs only with [`ScannerOptions::reconcile_objects`]
+    /// on: off (tier mode) a row without a file is a cold object, so the
+    /// per-bucket stage is skipped while the non-object stages below —
+    /// stale bucket records (their `UPLOADS`/`PARTS` rows included) and
+    /// deletion-tombstone leftovers — still run.
+    ///
     /// Per-bucket isolation (F12): one bucket's reconcile error (an
     /// unreadable bucket dir, a concurrent bucket-dir deletion, an R4
     /// abort) is warned and skipped — the remaining buckets and the
     /// stale-bucket stage still run, so a permanently failing bucket
     /// cannot starve the rest of the pass (or leave ghost bucket records)
-    /// forever. Only a root-level failure (the `bucket_names` walk)
-    /// aborts the pass.
+    /// forever. Only a root-level failure (the `bucket_names` walk, which
+    /// runs only with reconciliation on) aborts the pass.
     #[instrument(
         target = "tinio::storage",
         level = "info",
@@ -245,20 +259,22 @@ impl Scanner {
     )]
     pub async fn scan_once(&self) -> Result<ScanSummary, Error> {
         let mut summary = ScanSummary::default();
-        for name in self.storage.bucket_names("").await? {
-            match self.reconcile_bucket(&name).await {
-                Ok((reconciled, recomputed, reclaimed)) => {
-                    summary.reconciled += reconciled;
-                    summary.recomputed += recomputed;
-                    summary.reclaimed += reclaimed;
+        if self.options.reconcile_objects {
+            for name in self.storage.bucket_names("").await? {
+                match self.reconcile_bucket(&name).await {
+                    Ok((reconciled, recomputed, reclaimed)) => {
+                        summary.reconciled += reconciled;
+                        summary.recomputed += recomputed;
+                        summary.reclaimed += reclaimed;
+                    }
+                    Err(err) => tracing::warn!(
+                        bucket = %name,
+                        error = %err,
+                        "bucket reconcile failed; skipping the bucket (the next pass retries)"
+                    ),
                 }
-                Err(err) => tracing::warn!(
-                    bucket = %name,
-                    error = %err,
-                    "bucket reconcile failed; skipping the bucket (the next pass retries)"
-                ),
+                yield_now().await;
             }
-            yield_now().await;
         }
         // Stale bucket records (item 2): a bucket directory removed
         // out-of-band is invisible to the reconcile loop (it walks live
@@ -782,6 +798,7 @@ mod tests {
             max_wait: Duration::from_millis(10),
             cycle: Duration::from_millis(50),
             access: AccessMode::ReadWrite,
+            reconcile_objects: true,
         }
     }
 
@@ -1065,6 +1082,7 @@ mod tests {
                 max_wait: Duration::from_millis(10),
                 cycle: Duration::from_millis(50),
                 access: AccessMode::ReadWrite,
+                reconcile_objects: true,
             },
         );
         let started = Instant::now();
@@ -1218,6 +1236,7 @@ mod tests {
                 max_wait: Duration::from_millis(10),
                 cycle: Duration::from_millis(1),
                 access: AccessMode::ReadWrite,
+                reconcile_objects: true,
             },
         );
         let (tx, rx) = watch::channel(false);
@@ -1497,6 +1516,7 @@ mod tests {
                 max_wait: Duration::from_millis(10),
                 cycle: Duration::from_millis(50),
                 access: AccessMode::ReadWrite,
+                reconcile_objects: true,
             },
         );
         let task = tokio::spawn(async move { scanner.scan_once().await.unwrap() });
@@ -1545,5 +1565,128 @@ mod tests {
             2,
             "the existing path keeps its row"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_off_leaves_a_stale_row_alone() {
+        // Tier mode: a row whose file is absent is a cold object, not a
+        // stale row (T3/T17). Object reconciliation off must not reclaim
+        // it; the positive control proves the same fixture would be
+        // reclaimed with reconciliation on (the switch, not the setup).
+        let root = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path(), fs_options()).unwrap();
+        let b = bucket::name("data").unwrap();
+        storage
+            .create_bucket(&b, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        let key = object_key("cold.txt");
+        storage.put_object(&b, &key, body(b"cold")).await.unwrap();
+        // The file vanishes out of band; the row stays.
+        fs::remove_file(root.path().join("data/cold.txt"))
+            .await
+            .unwrap();
+
+        let off = Scanner::new(
+            storage.clone(),
+            ScannerOptions {
+                reconcile_objects: false,
+                ..options()
+            },
+        );
+        let summary = off.scan_once().await.unwrap();
+        assert_eq!(summary.reclaimed, 0, "reconciliation is off");
+        assert_eq!(summary.recomputed, 0);
+        let rows = storage.meta_store().walk(&b).await.unwrap();
+        assert_eq!(rows.len(), 1, "the row survives the pass");
+        assert_eq!(rows[0].key, key);
+
+        // Positive control: with reconciliation on the same row is an
+        // orphan of an absent file and is reclaimed.
+        let on = Scanner::new(storage.clone(), options());
+        let summary = on.scan_once().await.unwrap();
+        assert_eq!(summary.reclaimed, 1);
+        assert!(storage.meta_store().walk(&b).await.unwrap().is_empty());
+    }
+
+    /// Seed a root with the two non-object residues one pass sweeps: a
+    /// deletion-tombstone tree (the temporary delete residue under
+    /// `.tinio/deleting/`) and a vanished bucket whose `UPLOADS` (and
+    /// `PARTS`) rows are its orphaned derived state. Returns the storage,
+    /// the vanished bucket's name and the tombstone tree's path.
+    async fn seed_sweep_residue(root: &Path) -> (FsStorage, bucket::Name, PathBuf) {
+        let storage = FsStorage::new(root, fs_options()).unwrap();
+        let stale = bucket::name("stale-bucket").unwrap();
+        storage
+            .create_bucket(&stale, None, &Acl::default_private(None))
+            .await
+            .unwrap();
+        storage
+            .multipart_store()
+            .create(
+                &stale,
+                &object_key("part.bin"),
+                None,
+                object::Tags::empty(),
+                None,
+                &Acl::default_private(None),
+            )
+            .await
+            .unwrap();
+        // The bucket directory vanishes out of band; its rows are residue.
+        fs::remove_dir_all(root.join("stale-bucket")).await.unwrap();
+        let leftover = tombstone::dir(root).join("dead-bucket");
+        fs::create_dir_all(&leftover).await.unwrap();
+        fs::write(leftover.join("leftover.bin"), b"was-a-bucket")
+            .await
+            .unwrap();
+        (storage, stale, leftover)
+    }
+
+    /// One pass with `reconcile_objects` set to `reconcile_objects`
+    /// sweeps the temp/upload residue the same way: the switch gates
+    /// object reconciliation only, never the non-object stages.
+    async fn assert_sweeps_temp_and_uploads(reconcile_objects: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let (storage, stale, leftover) = seed_sweep_residue(root.path()).await;
+        let scanner = Scanner::new(
+            storage.clone(),
+            ScannerOptions {
+                reconcile_objects,
+                ..options()
+            },
+        );
+        let summary = scanner.scan_once().await.unwrap();
+        assert!(
+            !storage
+                .bucket_store()
+                .load_all()
+                .await
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == stale.as_ref()),
+            "the vanished bucket's record is pruned (reconcile_objects = {reconcile_objects})"
+        );
+        assert!(
+            !storage.multipart_store().has_uploads(&stale).await.unwrap(),
+            "its UPLOADS rows are drained (reconcile_objects = {reconcile_objects})"
+        );
+        assert!(
+            !leftover.exists(),
+            "the temporary delete residue is removed (reconcile_objects = {reconcile_objects})"
+        );
+        assert_eq!(
+            summary.reclaimed, 2,
+            "the stale record and the tombstone tree are this pass's reclamation"
+        );
+        assert_eq!(summary.removal_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_off_still_sweeps_temp_and_uploads() {
+        // The off leg is the requirement; the on leg is the unchanged
+        // positive control (the same residue, the same counts).
+        assert_sweeps_temp_and_uploads(false).await;
+        assert_sweeps_temp_and_uploads(true).await;
     }
 }

@@ -667,3 +667,52 @@ fn the_credential_policy_reads_the_bind_and_the_pair() {
         CredentialPolicy::Configured
     );
 }
+
+/// **A tier configuration is not a dsn-addressed pg run** (T1, ruling R8): the document names
+/// `[storage.pg]` because that is the tier layer's cold plane, so a `TINIO_PG_DSN` beside it must
+/// not buy the synthetic root a *pg* run lives under. Without a `DIR` and without a discovered
+/// root the run has no served root, and the resolution says so (the usage error names `DIR`)
+/// instead of handing the serving half a tool-state leaf as if it were the root to serve.
+#[test]
+fn resolve_keeps_a_tier_run_out_of_the_pg_arm() {
+    use crate::{
+        _util::secret::{Secret, SecretKey},
+        config::storage::Backend,
+    };
+
+    const DSN: &str = "postgres://tinio:tinio@127.0.0.1:55432/tinio?sslmode=disable";
+    let scratch = tempfile::TempDir::new().expect("a scratch working directory");
+    let config = scratch.path().join("tier.toml");
+    fs::write(
+        &config,
+        format!("version = 1\n[storage]\ntype = \"tier\"\n[storage.pg]\ndsn = \"{DSN}\"\n"),
+    )
+    .expect("write the tier configuration");
+    let discovery = Discovery {
+        dir: None,
+        config: Some(config),
+        read_only: false,
+        state_dir: None,
+        // The cold plane's dsn is also exported, which is the shape that used to make every
+        // dsn-carrying run pg-addressed.
+        pg_dsn: Some(Secret::from(SecretKey::from(DSN.to_owned()))),
+    };
+
+    let err = locate_from(discovery, &Provenance::default(), scratch.path())
+        .expect_err("a tier run with no DIR has no served root to synthesize");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("DIR"),
+        "the refusal is the missing-root usage error: {rendered}"
+    );
+
+    let parsed = Config::parse(&format!(
+        "version = 1\n[storage]\ntype = \"tier\"\n[storage.pg]\ndsn = \"{DSN}\"\n"
+    ))
+    .expect("the document parses");
+    assert_eq!(
+        parsed.backend(),
+        Backend::Tier,
+        "the selector is what the pg arm must read, not the section's presence"
+    );
+}

@@ -183,6 +183,18 @@ async fn doctor_root_holds_a_store(world: &mut World) {
     doctor_store(cli);
 }
 
+/// The tier layer's marker, planted as the seam reads it (existence; 16 bytes): either the
+/// marker or the index makes a root tier mode's, so a non-tier command must refuse it whole.
+/// The fixture is the shape a tier server leaves, not a record this build could decode — the
+/// refusal is the assertion, not the file's format.
+#[given("the root holds the tier marker")]
+async fn doctor_tier_marker(world: &mut World) {
+    let cli = harness(world);
+    let path = doctor_state_dir(cli).join("tier.mode");
+    fs::write(&path, [0u8; 16])
+        .unwrap_or_else(|err| panic!("the tier marker `{}`: {err}", path.display()));
+}
+
 /// The socket fixture's own two steps, both built on [`doctor_stale_state`]: the `state` file and
 /// the socket it names are one induction, so neither is a step of its own — a scenario that
 /// planted a `state` file with no socket would be planting a channel the report probes and finds

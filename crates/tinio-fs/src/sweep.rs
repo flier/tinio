@@ -235,6 +235,7 @@ async fn sweep_stale_files(
 ///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///     max_concurrent_uploads: tinio_core::storage::DEFAULT_MAX_CONCURRENT_UPLOADS,
 ///     owner_uids: std::collections::HashMap::new(),
 ///     io_pipeline: Arc::new(InlineRunner::default()),
 ///     remove_pipeline: Arc::new(InlineRunner::default()),
@@ -1621,6 +1622,7 @@ mod tests {
             status,
             filter: lifecycle::Filter::default(),
             expiration: None,
+            transitions: Vec::new(),
             noncurrent_version_expiration: None,
             abort_incomplete_multipart_upload: None,
         };

@@ -224,7 +224,8 @@ pub struct Store {
     /// max_concurrent_uploads`; default
     /// [`DEFAULT_MAX_CONCURRENT_UPLOADS`]). [`Store::ensure_capacity`]
     /// counts the live `UPLOADS` rows and refuses new uploads at the cap;
-    /// both the backend's create and [`Store::create`] run it.
+    /// both the backend's create and [`Store::create`] run it. A
+    /// construction-time input: [`Store::from_handle`] takes it once.
     max_concurrent_uploads: u32,
     /// `<state-dir>/multipart/` — part content files only.
     root: PathBuf,
@@ -256,12 +257,6 @@ impl Store {
             writer: AtomicWriter::new(state_dir),
             part_locks: PartLocks::new(),
         }
-    }
-
-    /// Adjust the concurrent-upload cap after construction (the `FsStorage`
-    /// wiring path reads `[s3] max_concurrent_uploads`).
-    pub(crate) fn set_max_concurrent_uploads(&mut self, max: u32) {
-        self.max_concurrent_uploads = max;
     }
 
     /// The per-upload part-write lock, held across a part write's rename and
@@ -296,9 +291,10 @@ impl Store {
     /// engine's), and [`Store::create`] runs it for its own callers — one
     /// home for the rule.
     pub(crate) async fn ensure_capacity(&self) -> Result<(), Error> {
+        let cap = self.max_concurrent_uploads;
         let live = self.live_upload_ids().await?.len() as u32;
-        if live >= self.max_concurrent_uploads {
-            return Err(storage::too_many_uploads(self.max_concurrent_uploads).into());
+        if live >= cap {
+            return Err(storage::too_many_uploads(cap).into());
         }
         Ok(())
     }
@@ -1273,10 +1269,23 @@ mod tests {
         (state, store)
     }
 
+    /// A store opened with `cap` as its upload cap: the cap is a
+    /// construction-time input (the `FsStorage` path passes
+    /// `FsOptions::max_concurrent_uploads` through this same constructor), so
+    /// a test that needs a non-default cap supplies it here.
+    fn fixture_with_cap(cap: u32) -> (tempfile::TempDir, Store) {
+        let state = tempfile::tempdir().unwrap();
+        let store = Store::from_handle(
+            Driver::new(database::open(state.path()).unwrap().db),
+            state.path(),
+            cap,
+        );
+        (state, store)
+    }
+
     #[tokio::test]
     async fn create_refuses_uploads_at_the_concurrency_cap() {
-        let (_, mut store) = fixture();
-        store.set_max_concurrent_uploads(1);
+        let (_, store) = fixture_with_cap(1);
         let b = bucket::name("data").unwrap();
         let k = object::key("big.bin").unwrap();
         store

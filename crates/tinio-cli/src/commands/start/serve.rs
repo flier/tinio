@@ -13,7 +13,7 @@ use tokio::{
 };
 use tracing::instrument;
 
-#[cfg(all(test, feature = "pg"))]
+#[cfg(all(test, feature = "pg", feature = "api"))]
 use super::serving::pg_pass;
 #[cfg(test)]
 use super::serving::{fs_cleanup, multipart_grace_for, scanner_options};
@@ -25,8 +25,12 @@ use super::{
 use crate::_fs::FsStorage;
 #[cfg(test)]
 use crate::_fs::sweep;
+#[cfg(feature = "tier")]
+use crate::_tier::{ColdStore, TierStorage};
 #[cfg(unix)]
 use crate::notify;
+#[cfg(feature = "tier")]
+use crate::resolve::fs_options;
 #[cfg(feature = "pg")]
 use crate::{_core::storage::Error as StorageError, _pg::PgStorage};
 use crate::{
@@ -36,6 +40,7 @@ use crate::{
         Capabilities, DataPlane, Identity, PlaneConfig,
         identity::{self, IdentityFromConfig},
     },
+    _tier::Config as TierConfig,
     Error,
     commands::EnvArgs,
     events,
@@ -112,6 +117,10 @@ struct Serving {
     adopted: Option<Adopted>,
     handles: signal::Handles,
     pipelines: Pipelines,
+    /// The tier layer's runtime configuration, when this run selected the tier backend (T22). The
+    /// serving half threads it to the tier arm's [`ServingBackend::background`], which reads the
+    /// layer's paces from it; every other arm leaves it `None`.
+    tier: Option<TierConfig>,
     on_ready: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -138,6 +147,7 @@ impl Ready {
                 adopted,
                 handles,
                 pipelines,
+                tier: None,
                 on_ready,
             },
         )
@@ -160,6 +170,17 @@ pub async fn serve(ready: Ready) -> Result<ExitCode, Error> {
             // (the construction, the management-plane bind, and anything added later), so a new
             // step inherits this frame instead of having to remember it.
             let (prepared, serving) = prepare_pg(config, access, serving)
+                .await
+                .inspect_err(frame_startup)?;
+            serve_backend(prepared, serving).await
+        }
+        #[cfg(feature = "tier")]
+        Served::Tier { config, pg, access } => {
+            // The tier arm's whole startup is framed here for the pg arm's reason: `serve` is
+            // reached from `on_runtime`, so every fallible step [`prepare_tier`] owns — the cold
+            // plane's connection and ownership lock, the layer's index bind, the management
+            // plane — inherits this one frame instead of each remembering its own.
+            let (prepared, serving) = prepare_tier(config, pg, access, serving)
                 .await
                 .inspect_err(frame_startup)?;
             serve_backend(prepared, serving).await
@@ -201,26 +222,24 @@ async fn bind_served_listener(
     Ok((listener, address))
 }
 
-/// Construct the pg backend and bind its management plane — **the pg arm's whole startup**, in one
-/// function so its refusals are framed once by [`serve`]'s caller (decision 19).
+/// The tail [`prepare_pg`] and [`prepare_tier`] share once their backend exists: the Object Lock
+/// cache, the management plane bound over the storage, and the [`Prepared`] the serving half
+/// reads — **one construction, so the two startup arms cannot disagree about which handles the
+/// plane and the data plane receive**.
 ///
-/// Order is the ruling, and it is `run()`'s for a filesystem run: `PgStorage::connect` is the
-/// single-instance gate (its ownership lock, PG12) and it runs first; the management plane's bind
-/// follows, still before the repair `serve_backend` runs.
-///
-/// **`serving` is taken and returned by value** so the returned future holds no borrow of it across
-/// the `connect` await — a `Serving` owns a `Box<dyn FnOnce() + Send>` (the readiness hook) and is
-/// therefore `Send` but not `Sync`, so a `&Serving` held across an await would make [`serve`]'s
-/// future non-`Send` and break the `tokio::spawn` that drives it.
-#[cfg(feature = "pg")]
-async fn prepare_pg(
-    config: _pg::Config,
-    access: _pg::Access,
-    serving: Serving,
-) -> Result<(Prepared<PgStorage>, Serving), Error> {
-    let storage = PgStorage::connect(&config, access)
-        .await
-        .map_err(StorageError::from)?;
+/// The cache is created before the plane because the admin needs the same handle the data plane
+/// later receives (OL18), and it is `None` when the capability is off. Every `api` and
+/// `object-lock` arm is the one the two callers had, moved here unchanged, so a build without
+/// either feature still constructs the same `Prepared`.
+#[cfg(any(feature = "pg", feature = "tier"))]
+fn prepare_management<S>(storage: S, serving: &Serving) -> Result<Prepared<S>, Error>
+where
+    S: Storage + Clone + 'static,
+{
+    // Without `api` there is no plane to bind and no Object Lock cache to create, so the
+    // serving state has no reader here.
+    #[cfg(not(feature = "api"))]
+    let _ = serving;
     // The Object Lock cache is created before the plane, because the admin needs the same
     // handle the data plane later receives (OL18). It is `None` when the capability is off.
     #[cfg(feature = "object-lock")]
@@ -244,6 +263,81 @@ async fn prepare_pg(
     };
     #[cfg(not(feature = "api"))]
     let prepared = Prepared { storage };
+    Ok(prepared)
+}
+
+/// Construct the pg backend and bind its management plane — **the pg arm's whole startup**, in one
+/// function so its refusals are framed once by [`serve`]'s caller (decision 19).
+///
+/// Order is the ruling, and it is `run()`'s for a filesystem run: `PgStorage::connect` is the
+/// single-instance gate (its ownership lock, PG12) and it runs first; the management plane's bind
+/// follows, still before the repair `serve_backend` runs.
+///
+/// **`serving` is taken and returned by value** so the returned future holds no borrow of it across
+/// the `connect` await — a `Serving` owns a `Box<dyn FnOnce() + Send>` (the readiness hook) and is
+/// therefore `Send` but not `Sync`, so a `&Serving` held across an await would make [`serve`]'s
+/// future non-`Send` and break the `tokio::spawn` that drives it.
+#[cfg(feature = "pg")]
+async fn prepare_pg(
+    config: _pg::Config,
+    access: _pg::Access,
+    serving: Serving,
+) -> Result<(Prepared<PgStorage>, Serving), Error> {
+    let storage = PgStorage::connect(&config, access)
+        .await
+        .map_err(StorageError::from)?;
+    let prepared = prepare_management(storage, &serving)?;
+    Ok((prepared, serving))
+}
+
+/// Construct the tiered backend and bind its management plane — **the tier arm's whole startup**,
+/// in one function so its refusals are framed once by [`serve`]'s caller (decision 19).
+///
+/// **The construction is the layer's own and it is ordered fail-closed** (T17): the marker is
+/// created (or read) before the index, the index is bound, the cold plane connects and takes the
+/// PG ownership lock, and the root identity is matched between the two records. The warm plane's
+/// options are the run's resolved filesystem options with the resolved access mode — the mode is
+/// set explicitly because `open_pg` applies it to one construction, and a read-only run must not
+/// let the warm plane write behind the read-only index (T27). `adopt` is `false`: this product has
+/// no opt-in conversion path here, so a fresh index over a populated database refuses rather than
+/// silently binding it.
+///
+/// **Read-only opens the index and the cold plane read-only and starts no task**, which is why the
+/// background future's own gate is the mode rather than each pass's
+/// ([`tier_background`](super::serving::tier_background)). The
+/// management plane is bound before the repair, as on every backend. `serving` is taken and
+/// returned by value for [`prepare_pg`]'s reason: it owns the readiness hook and must not be held
+/// across an await by reference.
+#[cfg(feature = "tier")]
+async fn prepare_tier(
+    config: TierConfig,
+    pg_config: _pg::Config,
+    access: _pg::Access,
+    mut serving: Serving,
+) -> Result<(Prepared<TierStorage<ColdStore>>, Serving), Error> {
+    let fs_access = if access.is_writable() {
+        AccessMode::ReadWrite
+    } else {
+        AccessMode::ReadOnly
+    };
+    let mut options = fs_options(&serving.resolution, Some(&serving.pipelines));
+    super::run::apply_upload_cap(&mut options, &serving.resolution);
+    // The layer applies one mode to the whole construction: a read-only run must not let the warm
+    // plane write behind the read-only index and cold plane (T27).
+    options.access = fs_access;
+    let storage = TierStorage::open_pg(
+        &serving.resolution.root,
+        options,
+        config.clone(),
+        &pg_config,
+        fs_access,
+        false,
+    )
+    .await?;
+    // The background passes read the layer's paces from this value; it is set before the plane is
+    // bound so the serving half carries one answer to both halves of the startup.
+    serving.tier = Some(config);
+    let prepared = prepare_management(storage, &serving)?;
     Ok((prepared, serving))
 }
 
@@ -283,6 +377,7 @@ where
         adopted,
         handles,
         pipelines,
+        tier,
         on_ready,
     } = serving;
 
@@ -500,8 +595,11 @@ where
         stop.clone(),
         access,
         sweep_options_for(&resolution),
-        scanner_options_for(&resolution, access),
+        // The backend's own answer to "do the files carry the content": tier mode must leave
+        // object rows alone, because a row without a file is a cold object (T3).
+        scanner_options_for(&resolution, access, S::reconcile_objects()),
         lifecycle,
+        tier,
     ));
 
     // **The order of these three awaits is the contract's, not a preference.** The api and data

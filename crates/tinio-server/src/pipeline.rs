@@ -949,8 +949,8 @@ mod tests {
             object,
             pipeline::Task,
             storage::{
-                DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_META_BATCH_BYTES,
-                DEFAULT_META_BATCH_SIZE,
+                DEFAULT_COMPACT_THRESHOLD_PERCENT, DEFAULT_MAX_CONCURRENT_UPLOADS,
+                DEFAULT_META_BATCH_BYTES, DEFAULT_META_BATCH_SIZE,
             },
         },
         _fs::etag::{self, Outcome as EtagOutcome},
@@ -1909,6 +1909,7 @@ mod tests {
                 compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
                 meta_batch_size: DEFAULT_META_BATCH_SIZE,
                 meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+                max_concurrent_uploads: DEFAULT_MAX_CONCURRENT_UPLOADS,
                 io_pipeline: pipelines.io(),
                 remove_pipeline: pipelines.remove(),
                 db_pipeline: pipelines.db(),

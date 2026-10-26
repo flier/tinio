@@ -122,6 +122,7 @@ fn rule() -> Rule {
         status: Status::Enabled,
         filter: Filter::default(),
         expiration: None,
+        transitions: Vec::new(),
         noncurrent_version_expiration: None,
         abort_incomplete_multipart_upload: None,
     }

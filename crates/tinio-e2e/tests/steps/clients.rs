@@ -41,15 +41,18 @@ use assert_cmd::{Command as AssertCmd, cargo::cargo_bin};
 use cucumber::{given, then, when};
 use tinio_sandbox::Event;
 use tinio_util::testing::{frame_line, job, kill_and_reap};
+#[cfg(feature = "tier")]
+use tokio::sync::SemaphorePermit;
+use tokio::{task::spawn_blocking, time::sleep};
 
 use super::{
-    FsKind, World,
+    Backend, FsKind, World,
     cli::scratch_dir,
     common::{contains_ignore_case, deterministic_bytes},
     has_tag,
 };
 use crate::{
-    _cli::config::{Config, s3},
+    _cli::config::{Config, s3, storage},
     _server::Capabilities,
     _util::env::{READ_ONLY_VAR, SANDBOX_VAR, STATE_DIR_VAR},
 };
@@ -161,6 +164,20 @@ pub struct External {
     /// The served storage root (`workdir/root`) — out-of-band file drops
     /// (cold listing, pagination truncation) write under it.
     pub root: PathBuf,
+    /// The scanner toggle the child was spawned with — replayed on a restart.
+    scanner: Option<bool>,
+    /// The `--config` file the child was spawned with (`None` when no knob was set) — replayed on
+    /// a restart, and the tier server's `[storage]`/`[storage.pg]`/`[storage.tier]` document.
+    config: Option<PathBuf>,
+    /// The CLI flags the child was spawned with — replayed on a restart.
+    confinement: Confinement,
+    /// The relocated state dir (the read-only arm alone) — replayed on a restart.
+    state: Option<PathBuf>,
+    /// The shared database's exclusive permit, held for the scenario's life: a writable tier
+    /// server owns the database (one root per database, T18), so the spawned tier processes are
+    /// serialized here rather than by a `--concurrency` flag the harness cannot check.
+    #[cfg(feature = "tier")]
+    _tier_permit: Option<SemaphorePermit<'static>>,
 }
 
 impl External {
@@ -182,7 +199,20 @@ impl External {
     /// **The workdir is the harness's [`scratch_dir`]**, not a bare tempdir: the child's control
     /// socket is `<root>/.tinio/tinio-<16 hex>.sock`, and on macOS `$TMPDIR` is too long for
     /// `sun_path` — the server refuses to start (that helper owns the rationale).
-    pub fn start(caps: &Capabilities, fs_kind: FsKind, confinement: Confinement) -> Self {
+    ///
+    /// **The tier arm is a spawned *product* start, not the in-process testing constructor**
+    /// (T25): `[storage] type = "tier"` with `[storage.pg]` and `[storage.tier]` travels in the
+    /// `--config` file, and the cold plane's dsn is the inherited `TINIO_PG_DSN` — the CLI's own
+    /// resolution, so the leg exercises the startup an operator runs. A writable tier start owns
+    /// its database (T18), so this arm takes the shared pg permit and truncates the database
+    /// before the spawn: the permit serializes it with every other pg/tier scenario, and the
+    /// truncate gives the fresh root the empty database its first `open_pg` bind requires.
+    pub async fn start(
+        backend: Backend,
+        caps: &Capabilities,
+        fs_kind: FsKind,
+        confinement: Confinement,
+    ) -> Self {
         let workdir = scratch_dir();
         let root = workdir.path().join("root");
         fs::create_dir_all(&root).unwrap();
@@ -191,7 +221,26 @@ impl External {
             fs::create_dir_all(&path).unwrap();
             path
         });
-        let config = config_for(caps).map(|text| {
+        #[cfg(feature = "tier")]
+        let tier = backend == Backend::Tier;
+        #[cfg(not(feature = "tier"))]
+        let tier = {
+            let _ = backend;
+            false
+        };
+        #[cfg(feature = "tier")]
+        let tier_permit = if tier {
+            let permit = super::common::pg_permit().await;
+            super::common::reset_pg_database().await;
+            // The dsn is the child's inherited environment; reading it here makes an unset
+            // variable this scenario's error rather than a refused child with no cause in its
+            // stderr (which `spawn_child` sends to the null device).
+            let _ = super::common::pg_dsn();
+            Some(permit)
+        } else {
+            None
+        };
+        let config = config_for(caps, tier).map(|text| {
             let path = workdir.path().join("config.toml");
             fs::write(&path, text).unwrap();
             path
@@ -211,7 +260,79 @@ impl External {
             target_url: base_url,
             workdir,
             root,
+            scanner,
+            config,
+            confinement,
+            state,
+            #[cfg(feature = "tier")]
+            _tier_permit: tier_permit,
         }
+    }
+
+    /// Restart the spawned server on the same root and configuration — the tier durability leg
+    /// (`the external tier server is restarted`), where the reopened process must find the same
+    /// index, the same pg rows and the same root identity.
+    ///
+    /// **The stop is the product's own, not a kill.** `tinio stop <root>` asks the plane to
+    /// cease accepting and drain (FR-018), which is the restart an operator performs; a
+    /// terminated process skips the drain the warm plane's write path and the layer's tasks
+    /// rely on, so the leg would assert crash tolerance the scenario does not claim. The
+    /// process-exit wait is bounded because `stop` confirms the control channel went away, not
+    /// necessarily that the process has returned.
+    ///
+    /// **The short wait after it is the database's.** A writable tier bind takes the store's
+    /// ownership advisory lock (T18); the stopped process's session is closed by the server just
+    /// after it exits, so the respawn waits out that window rather than reading the still-held
+    /// lock as a refusal.
+    pub async fn restart(&mut self) {
+        let root = self.root.clone();
+        let output = spawn_blocking(move || {
+            // The stop client resolves the same state the server wrote, and the four variables
+            // that would change what it resolves are cleared exactly as [`spawn_child`] clears
+            // them for the server itself: a shell exporting one of them must not make the stop
+            // probe a different root or mode than the child it is stopping.
+            let mut stop = Command::new(cargo_bin("tinio"));
+            stop.arg("stop")
+                .arg(&root)
+                .env_remove("TINIO_SCANNER")
+                .env_remove(READ_ONLY_VAR)
+                .env_remove(STATE_DIR_VAR)
+                .env_remove(SANDBOX_VAR);
+            stop.output()
+        })
+        .await
+        .expect("the stop task runs")
+        .expect("run `tinio stop`");
+        assert!(
+            output.status.success(),
+            "`tinio stop` failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for _ in 0..150 {
+            if self
+                .child
+                .try_wait()
+                .expect("the spawned server's status")
+                .is_some()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        // A server that outlived the stop's own confirmation is ended the hard way, so the respawn
+        // cannot race a second owner of the index and the database.
+        terminate(&mut self.child);
+        sleep(Duration::from_millis(250)).await;
+        let (child, endpoint) = spawn_child(
+            &self.root,
+            self.scanner,
+            self.config.as_deref(),
+            self.confinement,
+            self.state.as_deref(),
+        );
+        self.child = child;
+        self.base_url = format!("http://{endpoint}");
+        self.target_url = self.base_url.clone();
     }
 }
 
@@ -255,12 +376,14 @@ pub struct SpawnedServer {
 /// as well as the bind, so the confined arms take the sibling constant
 /// ([`CONFINED_START_TIMEOUT`]) rather than the plain one.
 ///
-/// The child inherits this process's environment, so the three variables
+/// The child inherits this process's environment, so the four variables
 /// that would change what it serves are cleared first: a shell exporting
 /// `TINIO_SCANNER` (the harness decides the scanner, not the caller
 /// shell), `TINIO_READ_ONLY` (FR-023, which would otherwise put every
-/// spawned server in read-only mode), and `TINIO_STATE_DIR` (which would
-/// relocate its state). The `scanner` argument sets its variable back
+/// spawned server in read-only mode), `TINIO_STATE_DIR` (which would
+/// relocate its state), and `TINIO_SANDBOX` (which would confine every
+/// spawned server, while each arm asks for confinement through its own
+/// flag). The `scanner` and `state_dir` arguments set their variables back
 /// afterwards.
 ///
 /// **The credential pair is one thing the spawned server needs and the
@@ -391,24 +514,40 @@ fn wait_for_ready(stdout: impl Read + Send + 'static, budget: Duration) -> Optio
     rx.recv_timeout(budget).ok()
 }
 
-/// The `[s3]` config text for capability overrides (grilling Q4): the
-/// spawned server receives the same tag→config mapping as the
-/// in-process hook, serialized through the config schema's own serde
-/// types — one home for the knob list (a knob the schema gains is a
-/// knob the scenarios can set). None when every knob sits at its
-/// default (no file).
-fn config_for(caps: &Capabilities) -> Option<String> {
-    if *caps == Capabilities::default() {
+/// The config text for capability overrides and the tier arm (grilling Q4): the spawned server
+/// receives the same tag→config mapping as the in-process hook, serialized through the config
+/// schema's own serde types — one home for the knob list (a knob the schema gains is a knob the
+/// scenarios can set). None when every knob sits at its default (no file).
+///
+/// `tier` selects the tiered backend: `[storage] type = "tier"` needs `[storage.pg]` (the cold
+/// plane; its dsn is the child's inherited `TINIO_PG_DSN`) and takes `[storage.tier]`'s defaults,
+/// narrowed so no background pass acts inside a scenario — the IA PUT demotes synchronously
+/// (T10), which is the placement the scenarios assert. A non-tier scenario keeps the old
+/// shape: no file unless a capability knob is set.
+fn config_for(caps: &Capabilities, tier: bool) -> Option<String> {
+    if !tier && *caps == Capabilities::default() {
         return None;
     }
+    let storage = tier.then(|| storage::Config {
+        backend: storage::Backend::Tier,
+        pg: Some(storage::pg::Config::default()),
+        tier: Some(storage::Tier {
+            scan_interval: Duration::from_secs(3600),
+            demote_idle: Duration::from_secs(3600),
+            stats_flush: Duration::from_secs(3600),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
     let config = Config {
         s3: Some(s3::Config {
             capabilities: *caps,
             ..Default::default()
         }),
+        storage,
         ..Default::default()
     };
-    Some(toml::to_string(&config).expect("capabilities serialize to toml"))
+    Some(toml::to_string(&config).expect("the scenario config serializes to toml"))
 }
 
 /// aws cli v2, pre-wired for path-style SigV4 against `base_url`.
@@ -627,7 +766,9 @@ fn scratch(world: &World, name: &str) -> PathBuf {
 /// Split a client command line into argv: whitespace-separated words;
 /// double-quoted segments stay one word (quotes stripped — the shell
 /// convention the old bash scripts used). `{work}` expands to the scratch
-/// workdir, `{captured}` to the last captured client output.
+/// workdir, `{captured}` to the last captured client output, and
+/// `{upload-id}` to the captured multipart upload id (the tier journey's
+/// initiate-then-part-copy pair needs two values alive at once).
 fn tokenize(world: &World, command: &str) -> Vec<String> {
     let work = world
         .ext
@@ -647,7 +788,8 @@ fn tokenize(world: &World, command: &str) -> Vec<String> {
                 if !cur.is_empty() {
                     args.push(
                         cur.replace("{work}", &work)
-                            .replace("{captured}", &world.ext_captured),
+                            .replace("{captured}", &world.ext_captured)
+                            .replace("{upload-id}", &world.ext_upload_id),
                     );
                     cur.clear();
                 }
@@ -658,7 +800,8 @@ fn tokenize(world: &World, command: &str) -> Vec<String> {
     if !cur.is_empty() {
         args.push(
             cur.replace("{work}", &work)
-                .replace("{captured}", &world.ext_captured),
+                .replace("{captured}", &world.ext_captured)
+                .replace("{upload-id}", &world.ext_upload_id),
         );
     }
     args
@@ -839,6 +982,68 @@ async fn run_boto3_read_only(world: &mut World, name: String) {
     run_external(world, &mut cmd, true);
 }
 
+/// Complete the aws multipart upload whose one part is the captured `UploadPartCopy` ETag.
+///
+/// The completion needs two captured values — the upload id from the initiate call and the
+/// part's ETag — and the one `{captured}` slot holds only the latter, so the id travels through
+/// [`World::ext_upload_id`]. The completion document is one inline argv word rather than a
+/// `file://` path: aws cli takes inline JSON, and a Windows scratch path inside a URL is the
+/// kind of quoting a client command line should not have to survive.
+#[given(
+    expr = "I complete the aws multipart upload {string} in bucket {string} with the captured part"
+)]
+#[when(
+    expr = "I complete the aws multipart upload {string} in bucket {string} with the captured part"
+)]
+#[then(
+    expr = "I complete the aws multipart upload {string} in bucket {string} with the captured part"
+)]
+async fn complete_aws_multipart(world: &mut World, key: String, bucket: String) {
+    let upload_id = world.ext_upload_id.trim().to_owned();
+    assert!(
+        !upload_id.is_empty(),
+        "no multipart upload id was captured before the completion"
+    );
+    let etag = world.ext_captured.trim().trim_matches('"').to_owned();
+    let document = format!(r#"{{"Parts":[{{"ETag":"{etag}","PartNumber":1}}]}}"#);
+    let command = format!("s3api complete-multipart-upload --bucket {bucket} --key {key}");
+    let mut cmd = aws_cmd(world, &command);
+    cmd.arg("--upload-id")
+        .arg(&upload_id)
+        .arg("--multipart-upload")
+        .arg(&document);
+    run_external(world, &mut cmd, true);
+}
+
+/// The tier journey's checked-in boto3 script — this crate's own (`tests/scripts/`), because the
+/// tier client leg is this suite's artifact; the older scripts stay beside the server crate's
+/// retired tests.
+fn boto3_tier_script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scripts/boto3_tier.py")
+}
+
+/// Run the tier journey script against the spawned tier server. The script asserts the SDK's own
+/// view of the class, the copy, the multipart assembly, the lifecycle round trip, the versioned
+/// refusal and the batch listing; the feature asserts the OK marker.
+#[given(expr = "I run the boto3 tier script")]
+#[when(expr = "I run the boto3 tier script")]
+#[then(expr = "I run the boto3 tier script")]
+async fn run_boto3_tier(world: &mut World) {
+    let script = boto3_tier_script();
+    assert!(
+        script.exists(),
+        "boto3 tier script not found at {}",
+        script.display()
+    );
+    let ext = world.ext.as_ref().expect("external server running");
+    let endpoint = ext
+        .base_url
+        .strip_prefix("http://")
+        .expect("base url has the http:// prefix");
+    let mut cmd = boto3(endpoint, &script);
+    run_external(world, &mut cmd, true);
+}
+
 /// The ephemeral `--port 0` leg (journey): a second server starts while
 /// the first keeps serving.
 #[given(expr = "I start a second server")]
@@ -854,6 +1059,20 @@ async fn start_second_server(world: &mut World) {
         "the second server must report the address it actually bound, not the `:0` it asked for"
     );
     world.ext_second = Some(spawned);
+}
+
+/// Restart the spawned server on the same root and configuration (the tier durability leg): the
+/// reopened process re-reads the index and the cold rows a scenario's earlier writes left.
+#[given(expr = "the external tier server is restarted")]
+#[when(expr = "the external tier server is restarted")]
+#[then(expr = "the external tier server is restarted")]
+async fn restart_external(world: &mut World) {
+    world
+        .ext
+        .as_mut()
+        .expect("external server running")
+        .restart()
+        .await;
 }
 
 /// Point the aws steps at one of the scenario's two servers.
@@ -995,6 +1214,13 @@ async fn error_contains_ignore_case(world: &mut World, text: String) {
 #[then(expr = "I capture the client output")]
 async fn capture_output(world: &mut World) {
     world.ext_captured = world.ext_output.trim().to_string();
+}
+
+/// Capture the initiate call's output as the multipart upload id — the second value the aws
+/// completion step needs alongside the captured part ETag.
+#[then(expr = "I capture the client output as the multipart upload id")]
+async fn capture_upload_id(world: &mut World) {
+    world.ext_upload_id = world.ext_output.trim().to_string();
 }
 
 #[then(expr = "the scratch file {string} equals the scratch file {string}")]

@@ -27,6 +27,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use super::hex;
+use crate::time::civil_from_days;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -263,7 +264,8 @@ fn aws_encode(input: &str, keep_slash: bool) -> String {
 
 /// The current UTC time in SigV4's `YYYYMMDDTHHMMSSZ` form — a small civil-from-days conversion
 /// (no extra date dependency; the s3s clock skew window is ±15 minutes, so a second-resolution
-/// timestamp is ample).
+/// timestamp is ample). The conversion is [`crate::time::civil_from_days`], the workspace's one
+/// copy.
 fn utc_timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -278,20 +280,6 @@ fn utc_timestamp() -> String {
         secs_of_day % 3_600 / 60,
         secs_of_day % 60,
     )
-}
-
-/// The (year, month, day) of a days-since-1970-01-01 count — Howard Hinnant's canonical
-/// `civil_from_days` algorithm.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
 #[cfg(test)]

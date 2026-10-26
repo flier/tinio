@@ -22,10 +22,10 @@
 //! (`MalformedXML`), every semantic violation is
 //! [`Semantic`](InvalidKind::Semantic) (`InvalidRequest`).
 //!
-//! This is the stored shape, not `s3s::dto`: no transition field exists
-//! (tinio has no storage tiers, LC9) and no member AWS documents but this
-//! build does not act on is mirrored here — the S3 surface maps the dto onto
-//! these types and refuses the rest.
+//! This is the stored shape, not `s3s::dto`: a transition is modelled as
+//! [`Transition`] (T11), `NoncurrentVersionTransition` is not modelled at all,
+//! and no member AWS documents but this build does not act on is mirrored
+//! here — the S3 surface maps the dto onto these types and refuses the rest.
 //!
 //! **The matcher is pure** (LC10): [`Facts`] is what a listing already carries,
 //! so evaluating a rule costs no read, and the day arithmetic lives in one

@@ -62,6 +62,8 @@ pub use crate::error::Error;
 #[cfg(feature = "versioning")]
 use crate::error::projected;
 pub(crate) use crate::error::{invalid_path, invalid_state_dir, invalid_value, root_not_directory};
+#[cfg(feature = "tier")]
+use crate::tier;
 #[cfg(feature = "versioning")]
 use crate::version_adapter::Rows;
 use crate::{
@@ -74,8 +76,8 @@ use crate::{
         object, object_lock, pipeline,
         storage::{
             self, COMPACT_THRESHOLD_MAX_PERCENT, COMPACT_THRESHOLD_MIN_PERCENT,
-            DEFAULT_MAX_CONCURRENT_UPLOADS, META_BATCH_BYTES_MAX, META_BATCH_BYTES_MIN,
-            META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN, Storage, no_such_bucket,
+            META_BATCH_BYTES_MAX, META_BATCH_BYTES_MIN, META_BATCH_SIZE_MAX, META_BATCH_SIZE_MIN,
+            Storage, no_such_bucket,
         },
         to_nanos,
         version::{Id, State, wire_of},
@@ -147,6 +149,7 @@ use crate::{
 ///     compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///     meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///     meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///     max_concurrent_uploads: tinio_core::storage::DEFAULT_MAX_CONCURRENT_UPLOADS,
 ///     owner_uids: std::collections::HashMap::new(),
 ///     io_pipeline: Arc::new(InlineRunner::default()),
 ///     remove_pipeline: Arc::new(InlineRunner::default()),
@@ -206,6 +209,14 @@ pub struct FsOptions {
     /// (pipeline-spec.md Q5).
     #[garde(range(min = META_BATCH_BYTES_MIN, max = META_BATCH_BYTES_MAX))]
     pub meta_batch_bytes: u32,
+    /// The cap on concurrently in-progress multipart uploads (`[s3]
+    /// max_concurrent_uploads`, 1..; default
+    /// [`tinio_core::storage::DEFAULT_MAX_CONCURRENT_UPLOADS`]). A construction-time policy:
+    /// the multipart store takes it once, and a
+    /// `create_multipart_upload` above the cap answers
+    /// `TooManyMultipartUploads`.
+    #[garde(range(min = 1))]
+    pub max_concurrent_uploads: u32,
     /// The config-supplied `OwnerId → uid` map (unix ownership
     /// hardening, spec 2026-09-05 §5a): an object file lands chowned to
     /// its owner's mapped uid, and bucket/prefix dirs to the bucket
@@ -273,6 +284,7 @@ pub struct FsOptions {
 ///         compact_threshold_percent: DEFAULT_COMPACT_THRESHOLD_PERCENT,
 ///         meta_batch_size: DEFAULT_META_BATCH_SIZE,
 ///         meta_batch_bytes: DEFAULT_META_BATCH_BYTES,
+///         max_concurrent_uploads: tinio_core::storage::DEFAULT_MAX_CONCURRENT_UPLOADS,
 ///         owner_uids: std::collections::HashMap::new(),
 ///         io_pipeline: Arc::new(InlineRunner::default()),
 ///         remove_pipeline: Arc::new(InlineRunner::default()),
@@ -949,6 +961,7 @@ impl FsStorage {
             compact_threshold_percent,
             meta_batch_size,
             meta_batch_bytes,
+            max_concurrent_uploads,
             owner_uids,
             io_pipeline,
             remove_pipeline,
@@ -973,7 +986,7 @@ impl FsStorage {
             multipart_store: MultipartStore::from_handle(
                 handle.clone(),
                 &state_dir,
-                DEFAULT_MAX_CONCURRENT_UPLOADS,
+                max_concurrent_uploads,
             ),
             handle,
             writer: AtomicWriter::new(&state_dir),
@@ -985,15 +998,6 @@ impl FsStorage {
             root: canonical,
             state_dir,
         })
-    }
-
-    /// Set the cap on concurrently in-progress multipart uploads
-    /// (`[s3] max_concurrent_uploads`; the store default is
-    /// [`DEFAULT_MAX_CONCURRENT_UPLOADS`]). Must be called before serving
-    /// requests; a `create_multipart_upload` above the cap answers
-    /// `TooManyMultipartUploads` (mapped to S3 `SlowDown`).
-    pub fn set_max_concurrent_uploads(&mut self, max: u32) {
-        self.multipart_store.set_max_concurrent_uploads(max);
     }
 
     /// The mapped uid of an owner element (unix ownership hardening):
@@ -1503,6 +1507,17 @@ impl FsStorage {
             metadata_failure: MetadataFailure::Warn,
             bucket_row: BucketRow::Lazy,
         }
+    }
+
+    /// The row-only tier seam over this backend's metadata store.
+    ///
+    /// The tier layer keeps object content outside the filesystem tree while
+    /// the object row stays here; this handle is the one surface it reads and
+    /// restores that row through. It carries the shared storage clone the
+    /// group receivers already ride, so repeated calls share one handle.
+    #[cfg(feature = "tier")]
+    pub fn tier_rows(&self) -> tier::Rows {
+        tier::Rows::new(Arc::clone(&self.receiver_handles().storage))
     }
 
     /// The object-group receiver over this backend's handles.

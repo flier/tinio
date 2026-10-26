@@ -14,7 +14,7 @@
 ## Non-goals
 
 - **No PostObject work.** s3s's default `post_object` delegates to `put_object` (s3_trait.rs:4654-4659), carrying `if_match`/`if_none_match`/`tagging` through the conversion (generated.rs:41967-41982) — tagging flows automatically once `op_put_object` parses `x-amz-tagging`. Nothing to build for PostObject itself.
-- **No RestoreObject / SelectObjectContent / WriteGetObjectResponse.** RestoreObject is Glacier-tier restore semantics tinio has no tiering for (`S3Location.tagging` stays moot); SelectObjectContent is a SQL-engine-scale feature; WriteGetObjectResponse is a data-plane write-back op with no meaning for tinio. All stay `NotImplemented`.
+- **No RestoreObject / SelectObjectContent / WriteGetObjectResponse.** RestoreObject is archive-tier restore semantics tinio has no archive class for (`S3Location.tagging` stays moot); SelectObjectContent is a SQL-engine-scale feature; WriteGetObjectResponse is a data-plane write-back op with no meaning for tinio. All stay `NotImplemented`.
 - **No string interning for tag keys.** `Tags` is a plain `BTreeMap<String, String>` — interning was proposed during brainstorming and explicitly dropped by the user; the fs backend persists tags as text, and interning would add a process-local table with no measurable win at object scale.
 - **No conditional-headers work** — the companion spec `2026-08-31-s3-conditionals-design.md`; RenameObject consumes its machinery.
 - **No removal of existing Rust tests.** They stay until the cucumber migration (separate plan) reaches parity; new HTTP-level coverage lands as cucumber features from the start.
@@ -75,7 +75,7 @@
 
 ## Design — GetObjectAttributes
 
-- **Read op** (no conditions, no toggle): returns the requested subset of ETag / ObjectSize / StorageClass / Checksum / ObjectParts per the `object_attributes` list. StorageClass is always STANDARD (tinio has no tiers). The Checksum attribute echoes the **recorded** object checksum (`Info.checksum`, with the recorded kind as `checksum_type`) — no computation on the read path.
+- **Read op** (no conditions, no toggle): returns the requested subset of ETag / ObjectSize / StorageClass / Checksum / ObjectParts per the `object_attributes` list. StorageClass is the serving backend's tier class — `STANDARD` on a backend without tiers, the warm/cold answer of FR-045 on the tiered one (`contracts/s3-surface.md` §Tiered storage). The Checksum attribute echoes the **recorded** object checksum (`Info.checksum`, with the recorded kind as `checksum_type`) — no computation on the read path.
 - **Part pagination**: honor `max_parts` (default **1000** — AWS documents no GetObjectAttributes default; ListParts' universal 1000 applies) and `part_number_marker` (listing starts after the marker); set `is_truncated`, `next_part_number_marker`, and `total_parts_count`. With `MAX_PART` = 10,000, truncation is a real path.
 - **Recording at write time** (all under the existing `checksum` toggle; off keeps today's accept-and-drop):
   - `PutObject` with `x-amz-checksum-*`: `stage_body`'s tee slot computes the digest while staging and validates at stream end (mismatch → the same BadDigest path as multipart); the validated value is stored in the object record.

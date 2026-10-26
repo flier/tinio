@@ -14,6 +14,7 @@ use cucumber::{
     gherkin::{Feature, Scenario},
 };
 pub mod acl;
+pub mod backend;
 pub mod buckets;
 pub mod cli;
 pub mod cli_object_lock;
@@ -31,6 +32,8 @@ pub mod objects;
 pub mod reserved_paths;
 pub mod select;
 pub mod tag_filter;
+#[cfg(feature = "tier")]
+pub mod tier;
 pub mod versioning;
 
 use std::collections::HashMap;
@@ -38,6 +41,8 @@ use std::collections::HashMap;
 pub use cli::Cli;
 pub use clients::{External, SpawnedServer};
 pub use common::{Backend, Client, FsKind, LastResponse, Server};
+#[cfg(feature = "tier")]
+pub use common::{Tier, TierKind};
 use cucumber::{
     World as _,
     cli::Empty as CliEmpty,
@@ -92,12 +97,31 @@ pub struct World {
     /// The captured (trimmed) client output, substituted for `{captured}`
     /// in later commands (the pagination continuation token).
     pub ext_captured: String,
+    /// The captured aws multipart upload id (clients.rs): the completion
+    /// step needs the id and the part's ETag at once, and one `{captured}`
+    /// slot cannot hold both.
+    pub ext_upload_id: String,
     /// The `@cli` scenarios' harness (cli.rs): the scratch root, the spawned
     /// binary and the last run's captured streams. None for every other
     /// scenario — those spawn the binary themselves and use neither the
     /// in-process server nor the wire client, which is why the `#[before]`
     /// hook leaves this world alone entirely.
     pub cli: Option<Cli>,
+    /// The `@tier` restart legs' root guard: the first server hands its temp
+    /// root here so the reopened server serves the same tree, and the guard
+    /// outlives both.
+    #[cfg(feature = "tier")]
+    pub tier_root: Option<tempfile::TempDir>,
+    /// The tier counters sampled before the scenario's reads (`the tier metrics report the
+    /// served planes`): the shape every tier metric assertion compares against, because the
+    /// registry is process-global and a retry leaves earlier samples in it.
+    #[cfg(feature = "tier")]
+    pub tier_metrics: Option<tier::MetricsSample>,
+    /// The tier scrape's exposition text — the same default registry the management `/metrics`
+    /// renders, read through the shared testing helper because the in-process plane serves no
+    /// management route.
+    #[cfg(feature = "tier")]
+    pub tier_metrics_text: Option<String>,
     /// The served root a step restricted to owner read and traverse, with the
     /// mode to give back on drop (common.rs: the `@unix` read-only scenario's
     /// `chmod 0500` fixture). Unix only — the plant is a permission bit —
@@ -118,22 +142,27 @@ pub fn has_tag(tags: &[String], tag: &str) -> bool {
 /// the same configuration whichever way the server runs.
 pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
     let tagged = |t: &str| has_tag(tags, t);
-    // Backend: an explicit @pg/@mem/@fs scenario tag wins; otherwise the
-    // TINIO_E2E_BACKEND env override (the CI mem and pg passes); default fs.
+    // Backend: an explicit @pg/@mem/@fs/@tier scenario tag wins; otherwise the
+    // TINIO_E2E_BACKEND env override (the CI mem, pg and tier passes); default fs.
     let env_backend = env::var("TINIO_E2E_BACKEND").ok();
-    let backend = if tagged("pg") {
-        Backend::Pg
+    let tagged_backend = if tagged("pg") {
+        Some(Backend::Pg)
     } else if tagged("mem") {
-        Backend::Mem
+        Some(Backend::Mem)
     } else if tagged("fs") {
-        Backend::Fs
-    } else if env_backend.as_deref() == Some("mem") {
-        Backend::Mem
-    } else if env_backend.as_deref() == Some("pg") {
-        Backend::Pg
+        Some(Backend::Fs)
     } else {
-        Backend::Fs
+        None
     };
+    #[cfg(feature = "tier")]
+    let tagged_backend = if tagged("tier") {
+        Some(Backend::Tier)
+    } else {
+        tagged_backend
+    };
+    let backend = tagged_backend
+        .or_else(|| backend::backend_from_env(env_backend.as_deref()))
+        .unwrap_or_default();
 
     // Capability toggles (specs/001-s3-local-server/contracts/s3-surface.md
     // §Object tagging — the tagging capability toggle of FR-030; grilling Q4).
@@ -203,6 +232,21 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
     (backend, caps, fs_kind)
 }
 
+/// The tier layer's write shape the scenario's tags ask for: `@batch` the buffered path,
+/// everything else the synchronous one.
+#[cfg(feature = "tier")]
+pub fn tier_kind_from_tags(tags: &[String]) -> TierKind {
+    if has_tag(tags, "batch") {
+        TierKind::Batch
+    } else if has_tag(tags, "tier-idle") {
+        // The product's own cadence: `demote_idle`/`scan_interval` short enough for a scenario to
+        // observe the background pass demote an unread object (the idle scenario).
+        TierKind::Idle
+    } else {
+        TierKind::Sync
+    }
+}
+
 /// The `#[before]` hook: spawn the scenario's server and bind the client.
 ///
 /// The `@external` branch (`@interop`/`@boto3`/`@mc`): skip the in-process
@@ -217,7 +261,12 @@ pub fn config_from_tags(tags: &[String]) -> (Backend, Capabilities, FsKind) {
 ///
 /// The `@read-only` branch (FR-023) spawns a read-only fs plane with its
 /// state in a scratch home ([`Server::read_only`]) — every mutating
-/// operation answers `AccessDenied`.
+/// operation answers `AccessDenied`. **A `@tier @read-only` scenario is
+/// refused**: a read-only tier construction needs a root that already holds
+/// its index (T27), which a hook-created empty root cannot have, and the tier
+/// corpus seeds a writable root and reopens it with `the tier server is
+/// restarted read-only`. Falling through to the filesystem plane would be a
+/// silent wrong backend.
 ///
 /// The `@cli` scenarios (cli.rs) take none of the three: they spawn the real
 /// binary and observe it from outside, so the hook spawns nothing and binds
@@ -233,6 +282,8 @@ fn before_hook<'a>(
             return;
         }
         let (backend, caps, fs_kind) = config_from_tags(&scenario.tags);
+        #[cfg(feature = "tier")]
+        let tier = tier_kind_from_tags(&scenario.tags);
         let external = ["interop", "boto3", "mc"]
             .iter()
             .any(|t| has_tag(&scenario.tags, t));
@@ -241,15 +292,26 @@ fn before_hook<'a>(
             // The confinement the scenario asks for is a tag of its own (`@confinement`, and
             // `@read-only` for FR-023's mode): the spawn happens here, before any step runs, so a
             // step could not request one — see `clients::Confinement`.
-            world.ext = Some(clients::External::start(
-                &caps,
-                fs_kind,
-                clients::Confinement::from_tags(&scenario.tags),
-            ));
+            world.ext = Some(
+                clients::External::start(
+                    backend,
+                    &caps,
+                    fs_kind,
+                    clients::Confinement::from_tags(&scenario.tags),
+                )
+                .await,
+            );
             return;
         }
         let acl = has_tag(&scenario.tags, "acl");
-        let server = if !acl && has_tag(&scenario.tags, "read-only") {
+        let read_only = !acl && has_tag(&scenario.tags, "read-only");
+        #[cfg(feature = "tier")]
+        assert!(
+            !(read_only && backend == Backend::Tier),
+            "a `@tier @read-only` scenario cannot be served by a fresh hook root (T27): seed a \
+             writable tier root and reopen it with `the tier server is restarted read-only`"
+        );
+        let server = if read_only {
             // The read-only plane (FR-023): every mutating operation
             // answers AccessDenied. Checked ahead of the backend
             // dispatch, which would otherwise need a read-only arm per
@@ -265,7 +327,15 @@ fn before_hook<'a>(
             // `DataPlane::new_with_acl`). `@acl-off` is NOT the acl arm
             // (the caps gate off runs the legacy no-identity plane, like
             // the other @minimal-caps off-mode scenarios).
-            Server::from_tags(backend, fs_kind, caps, acl).await
+            Server::from_tags(
+                backend,
+                fs_kind,
+                caps,
+                acl,
+                #[cfg(feature = "tier")]
+                tier,
+            )
+            .await
         };
         world.client.bind(server.addr());
         world.server = Some(server);
@@ -301,7 +371,15 @@ fn after_hook<'a>(
             // (common.rs's `RestrictedRoot` owns the restore, and its `Drop` is this take).
             #[cfg(unix)]
             world.restricted.take();
+            // Awaited before the guard drops: the tier tasks hold the index and the root open, and
+            // a tempdir still in use is a leak on Windows. For every other backend this is the
+            // serve loop's ordinary stop, awaited instead of detached.
+            if let Some(server) = world.server.as_mut() {
+                server.stop().await;
+            }
             world.server.take();
+            #[cfg(feature = "tier")]
+            world.tier_root.take();
         }
     })
 }

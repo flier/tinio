@@ -32,7 +32,7 @@ use std::{
 use clap::parser::ValueSource;
 
 use crate::{
-    _core::{mode::AccessMode, pipeline::InlineRunner},
+    _core::{mode::AccessMode, pipeline::InlineRunner, storage::DEFAULT_MAX_CONCURRENT_UPLOADS},
     _fs::{Error as FsError, FsOptions, etag},
     _server::{
         identity::{self, auth},
@@ -1016,6 +1016,13 @@ fn fold_flags(
 /// The state dir is always explicit: it is the resolved one, which is `<root>/.tinio` in
 /// read-write mode and the relocated directory in read-only mode (decision 6).
 ///
+/// **The upload cap is not this mapping's.** `[s3] max_concurrent_uploads` governs a served
+/// instance's live multipart uploads, so it is a serving policy applied by the serving
+/// constructions (`commands::start::run`'s filesystem arm and `commands::start::serve`'s tier
+/// arm) rather than a fact of the resolution. An offline command — `tier verify`/`repair`,
+/// `doctor` — therefore constructs its warm store with the default cap, which is what it had
+/// before the option existed.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -1057,6 +1064,7 @@ pub fn fs_options(resolution: &Resolution, pipelines: Option<&Pipelines>) -> FsO
         compact_threshold_percent: fs.compact_threshold_percent,
         meta_batch_size: fs.meta_batch_size,
         meta_batch_bytes: fs.meta_batch_bytes,
+        max_concurrent_uploads: DEFAULT_MAX_CONCURRENT_UPLOADS,
         owner_uids: identity::owner_uids_for(resolution.identity()),
         io_pipeline: Arc::new(InlineRunner::default()),
         remove_pipeline: Arc::new(InlineRunner::default()),

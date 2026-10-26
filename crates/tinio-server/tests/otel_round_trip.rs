@@ -14,8 +14,9 @@
 mod common;
 
 use opentelemetry::trace::{SpanId, TracerProvider as _};
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use tinio_util::testing::http::exchange;
+use tracing::subscriber;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::prelude::*;
 
@@ -28,7 +29,7 @@ async fn a_request_span_and_its_operation_export_with_the_parent_chain() {
     let subscriber = tracing_subscriber::registry().with(OpenTelemetryLayer::new(
         provider.tracer("tinio-server-test"),
     ));
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let _guard = subscriber::set_default(subscriber);
 
     let plane = common::spawn_plane().await;
     let addr = plane.addr;
@@ -61,7 +62,7 @@ async fn a_request_span_and_its_operation_export_with_the_parent_chain() {
         SpanId::INVALID,
         "the operation is not a root"
     );
-    let attribute = |span: &opentelemetry_sdk::trace::SpanData, name: &str| {
+    let attribute = |span: &SpanData, name: &str| {
         span.attributes
             .iter()
             .find(|kv| kv.key.as_str() == name)

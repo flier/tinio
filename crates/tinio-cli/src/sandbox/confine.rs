@@ -369,7 +369,7 @@ fn publish_state(
 /// grants: the confinement cuts the confined process's outbound connections, and the OTLP exporter
 /// is an outbound path this product has. **It is not the only one any more**: the pg backend's
 /// connection to its database is the other, and a pg run under a confinement is not warned about
-/// but **refused up front** ([`refuse_pg_under_confinement`]) — losing an observer is not grounds
+/// but **refused up front** ([`refuse_store_under_confinement`]) — losing an observer is not grounds
 /// for refusing to serve, losing the store is. The operator's ruling for the OTLP case is that the
 /// combination is **warned about, naming both, and the confinement proceeds** (design decision 25,
 /// FR-036) —
@@ -392,34 +392,44 @@ pub(crate) fn lost_export<'a>(
     Some((request.channel?.name(), endpoint?))
 }
 
-/// The refusal a **pg backend under a requested confinement** answers with, or `None` when either
-/// half is absent.
+/// The refusal a **store-backed backend under a requested confinement** answers with, or `None`
+/// when either half is absent.
 ///
-/// **A confinement and a postgres store cannot be honoured together.** The confinement cuts the
-/// confined process's outbound connections, and since the pg backend exists the store's connection
-/// to its database is such a path — so a jailed pg run has no route to its store and could never
-/// serve. FR-036's own trade ([`lost_export`]) is a **warning** because what it costs is an
-/// observer; here what is lost is the store itself, so the combination is **refused** up front,
-/// naming both settings, in the shape the run's other static refusals use (it precedes the fork,
-/// the directories and the confinement) — a silent unservable run is worse than a refusal.
+/// **A confinement and a database cannot be honoured together.** The confinement cuts the
+/// confined process's outbound connections, and both remote backends reach a PostgreSQL server
+/// over such a path: the pg backend's store connection, and the tier layer's connection to its
+/// cold plane (T1, T17). A jailed run of either has no route to its store and could never serve.
+/// FR-036's own trade ([`lost_export`]) is a **warning** because what it costs is an observer;
+/// here what is lost is the store itself, so the combination is **refused** up front, naming
+/// both settings, in the shape the run's other static refusals use (it precedes the fork, the
+/// directories and the confinement) — a silent unservable run is worse than a refusal.
 ///
 /// **It answers rather than emits**, for `lost_export`'s reason: the caller (the pre-runtime half)
 /// owns the refusal's rendering. The channel is read off the [`Request`] rather than recomputed —
 /// `plan` is the one reader of that precedence rule.
-pub(crate) fn refuse_pg_under_confinement(
+pub(crate) fn refuse_store_under_confinement(
     request: &Request,
     backend: storage::Backend,
 ) -> Option<Error> {
-    if backend != storage::Backend::Pg {
-        return None;
-    }
+    let (name, store, remedy) = match backend {
+        storage::Backend::Pg => (
+            "pg",
+            "the pg store's connection to its database",
+            "to serve PostgreSQL",
+        ),
+        storage::Backend::Tier => (
+            "tier",
+            "the tier layer's connection to its PostgreSQL cold plane",
+            "to serve the tiered backend",
+        ),
+        storage::Backend::Fs => return None,
+    };
     let channel = request.channel?;
     Some(Error::Usage(format!(
-        "{} asks for a confinement, but `[storage] type = \"pg\"` cannot serve under one: the \
-         confinement cuts the confined process's outbound connections, and the pg store's \
-         connection to its database is exactly such a path — a jailed pg run has no route to its \
-         store. Serve the filesystem backend under the confinement, or drop the confinement \
-         ({}) to serve PostgreSQL",
+        "{} asks for a confinement, but `[storage] type = \"{name}\"` cannot serve under one: the \
+         confinement cuts the confined process's outbound connections, and {store} is exactly \
+         such a path — a jailed {name} run has no route to its store. Serve the filesystem \
+         backend under the confinement, or drop the confinement ({}) {remedy}",
         channel.name(),
         channel.name(),
     )))

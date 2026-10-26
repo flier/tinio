@@ -8,13 +8,14 @@
 |---|---|
 | `tests/cucumber.rs` | The single cucumber binary (`harness = false`): installs the default tag filter and `fail_on_skipped()`. |
 | `tests/features/` | The `.feature` files, one per domain — the spec's executable form; `interop/` holds the external-client journeys. |
-| `tests/steps/` | The `World`, the `#[before]`/`#[after]` hooks, the domain step modules (`acl`, `buckets`, `cli`, `clients`, `common`, `conditions`, `doctor`, `errors`, `lifecycle`, `listing`, `multipart`, `object_lock`, `objects`, `reserved_paths`, `select`, `versioning`) and `tag_filter.rs`, which composes the default filter. |
+| `tests/steps/` | The `World`, the `#[before]`/`#[after]` hooks, the domain step modules (`acl`, `backend`, `buckets`, `cli`, `cli_object_lock`, `clients`, `common`, `conditions`, `doctor`, `errors`, `lifecycle`, `listing`, `metrics`, `multipart`, `object_lock`, `objects`, `reserved_paths`, `select`, `tag_filter`, `tier`, `versioning`) and `tag_filter.rs`, which composes the default filter. |
+| `tests/scripts/` | Client scripts this crate owns — the tier external leg's `boto3_tier.py` (the older boto3 scripts stay beside the server crate's retired tests). |
 | `tests/traceability.rs` | The spec↔tag cross-check — a plain-harness target with no cucumber involvement. |
 | `scripts/wsl-interop.sh` | One-command `@interop` run inside WSL2 (Linux-side aws-cli/rclone). |
 
 `cucumber` is `harness = false`, so cargo does not run it through libtest and the binary owns its argv, while `traceability` is a plain libtest target that rejects cucumber's flags. **Every run that passes cucumber args must scope with `--test cucumber`** — unscoped args reach `traceability` and fail it with "Unrecognized option".
 
-Step phrases are registered by the `given`/`when`/`then` attributes in `tests/steps/`; regex steps are unanchored, and a client command line is tokenized shell-style (a double-quoted segment stays one word) with `{work}` expanding to the scenario's scratch workdir and `{captured}` to the last captured client output. The features are the step reference: `tests/features/` shows the phrases in use and `tests/steps/` defines them.
+Step phrases are registered by the `given`/`when`/`then` attributes in `tests/steps/`; regex steps are unanchored, and a client command line is tokenized shell-style (a double-quoted segment stays one word) with `{work}` expanding to the scenario's scratch workdir, `{captured}` to the last captured client output and `{upload-id}` to the captured multipart upload id. The features are the step reference: `tests/features/` shows the phrases in use and `tests/steps/` defines them.
 
 ## Tags
 
@@ -29,6 +30,9 @@ The vocabulary the table leans on — scenario-level vs feature-level tags, the 
 | `@mc` | External: MinIO `mc`; best-effort tier (FR-025). |
 | `@aws` `@rclone` | Which client a given `@interop` scenario drives. |
 | `@fs` `@mem` `@pg` | Explicit backend, winning over `TINIO_E2E_BACKEND`; the traversal / nested-root / out-of-band scenarios ride `@fs`, while the mem and pg passes select by the env var. A `@pg` scenario needs a live PostgreSQL (`TINIO_PG_DSN`) and the `--features pg` build. |
+| `@tier` | Explicit backend (the tiered backend: filesystem warm + PostgreSQL cold), winning over `TINIO_E2E_BACKEND`; excluded from every default pass and run by its own explicit `--tags` legs — the in-process `tier.feature` scenarios and the external clients' `interop/tier.feature` (`--features tier`, a live `TINIO_PG_DSN`). |
+| `@batch` | Tier write shape: the buffered commit path (the default is the synchronous one), so a scenario can pin what the buffer holds until a listing, a lifecycle pass or a shutdown flushes it. |
+| `@tier-idle` | Tier cadence: `demote_idle` = 3 s and `scan_interval` = 100 ms (the default parks both far beyond a scenario's life), so the background pass demotes an object the scenario writes and never reads. The wait is a bounded 15 s poll, not a fixed sleep. |
 | `@nested-root` | fs: served root = tempdir/`root` (traversal-proof scenarios). |
 | `@checksum-on` | `caps.checksum = true` (checksum-validation scenarios). |
 | `@minimal-caps` | Multipart / copy-object / list v1 / list v2 / delete-objects / tagging / cors / acl all off — the unsupported-op error scenarios. |
@@ -51,7 +55,7 @@ The vocabulary the table leans on — scenario-level vs feature-level tags, the 
 
 ## The default filter
 
-With no `--tags`, the runner composes `CUCUMBER_FILTER_TAGS` (`tests/steps/tag_filter.rs`) from six independent axes: `@parquet` is excluded unless the binary was built `--features parquet`; `@object-lock` is excluded unless the binary was built `--features object-lock`; a scenario carrying platform tags is excluded where the host's target matches none of them; the `@external` umbrella is excluded unless `TINIO_E2E_EXTERNAL` is set (any value, `0` included — the axis tests presence, not the value); `@confinement` follows `TINIO_E2E_CONFINEMENT`; and `@pg` is always excluded, whatever the host — the `@pg` pass is its own explicit-`--tags` run against a live database (PG17).
+With no `--tags`, the runner composes `CUCUMBER_FILTER_TAGS` (`tests/steps/tag_filter.rs`) from seven independent axes: `@parquet` is excluded unless the binary was built `--features parquet`; `@object-lock` is excluded unless the binary was built `--features object-lock`; a scenario carrying platform tags is excluded where the host's target matches none of them; the `@external` umbrella is excluded unless `TINIO_E2E_EXTERNAL` is set (any value, `0` included — the axis tests presence, not the value); `@confinement` follows `TINIO_E2E_CONFINEMENT`; and `@pg` and `@tier` are always excluded, whatever the host — each database-backed backend has its own explicit-`--tags` run against a live database (PG17, T25).
 
 **An explicit `--tags` replaces the default filter rather than adding to it**, so a tagged run re-states every exclusion it wants. The platform axis needs care in a hand-written list: the runner's clause keeps a scenario carrying *any* matching platform tag, which a list of `not <tag>` clauses cannot express — so the backend-neutral lists below exclude every platform tag instead.
 
@@ -59,29 +63,34 @@ With no `--tags`, the runner composes `CUCUMBER_FILTER_TAGS` (`tests/steps/tag_f
 
 ```console
 cargo build -p tinio                             # the @cli scenarios spawn this binary
+cargo build -p tinio --features tier             # the @tier external leg's spawned server
 cargo test -p tinio-e2e --test cucumber -- --tags '@cli and not @unix and not @windows and not @linux and not @macos and not @confinement'
-cargo test -p tinio-e2e --test cucumber -- --tags '@interop and not @confinement' --retry 1
-cargo test -p tinio-e2e --test cucumber -- --tags '@boto3 and not @confinement'
-cargo test -p tinio-e2e --test cucumber -- --tags '@mc and not @confinement'
+cargo test -p tinio-e2e --test cucumber -- --tags '@interop and not @confinement and not @tier' --retry 1
+cargo test -p tinio-e2e --test cucumber -- --tags '@boto3 and not @confinement and not @tier'
+cargo test -p tinio-e2e --test cucumber -- --tags '@mc and not @confinement and not @tier'
 cargo test -p tinio-e2e --features parquet --test cucumber -- --tags '@parquet'
 TINIO_E2E_CONFINEMENT=1 cargo test -p tinio-e2e --test cucumber -- --tags '@cli and @FR-036 and not @unix and not @windows and not @linux and not @macos' --concurrency 1
 TINIO_E2E_CONFINEMENT=1 TINIO_E2E_EXTERNAL=1 cargo test -p tinio-e2e --test cucumber -- --tags '@confinement and (@interop or @boto3 or @mc)' --concurrency 1
-TINIO_PG_DSN='postgres://…/tinio?sslmode=disable' cargo test -p tinio-e2e --features pg --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @interop and not @boto3 and not @mc and not @confinement' --concurrency 1
-TINIO_E2E_BACKEND=mem cargo test -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @interop and not @boto3 and not @mc and not @confinement and not @pg'
+TINIO_PG_DSN='postgres://…/tinio?sslmode=disable' cargo test -p tinio-e2e --features pg --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @interop and not @boto3 and not @mc and not @confinement and not @tier' --concurrency 1
+TINIO_E2E_BACKEND=mem cargo test -p tinio-e2e --test cucumber -- --tags 'not @fs and not @unix and not @windows and not @linux and not @macos and not @parquet and not @interop and not @boto3 and not @mc and not @confinement and not @pg and not @tier'
+TINIO_PG_DSN='postgres://…/tinio?sslmode=disable' TINIO_E2E_BACKEND=tier cargo test -p tinio-e2e --features tier --test cucumber -- --tags '@tier and not @parquet and not @object-lock and not @interop and not @boto3 and not @mc and not @confinement and not @pg' --concurrency 1
+TINIO_PG_DSN='postgres://…/tinio?sslmode=disable' TINIO_E2E_EXTERNAL=1 TINIO_E2E_BACKEND=tier cargo test -p tinio-e2e --features tier --test cucumber -- --tags '@tier and (@interop or @boto3 or @mc) and not @confinement' --retry 1
 cargo test -p tinio-e2e --test traceability
 ```
 
-- **The `@pg` pass is serial** (`--concurrency 1`): every scenario truncates the one shared database before it runs, so nothing in the harness enforces it and a hand-run without it produces confusing cross-scenario resets.
+- **The in-process `@pg` and `@tier` passes are serial** (`--concurrency 1`): every scenario truncates the one shared database before it runs, so nothing in the harness enforces it and a hand-run without it produces confusing cross-scenario resets. The in-process tier pass is serial for the same fact plus one of its own: a writable tier server owns its database (one root per database, T18), so its scenarios must not overlap. The external tier leg serializes itself (next bullet).
+- **The external tier leg runs the four clients against a spawned product server.** `TINIO_E2E_EXTERNAL=1 TINIO_E2E_BACKEND=tier` selects `interop/tier.feature`, whose `@tier` server is a real `tinio server` start — the scenario's root, `[storage] type = "tier"`, `[storage.pg]` and `[storage.tier]` — not the in-process testing constructor. The harness truncates the shared database and holds its one permit while the server runs, so the legs serialize themselves even under the default concurrency; the class assertions use `GetObjectAttributes` alone (HEAD and listings send no class, the recorded deviation). CI's `tier-external` job selects all four client scenarios and its versions step fails closed, so a missing client is a red job.
 - **The `@confinement` family is opt-in off macOS and serial when it runs.** Force it in with `TINIO_E2E_CONFINEMENT=1` only on a host that can actually confine (WSL2 with an unprivileged userns, or a Windows host with a console and a writable volume) — no CI leg does, and its real gate is the platform script on a host that owes the precondition (`docs/tests.md`, "Platform-gated verification"). One confined run per scenario pays a real confinement grant, so `--concurrency 1` is the spelling to use. The external clients have a confined arm too: the `interop/*.feature` legs tagged `@confinement` run the same client journeys through a spawned `--sandbox` server (and `--read-only --sandbox` for the `@read-only` ones), asserting each client's own refusal shape, and need the family's opt-ins plus `TINIO_E2E_EXTERNAL` set.
 - **The `@cli` scenarios spawn the real binary**, so it must be built before the run — `assert_cmd::cargo::cargo_bin` resolves `<profile>/tinio` beside the test binary and builds nothing.
-- **Missing clients fail in the hook** with a hint naming the tool and the way out: `@interop` needs `aws` **and** `rclone` on PATH — both, even for a scenario that drives only one of them — `@mc` needs `mc`, and `@boto3` needs the venv python (`TINIO_BOTO3_PYTHON`).
+- **Missing clients fail in the hook** with a hint naming the tool and the way out, checked per scenario: `@interop` needs `aws` **and** `rclone` on PATH — both, even for a scenario that drives only one of them — `@mc` needs `mc`, and `@boto3` needs the venv python (`TINIO_BOTO3_PYTHON`). CI's `tier-external` job requires all four — aws cli v2, rclone, mc and the boto3 venv — because it selects all four scenarios and its versions step fails closed, so a missing client is a red job, never a reduced green suite (T25).
 - `--retry 1` retries failed scenarios once (the CI `@interop` run uses it against external-client flakes); a filter that matches nothing runs 0 scenarios and exits 0; tag expressions are cucumber's `and`/`or`/`not` syntax with parentheses.
 
 ## Environment
 
 | Var | Effect |
 |---|---|
-| `TINIO_E2E_BACKEND` | `mem`/`pg` run the backend-neutral scenarios on that backend (CI's mem and pg passes); explicit `@fs`/`@mem`/`@pg` scenario tags win over it; default `fs`. |
+| `TINIO_E2E_BACKEND` | `mem`/`pg`/`tier` run the backend-neutral scenarios on that backend (CI's mem, pg and in-process tier passes); explicit `@fs`/`@mem`/`@pg`/`@tier` scenario tags win over it; default `fs`. |
+| `TINIO_PG_DSN` | The PostgreSQL dsn the `@pg` and `@tier` passes (and the tier external leg's spawned server) open; no credential is written in this crate. The tier passes refuse a missing value rather than skipping. |
 | `TINIO_E2E_EXTERNAL` | Set it to any value — presence is what counts, `0` included — to disable the default `@external` exclusion (the `@parquet` exclusion is unaffected — it follows the cargo feature; an explicit `--tags` still wins). |
 | `TINIO_E2E_CONFINEMENT` | Three-state switch for the `@confinement` gate: unset is the platform default (kept on macOS, excluded elsewhere), `1`/`true` forces the family in on every target and `0`/`false` forces it out on every target, macOS included; any other value stops the run rather than defaulting. Force it in only on a host that can confine, and note that an explicit `--tags` still wins (the variable is not read at all then). |
 | `TINIO_E2E_REPORT` | Path of the Cucumber-JSON report written alongside the pretty stdout (CI uploads it for the PR test report); a bare filename lands in `crates/tinio-e2e/`, cargo's cwd for a test binary. |
@@ -94,7 +103,9 @@ cargo test -p tinio-e2e --test traceability
 | Tier | Clients | Gating |
 |---|---|---|
 | Mandated | aws cli v2, rclone | CI-gated (the interop stage) |
-| Best-effort | boto3, mc | targeted / manual — never CI; promoting them into CI needs an FR-025 amendment |
+| Best-effort | boto3, mc | targeted / manual — never CI, except the tier external leg below; promoting them into the general CI gate needs an FR-025 amendment |
+
+The tier external leg (`interop/tier.feature`) is the one place boto3 and mc are CI-gating: its job selects all four client scenarios and its versions step fails closed, so all four clients are required there. FR-025's three sets are otherwise unchanged — the general interop stage still gates aws cli v2 and rclone alone.
 
 ### Scenarios → tools
 

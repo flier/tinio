@@ -44,7 +44,7 @@ use crate::{
         database::{self, Integrity, Stats, check_integrity, needs_compact, open},
     },
     _server::identity,
-    Error,
+    _tier, Error,
     cli::PG_DSN_VAR,
     report::{Finding, PRIVATE_STATE, Report, Severity},
     resolve::{self, Resolution},
@@ -70,6 +70,10 @@ const STORAGE_ROOT_WRITABLE: &str = "storage root writable";
 
 /// The free-space row's name, owned here rather than repeated between the real leg and the skip.
 const FREE_SPACE: &str = "free space";
+
+/// The tier-root refusal's row name (T17, T28): the one row a root carrying the
+/// tier marker or the tier index earns instead of the check list.
+pub(crate) const TIER_ROOT: &str = "tier root";
 
 /// The private state store's inspect row's name, owned here for the skip row and the store legs.
 const META_STORE: &str = "meta.redb";
@@ -512,6 +516,17 @@ pub async fn checks(run: &Run<'_>, proposals: Proposals) -> Report {
     let mut report = Report::default();
     report.push(state_dir_finding(state));
 
+    // **A tier root is refused whole (T17, T28).** The marker or the index means
+    // tier mode owns the root — whatever storage type the run configured: a pg
+    // resolution's synthetic root is refused by the same predicate, so this command
+    // neither diagnoses a tier root as a filesystem one nor repairs it. The refusal
+    // is the report — no leg below reads the root — and `--fix` consults the same
+    // predicate before its repair, so the full repair never runs there either.
+    if let Some(finding) = tier_root_finding(resolution) {
+        report.push(finding);
+        return report;
+    }
+
     // **A pg run has no served root** (PG5/PG13; ruling R8): when the resolution took `locate`'s pg
     // arm — the arm's own record is [`Resolution::pg_root`] — or its configuration selects pg, the
     // subject is a database and not a directory. **The decision is the resolution's**
@@ -744,6 +759,41 @@ fn storage_root_findings(resolution: &Resolution) -> Vec<Finding> {
         out.push(writability(root));
     }
     out
+}
+
+/// The refusal a tier root earns (T17, T28): its marker, its index or both make the
+/// root tier mode's, so a non-tier build must not serve it and `doctor` must not
+/// diagnose or repair it.
+///
+/// **The configured storage type does not qualify the refusal.** A pg resolution's
+/// root is synthetic, but a marker or index planted there means tier mode owns that
+/// directory just as it does a served one, and a `doctor` run that skipped the check
+/// on a pg configuration would diagnose and repair a root it must refuse. The
+/// predicate is therefore the tier layer's own seam ([`_tier::is_tier_root`]) for
+/// every resolution, so the refusal cannot drift from the one the `fs` and `pg`
+/// starts apply. A stat failure other than "not found" is the seam's error and is
+/// reported as an `error` row — the fail-closed direction — rather than read as
+/// "no tier files".
+pub(crate) fn tier_root_finding(resolution: &Resolution) -> Option<Finding> {
+    match _tier::is_tier_root(&resolution.root) {
+        Ok(false) => None,
+        Ok(true) => Some(Finding::check(
+            TIER_ROOT,
+            Severity::Error,
+            format!(
+                "{} is in tier mode (the marker or the index is present), so this command will not \
+                 diagnose or repair it: run `tinio tier verify` / `tinio tier repair`, or promote \
+                 every cold object with `tinio tier prepare-downgrade` before serving it with a \
+                 non-tier build",
+                resolution.root.display()
+            ),
+        )),
+        Err(err) => Some(Finding::check(
+            TIER_ROOT,
+            Severity::Error,
+            format!("the tier marker/index could not be inspected: {err}"),
+        )),
+    }
 }
 
 /// The readability row, the first half of the contract's "exists, is readable and writable".

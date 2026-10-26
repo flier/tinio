@@ -5,10 +5,14 @@
 //! `state` and the drain stay in [`serve`](super::serve::serve): they are the same for every
 //! backend.
 
-#[cfg(feature = "lifecycle")]
+#[cfg(feature = "tier")]
+use std::future::Future;
+#[cfg(any(feature = "lifecycle", feature = "tier"))]
 use std::sync::Arc;
 use std::{fmt::Display, future::ready, time::Duration};
 
+#[cfg(all(feature = "tier", feature = "lifecycle"))]
+use futures::future::Either;
 use futures::{StreamExt, future::BoxFuture};
 use tokio::sync::watch;
 #[cfg(feature = "api")]
@@ -16,10 +20,14 @@ use tokio::task::JoinHandle;
 use tracing::instrument;
 
 use super::write_metrics::MetricsStorage;
+#[cfg(feature = "tier")]
+use crate::_core::content::ObjectContent;
 #[cfg(feature = "api")]
 use crate::_core::storage::WriteLockSnapshot;
 #[cfg(feature = "lifecycle")]
 use crate::_lifecycle::{Options as LifecycleOptions, Runner, Seed, SystemClock};
+#[cfg(feature = "tier")]
+use crate::_tier::{ColdStore, Mover, TierStorage, VolumeCapacity};
 #[cfg(feature = "api")]
 use crate::resolve::Pipelines;
 use crate::{
@@ -33,6 +41,7 @@ use crate::{
         sweep::{self, Sweeper},
     },
     _server::Capabilities,
+    _tier::Config as TierConfig,
     config,
     resolve::Resolution,
 };
@@ -361,6 +370,17 @@ pub(super) trait ServingBackend: Storage + Clone + Send + Sync + 'static {
     /// Wrap this backend for the data plane's write-failure recording.
     fn metrics_storage(&self) -> Self::Metrics;
 
+    /// Whether the scanner's object-row reconciliation runs against this backend's files.
+    ///
+    /// **`true` wherever the files are the content source.** In tier mode it is `false` (T3): a
+    /// row without a file is a cold object, not a stale row, so the pass that drains a
+    /// rows-gone entry would delete every cold object on its first cycle. The answer travels to
+    /// [`scanner_options`]'s `reconcile_objects`, which is the one place the scanner's options are
+    /// built, so the flag has exactly one reader on the serving path.
+    fn reconcile_objects() -> bool {
+        true
+    }
+
     /// The startup repair (design decision 12's post-bind step): **best-effort by contract**
     /// (`failure-handling.md` §3) — every stage is warned rather than propagated, because the
     /// backend's own recovery covers whatever residue a failed stage leaves behind, and a server
@@ -434,6 +454,12 @@ pub(super) trait ServingBackend: Storage + Clone + Send + Sync + 'static {
     /// bound covers it. The parameter is the run's pass ([`lifecycle_pass`]) or `None` when the
     /// run builds none (LC23, and every read-only run); a build without the `lifecycle` feature
     /// has neither the parameter nor the pass (LC15).
+    ///
+    /// **`tier` is the tier layer's runtime configuration and is always `None` for the filesystem
+    /// and pg arms.** The layer's paces (`scan_interval`, `batch_interval`, the mover's
+    /// concurrency) are runtime values the CLI owns (T22) that the layer does not retain, so the
+    /// serving half threads the value `run` selected through to the arm that reads it rather than
+    /// asking the layer for a second copy of the configuration.
     fn background(
         &self,
         stop: watch::Receiver<bool>,
@@ -441,8 +467,9 @@ pub(super) trait ServingBackend: Storage + Clone + Send + Sync + 'static {
         sweep: sweep::Options,
         scanner: ScannerOptions,
         lifecycle: Option<LifecyclePass>,
+        tier: Option<TierConfig>,
     ) -> BoxFuture<'static, ()> {
-        let _ = (stop, access, sweep, scanner, lifecycle);
+        let _ = (stop, access, sweep, scanner, lifecycle, tier);
         Box::pin(ready(()))
     }
 }
@@ -485,6 +512,7 @@ impl ServingBackend for FsStorage {
         sweep: sweep::Options,
         scanner: ScannerOptions,
         lifecycle: Option<LifecyclePass>,
+        _tier: Option<TierConfig>,
     ) -> BoxFuture<'static, ()> {
         Box::pin(scanner_and_sweeper(
             self.clone(),
@@ -536,6 +564,7 @@ impl ServingBackend for PgStorage {
         sweep: sweep::Options,
         _scanner: ScannerOptions,
         lifecycle: Option<LifecyclePass>,
+        _tier: Option<TierConfig>,
     ) -> BoxFuture<'static, ()> {
         let storage = self.clone();
         Box::pin(async move {
@@ -558,6 +587,345 @@ impl ServingBackend for PgStorage {
             residue.await
         })
     }
+}
+
+/// The lifecycle pass a tier run's background future carries: the shared pass when the feature
+/// exists, and nothing at all when it does not.
+///
+/// **The `()` arm is the shared signature's own shape** ([`LifecyclePass`] is `()` without the
+/// feature), so the tier arm spells it the way every other arm's parameter already reads.
+#[cfg(all(feature = "tier", feature = "lifecycle"))]
+pub(super) type TierLifecycle = Option<LifecyclePass>;
+
+/// A build without the `lifecycle` feature: the tier background carries no pass.
+#[cfg(all(feature = "tier", not(feature = "lifecycle")))]
+pub(super) type TierLifecycle = ();
+
+#[cfg(feature = "tier")]
+impl ServingBackend for TierStorage<ColdStore> {
+    type Metrics = MetricsStorage<TierStorage<ColdStore>>;
+    type Repair = FsCleanup;
+
+    fn metrics_storage(&self) -> Self::Metrics {
+        MetricsStorage::<TierStorage<ColdStore>>::new(self.clone())
+    }
+
+    /// **A read-only tier run performs no repair** (T27): the mode promises to write nothing, so
+    /// the startup repair answers before a cleanup is even built. The writable run takes the
+    /// filesystem cleanup over the warm plane — the tier layer's writes stream through the fs
+    /// staging areas, so a crash's residue is the fs residue — with the fs backend's warnings,
+    /// because the scanner (reconcile off) is what covers what a failed stage leaves.
+    fn repair<'a>(&'a self, resolution: &'a Resolution) -> BoxFuture<'a, bool> {
+        if resolution.read_only {
+            return Box::pin(ready(false));
+        }
+        Box::pin(startup_repair(self, resolution))
+    }
+
+    fn repair_cleanup(&self, resolution: &Resolution) -> FsCleanup {
+        fs_cleanup(self.fs(), resolution)
+    }
+
+    fn repair_warnings(&self) -> RepairWarnings {
+        FS_REPAIR_WARNINGS
+    }
+
+    /// **Tier mode never reconciles object rows against the files' presence** (T3): a row
+    /// without a file is a cold object, not a stale row.
+    fn reconcile_objects() -> bool {
+        false
+    }
+
+    /// The warm plane's write lane is the layer's write lane: every tier write reaches the
+    /// filesystem's writer, so the histograms the fs backend publishes are this backend's.
+    #[cfg(feature = "api")]
+    fn write_lock_stats(&self) -> Option<WriteLockSnapshot> {
+        Some(FsStorage::write_lock_stats(self.fs()))
+    }
+
+    /// The tier layer's versioned buckets live entirely on the warm plane — the mover skips a
+    /// bucket that records versions — so a root repaired above is verified by the filesystem's
+    /// block verification, exactly as an fs run's is.
+    #[cfg(feature = "versioning")]
+    fn verify_blocks<'a>(&'a self, access: AccessMode) -> BoxFuture<'a, ()> {
+        Box::pin(verify_fs_blocks(self.fs(), access))
+    }
+
+    /// The toggle-off warning reads the same warm plane's version-state rows, so a tier root with
+    /// `[s3] versioning` off gets the same count-named warning an fs root does.
+    #[cfg(feature = "versioning")]
+    fn versioning_warning<'a>(&'a self, caps: &'a Capabilities) -> BoxFuture<'a, Option<String>> {
+        Box::pin(super::serve::versioning_disabled_warning(self.fs(), caps))
+    }
+
+    fn background(
+        &self,
+        stop: watch::Receiver<bool>,
+        access: AccessMode,
+        sweep: sweep::Options,
+        scanner: ScannerOptions,
+        lifecycle: Option<LifecyclePass>,
+        tier: Option<TierConfig>,
+    ) -> BoxFuture<'static, ()> {
+        // The serving half always threads the selected configuration for this arm; a missing
+        // value would mean the selector and the backend disagreed, and starting no pass is the
+        // safe answer to that rather than inventing paces.
+        let Some(config) = tier else {
+            tracing::warn!(
+                "the tier backend has no runtime configuration, so its scanner, sweeper, mover and flush passes are not started; this is a wiring defect, not a configuration the operator can fix"
+            );
+            return Box::pin(ready(()));
+        };
+        // The shared signature carries `Option<LifecyclePass>` in every build; the tier
+        // background's own parameter is the pass itself (or `()` without the feature), so the
+        // arm is translated here rather than at two call sites.
+        #[cfg(feature = "lifecycle")]
+        let background = tier_background(
+            self.clone(),
+            config,
+            stop,
+            access,
+            sweep,
+            scanner,
+            lifecycle,
+        );
+        #[cfg(not(feature = "lifecycle"))]
+        let background = {
+            let _ = &lifecycle;
+            tier_background(self.clone(), config, stop, access, sweep, scanner, ())
+        };
+        Box::pin(background)
+    }
+}
+
+/// The tier arm's background future — **every loop the layer owns, joined on the serving half's
+/// one shutdown channel**.
+///
+/// The work is: the filesystem **scanner and sweeper** over the warm plane (with
+/// `reconcile_objects` off, so cold rows survive), the batch buffer's **flush** at
+/// `batch_interval`, the **mover's pass** and **GC** at `scan_interval`, the **heat flush** at
+/// `stats_flush` (its own loop, so heat is not gated by `scan_interval`), and the shared
+/// **lifecycle** pass when the run builds one. A stop ends every loop on the same channel, and
+/// the future completes only when all of them have — the shutdown path then bounds the await, as
+/// it does for every backend.
+///
+/// **A read-only run returns before it constructs the mover, the scanner or the sweeper** (T27):
+/// nothing scans, flushes, moves or collects, so the mode's promise of writing nothing is kept by
+/// construction rather than by each pass's own gate. The writable run's passes then flush once
+/// more after they join, so a stop does not strand acknowledged writes in the batch buffer.
+///
+/// **Every loop joins at one arity**: the lifecycle pass is one more future in the same
+/// `tokio::join!` — a ready one when this run builds none — so a new background loop is added to
+/// that list once rather than to a `Some`/`None` pair and their feature-off copy.
+#[cfg(feature = "tier")]
+pub(super) async fn tier_background<C: ObjectContent + Clone>(
+    storage: TierStorage<C>,
+    config: TierConfig,
+    stop: watch::Receiver<bool>,
+    access: AccessMode,
+    sweep_options: sweep::Options,
+    scanner_options: ScannerOptions,
+    lifecycle: TierLifecycle,
+) {
+    if access.is_read_only() {
+        return;
+    }
+    let mover = Mover::new(
+        storage.clone(),
+        Arc::new(VolumeCapacity::new(storage.fs().root())),
+        config.move_concurrency,
+    );
+    let scan = scan(
+        Scanner::new(storage.fs().clone(), scanner_options),
+        stop.clone(),
+    );
+    let sweep = sweep(
+        Sweeper::new(storage.fs().clone(), sweep_options),
+        stop.clone(),
+    );
+    let passes = tier_passes(&mover, config.clone(), stop.clone());
+    let stats = tier_stats(&mover, config.stats_flush, stop.clone());
+    let flush = tier_flush(storage.clone(), config.batch_interval, stop.clone());
+    // One list, one arity: a run that builds no pass (or a build without the feature) joins a
+    // ready future instead, so this list is the only place a loop is added.
+    #[cfg(feature = "lifecycle")]
+    let lifecycle = match lifecycle {
+        Some(pass) => Either::Left(self::lifecycle(storage.clone(), pass, stop.clone())),
+        None => Either::Right(ready(())),
+    };
+    #[cfg(not(feature = "lifecycle"))]
+    let lifecycle = {
+        let _ = &lifecycle;
+        ready(())
+    };
+    let (_, _, _, _, _, _) = tokio::join!(scan, sweep, passes, stats, flush, lifecycle);
+    // The final drain is unconditional and carries no warning branch: the layer's drain
+    // answers `Ok` for every entry — a failed publish is quarantined, never returned — so
+    // there is no failure here to log. A future drain that can fail would reintroduce the
+    // warning where the contract changes, not as a dead branch here.
+    let _ = storage.shutdown().await;
+}
+
+/// The chunk a tier loop sleeps in, so a stop is honoured inside it.
+#[cfg(feature = "tier")]
+const TIER_PASS_CHUNK: Duration = Duration::from_secs(1);
+
+/// Run `tick` once per `interval` on the serving half's stop channel — **the cadence every tier
+/// loop shares**.
+///
+/// The interval never drops below [`TIER_PASS_CHUNK`], and the sleep is chunked at that length,
+/// so a stop is honoured inside one chunk rather than after a whole pacing interval; the channel
+/// is re-read after each sleep, and a flipped channel ends the loop before `tick` runs. `tick` is
+/// the loop's own body and is awaited between ticks, so each caller supplies only the work and
+/// keeps its own logging and shutdown responsiveness.
+///
+/// **`tick` returns an owned future rather than borrowing its closure**, which is what keeps each
+/// loop's future `Send`: a caller captures the reference it works through (a `&Mover`, a
+/// `&TierStorage`) by copy before the async block, so no borrow of the closure's own frame crosses
+/// the await.
+#[cfg(feature = "tier")]
+async fn run_cadence<F, Fut>(interval: Duration, stop: &watch::Receiver<bool>, mut tick: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let interval = interval.max(TIER_PASS_CHUNK);
+    loop {
+        sleep_checked(interval, TIER_PASS_CHUNK, stop).await;
+        if *stop.borrow() {
+            return;
+        }
+        tick().await;
+    }
+}
+
+/// The heat-flush loop: make the in-memory read counters durable every `stats_flush` (T9, T21).
+///
+/// **Heat does not wait for the mover's `scan_interval`.** The mover's pass flushes the counters
+/// at the same cadence as part of its own work, but a root whose passes are far apart would keep
+/// a read's heat only in memory between them; this loop is what makes `stats_flush` the bound.
+/// `Mover::flush_stats` is idempotent and skips a tick that is not due, so the pass's own flush
+/// and this loop cannot double-apply the same counters. A failure is logged and the next tick
+/// retries: a background stats flush never aborts the server.
+#[cfg(feature = "tier")]
+#[instrument(
+    level = "info",
+    target = "tinio::cli",
+    name = "tinio.cli.tier.stats",
+    skip_all
+)]
+async fn tier_stats<C: ObjectContent>(
+    mover: &Mover<C>,
+    interval: Duration,
+    stop: watch::Receiver<bool>,
+) {
+    run_cadence(interval, &stop, move || async move {
+        if let Err(err) = mover.flush_stats() {
+            tracing::warn!(
+                error = %err,
+                "the tier heat counters could not be flushed; the next tick retries"
+            );
+        }
+    })
+    .await;
+}
+
+/// The tier flush loop: drain the batch buffer every `interval` (T7/T8). The periodic drain is
+/// [`TierStorage::flush`]; the final call after the loops join is [`TierStorage::shutdown`],
+/// which carries the end-of-run meaning.
+#[cfg(feature = "tier")]
+#[instrument(
+    level = "info",
+    target = "tinio::cli",
+    name = "tinio.cli.tier.flush",
+    skip_all
+)]
+async fn tier_flush<C: ObjectContent + Clone>(
+    storage: TierStorage<C>,
+    interval: Duration,
+    stop: watch::Receiver<bool>,
+) {
+    let storage = &storage;
+    run_cadence(interval, &stop, move || async move {
+        if let Err(err) = storage.flush().await {
+            tracing::warn!(error = %err, "the tier buffer could not flush; the writes stay buffered");
+        }
+    })
+    .await;
+}
+
+/// The mover's loop: rebuild the warm-candidate table once (T21), then run one capacity-and-heat
+/// pass and the GC cadence every `scan_interval`.
+///
+/// **A failed bind does not end the loop**: the warm table gates capacity demotion alone, and
+/// promotions and GC keep working from the index; the warning says exactly that. A failed move is
+/// counted in the pass's own summary and retried by the next pass, and a GC pass's own cadence
+/// (`gc_grace`) decides whether it scans at all.
+#[cfg(feature = "tier")]
+#[instrument(
+    level = "info",
+    target = "tinio::cli",
+    name = "tinio.cli.tier.mover",
+    skip_all
+)]
+async fn tier_passes<C: ObjectContent>(
+    mover: &Mover<C>,
+    config: TierConfig,
+    stop: watch::Receiver<bool>,
+) {
+    if let Err(err) = mover.bind().await {
+        tracing::warn!(
+            error = %err,
+            "the tier mover could not rebuild its warm table; capacity demotion waits and the next pass retries it"
+        );
+    }
+    run_cadence(config.scan_interval, &stop, move || async move {
+        match mover.pass().await {
+            Ok(summary) => {
+                // An idle-only pass moves objects too, so `idle_demoted` is part of the gate: a
+                // pass that demoted one unread object and promoted nothing is not silent.
+                if summary.promoted + summary.demoted > 0 || summary.idle_demoted > 0 {
+                    tracing::info!(
+                        promoted = summary.promoted,
+                        demoted = summary.demoted,
+                        idle_demoted = summary.idle_demoted,
+                        failed = summary.failed,
+                        "the tier mover moved objects between the planes"
+                    );
+                }
+            }
+            Err(err) => tracing::warn!(
+                error = %err,
+                "the tier mover's pass failed; the next pass retries"
+            ),
+        }
+        match mover.gc().await {
+            Ok(Some(summary)) => {
+                // A pass whose only outcome is a failure or an undecided copy is not
+                // silent at info: both counters are part of the gate.
+                if summary.tombstones + summary.files + summary.completed + summary.reverted > 0
+                    || summary.failed > 0
+                    || summary.unresolved > 0
+                {
+                    tracing::info!(
+                        tombstones = summary.tombstones,
+                        files = summary.files,
+                        completed = summary.completed,
+                        reverted = summary.reverted,
+                        unresolved = summary.unresolved,
+                        failed = summary.failed,
+                        "the tier GC pass settled leftovers"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!(
+                error = %err,
+                "the tier GC pass failed; its cadence retries it"
+            ),
+        }
+    })
+    .await;
 }
 
 /// The `FsCleanup` the filesystem startup repair runs ([`ServingBackend::repair_cleanup`]): the
@@ -660,9 +1028,13 @@ async fn scanner_and_sweeper(
 /// `delay` is seconds as a float in the config; a value [`Duration`] cannot represent (a TOML
 /// `nan`/`inf` slips through the parser's lower-bound check) falls back to the default rather than
 /// panicking in `Duration::from_secs_f64`.
+///
+/// `reconcile_objects` is the caller's answer: `true` for every backend whose files are the content
+/// source, `false` in tier mode, where a row without a file is a cold object, not a stale row.
 pub(super) fn scanner_options(
     section: Option<&config::scanner::Config>,
     access: AccessMode,
+    reconcile_objects: bool,
 ) -> ScannerOptions {
     let enabled = section.is_some();
     let defaults = config::scanner::Config::default();
@@ -674,13 +1046,22 @@ pub(super) fn scanner_options(
         max_wait: section.max_wait,
         cycle: section.cycle,
         access,
+        reconcile_objects,
     }
 }
 
 /// [`scanner_options`] for the resolved configuration — the one reading of
 /// `resolution.config.scanner` on the serving path.
-pub(super) fn scanner_options_for(resolution: &Resolution, access: AccessMode) -> ScannerOptions {
-    scanner_options(resolution.config.scanner.as_ref(), access)
+pub(super) fn scanner_options_for(
+    resolution: &Resolution,
+    access: AccessMode,
+    reconcile_objects: bool,
+) -> ScannerOptions {
+    scanner_options(
+        resolution.config.scanner.as_ref(),
+        access,
+        reconcile_objects,
+    )
 }
 
 /// The background sweep's options from the resolved `[s3]` section (R2): the two TTLs —

@@ -498,10 +498,20 @@ fn locate_in(
     // the database, and a pg run has no served root for the walk-up to find. `rooted` returns
     // `None` for exactly that arm and nothing else; with no dsn it returns the usage error, so the
     // no-root-with-no-dsn case is unchanged.
+    // **A tier document is not a dsn-addressed pg run** (T1, ruling R8). It carries
+    // `[storage.pg]` because that section *is* the tier layer's cold plane, so the dsn it names —
+    // or the one `TINIO_PG_DSN` exports beside it — must not buy the synthetic root a pg run lives
+    // under. With no `DIR` and no discovered root the run has no served root, which is the usage
+    // error `rooted` answers rather than a tool-state leaf handed to the serving half as if it
+    // were the root to serve.
+    let pg_addressed = discovery.pg_dsn.is_some()
+        && !anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.config().backend() == storage::Backend::Tier);
     let root = match rooted(
         discovery.dir.as_deref(),
         from,
-        discovery.pg_dsn.is_some(),
+        pg_addressed,
         adopted_root,
     )? {
         Some(root) => root,

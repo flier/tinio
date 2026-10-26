@@ -46,6 +46,8 @@ pub mod sweep;
 pub mod testing;
 #[cfg(test)]
 mod testutil;
+#[cfg(feature = "tier")]
+pub mod tier;
 pub mod tombstone;
 #[cfg(feature = "versioning")]
 mod version;

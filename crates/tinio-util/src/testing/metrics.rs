@@ -57,6 +57,12 @@ pub fn counter(family: &str, labels: &[(&str, &str)]) -> f64 {
     series(family, labels).map_or(0.0, |metric| metric.get_counter().value())
 }
 
+/// One gauge series' current value, or zero when the family or series has no
+/// sample.
+pub fn gauge(family: &str, labels: &[(&str, &str)]) -> f64 {
+    series(family, labels).map_or(0.0, |metric| metric.get_gauge().value())
+}
+
 /// One histogram series' sample count, or zero when the family or series has
 /// no sample.
 pub fn histogram_count(family: &str, labels: &[(&str, &str)]) -> f64 {

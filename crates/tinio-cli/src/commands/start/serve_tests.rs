@@ -1,7 +1,13 @@
 #[cfg(feature = "versioning")]
 use std::future::pending;
+#[cfg(feature = "tier")]
+use std::path::Path;
+#[cfg(feature = "tier")]
+use std::sync::Arc;
 use std::{path::PathBuf, time::Duration};
 
+#[cfg(all(feature = "tier", feature = "api"))]
+use tinio_util::testing::body;
 use tokio::{
     sync::watch,
     time::{sleep, timeout},
@@ -15,12 +21,19 @@ use super::{
 };
 #[cfg(feature = "versioning")]
 use super::{bounded_versioning_warning, versioning_disabled_warning};
+#[cfg(all(feature = "tier", feature = "api"))]
+use crate::_core::storage::ObjectOps;
 #[cfg(feature = "versioning")]
 use crate::_core::{
     acl::Acl,
     bucket,
     storage::{BucketOps, VersionOps},
     version::State,
+};
+#[cfg(feature = "tier")]
+use crate::_core::{
+    object,
+    storage::{DEFAULT_MAX_CONCURRENT_UPLOADS, Error as StorageError, MultipartOps},
 };
 #[cfg(any(feature = "versioning", feature = "lifecycle"))]
 use crate::_server::Capabilities;
@@ -29,7 +42,15 @@ use crate::config::lifecycle;
 use crate::{
     _core::mode::AccessMode,
     _fs::{FsStorage, testing},
-    config::{Config, s3, scanner},
+    _tier::{index_path, marker_path},
+    commands::start::run::{refuse_tier_root, tier_selection},
+    config::{Config, s3, scanner, storage::Backend},
+};
+#[cfg(feature = "tier")]
+use crate::{
+    _fs::{FsContent, FsOptions},
+    _pg::Access as TierAccess,
+    _tier::{ColdStore, Config as TierConfig, FlushMode, TierStorage},
 };
 
 /// **The drain bound is armed by a stop, never by the clock**, and this leg is the defect in
@@ -159,6 +180,478 @@ async fn a_timed_out_versioning_warning_names_the_condition_without_a_count() {
     );
 }
 
+// ---- the tier backend's start wiring (Task 21) ----
+
+/// The document a `type = "tier"` run resolves: the selector, its cold plane, and no
+/// `[storage.tier]` section (so the CLI's defaults are the runtime value's).
+const TIER_DOC: &str = "version = 1\n[storage]\ntype = \"tier\"\n[storage.pg]\n\
+                        dsn = \"postgres://tinio:tinio@127.0.0.1:55432/tinio?sslmode=disable\"\n";
+
+/// A resolution of the shape `run` hands the serving half for a tier document — the value the
+/// selection and the marker refusal read, built without touching a root or a database.
+fn tier_resolution_with(read_only: bool) -> Resolution {
+    Resolution {
+        pg_root: None,
+        root: PathBuf::from("/srv/tier"),
+        config: Config::parse(TIER_DOC).expect("the tier document parses"),
+        identity: Default::default(),
+        config_text: TIER_DOC.to_owned(),
+        config_path: PathBuf::from("/srv/tier/.tinio/.tinio.toml"),
+        read_only,
+        state_dir: PathBuf::from("/srv/tier/.tinio"),
+        state_dir_override: None,
+        config_error: None,
+    }
+}
+
+/// A tier resolution with the defaults' direct-write regime.
+fn tier_resolution() -> Resolution {
+    tier_resolution_with(false)
+}
+
+/// **A `type = "tier"` configuration selects the tier arm, and its construction inputs are the
+/// resolved ones** — the selector, not the presence of a `[storage.pg]` section, is what answers
+/// (a tier document carries that section and must never be served as pg).
+#[cfg(feature = "tier")]
+#[test]
+fn a_tier_config_selects_the_tier_arm() {
+    let selected = tier_selection(&tier_resolution(), None)
+        .expect("the tier arm resolves")
+        .expect("a tier configuration selects it");
+    let super::Served::Tier { config, pg, access } = selected else {
+        panic!("a tier configuration must not select the filesystem or pg arm");
+    };
+    assert_eq!(
+        config.capacity_bytes,
+        256 * 1024 * 1024,
+        "the runtime value is the CLI's tier defaults (T22)"
+    );
+    assert_eq!(
+        config.flush_mode,
+        FlushMode::Sync,
+        "the default write regime is the documented one"
+    );
+    assert!(
+        matches!(access, TierAccess::ReadWrite),
+        "a writable run takes the cold plane's ownership (T18)"
+    );
+    assert_eq!(pg.pool(), 8, "the cold plane's pool is the pg default");
+
+    let read_only = tier_selection(&tier_resolution_with(true), None)
+        .expect("the read-only tier arm resolves")
+        .expect("a tier configuration selects it in either mode");
+    let super::Served::Tier { access, .. } = read_only else {
+        panic!("the tier arm answered");
+    };
+    assert!(
+        matches!(access, TierAccess::ReadOnly),
+        "read-only takes no ownership lock (T27)"
+    );
+
+    // The other selectors stay out of it, so the arm is the selector's answer.
+    assert!(
+        tier_selection(&resolution(None), None)
+            .expect("the filesystem resolution selects nothing")
+            .is_none(),
+        "an fs configuration does not select the tier arm"
+    );
+}
+
+/// **I6: a tier start refuses an explicit `TINIO_STATE_DIR` that names another path**, naming the
+/// variable. Every tier record — the marker, the index and the `[storage.tier]`/`[storage.pg]`
+/// configuration — lives in the root's own `<root>/.tinio`, so an override pointing elsewhere
+/// would have the tier records and the run's configuration in two different directories.
+#[cfg(feature = "tier")]
+#[test]
+fn a_tier_start_refuses_a_relocated_state_dir() {
+    let mut relocated = tier_resolution_with(true);
+    relocated.state_dir = PathBuf::from("/srv/relocated");
+    relocated.state_dir_override = Some(PathBuf::from("/srv/relocated"));
+    let refused = match tier_selection(&relocated, None) {
+        Ok(_) => panic!("the relocated state dir is refused"),
+        Err(err) => err,
+    };
+    assert!(matches!(refused, crate::Error::Usage(_)), "{refused}");
+    assert!(
+        refused.to_string().contains("TINIO_STATE_DIR"),
+        "the refusal names the variable: {refused}"
+    );
+
+    // The rule reads the override, not the resolved directory: an explicit differing override is
+    // refused in writable mode too, where the resolver would otherwise have ignored it.
+    let mut writable = tier_resolution();
+    writable.state_dir_override = Some(PathBuf::from("/srv/relocated"));
+    assert!(
+        tier_selection(&writable, None).is_err(),
+        "an explicit override naming another path is refused in either mode"
+    );
+
+    // The root's own directory is the shape every mode accepts.
+    assert!(
+        tier_selection(&tier_resolution_with(true), None).is_ok(),
+        "the root's own state dir is the accepted one"
+    );
+
+    // **A read-only run that names no override is accepted**, whichever leaf its *tool* state
+    // resolves to: the tier root's state dir is fixed at `<root>/.tinio`, and the storage reads it
+    // directly in read-only mode.
+    let mut derived = tier_resolution_with(true);
+    derived.state_dir = PathBuf::from("/home/operator/.tinio/roots/0123456789abcdef");
+    assert!(
+        derived.state_dir_override.is_none(),
+        "the fixture names no override"
+    );
+    assert!(
+        tier_selection(&derived, None).is_ok(),
+        "a read-only run resolves its tool state elsewhere and still serves the root"
+    );
+}
+
+/// **A build without the `tier` feature refuses `type = "tier"` rather than falling through to
+/// the filesystem backend** — the same shape the pg selector's own refusal has. The same leg runs
+/// in a feature-carrying build, where it pins the other answer: the selector resolves.
+#[test]
+fn tier_requires_the_feature() {
+    let selected = tier_selection(&tier_resolution(), None);
+
+    #[cfg(feature = "tier")]
+    assert!(
+        matches!(selected, Ok(Some(super::Served::Tier { .. }))),
+        "the feature carries the tier arm"
+    );
+
+    #[cfg(not(feature = "tier"))]
+    {
+        // Matched rather than `expect_err`: `Served` carries a bound plane and a whole backend,
+        // neither of which implements `Debug`, and the failure arm is all this leg reads.
+        let err = match selected {
+            Err(err) => err,
+            Ok(_) => panic!("a build without the tier feature refuses the configuration"),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("tier"), "{rendered}");
+        assert!(
+            rendered.contains("feature"),
+            "the remedy names the build: {rendered}"
+        );
+    }
+}
+
+/// **The marker or the index alone makes a root tier-owned, and a non-tier start refuses it**
+/// (T17): both the filesystem and pg backends ask the one seam, so neither can serve a root whose
+/// warm rows, cold placements and identity belong to the tier layer.
+#[test]
+fn a_marker_or_index_root_is_refused_by_fs_pg() {
+    use std::fs;
+
+    let dir = tempfile::tempdir().expect("a scratch root");
+    let root = dir.path();
+    let refuse = |backend| refuse_tier_root(backend, root);
+
+    refuse(Backend::Fs).expect("a plain root may start as fs");
+    refuse(Backend::Pg).expect("a plain root may start as pg");
+    refuse(Backend::Tier).expect("a tier start claims its own root");
+
+    fs::create_dir_all(root.join(".tinio")).expect("the private directory");
+    fs::write(marker_path(root), [0_u8; 16]).expect("the marker");
+    let err = refuse(Backend::Fs).expect_err("the marker alone makes the root tier-owned");
+    assert!(err.to_string().contains("tier mode"), "{err}");
+    assert!(
+        refuse(Backend::Pg).is_err(),
+        "pg refuses a marker-only root too"
+    );
+    assert!(
+        refuse(Backend::Tier).is_ok(),
+        "the tier backend owns the root it marks"
+    );
+
+    fs::remove_file(marker_path(root)).expect("remove the marker");
+    fs::write(index_path(root), b"index").expect("the index");
+    let err = refuse(Backend::Fs).expect_err("the index alone makes the root tier-owned");
+    assert!(err.to_string().contains("tier mode"), "{err}");
+    assert!(
+        refuse(Backend::Pg).is_err(),
+        "pg refuses an index-only root too"
+    );
+    assert!(refuse(Backend::Tier).is_ok());
+}
+
+/// **In tier mode the scanner never reconciles object rows against the files' presence** (T3):
+/// a row without a file is a cold object, not a stale row, so the pass that drains one would
+/// delete every cold object on its first cycle. The flag is the backend's own answer, read by
+/// the one call site that builds the scanner's options.
+#[cfg(feature = "tier")]
+#[test]
+fn scanner_off_in_tier_mode() {
+    use super::super::serving::ServingBackend;
+
+    type Tier = TierStorage<ColdStore>;
+
+    assert!(
+        !<Tier as ServingBackend>::reconcile_objects(),
+        "tier mode must leave object rows alone"
+    );
+    assert!(
+        <FsStorage as ServingBackend>::reconcile_objects(),
+        "the filesystem backend reconciles: its files are the content source"
+    );
+
+    let options = scanner_options(
+        Some(&scanner::Config::default()),
+        AccessMode::ReadWrite,
+        <Tier as ServingBackend>::reconcile_objects(),
+    );
+    assert!(options.enabled, "the section is present in this leg");
+    assert!(
+        !options.reconcile_objects,
+        "the options the tier run builds carry the backend's answer"
+    );
+}
+
+/// A tier layer over two scratch planes, for the legs that need no database: the warm root and
+/// an `FsContent` cold plane (the same fixture `write_metrics`'s wrapper tests use).
+#[cfg(feature = "tier")]
+fn tier_layer(
+    warm: &Path,
+    cold: &Path,
+    config: TierConfig,
+    access: AccessMode,
+    max_concurrent_uploads: u32,
+) -> TierStorage<FsContent> {
+    let cold_fs = Arc::new(
+        FsStorage::new(cold, testing::fs_options()).expect("the cold content plane opens"),
+    );
+    TierStorage::open(
+        warm,
+        FsOptions {
+            access,
+            max_concurrent_uploads,
+            ..testing::fs_options()
+        },
+        config,
+        cold_fs.content(),
+    )
+    .expect("the tier layer opens")
+}
+
+/// A layer reopened read-only over a root an earlier writable open marked: the constructor
+/// creates nothing in this mode (T27), so the fixture must have run once writable.
+#[cfg(feature = "tier")]
+fn read_only_tier(warm: &Path, cold: &Path, config: TierConfig) -> TierStorage<FsContent> {
+    drop(tier_layer(
+        warm,
+        cold,
+        config.clone(),
+        AccessMode::ReadWrite,
+        DEFAULT_MAX_CONCURRENT_UPLOADS,
+    ));
+    tier_layer(
+        warm,
+        cold,
+        config,
+        AccessMode::ReadOnly,
+        DEFAULT_MAX_CONCURRENT_UPLOADS,
+    )
+}
+
+/// The run's runtime configuration for these legs: the CLI's defaults, with the pacing the test
+/// can afford.
+#[cfg(feature = "tier")]
+fn tier_config(flush_mode: FlushMode) -> TierConfig {
+    TierConfig {
+        capacity_bytes: 1024 * 1024,
+        max_object_bytes: 64 * 1024,
+        flush_mode,
+        batch_bytes: 8 * 1024,
+        batch_interval: Duration::from_secs(1),
+        heat_window: Duration::from_secs(60),
+        promote_reads: 3,
+        stats_flush: Duration::from_secs(10),
+        high_water_percent: 90,
+        low_water_percent: 80,
+        demote_idle: Duration::from_secs(3600),
+        dwell: Duration::from_secs(3600),
+        scan_interval: Duration::from_secs(60),
+        move_concurrency: 1,
+        index_compact_percent: 30,
+        gc_grace: Duration::from_secs(300),
+    }
+}
+
+/// The run's pass, spelled the way both feature regimes spell it: an `Option` when the
+/// `lifecycle` feature exists, `()` when it does not.
+#[cfg(all(feature = "tier", feature = "lifecycle"))]
+fn no_pass() -> Option<super::super::serving::LifecyclePass> {
+    None
+}
+
+#[cfg(all(feature = "tier", not(feature = "lifecycle")))]
+fn no_pass() {}
+
+/// **A read-only tier run starts no task at all** (T27): the background future returns before it
+/// constructs the mover or any loop, so nothing scans, flushes, moves or collects. The same
+/// fixture writable stays pending, which is what proves the early return is the mode's answer
+/// and not an empty future in both arms.
+#[cfg(feature = "tier")]
+// `no_pass()` is `()` without the `lifecycle` feature, and that arm is the shared signature's own
+// shape rather than a mistake this test makes.
+#[cfg_attr(
+    not(feature = "lifecycle"),
+    expect(
+        clippy::unit_arg,
+        reason = "test context: the no-pass fixture is `()` without the lifecycle feature"
+    )
+)]
+#[tokio::test]
+async fn read_only_starts_nothing() {
+    let warm = tempfile::tempdir().expect("a warm root");
+    let cold = tempfile::tempdir().expect("a cold root");
+    let config = tier_config(FlushMode::Sync);
+    let read_only = read_only_tier(warm.path(), cold.path(), config.clone());
+    let (_stopper, stop) = watch::channel(false);
+
+    let background = super::super::serving::tier_background(
+        read_only,
+        config.clone(),
+        stop.clone(),
+        AccessMode::ReadOnly,
+        sweep::Options::default(),
+        scanner_options(None, AccessMode::ReadOnly, false),
+        no_pass(),
+    );
+    timeout(Duration::from_millis(200), background)
+        .await
+        .expect("a read-only tier run starts no task and returns at once");
+
+    let writable = tier_layer(
+        warm.path(),
+        cold.path(),
+        config.clone(),
+        AccessMode::ReadWrite,
+        DEFAULT_MAX_CONCURRENT_UPLOADS,
+    );
+    let background = super::super::serving::tier_background(
+        writable,
+        config,
+        stop,
+        AccessMode::ReadWrite,
+        sweep::Options::default(),
+        scanner_options(None, AccessMode::ReadWrite, false),
+        no_pass(),
+    );
+    assert!(
+        timeout(Duration::from_millis(200), background)
+            .await
+            .is_err(),
+        "the writable run's passes keep the background future alive"
+    );
+}
+
+/// **`[s3] max_concurrent_uploads` reaches tier mode.** The cap is applied to the warm plane the
+/// layer decorates (the same shared handle a plain fs run caps), so a second live multipart
+/// upload answers the store's upload-count refusal — `TooManyMultipartUploads`, the S3
+/// `SlowDown` — rather than accumulating without bound.
+#[cfg(feature = "tier")]
+#[tokio::test]
+async fn a_tier_root_refuses_a_second_live_multipart_upload() {
+    let warm = tempfile::tempdir().expect("a warm root");
+    let cold = tempfile::tempdir().expect("a cold root");
+    let storage = tier_layer(
+        warm.path(),
+        cold.path(),
+        tier_config(FlushMode::Sync),
+        AccessMode::ReadWrite,
+        1,
+    );
+    let name = bucket::name("data").expect("a bucket name");
+    storage
+        .create_bucket(&name, None, &Acl::default_private(None))
+        .await
+        .expect("the bucket is created");
+    let key = object::key("upload.bin").expect("an object key");
+    storage
+        .create_multipart_upload(
+            &name,
+            &key,
+            None,
+            object::Tags::empty(),
+            None,
+            &Acl::default_private(None),
+            None,
+        )
+        .await
+        .expect("the first upload opens");
+    let refused = storage
+        .create_multipart_upload(
+            &name,
+            &key,
+            None,
+            object::Tags::empty(),
+            None,
+            &Acl::default_private(None),
+            None,
+        )
+        .await
+        .expect_err("the cap refuses the second live upload");
+    let projected: StorageError = refused.into();
+    assert!(
+        matches!(
+            projected,
+            StorageError::TooManyMultipartUploads { limit: 1 }
+        ),
+        "the refusal is the upload-count one: {projected}"
+    );
+}
+
+/// **The metrics reader lists through `Storage::metrics_scan`, never the client listing** (T26):
+/// a client listing flushes the batch buffer first, so a reader built on it would publish a
+/// buffered key and write the buffer at every tick. The buffered write is therefore invisible to
+/// the scan and stays buffered; after the drain it is counted like any other object.
+#[cfg(all(feature = "tier", feature = "api"))]
+#[tokio::test]
+async fn the_metrics_reader_uses_metrics_scan() {
+    let warm = tempfile::tempdir().expect("a warm root");
+    let cold = tempfile::tempdir().expect("a cold root");
+    let storage = tier_layer(
+        warm.path(),
+        cold.path(),
+        tier_config(FlushMode::Batch),
+        AccessMode::ReadWrite,
+        DEFAULT_MAX_CONCURRENT_UPLOADS,
+    );
+    let name = bucket::name("metrics-scan").expect("a bucket name");
+    storage
+        .create_bucket(&name, None, &Acl::default_private(None))
+        .await
+        .expect("a bucket");
+    let key = object::key("buffered.bin").expect("a key");
+    storage
+        .put_object(&name, &key, body(b"acknowledged but buffered"))
+        .await
+        .expect("the write is acknowledged");
+    assert!(
+        !storage.buffer().is_empty(),
+        "the fixture's write waits in the batch buffer"
+    );
+
+    let counts = super::super::reader::scan(&storage).await;
+    assert_eq!(
+        counts.objects, 0,
+        "metrics_scan does not flush, so a buffered write is not in its listing yet"
+    );
+    assert!(
+        !storage.buffer().is_empty(),
+        "the metrics reader must not flush the batch buffer"
+    );
+
+    storage.shutdown().await.expect("the buffer drains");
+    let counts = super::super::reader::scan(&storage).await;
+    assert_eq!(
+        counts.objects, 1,
+        "the persisted object is what the reader counts"
+    );
+}
+
 /// A resolved-config fixture: the `[s3]` section the legs under it exercise is handed in
 /// **directly**, and every other section is the defaults.
 ///
@@ -246,14 +739,18 @@ fn scanner_options_map_the_section_presence_and_pacing() {
     let write = AccessMode::ReadWrite;
     let read_only = AccessMode::ReadOnly;
 
-    let absent = scanner_options(None, write);
+    let absent = scanner_options(None, write, true);
     assert!(!absent.enabled);
     assert_eq!(absent.delay, Duration::from_secs(10));
     assert_eq!(absent.max_wait, Duration::from_secs(15));
     assert_eq!(absent.cycle, Duration::from_secs(24 * 3600));
     assert_eq!(absent.access, write);
+    assert!(
+        absent.reconcile_objects,
+        "the caller's flag travels through"
+    );
 
-    let present = scanner_options(Some(&scanner::Config::default()), read_only);
+    let present = scanner_options(Some(&scanner::Config::default()), read_only, true);
     assert!(present.enabled);
     assert_eq!(present.delay, Duration::from_secs(10));
     assert_eq!(present.max_wait, Duration::from_secs(15));
@@ -265,7 +762,7 @@ fn scanner_options_map_the_section_presence_and_pacing() {
         max_wait: Duration::from_secs(60),
         cycle: Duration::from_secs(2 * 3600),
     };
-    let options = scanner_options(Some(&custom), write);
+    let options = scanner_options(Some(&custom), write, true);
     assert!(options.enabled);
     assert_eq!(options.delay, Duration::from_millis(2_500));
     assert_eq!(options.max_wait, Duration::from_secs(60));
@@ -277,7 +774,7 @@ fn scanner_options_map_the_section_presence_and_pacing() {
         ..scanner::Config::default()
     };
     assert_eq!(
-        scanner_options(Some(&non_finite), write).delay,
+        scanner_options(Some(&non_finite), write, true).delay,
         Duration::from_secs(10)
     );
 }
@@ -294,14 +791,19 @@ fn scanner_options_for_reads_the_resolved_scanner_section() {
         config,
         ..resolution(None)
     };
-    let options = scanner_options_for(&configured, AccessMode::ReadWrite);
+    let options = scanner_options_for(&configured, AccessMode::ReadWrite, true);
     assert!(options.enabled);
     assert_eq!(options.delay, Duration::from_millis(2_500));
     assert_eq!(options.max_wait, Duration::from_secs(60));
     assert_eq!(options.cycle, Duration::from_secs(2 * 3600));
+    assert!(options.reconcile_objects);
 
-    let absent = scanner_options_for(&resolution(None), AccessMode::ReadWrite);
+    let absent = scanner_options_for(&resolution(None), AccessMode::ReadWrite, false);
     assert!(!absent.enabled);
+    assert!(
+        !absent.reconcile_objects,
+        "the caller's flag travels through"
+    );
 }
 
 /// A resolution whose `[lifecycle]` section declares one seed rule — the document both gate
@@ -362,6 +864,27 @@ fn a_disabled_capability_builds_no_pass_and_no_seed() {
         lifecycle_pass(&resolution, &Capabilities::default(), AccessMode::ReadWrite).is_some(),
         "the same document with the capability on builds one — the switch is what answered"
     );
+}
+
+/// **`[lifecycle] concurrency` reaches the runner**: the pass the serving half builds carries
+/// the document's worker count in its options, and `Runner::new` receives that
+/// value — so a written count is what the pass runs, not the code's default.
+#[cfg(feature = "lifecycle")]
+#[test]
+fn the_lifecycle_pass_carries_the_configured_concurrency() {
+    let mut resolution = resolution(Some(s3::Config::default()));
+    resolution.config.lifecycle = Some(lifecycle::Config {
+        concurrency: 3,
+        ..Default::default()
+    });
+    let (options, seeds) =
+        lifecycle_pass(&resolution, &Capabilities::default(), AccessMode::ReadWrite)
+            .expect("the document builds the pass");
+    assert_eq!(
+        options.concurrency, 3,
+        "the runner's options carry the configured worker count"
+    );
+    assert!(seeds.is_empty(), "the fixture declares no rule");
 }
 
 /// The startup repair hands the cleanup the resolved `[s3] multipart_expire_days` as its
@@ -431,7 +954,7 @@ use crate::{
     _util::secret::{Secret, SecretKey},
     config::{
         server,
-        storage::{self, Backend, pg},
+        storage::{self, pg},
     },
     resolve::Pipelines,
     signal,
