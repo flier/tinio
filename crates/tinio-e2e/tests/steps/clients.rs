@@ -1144,8 +1144,9 @@ async fn served_root_files(world: &mut World, bucket: String, count: u64, stem: 
 async fn output_contains(world: &mut World, text: String) {
     assert!(
         world.ext_output.contains(&text),
-        "client output missing {text:?}: {}",
-        world.ext_output
+        "client output missing {text:?}: {}\nstderr: {}",
+        world.ext_output,
+        world.ext_error
     );
 }
 
@@ -1155,8 +1156,9 @@ async fn output_contains(world: &mut World, text: String) {
 async fn output_contains_ignore_case(world: &mut World, text: String) {
     assert!(
         contains_ignore_case(&world.ext_output, &text),
-        "client output missing {text:?} (case-insensitive): {}",
-        world.ext_output
+        "client output missing {text:?} (case-insensitive): {}\nstderr: {}",
+        world.ext_output,
+        world.ext_error
     );
 }
 
