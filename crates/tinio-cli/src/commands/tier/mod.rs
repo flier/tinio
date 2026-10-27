@@ -969,8 +969,10 @@ pub(crate) mod tests {
             rendered.contains("TINIO_STATE_DIR"),
             "the refusal names the variable: {rendered}"
         );
+        // The refusal renders the resolved root, which is canonical; the TempDir path is not.
+        let expected = root.path().canonicalize().expect("the root canonicalizes");
         assert!(
-            rendered.contains(&root.path().join(".tinio").display().to_string()),
+            rendered.contains(&expected.join(".tinio").display().to_string()),
             "the refusal names the expected directory: {rendered}"
         );
     }

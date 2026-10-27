@@ -1834,7 +1834,9 @@ fn create_parent(path: &Path) -> Result<(), Error> {
 /// format gate and redb's own open flags protect the file there.
 #[cfg(unix)]
 fn prepare_file(path: &Path) -> Result<(), Error> {
-    crate::atomic::append_private(path)?;
+    use crate::atomic;
+
+    atomic::append_private(path)?;
     Ok(())
 }
 

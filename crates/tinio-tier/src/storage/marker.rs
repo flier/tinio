@@ -10,7 +10,7 @@ use std::{
 use tinio_util::fsutil::ok_if_missing;
 
 use super::{ROOT_ID_LEN, index_path, marker_path, path_present};
-use crate::{_fs, Error, Index, atomic};
+use crate::{Error, Index, atomic};
 
 /// The root identity a construction records, and whether this run created the
 /// marker carrying it.
@@ -206,6 +206,9 @@ pub(super) fn open_index_read_only(
 /// write-only under `follow`, rejecting a link at open time when following is
 /// disabled.
 pub(super) fn open_mutation_file(path: &Path, follow: bool) -> io::Result<fs::File> {
+    #[cfg(windows)]
+    use crate::_fs;
+
     let mut options = OpenOptions::new();
     options.write(true);
     if !follow {
