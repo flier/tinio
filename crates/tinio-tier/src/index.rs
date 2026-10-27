@@ -2640,7 +2640,7 @@ mod tests {
         let dir = tempdir().expect("a temp dir");
         let path = dir.path().join("tier.redb");
         drop(Index::open(&path).expect("the index opens"));
-        let mode = std::fs::metadata(&path)
+        let mode = fs::metadata(&path)
             .expect("the file exists")
             .permissions()
             .mode()

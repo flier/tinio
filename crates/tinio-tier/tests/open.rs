@@ -445,7 +445,7 @@ fn a_failed_writable_open_leaves_the_marker_behind() {
 
     // The refused construction wrote no identity into the index it could not
     // open: the planted index still records none.
-    let index = Index::open_read_only(&index_path(root.path())).expect("the index is readable");
+    let index = Index::open_read_only(index_path(root.path())).expect("the index is readable");
     assert_eq!(
         index.root_id().expect("the root id is read"),
         None,
