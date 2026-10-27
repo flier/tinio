@@ -61,7 +61,9 @@ proptest = "1.11"
 rayon = "1"
 redb = "4.2"
 rust_decimal = "1"
-rustix = "1.1"
+# Pinned: rustix 1.1.5 mangles `rustix::runtime`'s name (#1633), and
+# tinio-sandbox-linux's userns probe needs it (kernel_fork / exit_group).
+rustix = "=1.1.4"
 s3s = "0.17"
 sd-notify = "0.5"
 secrecy = "0.10"
