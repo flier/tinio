@@ -508,12 +508,7 @@ fn locate_in(
         && !anchor
             .as_ref()
             .is_some_and(|anchor| anchor.config().backend() == storage::Backend::Tier);
-    let root = match rooted(
-        discovery.dir.as_deref(),
-        from,
-        pg_addressed,
-        adopted_root,
-    )? {
+    let root = match rooted(discovery.dir.as_deref(), from, pg_addressed, adopted_root)? {
         Some(root) => root,
         None => {
             let mut located = pg_located(discovery, provenance, &Config::default())?;

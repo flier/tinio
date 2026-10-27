@@ -14,7 +14,8 @@
 
 - The fixture is `tools/pg/docker-compose.yml`: postgres 18, host port 55432, user and database `tinio`.
 - Start it before the DB legs; the compose healthcheck gates readiness.
-- Run the DB legs and the sqlx cache check with the DSN below.
+- Run the DB legs with the DSN below.
+- The sqlx cache check describes a database only **as migrated**: run it before any leg writes to the fixture, and on a reused fixture reset the volume (`down -v`) first. The cache records the nullability the driver reads there, and a database carrying rows or planner statistics re-reads an outer join's inner columns as nullable — the same SQL then reports as drift.
 - Set `TINIO_PG_REQUIRED=1` to fail closed; unset means the legs skip.
 
 ```sh

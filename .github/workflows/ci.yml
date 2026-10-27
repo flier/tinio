@@ -1026,6 +1026,31 @@ jobs:
       - *rust-cache
       - *sccache
 
+      # The sqlx-cache drift leg (design §"The SQL layout") runs FIRST, before
+      # any step writes to the service's database: the committed cache records
+      # what the driver read from a database that had just been migrated — no
+      # rows, no planner statistics. Once another leg has written to that
+      # database (or autovacuum has analyzed it), the `EXPLAIN` the driver runs
+      # to patch a column's nullability no longer folds to an empty result, the
+      # inner half of the `parts ⟕ part_checksums` join reads as nullable, and
+      # `query-c12ef6dc…` re-reads as `changed` with the same SQL — the drift the
+      # 2026-10-25 dev run reported on a commit whose PR run was green.
+      # `cargo xtask sqlx check` describes against `TINIO_PG_DSN`'s database, so
+      # "as migrated, nothing written" is the fixture the recorded shape
+      # describes; the store suite's
+      # `the_base_database_is_migrated_for_the_sqlx_drift_check` leg is the
+      # migration on its own (2026-10-13 finding 4c) — an unmigrated database
+      # makes the driver fail to infer a column's type instead. `always()` on
+      # both so the drift is reported whatever the credential scan above said:
+      # the drift is independent of it.
+      - name: migrate the fixture database (the drift check's subject)
+        if: always()
+        run: cargo test --profile ci -p tinio-store-pg --lib the_base_database_is_migrated_for_the_sqlx_drift_check
+
+      - name: sqlx cache drift (cargo xtask sqlx check)
+        if: always()
+        run: cargo xtask sqlx check
+
       # Cheapest signal first, in the order that wastes least: the store's own
       # database-backed suite proves the persistence layer before the backend
       # above it is exercised. Every DB-backed test creates its own scratch
@@ -1089,29 +1114,6 @@ jobs:
           # on the step, not the job, mirroring the mem leg: it is read only by
           # the cucumber process, and no other step in this job wants it.
           TINIO_E2E_BACKEND: pg
-
-      # An explicit migration of the fixture database, before the drift check
-      # (2026-10-13 finding 4c): `cargo xtask sqlx check` describes every
-      # statement against `TINIO_PG_DSN`'s database, and an unmigrated one makes
-      # the driver fail to infer a column's type (`relation "…" does not exist`),
-      # which the check would report instead of drift. The @pg pass happens to
-      # migrate the base database as its first connect, so the check used to
-      # depend on that pass; this step is the migration on its own — the store
-      # suite's `the_base_database_is_migrated_for_the_sqlx_drift_check` leg
-      # against the base dsn — `always()` so the check reports drift whatever ran
-      # before it.
-      - name: migrate the fixture database (the drift check's subject)
-        if: always()
-        run: cargo test --profile ci -p tinio-store-pg --lib the_base_database_is_migrated_for_the_sqlx_drift_check
-
-      # The sqlx-cache drift leg (design §"The SQL layout"): a committed `.sqlx`
-      # entry that has gone stale against the schema it describes is caught
-      # ONLY by `cargo xtask sqlx check` beside a live, migrated database — this
-      # job is that database's only home. `always()` so the drift is reported
-      # even when a step above is red: the drift is independent of it.
-      - name: sqlx cache drift (cargo xtask sqlx check)
-        if: always()
-        run: cargo xtask sqlx check
 
   # The tiered backend's own in-process pass (T25): the `@tier` scenarios run
   # against a PostgreSQL cold plane, so this job carries the workflow's second
