@@ -73,10 +73,15 @@ Feature: Tiered storage through external S3 clients
     When I run mc cat tinio/tier-mc/cold.txt
     Then the external client output contains "cold payload from mc"
     # The lifecycle round trip: a transition-only rule to STANDARD_IA at the 30-day floor, listed and removed.
+    # Listed with `--json`, which mc documents as its machine-readable form: the `ls` table is a layout the
+    # client is free to stop printing (the current release renders none for this rule while still serving it),
+    # and the rule's presence in the served configuration is what this scenario claims. The `ls` after the
+    # removal stays table-mode on purpose: `--json` moves the error itself to stdout, and this leg asserts stderr.
     When I run mc ilm rule add --transition-days 30 --transition-tier STANDARD_IA tinio/tier-mc
     Then the external client output contains "added"
-    When I run mc ilm rule ls tinio/tier-mc
-    Then the external client output contains "STANDARD_IA"
+    When I run mc ilm rule ls --json tinio/tier-mc
+    Then the external client output contains "StorageClass"
+    And the external client output contains "STANDARD_IA"
     When I run mc ilm rule rm --all --force tinio/tier-mc
     And I try mc ilm rule ls tinio/tier-mc
     Then the external client error contains "lifecycle configuration does not exist"

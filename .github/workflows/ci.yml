@@ -1219,12 +1219,25 @@ jobs:
       # mc has no install-action manifest; the release binary is the official
       # distribution. It lands in the runner's own bin dir, put on PATH for the
       # steps below.
+      # The community tree (dl.min.io/client/mc/release/) answers 410 as of
+      # 2026-10: MinIO retired it. The aiStor release path is MinIO's current
+      # distribution, so that is what this fetches.
+      # The published sha256 is checked because the suite executes this
+      # binary: a truncated or substituted download must fail here, not as a
+      # strange client error. The sum file names the release asset, not mc, so
+      # the digest line is re-pointed at the file we wrote. The version cannot
+      # be pinned — the site now serves only its current build — so the digest
+      # is the pin.
       - name: install mc
         run: |
           set -euo pipefail
+          base=https://dl.min.io/aistor/mc/release/linux-amd64
           mkdir -p "$HOME/.local/bin"
-          curl -fsSLo "$HOME/.local/bin/mc" https://dl.min.io/client/mc/release/linux-amd64/mc
-          chmod +x "$HOME/.local/bin/mc"
+          cd "$HOME/.local/bin"
+          curl -fsSLo mc "$base/mc"
+          curl -fsSLo "$RUNNER_TEMP/mc.sha256sum" "$base/mc.sha256sum"
+          awk '{print $1"  mc"}' "$RUNNER_TEMP/mc.sha256sum" | sha256sum -c -
+          chmod +x mc
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # boto3 is not on the hosted image; the harness reads the venv python at

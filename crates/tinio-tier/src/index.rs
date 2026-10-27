@@ -1834,7 +1834,9 @@ fn create_parent(path: &Path) -> Result<(), Error> {
 /// format gate and redb's own open flags protect the file there.
 #[cfg(unix)]
 fn prepare_file(path: &Path) -> Result<(), Error> {
-    crate::atomic::append_private(path)?;
+    use crate::atomic;
+
+    atomic::append_private(path)?;
     Ok(())
 }
 
@@ -2638,7 +2640,7 @@ mod tests {
         let dir = tempdir().expect("a temp dir");
         let path = dir.path().join("tier.redb");
         drop(Index::open(&path).expect("the index opens"));
-        let mode = std::fs::metadata(&path)
+        let mode = fs::metadata(&path)
             .expect("the file exists")
             .permissions()
             .mode()

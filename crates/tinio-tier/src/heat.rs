@@ -262,8 +262,8 @@ impl Heat {
     /// Take every counter inside the window, in `(bucket, key)` order, for the
     /// index flush.
     ///
-    /// One implementation with the flush: [`Heat::snapshot`] then
-    /// [`Heat::forget`], so the window rule lives once. Each row carries the
+    /// One implementation with the flush: `Heat::snapshot` then
+    /// `Heat::forget`, so the window rule lives once. Each row carries the
     /// counter's own last-read time, not the drain time, so a counter that
     /// outlived a slower flush cadence is still aged correctly once it reaches
     /// the durable table. An out-of-window counter is not persisted as fresh

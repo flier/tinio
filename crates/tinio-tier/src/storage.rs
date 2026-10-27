@@ -3716,9 +3716,14 @@ fn tier_evidence(root: &Path) -> Result<(bool, bool), Error> {
     ))
 }
 
-/// Whether `path` exists; a failure is an error rather than "absent".
+/// Whether `path` exists; a failure is an error rather than "absent", except
+/// a parent that is a file: nothing can exist under it, so the path is absent.
 fn path_present(path: &Path) -> Result<bool, Error> {
-    path.try_exists().map_err(Error::Io)
+    match path.try_exists() {
+        Err(err) if err.kind() == io::ErrorKind::NotADirectory => Ok(false),
+        Err(err) => Err(Error::Io(err)),
+        Ok(present) => Ok(present),
+    }
 }
 
 #[cfg(test)]
@@ -3931,6 +3936,19 @@ mod tests {
         );
         assert!(!temp.exists(), "the leftover temp is removed on the open");
         assert!(tier.index().root_id().expect("the index answers").is_some());
+    }
+
+    /// A regular file handed in as the root carries no tier evidence: the
+    /// probe answers "absent" for the paths under it (ENOTDIR), so the
+    /// backend's own "not a directory" refusal is what the caller reports.
+    #[test]
+    fn a_regular_file_is_not_a_tier_root() {
+        let root = tempfile::tempdir().expect("a temporary root");
+        let file = root.path().join("a-file");
+        fs::write(&file, b"not a root").expect("the file exists");
+
+        assert!(!is_tier_root(&file).expect("the seam answers"));
+        refuse_non_tier_root(&file).expect("a file carries no tier evidence");
     }
 
     /// An index that exists but cannot be read is refused before the marker is
